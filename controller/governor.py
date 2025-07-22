@@ -1,9 +1,9 @@
 import os
 import subprocess
+from utils.logger import logger
 
 class GovernorController:
-    def __init__(self, logging, cgroup_mount: str):
-        self.logging = logging
+    def __init__(self, cgroup_mount: str):
         self.cgroup_mount = cgroup_mount
         #self.cpu = cpuFreq()
 
@@ -19,14 +19,14 @@ class GovernorController:
                 if 'governor' in line.lower():
                     return line.split('"')[1]
         except subprocess.CalledProcessError as e:
-            self.logging.warning("Install cpupower first: sudo apt install linux-tools-common")
+            logger.warning("Install cpupower first: sudo apt install linux-tools-common")
 
         return None
 
     def __set_governor(self, governor="performance"):
         curr_governor = self.__get_governor()
         if curr_governor == governor:
-            # self.logging.info("current gov: %s, target gov: %s", curr_governor, governor)
+            # logger.info("current gov: %s, target gov: %s", curr_governor, governor)
             return
 
         try:
@@ -39,7 +39,7 @@ class GovernorController:
             #print(f"All CPUs set to {governor} mode")
         except subprocess.CalledProcessError as e:
             #print(f"Error: {e}")
-            self.logging.warning(f"Error: {e}")
+            logger.warning(f"Error: {e}")
 
     def set_performance(self) -> bool:
         """Set CPU governor to performance"""

@@ -38,7 +38,7 @@ systemctl set-property --runtime
 
 Build libcgroup wheel from source:
     1.  pip install Cython
-    2.  sudo apt install libpam-dev
+    2.  sudo apt install libpam-dev flex bison libsystemd-dev
     3.  git clone https://github.com/libcgroup/libcgroup.git
     4.  cd libcgroup
     5.  git checkout v3.2.0 -b v3.2.0
@@ -74,3 +74,17 @@ Note:
    ./lscgroup  -g misc://user.slice/user-1000.slice/user@1000.service/app.slice
    systemd-cgls
    lslogins -u
+
+5. How to run:
+
+   a. Launch a terminal:
+       conda create -n mt_py312 python=3.12.7
+       conda activate mt_py312
+       pip install -r requirements.txt
+       pip install dist/libcgroup-3.2.0-cp310-cp310-linux_x86_64.whl (Refer above "Build libcgroup wheel from source")
+   b. Run:
+       python BalanceService.py
+   c. Launch a new terminal and run the testing case:
+       python test/test_bservice.py
+
+

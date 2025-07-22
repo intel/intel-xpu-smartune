@@ -76,8 +76,9 @@ class Controller:
         scopes = self.get_user_scopes()
         services = self.get_app_services()
 
+        print(f"restore_cpu_throttle scopes = {scopes}, services = {services}")
         for scope in scopes:
-            result = subprocess.run(['systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=100%'],
+            result = subprocess.run(['sudo', 'systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=100%'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
         for service in services:
@@ -89,8 +90,9 @@ class Controller:
         scopes = self.get_user_scopes()
         services = self.get_app_services()
 
+        print(f"high_cpu_throttle scopes = {scopes}, services = {services}")
         for scope in scopes:
-            result = subprocess.run(['systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=60%'],
+            result = subprocess.run(['sudo', 'systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=60%'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
         for service in services:
@@ -102,8 +104,9 @@ class Controller:
         scopes = self.get_user_scopes()
         services = self.get_app_services()
 
+        print(f"critical_cpu_throttle scopes = {scopes}, services = {services}")
         for scope in scopes:
-            result = subprocess.run(['systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=30%'],
+            result = subprocess.run(['sudo', 'systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=30%'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
         for service in services:

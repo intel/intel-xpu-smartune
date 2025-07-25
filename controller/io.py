@@ -1,8 +1,35 @@
 import os
+from controller.base import ControllerBase
+from utils.logger import logger
 
-class IOController:
+class IOController(ControllerBase):
     def __init__(self, cgroup_mount: str):
-        self.cgroup_mount = cgroup_mount
+        super().__init__(cgroup_mount)
+    def controller_type(self) -> str:
+        return "blkio"
+
+    def set_parameter(self, cgroup: str, param: str, value: str) -> bool:
+        try:
+            path = os.path.join(self.get_full_path(cgroup), param)
+            print(f"io set_parameter path = {path}")
+            os.system(f"echo {value} > sudo {path}")
+            # with open(os.path.join(self.get_full_path(cgroup), param), 'w') as f:
+            #     f.write(value)
+            return True
+        except (FileNotFoundError, PermissionError) as e:
+            logger.error(f"Failed to set {param}={value}: {e}")
+            return False
+
 
     def set_limit(self, name: str, cgroup: str, weight: int) -> bool:
         pass
+
+    def set_throttle(self, cgroup: str, op_type: str, bps: int) -> bool:
+        """
+        设置IO速率限制
+        :param op_type: 'read' 或 'write'
+        :param bps: 字节/秒
+        """
+        device = "8:0"  # 默认主设备号，实际使用应检测具体设备
+        param = f"blkio.throttle.{op_type}_bps_device"
+        return self.set_parameter(cgroup, param, f"{device} {bps}")

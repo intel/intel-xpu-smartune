@@ -8,6 +8,7 @@ class Config:
     thresholds: dict = None
     weights: dict = None
     workloads: dict = None
+    balance_service: dict = None
 
     @classmethod
     def from_file(cls, path: str):

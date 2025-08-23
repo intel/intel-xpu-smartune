@@ -1,6 +1,4 @@
 import signal
-from time import sleep
-from config import Config
 from balancer.balancer import DynamicBalancer
 from utils.logger import logger
 from flask import Flask, request, jsonify
@@ -19,13 +17,14 @@ class APIStatus(Enum):
     FAILED = 1
     INVALID_PARAM = 2
     NOT_FOUND = 3
+    BAD_REQUEST = 4
 
 
 class DynamicService:
     """将核心逻辑封装在服务类中"""
 
-    def __init__(self, config_path="config.yaml"):
-        self.balancer = DynamicBalancer(config_path)
+    def __init__(self):
+        self.balancer = DynamicBalancer()
 
     def start(self):
         """启动服务线程"""
@@ -35,17 +34,20 @@ class DynamicService:
         """直接代理到balancer"""
         self.balancer.add_workload(priority, payload)
 
+    def add_control(self, app_name):
+        self.balancer.bpf_monitor.add_to_monitorlist(app_name)
+
     def shutdown(self):
         """关闭服务"""
         self.balancer.shutdown()
 
 
-def start_service(config_path="config.yaml"):
+def start_service():
     """初始化服务并设置信号处理"""
     global _service
     with _service_lock:
         if _service is None:
-            _service = DynamicService(config_path)
+            _service = DynamicService()
 
             # 信号处理
             signal.signal(signal.SIGINT, _handle_signal)
@@ -106,7 +108,7 @@ def get_apps():
                     id=app_id.replace('.desktop', ''),
                     app_id=app_id,
                     name=app.get_name(),
-                    priority='low',  # 默认优先级
+                    priority=0,  # 默认优先级
                     cmdline=app.get_commandline(),
                     last_update_time=datetime.now()
                 )
@@ -181,27 +183,43 @@ def set_priority():
         }), 500
 
 
-@app.route('/app/get_priority', methods=['POST'])
-def get_priority_by_app_id():
-    """根据app_id获取单个应用的优先级设置"""
+@app.route('/app/get_priority_data', methods=['POST'])
+def get_priority_data():
+    """根据 app_id 或 name 获取应用的优先级设置（支持同时查询）"""
 
     try:
-        record = None
         data = request.get_json()
-        app_id = data.get('app_id')
+        app_id = data.get('app_id', "")
+        name = data.get('app_name', "")
 
-        try:
-            record = AIAppPriority.query().where(AIAppPriority.app_id == app_id).first()
-        except Exception as e:
-            print(f"App - {app_id} not found.")
+        # 构建 OR 查询条件
+        query = AIAppPriority.query()
+        conditions = []
+        if app_id:
+            conditions.append(AIAppPriority.app_id == app_id)
+        if name:
+            conditions.append(AIAppPriority.name == name)
+
+        query = query.where(conditions[0])
+        record = query.first()
 
         if not record:
+            # 生成更友好的错误提示
+            not_found_msg = "未找到匹配的应用"
+            if app_id and name:
+                not_found_msg = f"未找到 app_id={app_id} 或 name={name} 的应用"
+            elif app_id:
+                not_found_msg = f"未找到 app_id={app_id} 的应用"
+            elif name:
+                not_found_msg = f"未找到 name={name} 的应用"
+
             return jsonify({
                 "code": APIStatus.NOT_FOUND.value,
                 "data": None,
-                "message": f"App with id {app_id} not found"
+                "message": not_found_msg
             }), 404
 
+        # 返回标准化数据结构
         priority_data = {
             "id": record.id,
             "app_id": record.app_id,
@@ -227,6 +245,90 @@ def get_priority_by_app_id():
         }), 500
 
 
+@app.route('/app/set_to_control', methods=['POST'])
+def set_to_control():
+    """设置应用管控状态并添加到监控列表"""
+    try:
+        data = request.get_json()
+        app_name = data.get('app_name')
+        app_id = data.get('app_id', "")
+        controlled = data.get('controlled', True)  # 默认为True（启用管控）
+        cgroup = data.get('cgroup', '')
+        priority = data.get('priority', 0)
+
+        # 更新或创建数据库记录
+        result = AIAppPriority.update_record(
+            id=app_id.replace('.desktop', ''),
+            controlled=controlled,
+            cgroup=cgroup
+        )
+
+        if result == DBStatus.NOT_FOUND:
+            AIAppPriority.insert_record(
+                id=app_id.replace('.desktop', ''),
+                app_id=app_id,
+                name=app_name,
+                priority=priority,  # 默认优先级
+                controlled=controlled,
+                cgroup=cgroup,
+                cmdline="",
+                status=False
+            )
+
+        _service.add_control(app_name)
+
+        return jsonify({
+            "code": APIStatus.SUCCESS.value,
+            "message": f"App control {'enabled' if controlled else 'disabled'} and added to monitor",
+            "data": {
+                "app_name": app_name,
+                "controlled": controlled,
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Control set failed: {str(e)}")
+        return jsonify({
+            "code": APIStatus.FAILED.value,
+            "message": f"Control operation failed: {str(e)}"
+        }), 500
+
+
+@app.route('/app/get_controlled_app', methods=['POST'])
+def get_controlled_app():
+    """获取所有受管控应用并添加到服务监控列表"""
+    try:
+        controlled_apps = AIAppPriority.query().filter(AIAppPriority.controlled == True)
+
+        if not controlled_apps:
+            return jsonify({
+                "code": APIStatus.SUCCESS.value,
+                "message": "No controlled apps found",
+                "data": []
+            })
+
+        # 处理结果并添加到服务监控
+        result_data = []
+        for app in controlled_apps:
+            result_data.append({
+                "app_id": app.app_id,
+                "app_name": app.name,
+                "controlled": app.controlled,
+                "cgroup": app.cgroup
+            })
+
+        return jsonify({
+            "code": APIStatus.SUCCESS.value,
+            "message": f"Found {len(controlled_apps)} controlled apps",
+            "data": result_data
+        })
+
+    except Exception as e:
+        logger.error(f"Get controlled apps failed: {str(e)}")
+        return jsonify({
+            "code": APIStatus.FAILED.value,
+            "message": f"Query operation failed: {str(e)}"
+        }), 500
 
 
 def main():

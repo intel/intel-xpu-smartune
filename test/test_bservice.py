@@ -54,12 +54,12 @@ def test_set_priority():
     test_cases = [
         {
             "name": "正常设置优先级",
-            "payload": {"app_id": "gnome-privacy-panel.desktop", "priority": "high", "cgroup": "system"},
-            "expected": "high"
+            "payload": {"app_id": "gnome-privacy-panel.desktop", "priority": 60, "cgroup": "system"},
+            "expected": 60
         },
         {
             "name": "设置不存在的应用",
-            "payload": {"app_id": "nonexistent.app", "priority": "critical", "cgroup": "user"},
+            "payload": {"app_id": "nonexistent.app", "priority": 80, "cgroup": "user"},
             "expected": None  # 预期会失败
         }
     ]
@@ -86,12 +86,13 @@ def test_set_priority():
 def test_get_priority():
     """测试根据app_id获取优先级设置API"""
     try:
-        print("\n[POST /app/get_priority]")
-        test_app_id = "gnome-privacy-panel.desktop" # "gnome-system-panel.desktop"
+        print("\n[POST /app/get_priority_data]")
+        test_app_id = "org.gnome.Calculator.desktop"
+        app_name = "Calculator"
 
         resp = requests.post(
-            f"{BASE_URL}/app/get_priority",
-            json={"app_id": test_app_id},
+            f"{BASE_URL}/app/get_priority_data",
+            json={"app_id": test_app_id, "app_name": app_name},
             timeout=5
         )
 
@@ -115,8 +116,56 @@ def test_get_priority():
         print(f"Test failed: {str(e)}")
 
 
+def test_set_control():
+    """测试设置应用管控API"""
+    test_cases = [
+        {
+            "name": "Firefox",
+            "payload": {
+                "app_name": "Firefox",
+                "app_id": "firefox_firefox.desktop",
+                "controlled": True,
+                "priority": 50
+            }
+        },
+        {
+            "name": "Calculator",
+            "payload": {
+                "app_name": "Calculator",
+                "app_id": "org.gnome.Calculator.desktop",
+                "controlled": True,
+                "priority": 60
+            }
+        },
+        {
+            "name": "Gedit",
+            "payload": {
+                "app_name": "gedit",
+                "app_id": "org.gnome.gedit.desktop",
+                "controlled": True,
+                "priority": 30
+            }
+        }
+    ]
+
+    for case in test_cases:
+        try:
+            print(f"\n[POST /app/set_to_control] {case['name']}")
+            resp = requests.post(
+                f"{BASE_URL}/app/set_to_control",
+                json=case["payload"],
+                timeout=5
+            )
+            print(f"Status: {resp.status_code}")
+            print("Response:")
+            print(json.dumps(resp.json(), indent=2))
+        except Exception as e:
+            print(f"测试失败: {str(e)}")
+
+
 if __name__ == "__main__":
     # test_add_workload()
     # test_get_apps()
     # test_set_priority()
-    test_get_priority()
+    # test_get_priority()
+    test_set_control()

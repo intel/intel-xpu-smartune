@@ -1,20 +1,17 @@
-import time
+import os, signal, time
 from dataclasses import dataclass
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 
-from monitor.psi import PSIMonitor
-from monitor.cgroup import CgroupMonitor
-from monitor.pressure import PressureAnalyzer
+from controller.control_management import ControlManagement
+from monitor.appIntercept import AppIntercept
 
-from controller.controller import Controller
-from controller.io import IOController
-from controller.cpu import CPUController
-from controller.memory import MemoryController
-from controller.governor import GovernorController
-
-from balancer.baseArch import BaseBalancer
 from utils.logger import logger
-from config import Config
+from utils import app_utils
+from config.config import Config
+import threading
+from multiprocessing import JoinableQueue
+import queue
+import heapq
 
 
 @dataclass
@@ -34,25 +31,51 @@ class WorkloadTask:
     task_id: str = ""
 
 
-class DynamicBalancer(BaseBalancer):
-    def __init__(self, config_file=None):
-        self.config = Config.from_file(config_file)
-        self.psi = PSIMonitor()
-        self.cgroups = CgroupMonitor(self.config.cgroup_mount)
-        self.analyzer = PressureAnalyzer(self.config)
-        self.controller = Controller(self.config.cgroup_mount)
-        self.cpu = CPUController(self.config.cgroup_mount)
-        self.memory = MemoryController(self.config.cgroup_mount)
-        self.io = IOController(self.config.cgroup_mount)
-        self.governor = GovernorController(self.config.cgroup_mount)
+class MaxPriorityQueue:
+    def __init__(self):
+        self._queue = queue.PriorityQueue()
+        self._index = 0  # 用于处理相同优先级的情况
+
+    def put(self, item):
+        # 存储负值实现最大堆，使用三元组 (负优先级, 自增索引, 数据)
+        priority = -item[1]
+        heapq.heappush(self._queue.queue, (priority, self._index, item))
+        self._index += 1
+
+    def get(self):
+        # 获取时取出原始数据
+        return heapq.heappop(self._queue.queue)[-1]
+
+    def empty(self):
+        """检查队列是否为空"""
+        return len(self._queue.queue) == 0
+
+    def __str__(self):
+        # 按优先级降序展示（实际存储是升序）
+        items = sorted(((-priority, data) for priority, _, data in self._queue.queue), reverse=True)
+        return str([(k, v) for (_, (k, v)) in items])
+
+    def __len__(self):
+        """获取队列当前元素数量"""
+        return len(self._queue.queue)
+
+
+class DynamicBalancer:
+    def __init__(self):
+        self.control_management = ControlManagement()
+        self.bpf_monitor = AppIntercept("monitor/bpf_event.c")
+
 
         # 资源管理
         self.workload_groups = {}  # 注册的workload类型
         self.running_tasks = {}  # pid -> WorkloadTask
         self.known_pids = set()  # 已识别的PID集合
 
-        self._init_default_workloads()
+        self.is_running = False
+        self.app_detect_queue = JoinableQueue(1000000)
+        self.app_priority_queue = MaxPriorityQueue()
 
+        self._init_default_workloads()
 
     def _init_default_workloads(self):
         default_groups = [
@@ -61,50 +84,157 @@ class DynamicBalancer(BaseBalancer):
             WorkloadGroup("normal", 50, 100, 0, 200),
             WorkloadGroup("best-effort", 20, 50, 0, 100)
         ]
-        for group in default_groups:
-            self.register_workload_group(group)
+        # for group in default_groups:
+        #     self.register_workload_group(group)
+
+    def start(self):
+        """
+        启动服务，包括启动服务线程来处理任务队列中的任务
+        """
+        self.is_running = True
+        # self.thread = threading.Thread(target=self._run_app_detect_loop)
+        # self.thread.start()
+
+        self.monitor_thread = threading.Thread(target=self._run_monitor_resource_loop)
+        self.monitor_thread.start()
+
+        self.handle_thread = threading.Thread(target=self._run_handle_loop)
+        self.handle_thread.start()
+
+        self.app_intercept_thread = threading.Thread(target=self._run_app_intercept_loop)
+        self.app_intercept_thread.start()
+
+        print("服务已启动，线程已开始运行")
+
+    # def _run_app_detect_loop(self):
+    #     logger.info("APP detect service is wait for processing")
+    #     # 模拟检测到新应用
+    #     test_app = ["test1", "test2", "test3"]
+    #     for i in test_app:
+    #         self.app_detect_queue.put(i)
+    #     # while self.is_running:
+    #         # call self._detect_new_apps() to check for new applications
+    #         # new_app = "test"
+    #         # self.app_detect_queue.put(new_app)
+    #     while self.is_running:
+    #         time.sleep(1)
+    #     print("退出_run_app_detect_loop")
 
 
-    def _process_task(self, task: Dict) -> Dict:
-        """重写基类方法处理具体任务"""
-        try:
-            if task["type"] == "new_app":
-                return self._handle_new_app(task)
-        except Exception as e:
-            logger.error(f"Task processing failed: {str(e)}")
-            return {"status": "error", "message": str(e)}
-        return {"status": "ignored"}
+    def _run_monitor_resource_loop(self):
+        logger.info("Monitor resource service started")
+        idle_check_interval = 120  # 2分钟（单位：秒）
+        last_check_time = 0
+
+        while self.is_running:
+            try:
+                current_time = time.time()
+
+                # 当队列不为空时立即处理，为空时每2分钟检查一次
+                if not self.app_priority_queue.empty() or (current_time - last_check_time) >= idle_check_interval:
+                    pressure = self.control_management._get_current_pressure_level()
+                    last_check_time = current_time
+
+                    if pressure == "critical":
+                        # adjust app
+                        pass
+                    elif not self.app_priority_queue.empty():
+                        # 处理队列中的应用
+                        app_data, priority = self.app_priority_queue.get()
+                        logger.info(
+                            f"Starting app: {app_data['app_name']} (PID: {app_data['pid']}, Priority: {priority})")
+                        os.kill(app_data['pid'], signal.SIGCONT)
+
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"Error in monitor loop: {str(e)}", exc_info=True)
+                time.sleep(1)
+
+        logger.info("Monitor resource service stopped")
+
+    def _run_handle_loop(self):
+        logger.info("Resource handle service is wait for processing")
+        while self.is_running:
+            try:
+                # 从app_detect_queue任务队列中获取任务并处理
+                coming_app = self.bpf_monitor.app_pending_queue.get(block=True, timeout=5)
+                logger.info(f"_run_handle_loop: Processing app {coming_app}")
+
+                # 从DB中获取coming_app priority,如没有设置，就是low
+                # priority = "1000"  # critical
+                # priority_value = {"Calculator": 1000, "test2": 1500, "test3": 1300}
+                priority = self.control_management.get_app_priority(app_name=coming_app["app_name"])
+                logger.info(f"_run_handle_loop: App {coming_app['app_name']} priority is {priority}")
+                # priority = priority_value[coming_app["app_name"]]
+                #
+                # # 将任务放入待处理队列
+                self.app_priority_queue.put((coming_app, priority))
+                logger.info(f"_run_handle_loop: Resource insufficient, {coming_app} app added to pending queue")
+
+            except:
+                time.sleep(2)
+        print("退出_run_handle_loop")
+
+    def _run_app_intercept_loop(self):
+        logger.info("Resource app intercept service is wait for processing")
+
+        # 打开性能缓冲区
+        self.bpf_monitor.bpf["events"].open_perf_buffer(self.bpf_monitor.print_event)
+        print("Ctrl+C to exit")
+
+        monitor_apps = app_utils.get_controlled_apps()
+        if monitor_apps:
+            # 将受控应用添加到BPF监控列表
+            monitored_names = [app["app_name"] for app in monitor_apps]
+            self.bpf_monitor.add_to_monitorlist(monitored_names)
+            print(f"Monitoring execve() for: {', '.join(monitored_names)}")
+        else:
+            logger.warning("No controlled apps to monitor")
+
+        while self.is_running:
+            try:
+                # 监控启动事件
+                self.bpf_monitor.bpf.perf_buffer_poll(timeout=100)
+            except KeyboardInterrupt:
+                print("\nExiting...")
+                break
+            except Exception as e:
+                logger.error(f"App intercept error: {str(e)}")
+                time.sleep(3)
+                break
+
+    # def _process_task(self, task: Dict) -> Dict:
+    #     """重写基类方法处理具体任务"""
+    #     try:
+    #         if task["type"] == "new_app":
+    #             return self._handle_new_app(task)
+    #     except Exception as e:
+    #         logger.error(f"Task processing failed: {str(e)}")
+    #         return {"status": "error", "message": str(e)}
+    #     return {"status": "ignored"}
 
 
-    def _handle_new_app(self, task: Dict) -> Dict:
-        """处理新应用启动请求"""
-        logger.info("Handling new app request for group: %s", task["group"])
-
-        # 校验任务组
-        if task["group"] not in self.workload_groups:
-            return {"status": "error", "reason": "unknown_workload"}
-
-        # 创建任务实例
-        workload = self.workload_groups[task["group"]]
-        new_task = WorkloadTask(
-            workload=workload,
-            params=task.get("params", {}),
-            task_id=task.get("task_id", ""),
-            pid=task.get("params", {}).get("pid")
-        )
-
-        pressure_level = self._get_current_pressure_level()
-        self._execute_task(new_task, pressure_level)
-
-        return {"status": "success" if new_task.pid else "queued"}
-
-    def _get_current_pressure_level(self) -> str:
-        """获取当前系统压力级别"""
-        psi_data = self.psi.get_current_pressure()
-        score = self.analyzer.calculate_pressure_score(psi_data)
-        level = self.analyzer.get_pressure_level(score)
-        logger.debug("Current PSI level: %s (score: %.2f)", level, score)
-        return level
+    # def _handle_new_app(self, task: Dict) -> Dict:
+    #     """处理新应用启动请求"""
+    #     logger.info("Handling new app request for group: %s", task["group"])
+    #
+    #     # 校验任务组
+    #     if task["group"] not in self.workload_groups:
+    #         return {"status": "error", "reason": "unknown_workload"}
+    #
+    #     # 创建任务实例
+    #     workload = self.workload_groups[task["group"]]
+    #     new_task = WorkloadTask(
+    #         workload=workload,
+    #         params=task.get("params", {}),
+    #         task_id=task.get("task_id", ""),
+    #         pid=task.get("params", {}).get("pid")
+    #     )
+    #
+    #     pressure_level = self._get_current_pressure_level()
+    #     self._execute_task(new_task, pressure_level)
+    #
+    #     return {"status": "success" if new_task.pid else "queued"}
 
     def _execute_task(self, task: WorkloadTask, pressure_level: str) -> bool:
         """执行任务"""
@@ -113,60 +243,12 @@ class DynamicBalancer(BaseBalancer):
                 self.running_tasks[task.pid] = task
                 logger.info("Task %s registered (PID: %d)", task.workload.name, task.pid)
 
-                self.adjust_resources(pressure_level)
+                self.control_management.adjust_resources(pressure_level)
                 return True
             return False
         except Exception as e:
             logger.error("Task registration failed: %s", str(e))
             return False
-
-
-    def adjust_resources(self, pressure_level: str):
-        """Adjust resources based on pressure level"""
-        adjustments = {
-            'low': self._low_pressure_adjustment,
-            'medium': self._medium_pressure_adjustment,
-            'high': self._high_pressure_adjustment,
-            'critical': self._critical_pressure_adjustment
-        }
-        adjustments.get(pressure_level, lambda: None)()
-
-    def _low_pressure_adjustment(self):
-        """Low pressure adjustments"""
-        self.governor.set_powersave()
-
-        # release CPU/MEM throttling
-        self.controller.restore_cpu_throttle()
-
-    def _medium_pressure_adjustment(self):
-        """Medium pressure adjustments"""
-        self.governor.set_powersave()
-
-        # release CPU/MEM throttling
-        self.controller.restore_cpu_throttle()
-
-    def _high_pressure_adjustment(self):
-        """High pressure adjustments"""
-        self.governor.set_performance()
-
-        # throttle CPU/MEM
-        self.controller.high_cpu_throttle()
-
-    def _critical_pressure_adjustment(self):
-        """Critical pressure adjustments"""
-        self.governor.set_performance()
-
-        # throttle CPU/MEM
-        self.controller.critical_cpu_throttle()
-
-        # Throttle best-effort workloads heavily
-        self.cpu.set_weight("best-effort", 10)
-        self.memory.set_limit("best-effort", "high", "20%")
-        self.io.set_limit("best-effort", "max", "1000")
-
-        # Boost critical workloads
-        self.cpu.set_weight("critical", 500)
-        self.memory.protect("critical", "min", "4G")
 
 
     def register_workload_group(self, group: WorkloadGroup):
@@ -192,8 +274,22 @@ class DynamicBalancer(BaseBalancer):
         return True
 
     def shutdown(self):
-        """安全关闭服务"""
-        super().stop()
+        """
+        停止服务线程，设置运行标志为False，并等待线程结束，同时确保任务队列中的任务都已处理完成
+        """
+        print("服务开始停止.............")
+        if not self.is_running:
+            print("服务已经停止，无需再次操作")
+            return
+        self.is_running = False
+
+        # 清空任务队列
+
+        # self.thread.join()
+        self.monitor_thread.join()
+        self.handle_thread.join()
+        self.app_intercept_thread.join()
+        print("服务已停止，线程已结束")
 
     #
     # def _detect_new_apps(self):

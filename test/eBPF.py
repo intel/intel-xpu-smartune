@@ -103,7 +103,7 @@ def add_to_blacklist(app_name):
     value.name = app_name_bytes + b'\0'
 
     # Use ctypes.create_string_buffer to handle the string
-    # buffer = ctypes.create_string_buffer(null_terminated, PY_MAX_TARGET_LEN)
+    # buffer = ctypes.create_string_buffer(null_terminated, PY_MAX_FILE_LEN)
     # ctypes.memmove(value.name, buffer, len(buffer))
 
     # 使用固定键0

@@ -19,3 +19,7 @@ workloads:
     cpu_weight: 50
     memory_min: "0"
     io_weight: 100
+balance_service:
+  url: "http://127.0.0.1"
+  port: 9001
+  get_priority: "app/get_priority_data"

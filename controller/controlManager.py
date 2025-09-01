@@ -13,7 +13,7 @@ from controller.governor import GovernorController
 from config.config import Config  # Assuming Config is defined in a module named `config`
 
 
-class ControlManagement:
+class ControlManager:
     def __init__(self, config_file="config/config.yaml"):
         self.config = Config.from_file(config_file)
         self.psi = PSIMonitor()

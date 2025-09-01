@@ -1,0 +1,126 @@
+import os
+import sys
+
+import streamlit as st
+import streamlit_antd_components as sac
+from streamlit_extras.stylable_container import stylable_container
+from conf import VERSION
+
+from pages.controller import apps_management
+
+if 'language' not in st.session_state:
+    st.session_state['language'] = 'English'  # default language setting
+
+if "default_menu_index" not in st.session_state:
+    st.session_state.default_menu_index = 0
+
+
+def update_language_choice():
+    st.session_state['language'] = st.session_state['selected_language']
+
+
+if __name__ == "__main__":
+    is_lite = "lite" in sys.argv
+
+    st.set_page_config(
+        "AI NAS Multi-Apps Startup Manager",
+        os.path.join("img", "chatchat_icon_blue_square_v2.png"),
+        initial_sidebar_state="collapsed",  #  'expanded' or 'collapsed'
+        layout="wide",
+        menu_items={
+            'Get Help': 'https://www.intel.com',
+            'Report a bug': "https://www.intel.com",
+            'About': f"""欢迎使用 AI NAS Multi-Apps Startup Manager {VERSION}！"""
+        }
+    )
+
+    st.markdown("""
+        <style>
+            [data-testid="stSidebarNavLink"] {
+                display: none;
+            }
+            [data-testid="stSidebarNav"] {
+                display: none;
+            }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+        <style>
+            .reportview-container {
+                margin-top: -2em;
+            }
+            #MainMenu {visibility: hidden;}
+            header {visibility: hidden;}
+            footer {visibility: hidden;}
+            #stDecoration {display:none;}
+        </style>
+    """, unsafe_allow_html=True)
+
+    with st.sidebar:
+        st.image(
+            os.path.join(
+                "img",
+                "Intel-logo-48.png"
+            )
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        st.markdown(f"""
+        <div style="text-align: left; font-weight: bold; font-size: 24px;">
+            Multi-Apps Manager
+        </div>
+        """, unsafe_allow_html=True)
+
+        version_text = {
+            "简体中文": "当前版本：",
+            "English": "Current Version: "
+        }
+        st.caption(
+            f"""<p align="left">{version_text[st.session_state['language']]}{VERSION}</p>""",
+            unsafe_allow_html=True,
+        )
+
+        select_language_text = {
+            'English': '🌐 Interface Display Language',
+            '简体中文': '🌐 界面显示语言',
+        }
+
+        language_options = ["简体中文", "English"]
+
+        selected_language = st.selectbox(
+            select_language_text[st.session_state['language']],
+            options=language_options,
+            index=language_options.index(st.session_state.get('language', '简体中文')),
+            on_change=update_language_choice,
+            key='selected_language'
+        )
+        sac.divider(align='center', color='gray')
+
+        menu_text = {
+            "app_manager": {
+                "简体中文": "应用管理",
+                "English": "App Management",
+                "index": 0,
+                "func": apps_management
+            }
+        }
+        menu_func = {}
+        for k, v in menu_text.items():
+            menu_func[v["index"]] = v["func"]
+
+        # menu
+        menu_index = sac.menu(
+            items=[
+                sac.MenuItem(menu_text["app_manager"][selected_language], icon='gear')
+            ],
+            key='menu',
+            index=st.session_state.default_menu_index,
+            open_all=True,
+            indent=20,
+            format_func='title',
+            return_index=True
+        )
+
+    if menu_index in menu_func and menu_func[menu_index]:
+        menu_func[menu_index]()

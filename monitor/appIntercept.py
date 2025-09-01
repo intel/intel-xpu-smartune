@@ -7,7 +7,7 @@ from typing import List, Set, Dict, Any, Union
 from gi.repository import Gio
 import psutil
 from multiprocessing import JoinableQueue
-from controller.control_management import ControlManagement
+from controller.controlManager import ControlManager
 from utils import app_utils
 
 # 定义与BPF代码中相同的常量
@@ -27,7 +27,7 @@ class SingletonMeta(type):
 class AppIntercept(metaclass=SingletonMeta):
     def __init__(self, c_src_file: str = "bpf_event.c"):
         self.bpf = BPF(src_file=c_src_file)
-        self.controlManagement = ControlManagement()
+        self.controlManager = ControlManager()
         self.monitored_apps: Set[str] = set()
         self.processes_to_relaunch: Dict[int, Dict[str, Any]] = {}  # 存储需要重启的进程信息
         self.handled_processes: Set[int] = set()  # 初始化已处理进程集合
@@ -107,7 +107,7 @@ class AppIntercept(metaclass=SingletonMeta):
             os.kill(pid, signal.SIGSTOP)
 
             # 检查系统资源
-            pressure = self.controlManagement._get_current_pressure_level()
+            pressure = self.controlManager._get_current_pressure_level()
             print(f"Current system pressure level: {pressure}")
             if pressure == "critical":
                 # 存储进程信息以便重启

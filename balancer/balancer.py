@@ -2,7 +2,7 @@ import os, signal, time
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-from controller.control_management import ControlManagement
+from controller.controlManager import ControlManager
 from monitor.appIntercept import AppIntercept
 
 from utils.logger import logger
@@ -62,7 +62,7 @@ class MaxPriorityQueue:
 
 class DynamicBalancer:
     def __init__(self):
-        self.control_management = ControlManagement()
+        self.controlManager = ControlManager()
         self.bpf_monitor = AppIntercept("monitor/bpf_event.c")
 
 
@@ -132,7 +132,7 @@ class DynamicBalancer:
 
                 # 当队列不为空时立即处理，为空时每2分钟检查一次
                 if not self.app_priority_queue.empty() or (current_time - last_check_time) >= idle_check_interval:
-                    pressure = self.control_management._get_current_pressure_level()
+                    pressure = self.controlManager._get_current_pressure_level()
                     last_check_time = current_time
 
                     if pressure == "critical":
@@ -163,7 +163,7 @@ class DynamicBalancer:
                 # 从DB中获取coming_app priority,如没有设置，就是low
                 # priority = "1000"  # critical
                 # priority_value = {"Calculator": 1000, "test2": 1500, "test3": 1300}
-                priority = self.control_management.get_app_priority(app_name=coming_app["app_name"])
+                priority = self.controlManager.get_app_priority(app_name=coming_app["app_name"])
                 logger.info(f"_run_handle_loop: App {coming_app['app_name']} priority is {priority}")
                 # priority = priority_value[coming_app["app_name"]]
                 #
@@ -243,7 +243,7 @@ class DynamicBalancer:
                 self.running_tasks[task.pid] = task
                 logger.info("Task %s registered (PID: %d)", task.workload.name, task.pid)
 
-                self.control_management.adjust_resources(pressure_level)
+                self.controlManager.adjust_resources(pressure_level)
                 return True
             return False
         except Exception as e:

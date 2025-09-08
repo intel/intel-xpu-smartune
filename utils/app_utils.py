@@ -1,4 +1,5 @@
 import os
+import requests
 import subprocess
 import shutil
 from getpass import getuser
@@ -6,6 +7,45 @@ from pwd import getpwnam
 
 from utils.logger import logger
 from db.DatabaseModel import AIAppPriority
+from typing import Optional, Dict, Any
+
+class ClientCallbackManager:
+    """管理客户端回调的全局状态和操作"""
+    _instance = None
+    _registered_url: Optional[str] = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    @property
+    def callback_url(self) -> Optional[str]:
+        return self._registered_url
+
+    def register_callback_url(self, url: str) -> None:
+        """注册全局回调地址"""
+        self._registered_url = url
+
+    def send_callback_notification(self, data: Dict[str, Any]) -> bool:
+        """发送回调通知（线程安全）"""
+        if not self._registered_url:
+            raise ValueError("No callback URL registered")
+
+        try:
+            response = requests.post(
+                self._registered_url,
+                json=data,
+                timeout=5
+            )
+            return response.status_code == 200 and response.json().get("status") == "ok"
+        except Exception as e:
+            raise ConnectionError(f"Callback failed: {str(e)}")
+
+
+# 单例实例
+callback_manager = ClientCallbackManager()
+
 
 def get_controlled_apps():
     try:

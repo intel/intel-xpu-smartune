@@ -21,14 +21,29 @@ class HS_retcode(IntEnum):
 
 class MABridge:
 
+    def register_callback(self, register_url: str, callback_url: str) -> bool:
+        """向Multi-Apps服务注册回调地址（业务逻辑层）"""
+        try:
+            response = requests.post(
+                register_url,
+                json={"callback_url": callback_url},
+                timeout=5
+            )
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+                return True
+            return False
+        except Exception as e:
+            print(f"Callback registration failed: {e}")
+            return False
+
     def get_controlled_apps(self, url):
         """ Get controlled apps from multi-apps service.
 
         :return: list of controlled apps
         """
-        data = {}
         try:
-            response = requests.post(url, json=data)
+            response = requests.post(url, json={})
             response_data = response.json()
             if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
                 return response_data["data"]
@@ -36,3 +51,99 @@ class MABridge:
         except requests.exceptions.RequestException as e:
             print('get_controlled_apps request error: ', e)
             return []
+
+    def set_controlled_apps(self, url, app_data):
+        """ Set controlled app in multi-apps service.
+
+        :param app_data: dict with app control data
+        :return: response from the service
+        """
+        try:
+            response = requests.post(url, json=app_data)
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+                return response_data["data"]
+            return {}
+        except requests.exceptions.RequestException as e:
+            print('set_controlled_app request error: ', e)
+            return {}
+
+    def remove_controlled_apps(self, url, app_data):
+        """ Remove controlled app from multi-apps service.
+
+        :param app_data: dict with app control data
+        :return: response from the service
+        """
+        try:
+            response = requests.post(url, json=app_data)
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+                return response_data["data"]
+            return {}
+        except requests.exceptions.RequestException as e:
+            print('remove_controlled_app request error: ', e)
+            return {}
+
+    def get_priority_data(self, url, query_data):
+        """ Get priority data for a specific app.
+
+        :param query_data: dict with app_id or app_name
+        :return: priority data dict
+        """
+        try:
+            response = requests.post(url, json=query_data)
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+                return response_data["data"]
+            return {}
+        except requests.exceptions.RequestException as e:
+            print('get_priority_data request error: ', e)
+            return {}
+
+    def set_priority(self, url, priority_data):
+        """ Set priority for a specific app.
+
+        :param priority_data: dict with app_id, priority, and optional cgroup
+        :return: response from the service
+        """
+        try:
+            response = requests.post(url, json=priority_data)
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+                return response_data["data"]
+            return {}
+        except requests.exceptions.RequestException as e:
+            print('set_priority request error: ', e)
+            return {}
+
+    def get_apps(self, url, store):
+        """ Get list of all apps from multi-apps service.
+
+        :return: list of apps
+        """
+        data = {"store": store}
+        try:
+            response = requests.get(url, json=data)
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+                return response_data["data"]
+            return []
+        except requests.exceptions.RequestException as e:
+            print('get_apps request error: ', e)
+            return []
+
+    def add_workload(self, url, workload_data):
+        """ Add workload to the multi-apps service.
+
+        :param workload_data: dict with workload details
+        :return: response from the service
+        """
+        try:
+            response = requests.post(url, json=workload_data)
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+                return response_data["data"]
+            return {}
+        except requests.exceptions.RequestException as e:
+            print('add_workload request error: ', e)
+            return {}

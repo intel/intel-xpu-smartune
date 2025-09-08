@@ -121,9 +121,11 @@ class AppIntercept(metaclass=SingletonMeta):
                 # 延迟重启，避免频繁操作
                 # time.sleep(1)
                 os.kill(pid, signal.SIGCONT)
+                app_utils.callback_manager.send_callback_notification({'app_name': app_name, 'status': "running"})
             else:
                 print(f"System resources busy, skipping relaunch of {app_name}")
                 app_utils.safe_notify("System resources busy", f"已暂停应用{app_name}启动，请前往应用控制中心操作", icon='dialog-warning')
+                app_utils.callback_manager.send_callback_notification({'app_name': app_name, 'status': "pending"})
                 self.app_pending_queue.put(
                     {"pid": pid, "comm": comm, "filename": filename, "app_name": app_name, "desktop_id": desktop_id})
 

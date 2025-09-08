@@ -9,6 +9,7 @@ class Config:
     weights: dict = None
     workloads: dict = None
     balance_service: dict = None
+    app_priority: dict = None
 
     @classmethod
     def from_file(cls, path: str):

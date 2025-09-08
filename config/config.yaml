@@ -23,3 +23,8 @@ balance_service:
   url: "http://127.0.0.1"
   port: 9001
   get_priority: "app/get_priority_data"
+app_priority:
+  critical: 100
+  high: 80
+  medium: 50
+  low: 20

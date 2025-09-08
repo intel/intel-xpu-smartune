@@ -168,7 +168,9 @@ class DynamicBalancer:
                 # priority = priority_value[coming_app["app_name"]]
                 #
                 # # 将任务放入待处理队列
-                self.app_priority_queue.put((coming_app, priority))
+                priority_num = self.controlManager.get_priority_value(priority)
+                print(f"_run_handle_loop: priority value is {priority_num}")
+                self.app_priority_queue.put((coming_app, priority_num))
                 logger.info(f"_run_handle_loop: Resource insufficient, {coming_app} app added to pending queue")
 
             except:

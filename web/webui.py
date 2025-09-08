@@ -3,10 +3,12 @@ import sys
 
 import streamlit as st
 import streamlit_antd_components as sac
-from streamlit_extras.stylable_container import stylable_container
 from conf import VERSION
-
 from pages.controller import apps_management
+from apis.api import Client_multiapps_api
+
+# API 客户端初始化
+api = Client_multiapps_api()
 
 if 'language' not in st.session_state:
     st.session_state['language'] = 'English'  # default language setting
@@ -22,9 +24,11 @@ def update_language_choice():
 if __name__ == "__main__":
     is_lite = "lite" in sys.argv
 
+    api.start_client_callback()
+
     st.set_page_config(
-        "AI NAS Multi-Apps Startup Manager",
-        os.path.join("img", "chatchat_icon_blue_square_v2.png"),
+        page_title="AI NAS Multi-Apps Startup Manager",
+        page_icon="🧊",
         initial_sidebar_state="collapsed",  #  'expanded' or 'collapsed'
         layout="wide",
         menu_items={

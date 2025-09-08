@@ -78,7 +78,7 @@ class ControlManager:
         self.cpu.set_weight("critical", 500)
         self.memory.protect("critical", "min", "4G")
 
-    def get_app_priority(self, app_id: str = "", app_name: str = "") -> int:
+    def get_app_priority(self, app_id: str = "", app_name: str = "") -> str:
         """Get the priority of an application."""
         resp = requests.post(
             f"{self.balance_url}/{self.config.balance_service['get_priority']}",
@@ -87,7 +87,18 @@ class ControlManager:
         )
         if resp.status_code == 200:
             data = resp.json()
-            return data["data"].get("priority", 0)
+            return data["data"].get("priority", "low")
         else:
             logger.error("Failed to get app priority: %s", resp.text)
-            return 0
+            return "low"
+
+    def get_priority_value(self, priority_str: str = "") -> int:
+        """
+        :param priority_str: e.g. critical
+        :return: 100
+        """
+        priority = priority_str.lower()
+        print(f"Getting priority value for: {priority}, self.config.app_priority: {self.config.app_priority}")
+        if priority not in self.config.app_priority:
+            raise ValueError(f"Invalid priority: {priority_str}")
+        return self.config.app_priority[priority]

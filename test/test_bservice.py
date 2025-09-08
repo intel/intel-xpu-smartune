@@ -1,9 +1,12 @@
 # test.py
-import requests
-import json
+import requests, json
+import threading
+from flask import Flask, request, jsonify
 
 BASE_URL = "http://localhost:9001"
+CLIENT_URL = "http://localhost:8656"
 
+client_app = Flask(__name__)
 
 def test_add_workload():
     payloads = [
@@ -163,9 +166,45 @@ def test_set_control():
             print(f"测试失败: {str(e)}")
 
 
+# 回调处理路由
+@client_app.route('/callback', methods=['POST'])
+def handle_callback():
+    data = request.json
+    print(f"[Client] Received callback: {data}")
+    # 如果是 Streamlit 环境，可以在这里更新 UI
+    print(f"Task {data['task_id']} status: {data['status']}")
+    return jsonify({"status": "ok"})
+
+def test_submit_task():
+    """测试提交任务并接收回调"""
+    try:
+        print("\n[POST /submit_task] Submitting task...")
+        resp = requests.post(
+            f"{BASE_URL}/app/submit_task",
+            json={
+                "task_id": "test_123",
+                "callback_url": f"{CLIENT_URL}/callback"  # 指向客户端的回调地址
+            },
+            timeout=5
+        )
+        print(f"Status: {resp.status_code}")
+        print("Response:", resp.json())
+
+    except Exception as e:
+        print(f"测试失败: {str(e)}")
+
+
 if __name__ == "__main__":
     # test_add_workload()
     # test_get_apps()
     # test_set_priority()
     # test_get_priority()
-    test_set_control()
+    # test_set_control()
+    # 启动客户端 Flask 服务（在后台线程）
+    threading.Thread(
+        target=client_app.run,
+        kwargs={"host": "0.0.0.0", "port": 8656},
+        daemon=True
+    ).start()
+
+    test_submit_task()  # 测试任务提交

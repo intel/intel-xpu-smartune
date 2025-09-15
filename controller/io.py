@@ -20,6 +20,10 @@ class IOController(ControllerBase):
             logger.error(f"Failed to set {param}={value}: {e}")
             return False
 
+    def set_weight(self, cgroup: str, weight: int) -> bool:
+        """设置IO权重，范围10-1000"""
+        weight = max(10, min(weight, 1000))
+        print(f"io set_weight weight = {weight}")
 
     def set_limit(self, name: str, cgroup: str, weight: int) -> bool:
         pass

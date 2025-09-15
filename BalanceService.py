@@ -28,6 +28,12 @@ class DynamicService:
         """直接代理到balancer"""
         self.balancer.add_workload(priority, payload)
 
+    def cancel_relaunch(self, app_id):
+        return self.balancer.cancel_relaunch_by_app_id(app_id)
+
+    def resource_limit(self, app_id):
+        return self.balancer.set_resource_limit(app_id)
+
     def add_control(self, app_name):
         self.balancer.bpf_monitor.add_to_monitorlist(app_name)
 
@@ -114,7 +120,7 @@ def get_apps():
                         priority=0,  # 默认优先级
                         remark="",
                         cmdline=app.get_commandline(),
-                        status="stopped",
+                        status="NA",
                         last_update_time=datetime.now()
                     )
 
@@ -281,7 +287,7 @@ def set_to_control():
                 cgroup=cgroup,
                 remark=remark,
                 cmdline="",
-                status="stopped",
+                status="NA",
                 last_update_time=datetime.now()
             )
 
@@ -366,6 +372,7 @@ def get_controlled_app():
                 "priority": app.priority,
                 "cgroup": app.cgroup,
                 "remark": app.remark,
+                "status": app.status
             })
 
         return construct_response(
@@ -374,6 +381,90 @@ def get_controlled_app():
         )
     except Exception as e:
         logger.error(f"Get controlled apps failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/cancel_relaunch', methods=['POST'])
+def cancel_relaunch_app():
+    """ Cancel relaunch for a specific app by app_id. """
+    try:
+        data = request.get_json()
+        app_id = data.get('app_id', "")
+
+        # 验证必要参数
+        if not app_id:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="Either app_id must be provided"
+            )
+
+        result = _service.cancel_relaunch(app_id)
+
+        try:
+            update_db_result = AIAppPriority.update_record(
+                id=app_id.replace('.desktop', ''),
+                status="stopped",
+                up_time=datetime.now()
+            )
+        except Exception as db_error:
+            logger.error(f"Update database failed for {app_id}: {str(db_error)}")
+            update_db_result = False
+
+        if result and update_db_result:
+            return construct_response(
+                data={"app_id": app_id},
+                retmsg="Successfully found and canceled relaunch"
+            )
+        else:
+            return construct_response(
+                data={"app_id": app_id},
+                retcode=RetCode.OPERATING_ERROR,
+                retmsg="No matching app found or failed to cancel relaunch it"
+            )
+    except Exception as e:
+        logger.error(f"Cancel relaunch failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/resource_limit', methods=['POST'])
+def app_resource_limit():
+    """ Set resource limit for a specific app by app_id. """
+    try:
+        data = request.get_json()
+        app_id = data.get('app_id', "")
+
+        # 验证必要参数
+        if not app_id:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="Either app_id must be provided"
+            )
+
+        result = _service.resource_limit(app_id)
+
+        if result:
+            return construct_response(
+                data={},
+                retmsg="Successfully found and set resource limit"
+            )
+        else:
+            return construct_response(
+                data={},
+                retcode=RetCode.OPERATING_ERROR,
+                retmsg="No matching app found or failed to set resource limit"
+            )
+    except Exception as e:
+        logger.error(f"Set resource limit failed: {str(e)}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,

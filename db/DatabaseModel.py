@@ -139,7 +139,7 @@ class AIAppPriority(DataBaseModel):
     cmdline = TextField(null=True, help_text="app launch cmdline", index=True)
     remark = CharField(max_length=255, null=True, help_text="remark for this app", index=True)
     up_time = DateTimeField(null=True, index=True)
-    status = CharField(default="stopped", max_length=32, null=True, help_text="app status, running, pending, stopped", index=True)
+    status = CharField(default="NA", max_length=32, null=True, help_text="app status, NA, running, pending, stopped", index=True)
 
 
 def init_database():

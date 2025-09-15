@@ -46,6 +46,25 @@ class MaxPriorityQueue:
         # 获取时取出原始数据
         return heapq.heappop(self._queue.queue)[-1]
 
+    def remove_if(self, condition_func):
+        """
+        删除满足条件的项目（通用方法，不涉及业务逻辑）
+        :param condition_func: 接受一个队列项目（元组 (data, priority)），返回 bool
+        :return: 被删除的项目列表
+        """
+        removed_items = []
+        new_queue = []
+
+        for priority, idx, item in self._queue.queue:
+            if condition_func(item):
+                removed_items.append(item)
+            else:
+                new_queue.append((priority, idx, item))
+
+        self._queue.queue = new_queue
+        heapq.heapify(self._queue.queue)  # 重新堆化
+        return removed_items
+
     def empty(self):
         """检查队列是否为空"""
         return len(self._queue.queue) == 0
@@ -92,8 +111,6 @@ class DynamicBalancer:
         启动服务，包括启动服务线程来处理任务队列中的任务
         """
         self.is_running = True
-        # self.thread = threading.Thread(target=self._run_app_detect_loop)
-        # self.thread.start()
 
         self.monitor_thread = threading.Thread(target=self._run_monitor_resource_loop)
         self.monitor_thread.start()
@@ -105,20 +122,6 @@ class DynamicBalancer:
         self.app_intercept_thread.start()
 
         print("服务已启动，线程已开始运行")
-
-    # def _run_app_detect_loop(self):
-    #     logger.info("APP detect service is wait for processing")
-    #     # 模拟检测到新应用
-    #     test_app = ["test1", "test2", "test3"]
-    #     for i in test_app:
-    #         self.app_detect_queue.put(i)
-    #     # while self.is_running:
-    #         # call self._detect_new_apps() to check for new applications
-    #         # new_app = "test"
-    #         # self.app_detect_queue.put(new_app)
-    #     while self.is_running:
-    #         time.sleep(1)
-    #     print("退出_run_app_detect_loop")
 
 
     def _run_monitor_resource_loop(self):
@@ -137,7 +140,8 @@ class DynamicBalancer:
 
                     if pressure == "critical":
                         # adjust app
-                        pass
+                        time.sleep(5)
+                        continue
                     elif not self.app_priority_queue.empty():
                         # 处理队列中的应用
                         app_data, priority = self.app_priority_queue.get()
@@ -205,38 +209,33 @@ class DynamicBalancer:
                 time.sleep(3)
                 break
 
-    # def _process_task(self, task: Dict) -> Dict:
-    #     """重写基类方法处理具体任务"""
-    #     try:
-    #         if task["type"] == "new_app":
-    #             return self._handle_new_app(task)
-    #     except Exception as e:
-    #         logger.error(f"Task processing failed: {str(e)}")
-    #         return {"status": "error", "message": str(e)}
-    #     return {"status": "ignored"}
 
+    def cancel_relaunch_by_app_id(self, app_id: str) -> bool:
+        """ 根据 app_id 删除队列中的项目，并杀死对应进程 """
+        def condition(item):
+            data, _ = item
+            return data.get('app_id') == app_id
 
-    # def _handle_new_app(self, task: Dict) -> Dict:
-    #     """处理新应用启动请求"""
-    #     logger.info("Handling new app request for group: %s", task["group"])
-    #
-    #     # 校验任务组
-    #     if task["group"] not in self.workload_groups:
-    #         return {"status": "error", "reason": "unknown_workload"}
-    #
-    #     # 创建任务实例
-    #     workload = self.workload_groups[task["group"]]
-    #     new_task = WorkloadTask(
-    #         workload=workload,
-    #         params=task.get("params", {}),
-    #         task_id=task.get("task_id", ""),
-    #         pid=task.get("params", {}).get("pid")
-    #     )
-    #
-    #     pressure_level = self._get_current_pressure_level()
-    #     self._execute_task(new_task, pressure_level)
-    #
-    #     return {"status": "success" if new_task.pid else "queued"}
+        # 从队列中删除符合条件的项目
+        removed_items = self.app_priority_queue.remove_if(condition)
+
+        # 杀死对应的进程
+        killed = False
+        for item in removed_items:
+            data, _ = item
+            pid = data.get('pid')
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed = True
+                except ProcessLookupError:
+                    pass
+
+        return killed
+
+    def set_resource_limit(self, app_id: str) -> bool:
+        """ 根据 app_id 设置资源限制 """
+        return self.controlManager.adjust_resources(app_id, "critical")
 
     def _execute_task(self, task: WorkloadTask, pressure_level: str) -> bool:
         """执行任务"""
@@ -245,7 +244,7 @@ class DynamicBalancer:
                 self.running_tasks[task.pid] = task
                 logger.info("Task %s registered (PID: %d)", task.workload.name, task.pid)
 
-                self.controlManager.adjust_resources(pressure_level)
+                self.controlManager.adjust_resources("", pressure_level)
                 return True
             return False
         except Exception as e:
@@ -258,6 +257,7 @@ class DynamicBalancer:
         with self._lock:
             self.workload_groups[group.name] = group
             logger.info(f"Registered workload group: {group.name}")
+
 
     def add_workload(self, group_name: str, params: Dict = None) -> bool:
         """添加具体任务到队列"""
@@ -275,6 +275,7 @@ class DynamicBalancer:
         print(f"add workload to task: {task}")
         return True
 
+
     def shutdown(self):
         """
         停止服务线程，设置运行标志为False，并等待线程结束，同时确保任务队列中的任务都已处理完成
@@ -285,61 +286,7 @@ class DynamicBalancer:
             return
         self.is_running = False
 
-        # 清空任务队列
-
-        # self.thread.join()
         self.monitor_thread.join()
         self.handle_thread.join()
         self.app_intercept_thread.join()
         print("服务已停止，线程已结束")
-
-    #
-    # def _detect_new_apps(self):
-    #     """检测新启动的应用进程"""
-    #     current_pids = self.cgroups.get_all_pids()
-    #     new_pids = set(current_pids) - self.known_pids
-    #
-    #     for pid in new_pids:
-    #         app_type = self._classify_app(pid)
-    #         if app_type in self.workload_groups:
-    #             task = WorkloadTask(
-    #                 workload=self.workload_groups[app_type],
-    #                 params={"pid": pid},
-    #                 pid=pid,
-    #                 task_id=f"app_{pid}"
-    #             )
-    #             self._add_task_to_queue(task)
-    #             self.known_pids.add(pid)
-    #
-    # def _auto_balance(self):
-    #     """基于系统压力的自动资源平衡"""
-    #     psi_data = self.psi.get_current_pressure()
-    #     score = self.analyzer.calculate_pressure_score(psi_data)
-    #     level = self.analyzer.get_pressure_level(score)
-    #
-    #     adjustments = {
-    #         'low': self._low_pressure_adjustment,
-    #         'medium': self._medium_pressure_adjustment,
-    #         'high': self._high_pressure_adjustment,
-    #         'critical': self._critical_pressure_adjustment
-    #     }
-    #     adjustments.get(level, lambda: None)()
-    #
-    #
-    # def _add_task_to_queue(self, task: WorkloadTask) -> bool:
-    #     """实际队列添加逻辑"""
-    #     try:
-    #         task_dict = {
-    #             "type": "new_app",
-    #             "group": task.workload.name,
-    #             "params": task.params,
-    #             "task_id": task.task_id
-    #         }
-    #
-    #         with self._lock:
-    #             self.task_queue.put(task_dict)
-    #             logger.debug(f"Added task {task.task_id} to queue")
-    #             return True
-    #     except Exception as e:
-    #         logger.error(f"Task submission failed: {e}")
-    #         return False

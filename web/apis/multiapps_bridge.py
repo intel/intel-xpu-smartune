@@ -100,6 +100,40 @@ class MABridge:
             print('get_priority_data request error: ', e)
             return {}
 
+    def cancel_relaunch(self, url, app_id):
+        """ Cancel relaunch for a specific app.
+
+        :param app_id: condition
+        :return:
+        """
+        data = {"app_id": app_id}
+        try:
+            response = requests.post(url, json=data)
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+                return True
+            return False
+        except requests.exceptions.RequestException as e:
+            print('cancel_relaunch request error: ', e)
+            return False
+
+    def resource_limit(self, url, app_id):
+        """ Resource limit for a specific app.
+
+        :param app_id:
+        :return:
+        """
+        data = {"app_id": app_id}
+        try:
+            response = requests.post(url, json=data)
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+                return True
+            return False
+        except requests.exceptions.RequestException as e:
+            print('resource_limit request error: ', e)
+            return False
+
     def set_priority(self, url, priority_data):
         """ Set priority for a specific app.
 

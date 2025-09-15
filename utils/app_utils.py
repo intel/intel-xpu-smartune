@@ -4,6 +4,7 @@ import subprocess
 import shutil
 from getpass import getuser
 from pwd import getpwnam
+from datetime import datetime
 
 from utils.logger import logger
 from db.DatabaseModel import AIAppPriority
@@ -31,6 +32,17 @@ class ClientCallbackManager:
         """发送回调通知（线程安全）"""
         if not self._registered_url:
             raise ValueError("No callback URL registered")
+
+        try:
+            result = AIAppPriority.update_record(
+                id=data['app_id'].replace('.desktop', ''),
+                status=data['status'],
+                up_time=datetime.now()
+            )
+            if not result:
+                print(f"Warning: Failed to update database record for {data['app_id']}")
+        except Exception as db_error:
+            print(f"Database update error: {db_error}")
 
         try:
             response = requests.post(
@@ -92,3 +104,38 @@ def safe_notify(title, message, icon="dialog-information"):
             )
         except:
             print(f"\a⚠️ {title}: {message}")
+
+
+def get_dbus_address():
+    """动态获取当前用户的DBus地址"""
+    uid = os.getuid()
+
+    # 方法1：检查标准路径
+    standard_path = f"/run/user/{uid}/bus"
+    if os.path.exists(standard_path):
+        return f"unix:path={standard_path}"
+
+    # 方法2：从进程环境获取
+    try:
+        import psutil
+        for proc in psutil.process_iter(['environ']):
+            try:
+                env = proc.environ()
+                if 'DBUS_SESSION_BUS_ADDRESS' in env:
+                    return env['DBUS_SESSION_BUS_ADDRESS']
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except ImportError:
+        pass
+
+    # 方法3：通过loginctl获取
+    try:
+        cmd = ["loginctl", "show-user", str(uid), "--property=Display"]
+        display = subprocess.check_output(cmd).decode().strip()
+        if display:
+            return f"unix:path=/run/user/{uid}/bus"
+    except:
+        pass
+
+    return None
+

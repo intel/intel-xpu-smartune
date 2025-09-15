@@ -33,13 +33,14 @@ class ControlManager:
             psi_data = self.psi.get_current_pressure()
             score = self.analyzer.calculate_pressure_score(psi_data)
             level = self.analyzer.get_pressure_level(score)
+            # level = "critical" # debug
             logger.debug("Current PSI level: %s (score: %.2f)", level, score)
             return level
         except Exception as e:
             logger.error("Failed to get current pressure level: %s", str(e))
             return "unknown"
 
-    def adjust_resources(self, pressure_level: str):
+    def adjust_resources(self, app_id: str, pressure_level: str):
         """Adjust resources based on the pressure level."""
         try:
             adjustments = {
@@ -49,34 +50,52 @@ class ControlManager:
                 'critical': self._critical_pressure_adjustment
             }
             adjustment_method = adjustments.get(pressure_level, lambda: None)
-            adjustment_method()
+            return adjustment_method(app_id)
         except Exception as e:
             logger.error("Failed to adjust resources: %s", str(e))
+            return False
 
-    def _low_pressure_adjustment(self):
+    def _low_pressure_adjustment(self, app_id: str):
         """Low pressure adjustments."""
-        self.governor.set_powersave()
-        self.controller.restore_cpu_throttle()
+        results = [
+            self.governor.set_powersave(),
+            self.controller.restore_cpu_throttle()
+        ]
 
-    def _medium_pressure_adjustment(self):
+        return all(results)
+
+    def _medium_pressure_adjustment(self, app_id: str):
         """Medium pressure adjustments."""
-        self.governor.set_powersave()
-        self.controller.restore_cpu_throttle()
+        results = [
+            self.governor.set_powersave(),
+            self.controller.restore_cpu_throttle()
+        ]
 
-    def _high_pressure_adjustment(self):
+        return all(results)
+
+    def _high_pressure_adjustment(self, app_id: str):
         """High pressure adjustments."""
-        self.governor.set_performance()
-        self.controller.high_cpu_throttle()
+        results = [
+            self.governor.set_performance(),
+            self.controller.high_cpu_throttle()
+        ]
 
-    def _critical_pressure_adjustment(self):
+        return all(results)
+
+    def _critical_pressure_adjustment(self, app_id: str):
         """Critical pressure adjustments."""
-        self.governor.set_performance()
-        self.controller.critical_cpu_throttle()
-        self.io.set_weight("best-effort", 10)
-        self.memory.set_limit("best-effort", "high", "20%")
-        self.io.set_limit("best-effort", "max", "1000")
-        self.cpu.set_weight("critical", 500)
-        self.memory.protect("critical", "min", "4G")
+        results = [
+            self.governor.set_performance(),
+            self.controller.critical_cpu_throttle(app_id),
+            # self.io.set_weight("best-effort", 10),
+            # self.memory.set_limit("best-effort", "high", "20%"),
+            # self.io.set_limit("best-effort", "max", "1000"),
+            # self.cpu.set_weight("critical", 500),
+            # self.memory.protect("critical", "min", "4G")
+        ]
+
+        return all(results)
+
 
     def get_app_priority(self, app_id: str = "", app_name: str = "") -> str:
         """Get the priority of an application."""

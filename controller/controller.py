@@ -2,6 +2,9 @@ import os
 import subprocess
 from subprocess import check_output, Popen, PIPE
 
+from utils.logger import logger
+from utils import app_utils
+
 class Controller:
     def __init__(self, cgroup_mount: str):
         self.cgroup_mount = cgroup_mount
@@ -100,18 +103,80 @@ class Controller:
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
 
-    def critical_cpu_throttle(self):
+    def critical_cpu_throttle(self, app_id: str):
+        """Throttle CPU for specific app by searching in both scopes and services."""
         scopes = self.get_user_scopes()
         services = self.get_app_services()
 
-        print(f"critical_cpu_throttle scopes = {scopes}, services = {services}")
-        for scope in scopes:
-            result = subprocess.run(['sudo', 'systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=30%'],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        logger.debug(f"critical_cpu_throttle scopes = {scopes}, services = {services}")
+        app_base_name = app_id.replace('.desktop', '').split('.')[-1].lower()
 
-        for service in services:
-            result = subprocess.run(['systemctl', '--user', 'set-property', '--runtime', '%s' % service, 'CPUQuota=30%'],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        matching_app = None
+        unit_type = None
+
+        # Check scopes first
+        for scope in scopes:
+            if app_base_name in scope.lower():
+                matching_app = scope
+                unit_type = 'scope'
+                break
+
+        # If not found in scopes, check services
+        if not matching_app:
+            for service in services:
+                if app_base_name in service.lower():
+                    matching_app = service
+                    unit_type = 'service'
+                    break
+
+        if not matching_app:
+            logger.warning(f"No matching scope or service found for app_id: {app_id}")
+            return
+
+        logger.info(f"Throttling CPU for {unit_type}: {matching_app}")
+
+        try:
+            dbus_address = app_utils.get_dbus_address()
+            if not dbus_address:
+                raise Exception("无法获取DBus会话地址")
+
+            logger.debug(f"Using DBus address: {dbus_address}")
+            # Build and log the command
+            if unit_type == 'scope':
+                cmd = ['sudo', 'systemctl', 'set-property', '--runtime', matching_app, 'CPUQuota=30%']
+            else:
+                # cmd = ['systemctl', '--user', 'set-property', '--runtime', matching_app, 'CPUQuota=30%']
+                cmd = [
+                    'sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(),
+                    f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',
+                    'systemctl', '--user', 'set-property',
+                    '--runtime', matching_app, 'CPUQuota=30%'
+                ]
+
+            logger.debug(f"Executing command: {' '.join(cmd)}")
+
+            env = os.environ.copy()
+            env['DBUS_SESSION_BUS_ADDRESS'] = dbus_address
+
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True
+            )
+
+            logger.debug(f"Command output: {result}")
+            if result.returncode == 0:
+                return True
+            else:
+                logger.error(f"Failed to throttle CPU for {matching_app} (returncode={result.returncode})")
+                logger.error(f"Error details: {result.stderr}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Unexpected error throttling CPU for {matching_app}: {str(e)}")
+            return False
 
 
     def set_weight(self, cgroup: str, weight: int) -> bool:

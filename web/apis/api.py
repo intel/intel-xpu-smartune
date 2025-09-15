@@ -17,12 +17,12 @@ class CallbackManager(metaclass=SingletonMeta):
     def __init__(self):
         self._last_callback: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()
-        self._app_handlers = []
+        self._app_handlers = set()
 
     def add_to_handler(self, handler):
         """注册UI更新函数"""
         with self._lock:
-            self._app_handlers.append(handler)
+            self._app_handlers.add(handler)
 
     def handle_callback(self, data: Dict[str, Any]):
         """处理回调并通知UI"""
@@ -61,6 +61,8 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         self.app_remove_controlled_url = MULTIAPPS_URL + '/app/remove_from_control'
         self.app_get_priority_url = MULTIAPPS_URL + '/app/get_priority_data'
         self.app_set_priority_url = MULTIAPPS_URL + '/app/set_priority'
+        self.app_cancel_relaunch_url = MULTIAPPS_URL + '/app/cancel_relaunch'
+        self.app_resource_limit_url = MULTIAPPS_URL + '/app/resource_limit'
         self.app_obtain_url = MULTIAPPS_URL + '/app/get_apps'
         self.app_workload_url = MULTIAPPS_URL + '/task/add_workload'
         self.app_register_callback_url = MULTIAPPS_URL + '/app/register_callback'
@@ -110,6 +112,20 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         :return: Set the priority of an app.
         """
         return self.ma_bridge.set_priority(self.app_set_priority_url, priority_data)
+
+    def cancel_relaunch(self, app_id):
+        """
+        :param app_id: according to app_id to cancel relaunch.
+        :return: success or not
+        """
+        return self.ma_bridge.cancel_relaunch(self.app_cancel_relaunch_url, app_id)
+
+    def resource_limit(self, app_id):
+        """
+        :param app_id: according to app_id to do the resource limit.
+        :return:
+        """
+        return self.ma_bridge.resource_limit(self.app_resource_limit_url, app_id)
 
     def get_apps(self, store=False):
         """

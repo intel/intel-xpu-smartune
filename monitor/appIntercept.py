@@ -39,10 +39,10 @@ class AppIntercept(metaclass=SingletonMeta):
         """构建桌面应用数据库"""
         db = {}
         for app in Gio.AppInfo.get_all():
-            desktop_id = app.get_id()
-            if desktop_id.endswith('.desktop'):
+            app_id = app.get_id()
+            if app_id.endswith('.desktop'):
                 db[app.get_name().lower()] = {
-                    'desktop_id': desktop_id,
+                    'app_id': app_id,
                     'command': app.get_commandline() or ''
                 }
         return db
@@ -80,8 +80,8 @@ class AppIntercept(metaclass=SingletonMeta):
             print(f"Is this filename main process? {is_main_process}, app_name={app_name}")
             # 防止重复处理同一个进程树
             if not self.is_process_handled(pid):
-                desktop_id = self.app_db.get(app_name.lower(), {}).get('desktop_id', '')
-                self.handle_monitored_app(pid, comm, filename, app_name, desktop_id)
+                app_id = self.app_db.get(app_name.lower(), {}).get('app_id', '')
+                self.handle_monitored_app(pid, comm, filename, app_name, app_id)
                 self.mark_process_handled(pid)
 
     def is_process_handled(self, pid: int) -> bool:
@@ -100,8 +100,8 @@ class AppIntercept(metaclass=SingletonMeta):
         """标记进程为已处理"""
         self.handled_processes.add(pid)
 
-    def handle_monitored_app(self, pid: int, comm: str, filename: str, app_name: str, desktop_id: str) -> None:
-        print(f"Detected monitored app '{app_name}' (PID: {pid}, COMM: {comm}, FILE: {filename}, desktop_id: {desktop_id})")
+    def handle_monitored_app(self, pid: int, comm: str, filename: str, app_name: str, app_id: str) -> None:
+        print(f"Detected monitored app '{app_name}' (PID: {pid}, COMM: {comm}, FILE: {filename}, app_id: {app_id})")
 
         try:
             os.kill(pid, signal.SIGSTOP)
@@ -109,10 +109,10 @@ class AppIntercept(metaclass=SingletonMeta):
             # 检查系统资源
             pressure = self.controlManager._get_current_pressure_level()
             print(f"Current system pressure level: {pressure}")
-            if pressure == "critical":
+            if pressure != "critical":
                 # 存储进程信息以便重启
                 self.processes_to_relaunch[pid] = {
-                    'desktop_id': desktop_id,
+                    'app_id': app_id,
                     'comm': comm,
                     'filename': filename,
                     'detection_time': time.time(),
@@ -121,13 +121,13 @@ class AppIntercept(metaclass=SingletonMeta):
                 # 延迟重启，避免频繁操作
                 # time.sleep(1)
                 os.kill(pid, signal.SIGCONT)
-                app_utils.callback_manager.send_callback_notification({'app_name': app_name, 'status': "running"})
+                app_utils.callback_manager.send_callback_notification({'app_id': app_id, 'app_name': app_name, 'status': "running"})
             else:
                 print(f"System resources busy, skipping relaunch of {app_name}")
                 app_utils.safe_notify("System resources busy", f"已暂停应用{app_name}启动，请前往应用控制中心操作", icon='dialog-warning')
-                app_utils.callback_manager.send_callback_notification({'app_name': app_name, 'status': "pending"})
+                app_utils.callback_manager.send_callback_notification({'app_id': app_id, 'app_name': app_name, 'status': "pending"})
                 self.app_pending_queue.put(
-                    {"pid": pid, "comm": comm, "filename": filename, "app_name": app_name, "desktop_id": desktop_id})
+                    {"pid": pid, "comm": comm, "filename": filename, "app_name": app_name, "app_id": app_id})
 
         except Exception as e:
             print(f"Error handling {app_name} (PID: {pid}): {str(e)}")

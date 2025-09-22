@@ -78,6 +78,25 @@ class DataBaseModel(Model):
                 return DBStatus.FAILED
 
     @classmethod
+    def update_all_records(cls, **data):
+        """Update all records in a thread-safe manner."""
+        with db_lock:  # 复用现有的线程锁
+            timestamp = int(time.time())
+            now = datetime.now()
+            data.update({
+                'update_time': timestamp,
+                'update_date': now
+            })
+
+            try:
+                with db.atomic():
+                    updated_count = cls.update(**cls.normalize_data(data)).execute()
+                    return updated_count  # 返回实际更新的记录数
+            except (IntegrityError, OperationalError) as e:
+                print(f"Error batch updating data: {e}")
+                return 0
+
+    @classmethod
     def update_record(cls, id, **data):
         """Update a record by ID in a thread-safe manner."""
         with db_lock:

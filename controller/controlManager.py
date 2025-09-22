@@ -40,17 +40,20 @@ class ControlManager:
             logger.error("Failed to get current pressure level: %s", str(e))
             return "unknown"
 
-    def adjust_resources(self, app_id: str, pressure_level: str):
-        """Adjust resources based on the pressure level."""
+    def adjust_resources(self, app_id: str, policy: str):
+        """Adjust resources based on pressure level (or restore)."""
         try:
-            adjustments = {
-                'low': self._low_pressure_adjustment,
-                'medium': self._medium_pressure_adjustment,
-                'high': self._high_pressure_adjustment,
-                'critical': self._critical_pressure_adjustment
-            }
-            adjustment_method = adjustments.get(pressure_level, lambda: None)
-            return adjustment_method(app_id)
+            if policy == "restore":
+                return self.controller.restore_cpu_quota(app_id)  # 调用恢复方法
+            else:
+                adjustments = {
+                    'low': self._low_pressure_adjustment,
+                    'medium': self._medium_pressure_adjustment,
+                    'high': self._high_pressure_adjustment,
+                    'critical': self._critical_pressure_adjustment
+                }
+                adjustment_method = adjustments.get(policy, lambda: None)
+                return adjustment_method(app_id)
         except Exception as e:
             logger.error("Failed to adjust resources: %s", str(e))
             return False

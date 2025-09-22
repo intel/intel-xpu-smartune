@@ -28,21 +28,22 @@ class ClientCallbackManager:
         """注册全局回调地址"""
         self._registered_url = url
 
-    def send_callback_notification(self, data: Dict[str, Any]) -> bool:
+    def send_callback_notification(self, data: Dict[str, Any], store=False) -> bool:
         """发送回调通知（线程安全）"""
         if not self._registered_url:
             raise ValueError("No callback URL registered")
 
-        try:
-            result = AIAppPriority.update_record(
-                id=data['app_id'].replace('.desktop', ''),
-                status=data['status'],
-                up_time=datetime.now()
-            )
-            if not result:
-                print(f"Warning: Failed to update database record for {data['app_id']}")
-        except Exception as db_error:
-            print(f"Database update error: {db_error}")
+        if store:
+            try:
+                result = AIAppPriority.update_record(
+                    id=data['app_id'].replace('.desktop', ''),
+                    status=data['status'],
+                    up_time=datetime.now()
+                )
+                if not result:
+                    print(f"Warning: Failed to update database record for {data['app_id']}")
+            except Exception as db_error:
+                print(f"Database update error: {db_error}")
 
         try:
             response = requests.post(

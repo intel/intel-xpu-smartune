@@ -1,3 +1,4 @@
+import os
 import signal
 import requests
 from balancer.balancer import DynamicBalancer
@@ -34,11 +35,17 @@ class DynamicService:
     def resource_limit(self, app_id):
         return self.balancer.set_resource_limit(app_id)
 
+    def restore_resource(self, app_id):
+        return self.balancer.set_restore_resource(app_id)
+
     def add_control(self, app_name):
         self.balancer.bpf_monitor.add_to_monitorlist(app_name)
 
     def remove_control(self, app_name):
         self.balancer.bpf_monitor.remove_from_monitorlist(app_name)
+
+    def get_controlled_list(self):
+        return self.balancer.bpf_monitor.get_monitored_apps()
 
     def shutdown(self):
         self.balancer.shutdown()
@@ -49,16 +56,35 @@ def start_service():
     global _service
     with _service_lock:
         if _service is None:
+            print(">>>> 第一次初始化 DynamicService <<<<")
             _service = DynamicService()
             signal.signal(signal.SIGINT, _handle_signal)
             signal.signal(signal.SIGTERM, _handle_signal)
             _service.start()
+        else:
+            print(">>>> DynamicService 已经存在，跳过初始化 <<<<")  # 调试日志
     return _service
 
 def _handle_signal(signum, frame):
     if _service:
         _service.shutdown()
+        reset_app_status()
     raise SystemExit(0)
+
+
+def reset_app_status():
+    """重置所有应用状态为 NA"""
+    try:
+        updated_count = AIAppPriority.update_all_records(
+            status="NA",
+            up_time=datetime.now()
+        )
+        if updated_count == 0:
+            logger.warning("No records were updated (possible database error)")
+        else:
+            logger.info(f"Reset {updated_count} app statuses to 'NA'")
+    except Exception as e:
+        logger.error(f"Failed to reset app statuses: {str(e)}")
 
 
 @app.route('/task/add_workload', methods=['POST'])
@@ -118,6 +144,7 @@ def get_apps():
                         app_id=app_id,
                         name=app.get_name(),
                         priority=0,  # 默认优先级
+                        controlled=False,
                         remark="",
                         cmdline=app.get_commandline(),
                         status="NA",
@@ -472,6 +499,43 @@ def app_resource_limit():
         )
 
 
+@app.route('/app/resource_restore', methods=['POST'])
+def app_resource_restore():
+    """ Restore resource for a specific app by app_id. """
+    try:
+        data = request.get_json()
+        app_id = data.get('app_id', "")
+
+        # 验证必要参数
+        if not app_id:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="Either app_id must be provided"
+            )
+
+        result = _service.restore_resource(app_id)
+
+        if result:
+            return construct_response(
+                data={},
+                retmsg="Successfully found and restored resource"
+            )
+        else:
+            return construct_response(
+                data={},
+                retcode=RetCode.OPERATING_ERROR,
+                retmsg="No matching app found or failed to restore resource"
+            )
+    except Exception as e:
+        logger.error(f"Restore resource failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
 @app.route('/app/register_callback', methods=['POST'])
 def register_callback():
     """注册全局回调地址"""
@@ -499,10 +563,12 @@ def register_callback():
 
 
 def main():
+    print("Starting Balance Service...")
     init_database()
-    # 预初始化服务
-    start_service()
-    app.run(host="0.0.0.0", port=9001, debug=False)
+    if not hasattr(app, "_service_initialized"):  # 确保只初始化一次
+        start_service()
+        app._service_initialized = True  # 标记已初始化
+    app.run(host="0.0.0.0", port=9001, debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":

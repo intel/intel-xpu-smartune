@@ -3,12 +3,14 @@ import os
 import signal
 import subprocess
 import time
+from threading import Timer
 from typing import List, Set, Dict, Any, Union
 from gi.repository import Gio
 import psutil
 from multiprocessing import JoinableQueue
 from controller.controlManager import ControlManager
 from utils import app_utils
+from utils.logger import logger
 
 # 定义与BPF代码中相同的常量
 COMM_LEN = 32
@@ -29,11 +31,12 @@ class AppIntercept(metaclass=SingletonMeta):
         self.bpf = BPF(src_file=c_src_file)
         self.controlManager = ControlManager()
         self.monitored_apps: Set[str] = set()
-        self.processes_to_relaunch: Dict[int, Dict[str, Any]] = {}  # 存储需要重启的进程信息
         self.handled_processes: Set[int] = set()  # 初始化已处理进程集合
         self.app_db = self.build_app_database()
         self.relaunch_apps = {}
         self.app_pending_queue = JoinableQueue(1000000)
+        self.monitored_app_launched = {}  # 当前已经启动的监控app
+        self.pending_exit_events = {}  # 待处理的退出事件（PID: Timer）
 
     def build_app_database(self) -> Dict[str, Dict[str, str]]:
         """构建桌面应用数据库"""
@@ -50,6 +53,7 @@ class AppIntercept(metaclass=SingletonMeta):
     def trace_print(self) -> None:
         self.bpf.trace_print()
 
+
     def get_main_process(self, comm: str, filename: str) -> (bool, str):
         """检查是否是主进程"""
         filename_lower = filename.lower()
@@ -63,26 +67,76 @@ class AppIntercept(metaclass=SingletonMeta):
 
         if (any(special_flag) and any(app_flag[1] for app_flag in app_flag)) or is_bash_launch:
             return True, main_app[0] if main_app else os.path.basename(filename)
+
         return False, ""
+
+    def is_process_alive(self, pid):
+        try:
+            # 检查 /proc/[pid]/status 是否存在
+            with open(f"/proc/{pid}/status") as f:
+                return True
+        except FileNotFoundError:
+            return False
+
+
+    def handle_exit_event(self, pid, app_id, app_name, old_comm, old_filename):
+        """延迟检查进程是否真正退出"""
+        if self.is_process_alive(pid):
+            print(f"[Delay Check] PID={pid} still alive, not exiting normally.")
+            return
+
+        print(f"Monitored process terminated: PID={pid}, app={app_name}")
+        app_utils.callback_manager.send_callback_notification({
+            'app_id': app_id,
+            'app_name': app_name,
+            'status': "stopped",
+            'purpose': "app"
+        }, True)
+        del self.monitored_app_launched[pid]
+
+        # 清理 pending_exit_events
+        if pid in self.pending_exit_events:
+            del self.pending_exit_events[pid]
+
 
     def print_event(self, cpu: int, data: Any, size: int) -> None:
         event = self.bpf["events"].event(data)
         filename = event.filename.decode('utf-8', 'ignore')
         comm = event.comm.decode('utf-8', 'ignore')
         pid = event.pid
+        type = event.type
 
-        # 调试信息
-        print(f"*** Event: PID={pid}, COMM={comm}, FILENAME={filename} ***")
+        # print(f"*** Event: PID={pid}, type={type} COMM={comm}, FILENAME={filename} ***")
 
-        is_main_process, app_name = self.get_main_process(comm, filename)
-        # print(f"Is this filename main process? {is_main_process}, app_name={app_name}")
-        if is_main_process:
-            print(f"Is this filename main process? {is_main_process}, app_name={app_name}")
-            # 防止重复处理同一个进程树
-            if not self.is_process_handled(pid):
-                app_id = self.app_db.get(app_name.lower(), {}).get('app_id', '')
-                self.handle_monitored_app(pid, comm, filename, app_name, app_id)
-                self.mark_process_handled(pid)
+        if type == 0: # 启动事件
+            is_main_process, app_name = self.get_main_process(comm, filename)
+            # print(f"Is this filename main process? {is_main_process}, app_name={app_name}")
+            if is_main_process:
+                print(f"Is this filename main process? {is_main_process}, app_name={app_name}")
+                # 防止重复处理同一个进程树
+                if not self.is_process_handled(pid):
+                    app_id = self.app_db.get(app_name.lower(), {}).get('app_id', '')
+                    print(f"launch: app_id={app_id}, app_name={app_name}, comm={comm}, filename={filename}")
+                    self.monitored_app_launched[pid] = (app_id, app_name, comm, filename)
+                    self.handle_monitored_app(pid, comm, filename, app_name, app_id)
+                    self.mark_process_handled(pid)
+
+        elif type == 1:  # 退出事件
+            if pid not in self.monitored_app_launched:
+                return
+
+            # 如果已经有待处理的退出事件，取消旧的定时器
+            if pid in self.pending_exit_events:
+                self.pending_exit_events[pid].cancel()
+
+            app_id, app_name, old_comm, old_filename = self.monitored_app_launched[pid]
+            print(f"Detected possible exit: PID={pid}, comm={comm}")
+
+            # 延迟 1.5 秒后检查进程是否真正退出
+            timer = Timer(1.5, self.handle_exit_event, args=[pid, app_id, app_name, old_comm, old_filename])
+            self.pending_exit_events[pid] = timer
+            timer.start()
+
 
     def is_process_handled(self, pid: int) -> bool:
         """检查该进程是否已经被处理过"""
@@ -110,22 +164,22 @@ class AppIntercept(metaclass=SingletonMeta):
             pressure = self.controlManager._get_current_pressure_level()
             print(f"Current system pressure level: {pressure}")
             if pressure != "critical":
-                # 存储进程信息以便重启
-                self.processes_to_relaunch[pid] = {
-                    'app_id': app_id,
-                    'comm': comm,
-                    'filename': filename,
-                    'detection_time': time.time(),
-                    'app_name': app_name
-                }
-                # 延迟重启，避免频繁操作
-                # time.sleep(1)
                 os.kill(pid, signal.SIGCONT)
-                app_utils.callback_manager.send_callback_notification({'app_id': app_id, 'app_name': app_name, 'status': "running"})
+                app_utils.callback_manager.send_callback_notification({
+                    'app_id': app_id,
+                    'app_name': app_name,
+                    'status': "running",
+                    'purpose': "app"
+                }, True)
             else:
                 print(f"System resources busy, skipping relaunch of {app_name}")
                 app_utils.safe_notify("System resources busy", f"已暂停应用{app_name}启动，请前往应用控制中心操作", icon='dialog-warning')
-                app_utils.callback_manager.send_callback_notification({'app_id': app_id, 'app_name': app_name, 'status': "pending"})
+                app_utils.callback_manager.send_callback_notification({
+                    'app_id': app_id,
+                    'app_name': app_name,
+                    'status': "pending",
+                    'purpose': "app"
+                }, True)
                 self.app_pending_queue.put(
                     {"pid": pid, "comm": comm, "filename": filename, "app_name": app_name, "app_id": app_id})
 

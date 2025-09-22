@@ -63,6 +63,7 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         self.app_set_priority_url = MULTIAPPS_URL + '/app/set_priority'
         self.app_cancel_relaunch_url = MULTIAPPS_URL + '/app/cancel_relaunch'
         self.app_resource_limit_url = MULTIAPPS_URL + '/app/resource_limit'
+        self.app_resource_restore_url = MULTIAPPS_URL + '/app/resource_restore'
         self.app_obtain_url = MULTIAPPS_URL + '/app/get_apps'
         self.app_workload_url = MULTIAPPS_URL + '/task/add_workload'
         self.app_register_callback_url = MULTIAPPS_URL + '/app/register_callback'
@@ -126,6 +127,13 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         :return:
         """
         return self.ma_bridge.resource_limit(self.app_resource_limit_url, app_id)
+
+    def restore_resource(self, app_id):
+        """
+        :param app_id: according to app_id to do the resource limit.
+        :return:
+        """
+        return self.ma_bridge.restore_resource(self.app_resource_restore_url, app_id)
 
     def get_apps(self, store=False):
         """

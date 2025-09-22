@@ -4,6 +4,7 @@ from typing import Dict, Optional
 
 from controller.controlManager import ControlManager
 from monitor.appIntercept import AppIntercept
+from monitor.res_monitor import ResourceMonitor
 
 from utils.logger import logger
 from utils import app_utils
@@ -83,7 +84,7 @@ class DynamicBalancer:
     def __init__(self):
         self.controlManager = ControlManager()
         self.bpf_monitor = AppIntercept("monitor/bpf_event.c")
-
+        self.resource_monitor = ResourceMonitor()
 
         # 资源管理
         self.workload_groups = {}  # 注册的workload类型
@@ -112,22 +113,30 @@ class DynamicBalancer:
         """
         self.is_running = True
 
-        self.monitor_thread = threading.Thread(target=self._run_monitor_resource_loop)
+        self.monitor_thread = threading.Thread(target=self._run_monitor_resource_loop, daemon=True)
         self.monitor_thread.start()
 
-        self.handle_thread = threading.Thread(target=self._run_handle_loop)
+        self.handle_thread = threading.Thread(target=self._run_handle_loop, daemon=True)
         self.handle_thread.start()
 
-        self.app_intercept_thread = threading.Thread(target=self._run_app_intercept_loop)
+        self.app_intercept_thread = threading.Thread(target=self._run_app_intercept_loop, daemon=True)
         self.app_intercept_thread.start()
 
         print("服务已启动，线程已开始运行")
 
-
     def _run_monitor_resource_loop(self):
         logger.info("Monitor resource service started")
-        idle_check_interval = 120  # 2分钟（单位：秒）
+        idle_check_interval = 10  # 2分钟（单位：秒）
         last_check_time = 0
+        current_app_index = 0  # 用于跟踪当前处理的app索引
+        top_consume_apps = []  # 保存获取到的top应用列表
+        limited_apps = {}  # 记录被限制的应用
+        restore_pending = False  # 标记是否有待恢复的应用
+        def reset_state():
+            nonlocal current_app_index, top_consume_apps, idle_check_interval
+            current_app_index = 0
+            top_consume_apps = []
+            idle_check_interval = 10
 
         while self.is_running:
             try:
@@ -139,19 +148,103 @@ class DynamicBalancer:
                     last_check_time = current_time
 
                     if pressure == "critical":
-                        # adjust app
-                        time.sleep(5)
-                        continue
+                        # 如果是第一次检测到critical状态，获取top应用列表
+                        restore_pending = False
+                        if not top_consume_apps:
+                            top_consume_apps = self.resource_monitor.get_top_resource_consumers()
+                            print(f"Top resource consumers: {top_consume_apps}")
+                            """
+                              "Top resource consumers": [
+                                {
+                                  "process": {
+                                    "pid": 1790698,
+                                    "name": "python",
+                                    "cmdline": "python MetaSearch_agent.py",
+                                    "cpu": 0.0,
+                                    "memory_mb": 2682.0,
+                                    "score": 1.281
+                                  },
+                                  "app": {
+                                    "type": "systemd",
+                                    "id": "vte-spawn-89f79f2f-8e3f-4995-b0ea-1f56ed046e33.scope",
+                                    "name": "Systemd Scope: vte-spawn-89f79f2f-8e3f-4995-b0ea-1f56ed046e33.scope"
+                                  }
+                                },
+                                {
+                                  "process": {
+                                    "pid": 3748,
+                                    ...
+                                    "score": 0.996
+                                  },
+                                  "app": {
+                                    "type": "desktop",
+                                    "id": "org.gnome.Shell.desktop",
+                                    "name": "GNOME Shell"
+                                  }
+                                },
+                                ...
+                              ]                       
+                            """
+                            current_app_index = 0  # 重置索引
+
+                        # 如果还有应用待处理
+                        if current_app_index < len(top_consume_apps):
+                            app_info = top_consume_apps[current_app_index]
+                            app_id = app_info['app']['id'] if app_info['app'] else None
+                            app_name = app_info['process']['name'] if app_info['process'] else None
+
+                            if app_id:
+                                logger.info(
+                                    f"Adjusting resources for app {current_app_index + 1}/{len(top_consume_apps)}: {app_id}")
+                                auto_limit = self.controlManager.adjust_resources(app_id, "critical")
+                                if auto_limit:
+                                    limited_apps[app_id] = app_name
+                                    app_utils.callback_manager.send_callback_notification({
+                                        'app_id': app_id,
+                                        'app_name': app_name,
+                                        'status': "limited",
+                                        'purpose': "notify"
+                                    }, False)
+
+                            current_app_index += 1
+                            idle_check_interval = 5  # critical下，缩短检测时间
+                        else:
+                            reset_state()
                     elif not self.app_priority_queue.empty():
                         # 处理队列中的应用
                         app_data, priority = self.app_priority_queue.get()
                         logger.info(
                             f"Starting app: {app_data['app_name']} (PID: {app_data['pid']}, Priority: {priority})")
                         os.kill(app_data['pid'], signal.SIGCONT)
+                        app_utils.callback_manager.send_callback_notification({
+                            'app_id': app_data['app_id'],
+                            'app_name': app_data['app_name'],
+                            'status': "running",
+                            'purpose': "app"
+                        }, True)
+                        # 处理完队列后重置top应用状态
+                        reset_state()
+                    else:
+                        # 非 critical 状态：每次恢复一个应用
+                        if limited_apps and not restore_pending:
+                            app_id, app_name = limited_apps.popitem()
+                            logger.info(f"Restoring CPU quota for app: {app_id}, name: {app_name}")
+                            restore_pending = True
+                            if self.controlManager.adjust_resources(app_id, "restore"):
+                                app_utils.callback_manager.send_callback_notification({
+                                    'app_id': app_id,
+                                    'app_name': app_name,
+                                    'status': "limited",
+                                    'purpose': "notify"
+                                }, False)
+                            restore_pending = False
+                        else:
+                            reset_state()
 
                 time.sleep(1)
             except Exception as e:
                 logger.error(f"Error in monitor loop: {str(e)}", exc_info=True)
+                reset_state()
                 time.sleep(1)
 
         logger.info("Monitor resource service stopped")
@@ -237,6 +330,10 @@ class DynamicBalancer:
         """ 根据 app_id 设置资源限制 """
         return self.controlManager.adjust_resources(app_id, "critical")
 
+    def set_restore_resource(self, app_id: str) -> bool:
+        """ 根据 app_id 恢复资源限制 """
+        return self.controlManager.adjust_resources(app_id, "restore")
+
     def _execute_task(self, task: WorkloadTask, pressure_level: str) -> bool:
         """执行任务"""
         try:
@@ -286,7 +383,10 @@ class DynamicBalancer:
             return
         self.is_running = False
 
-        self.monitor_thread.join()
-        self.handle_thread.join()
-        self.app_intercept_thread.join()
+        if hasattr(self, "monitor_thread"):
+            self.monitor_thread.join(timeout=1)  # 等待线程结束
+        if hasattr(self, "handle_thread"):
+            self.handle_thread.join(timeout=1)
+        if hasattr(self, "app_intercept_thread"):
+            self.app_intercept_thread.join(timeout=1)
         print("服务已停止，线程已结束")

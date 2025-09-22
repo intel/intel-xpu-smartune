@@ -134,6 +134,23 @@ class MABridge:
             print('resource_limit request error: ', e)
             return False
 
+    def restore_resource(self, url, app_id):
+        """ Restore resource for a specific app.
+
+        :param app_id:
+        :return:
+        """
+        data = {"app_id": app_id}
+        try:
+            response = requests.post(url, json=data)
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+                return True
+            return False
+        except requests.exceptions.RequestException as e:
+            print('restore_resource request error: ', e)
+            return False
+
     def set_priority(self, url, priority_data):
         """ Set priority for a specific app.
 

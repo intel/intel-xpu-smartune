@@ -36,6 +36,7 @@ def init():
     """初始化会话状态"""
     if "app_data" not in st.session_state:
         st.session_state.app_data = {}
+
     if "controlled_apps" not in st.session_state:
         st.session_state.controlled_apps = []
 
@@ -97,8 +98,9 @@ def _process_callback():
                 app_id = data.get('app_id')
                 app_name = data.get('app_name')
                 new_status = data.get('status')
+                purpose = data.get('purpose')
 
-                if not all([app_id, app_name, new_status]):
+                if not all([app_id, app_name, new_status, purpose]):
                     continue
 
                 with status_lock:
@@ -114,7 +116,16 @@ def _process_callback():
                             break
 
                     if updated:
+                        if purpose == "notify":
+                            st.toast(
+                                f'系统繁忙中，管控的应用 {app_name} 被自动限制了资源使用，它将在系统资源空闲后自动恢复',
+                                icon='⚠️')
+                            time.sleep(2)
                         st.rerun()
+
+                if purpose == "notify":
+                    print(f"Notification: System busy, controlled app {app_name} limited.")
+                    st.toast(f'系统繁忙中，非管控应用 {app_name} 被自动限制了资源使用，它将在系统资源空闲后自动恢复', icon='⚠️')
             else:
                 time.sleep(1)
 
@@ -227,7 +238,7 @@ def app_management(default_apps):
             # 操作按钮
             with cols[4]:
                 cancel_disabled = status != "pending"
-                if st.button("⏯️ 取消启动", key=f"toggle_{app['app_id']}", type="primary", disabled=cancel_disabled):
+                if st.button("⏹️ 取消启动", key=f"toggle_{app['app_id']}", type="primary", disabled=cancel_disabled):
                     # 从优先级队列中删除
                     cancel_result = api.cancel_relaunch(app["app_id"])
                     if cancel_result:
@@ -239,7 +250,7 @@ def app_management(default_apps):
                     else:
                         st.toast(f'取消自动启动应用{app['app_name']}失败!', icon="❌")
 
-            if cols[5].button("🔧 更新优先级", key=f"priority_{idx}", type="primary"):
+            if cols[5].button("📊 更新优先级", key=f"priority_{idx}", type="primary"):
                 if new_priority != current_priority:
                     api.set_priority({
                         "app_id": app["app_id"],
@@ -250,19 +261,37 @@ def app_management(default_apps):
                             c_app["priority"] = new_priority
                             break
                     print(f"update priority: st.session_state.controlled_apps: {st.session_state.controlled_apps}")
+                    st.toast(f'已成功更新{app['app_name']}的优先级为{new_priority}!', icon='🎉')
+                    time.sleep(2)
                     st.rerun()
 
             with cols[6]:
-                limit_disabled = status != "pending" and status != "running"
-                if st.button("🔧 资源限制", key=f"limit_{idx}", type="primary", disabled=limit_disabled):
-                    limit_result = api.resource_limit(app["app_id"])
-                    if limit_result:
-                        print(f"App {app['app_name']} resource limit was applied.")
-                        st.toast(f'已成功对应用{app['app_name']}进行资源限制!', icon='🎉')
-                        time.sleep(2)
-                        st.rerun()
+                limit_key = f"resource_limit_{app['app_id']}"
+                if limit_key not in st.session_state:
+                    st.session_state[limit_key] = False  # False表示"限制"状态，True表示"恢复"状态
+
+                btn_text = "🔄 恢复正常" if st.session_state[limit_key] else "⛔ 资源限制"
+                btn_type = "secondary" if st.session_state[limit_key] else "primary"
+
+                limit_disabled = (status != "running") and not st.session_state[limit_key]
+
+                if st.button(btn_text, key=f"limit_{idx}", type=btn_type, disabled=limit_disabled):
+                    if st.session_state[limit_key]:
+                        restore_result = api.restore_resource(app["app_id"])
+                        if restore_result:
+                            st.session_state[limit_key] = False
+                            st.toast(f'已成功恢复应用{app["app_name"]}的资源!', icon='🎉')
+                        else:
+                            st.toast(f'恢复应用{app["app_name"]}的资源失败!', icon="❌")
                     else:
-                        st.toast(f'对应用{app['app_name']}进行资源限制失败!', icon="❌")
+                        limit_result = api.resource_limit(app["app_id"])
+                        if limit_result:
+                            st.session_state[limit_key] = True
+                            st.toast(f'已成功对应用{app["app_name"]}进行资源限制!', icon='🎉')
+                        else:
+                            st.toast(f'对应用{app["app_name"]}进行资源限制失败!', icon="❌")
+                    time.sleep(1)
+                    st.rerun()
 
             if cols[7].button("🗑️ 删除", key=f"delete_{app['app_id']}"):
                 response = api.remove_controlled_apps({

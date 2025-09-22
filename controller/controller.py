@@ -103,54 +103,59 @@ class Controller:
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
 
-    def critical_cpu_throttle(self, app_id: str):
-        """Throttle CPU for specific app by searching in both scopes and services."""
+    def _set_cpu_quota(self, app_id: str, quota_percent: int, is_restore: bool = False):
+        """Core method to set CPU quota (throttle or restore)."""
         scopes = self.get_user_scopes()
         services = self.get_app_services()
 
-        logger.debug(f"critical_cpu_throttle scopes = {scopes}, services = {services}")
-        app_base_name = app_id.replace('.desktop', '').split('.')[-1].lower()
+        # logger.debug(f"critical_cpu_throttle scopes = {scopes}, services = {services}")
+        if app_id.endswith('.scope'):
+            matching_app = app_id
+            unit_type = 'scope'
+        else:
+            app_base_name = app_id.replace('.desktop', '').split('.')[-1].lower()
 
-        matching_app = None
-        unit_type = None
+            matching_app = None
+            unit_type = None
 
-        # Check scopes first
-        for scope in scopes:
-            if app_base_name in scope.lower():
-                matching_app = scope
-                unit_type = 'scope'
-                break
-
-        # If not found in scopes, check services
-        if not matching_app:
-            for service in services:
-                if app_base_name in service.lower():
-                    matching_app = service
-                    unit_type = 'service'
+            # Check scopes first
+            for scope in scopes:
+                if app_base_name in scope.lower():
+                    matching_app = scope
+                    unit_type = 'scope'
                     break
+
+            # If not found in scopes, check services
+            if not matching_app:
+                for service in services:
+                    if app_base_name in service.lower():
+                        matching_app = service
+                        unit_type = 'service'
+                        break
 
         if not matching_app:
             logger.warning(f"No matching scope or service found for app_id: {app_id}")
-            return
+            return False
 
-        logger.info(f"Throttling CPU for {unit_type}: {matching_app}")
+        action = "Restoring" if is_restore else "Throttling"
+        logger.info(f"{action} CPU for {unit_type}: {matching_app}")
 
         try:
             dbus_address = app_utils.get_dbus_address()
             if not dbus_address:
                 raise Exception("无法获取DBus会话地址")
 
-            logger.debug(f"Using DBus address: {dbus_address}")
+            quota_value = f"CPUQuota={quota_percent}%"
             # Build and log the command
             if unit_type == 'scope':
-                cmd = ['sudo', 'systemctl', 'set-property', '--runtime', matching_app, 'CPUQuota=30%']
+                cmd = ['sudo', 'systemctl', 'set-property', '--runtime', matching_app, quota_value]
             else:
                 # cmd = ['systemctl', '--user', 'set-property', '--runtime', matching_app, 'CPUQuota=30%']
                 cmd = [
                     'sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(),
                     f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',
                     'systemctl', '--user', 'set-property',
-                    '--runtime', matching_app, 'CPUQuota=30%'
+                    '--runtime', matching_app, quota_value
                 ]
 
             logger.debug(f"Executing command: {' '.join(cmd)}")
@@ -170,13 +175,20 @@ class Controller:
             if result.returncode == 0:
                 return True
             else:
-                logger.error(f"Failed to throttle CPU for {matching_app} (returncode={result.returncode})")
-                logger.error(f"Error details: {result.stderr}")
+                logger.error(f"Failed to set CPU quota for {matching_app}")
                 return False
 
         except Exception as e:
-            logger.error(f"Unexpected error throttling CPU for {matching_app}: {str(e)}")
+            logger.error(f"Unexpected error setting CPU quota: {str(e)}")
             return False
+
+    def critical_cpu_throttle(self, app_id: str):
+        """Throttle CPU to 30%."""
+        return self._set_cpu_quota(app_id, quota_percent=30, is_restore=False)
+
+    def restore_cpu_quota(self, app_id: str):
+        """Restore CPU to 100%."""
+        return self._set_cpu_quota(app_id, quota_percent=100, is_restore=True)
 
 
     def set_weight(self, cgroup: str, weight: int) -> bool:

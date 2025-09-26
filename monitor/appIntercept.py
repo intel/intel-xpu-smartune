@@ -130,7 +130,7 @@ class AppIntercept(metaclass=SingletonMeta):
                 self.pending_exit_events[pid].cancel()
 
             app_id, app_name, old_comm, old_filename = self.monitored_app_launched[pid]
-            print(f"Detected possible exit: PID={pid}, comm={comm}")
+            # print(f"Detected possible exit: PID={pid}, comm={comm}")
 
             # 延迟 1.5 秒后检查进程是否真正退出
             timer = Timer(1.5, self.handle_exit_event, args=[pid, app_id, app_name, old_comm, old_filename])

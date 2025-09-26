@@ -12,8 +12,10 @@ from enum import Enum
 api = Client_multiapps_api()
 
 cb_running = False
-callback_queue = queue.Queue()
+callback_semaphore = threading.Semaphore(0)
 # new_callback_event = threading.Event()
+
+controlled_apps = []
 
 # 优先级枚举定义 (放在模块顶部)
 class PriorityLevel(Enum):
@@ -48,93 +50,90 @@ def get_all_apps():
     return apps or []
 
 
-# ---------- 替换原来的 queue.Queue ----------
-class ThreadSafeCallback:
-    _lock = threading.Lock()
-    _latest_data: Optional[Dict[str, Any]] = None
-    _has_new_data: bool = False
+# 共享数据结构和信号量
+class CallbackData:
+    def __init__(self):
+        self.latest_data: Optional[Dict[str, Any]] = None
+        self.lock = threading.Lock()
+        self.data_ready = threading.Semaphore(0)  # 初始值为0的信号量
+        self.has_new_data = False
 
-    @classmethod
-    def put(cls, data: Dict[str, Any]):
-        """线程安全的回调数据存储"""
-        with cls._lock:
-            cls._latest_data = data
-            cls._has_new_data = True
-            print(f"[Callback Stored] {data}")
-    @classmethod
-    def get(cls) -> Optional[Dict[str, Any]]:
-        """主线程安全获取数据"""
-        with cls._lock:
-            if not cls._has_new_data:
-                return None
-            cls._has_new_data = False
-            return cls._latest_data
+callback_data = CallbackData()
+
 
 # ---------- 修改原回调处理器 ----------
 def app_callback_handler(notify_data):
     """替换原来的队列操作"""
-    global callback_queue
     print(f"App callback received: {notify_data}")
     try:
-        callback_queue.put(notify_data)
-        # new_callback_event.set()
+        with callback_data.lock:
+            callback_data.latest_data = notify_data
+            callback_data.has_new_data = True
+        callback_data.data_ready.release()  # 释放信号量
     except Exception as e:
         print(f"Error in callback handler: {e}")
 
 
-# 全局状态锁
-status_lock = threading.Lock()
-
-
 def _process_callback():
     """主线程安全的状态更新处理"""
-    try:
-        print("Processing callback data...")
+    while True:
+        try:
+            # 非阻塞检查是否有新数据
+            if callback_data.data_ready.acquire(blocking=False):
+                print("New callback data available.")
+                with callback_data.lock:
+                    data = callback_data.latest_data
+                    callback_data.latest_data = None
+                    callback_data.has_new_data = False
 
-        while cb_running:
-            if not callback_queue.empty():
-                data = callback_queue.get_nowait()
+                if not data:
+                    print("[WARNING] Empty callback data received")
+                    continue
 
                 app_id = data.get('app_id')
                 app_name = data.get('app_name')
                 new_status = data.get('status')
                 purpose = data.get('purpose')
 
+                print(f"Callback data: {data}")
                 if not all([app_id, app_name, new_status, purpose]):
+                    print(f"[ERROR] Incomplete callback data: {data}")
                     continue
 
-                with status_lock:
-                    updated = False
+                # with status_lock:
+                    # updated = False
 
+                if purpose == "app":
                     # 查找目标应用
-                    for app in st.session_state.controlled_apps:
+                    for app in controlled_apps:
                         if app.get('app_id') == app_id or app.get('app_name') == app_name:
                             if app.get('status') != new_status:
                                 app['status'] = new_status
-                                updated = True
+                                # updated = True
                                 print(f"Status updated: {app_name} => {new_status}")
                             break
 
-                    if updated:
-                        if purpose == "notify":
-                            st.toast(
-                                f'系统繁忙中，管控的应用 {app_name} 被自动限制了资源使用，它将在系统资源空闲后自动恢复',
-                                icon='⚠️')
-                            time.sleep(2)
-                        st.rerun()
+                    if new_status == "limited":
+                        st.toast(
+                            f'系统繁忙中，应用 {app_name} 被自动限制了资源使用，它将在系统资源空闲后自动恢复',
+                            icon='⚠️')
+                        time.sleep(2)
+                    st.toast(f"应用 {app_name} 状态更新为 {new_status}", icon='ℹ️')
+                    time.sleep(0.2)
+                    st.rerun()
 
                 if purpose == "notify":
-                    print(f"Notification: System busy, controlled app {app_name} limited.")
-                    st.toast(f'系统繁忙中，非管控应用 {app_name} 被自动限制了资源使用，它将在系统资源空闲后自动恢复', icon='⚠️')
-            else:
-                time.sleep(1)
-
-    except Exception as e:
-        print(f"Error processing callback data: {e}")
+                    if new_status == "manual_app_limit_by_user":
+                        print(f"Notification: System busy, reminder user to limit app.")
+                        st.toast(f'友情提醒：系统繁忙中，建议您选择合适的应用进行资源限制处理', icon='⚠️')
+        except Exception as e:
+            print(f"Error processing callback data: {e}")
+        time.sleep(0.1)
 
 
 def app_management(default_apps):
     # 获取当前管控应用
+    global controlled_apps
     controlled_apps = st.session_state.controlled_apps
 
     # 添加应用管控区域
@@ -228,12 +227,12 @@ def app_management(default_apps):
                 )
 
             # 所属CGroup
-            cols[2].write(app.get("cgroup", "user"))
+            cols[2].markdown(app.get("cgroup", "user"))
 
             # 状态
             print(f"App {app['app_name']} status: {status}")
             with cols[3]:
-                st.write(f"{status}")
+                st.markdown(f"{status}")
 
             # 操作按钮
             with cols[4]:
@@ -349,3 +348,4 @@ def apps_management():
     app_management(st.session_state.app_data)
     _process_callback()
     print("App management UI rendered.")
+

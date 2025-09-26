@@ -1,6 +1,7 @@
 import os
 import subprocess
 from subprocess import check_output, Popen, PIPE
+from typing import Optional
 
 from utils.logger import logger
 from utils import app_utils
@@ -102,93 +103,170 @@ class Controller:
             result = subprocess.run(['systemctl', '--user', 'set-property', '--runtime', '%s' % service, 'CPUQuota=60%'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
+    def _set_resource_quota(
+            self,
+            app_id: str,
+            cpu_quota: Optional[int] = None,
+            mem_high: Optional[int] = None,
+            io_weight: Optional[int] = None,
+            is_restore: bool = False
+    ) -> bool:
+        """
+        安全设置资源限制（CPU/内存/IO）
+        :param cpu_quota: CPU百分比（None表示不修改，1-100之间）
+        :param mem_high: 内存软限制（如"500M"，必须大于0）
+        :param io_weight: IO权重（10-1000，默认100）
+        :param is_restore: 是否恢复默认值
+        """
+        # 参数范围检查
+        if cpu_quota is not None and not (1 <= cpu_quota <= 100):
+            logger.warning(f"Invalid cpu_quota {cpu_quota}, must be 1-100. Using None.")
+            cpu_quota = 1
 
-    def _set_cpu_quota(self, app_id: str, quota_percent: int, is_restore: bool = False):
-        """Core method to set CPU quota (throttle or restore)."""
+        if mem_high is not None and mem_high <= 0:
+            logger.warning(f"Invalid mem_high {mem_high}, must be >0. Using default 100M.")
+            mem_high = 100
+
+        if io_weight is not None and not (10 <= io_weight <= 1000):
+            logger.warning(f"Invalid io_weight {io_weight}, must be 10-1000. Using default 100.")
+            io_weight = 200
+
         scopes = self.get_user_scopes()
         services = self.get_app_services()
 
-        # logger.debug(f"critical_cpu_throttle scopes = {scopes}, services = {services}")
         if app_id.endswith('.scope'):
             matching_app = app_id
             unit_type = 'scope'
         else:
             app_base_name = app_id.replace('.desktop', '').split('.')[-1].lower()
-
-            matching_app = None
-            unit_type = None
-
-            # Check scopes first
-            for scope in scopes:
-                if app_base_name in scope.lower():
-                    matching_app = scope
-                    unit_type = 'scope'
-                    break
-
-            # If not found in scopes, check services
-            if not matching_app:
-                for service in services:
-                    if app_base_name in service.lower():
-                        matching_app = service
-                        unit_type = 'service'
-                        break
+            matching_app = next(
+                (unit for unit in scopes + services if app_base_name in unit.lower()),
+                None
+            )
+            unit_type = 'scope' if matching_app in scopes else 'service'
 
         if not matching_app:
-            logger.warning(f"No matching scope or service found for app_id: {app_id}")
+            logger.warning(f"No matching unit for {app_id}")
             return False
 
-        action = "Restoring" if is_restore else "Throttling"
-        logger.info(f"{action} CPU for {unit_type}: {matching_app}")
+        # 构建限制参数
+        properties = []
+        if not is_restore:
+            if cpu_quota is not None:
+                properties.append(f"CPUQuota={cpu_quota}%")
+            if mem_high:
+                properties.append(f"MemoryHigh={mem_high}M")
+            if io_weight:
+                properties.append(f"IOWeight={io_weight}")
+        else:
+            # 恢复时清除所有限制
+            properties.extend([
+                "CPUQuota=",
+                "MemoryHigh=",
+                "IOWeight="
+            ])
 
+        # 执行命令
         try:
             dbus_address = app_utils.get_dbus_address()
             if not dbus_address:
                 raise Exception("无法获取DBus会话地址")
 
-            quota_value = f"CPUQuota={quota_percent}%"
-            # Build and log the command
-            if unit_type == 'scope':
-                cmd = ['sudo', 'systemctl', 'set-property', '--runtime', matching_app, quota_value]
-            else:
-                # cmd = ['systemctl', '--user', 'set-property', '--runtime', matching_app, 'CPUQuota=30%']
-                cmd = [
+            cmd_base = (
+                ['sudo', 'systemctl', 'set-property', '--runtime', matching_app]
+                if unit_type == 'scope' else
+                [
                     'sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(),
                     f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',
-                    'systemctl', '--user', 'set-property',
-                    '--runtime', matching_app, quota_value
+                    'systemctl', '--user', 'set-property', '--runtime', matching_app
                 ]
+            )
 
+            cmd = cmd_base + properties
             logger.debug(f"Executing command: {' '.join(cmd)}")
-
-            env = os.environ.copy()
-            env['DBUS_SESSION_BUS_ADDRESS'] = dbus_address
 
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                check=True
+                check=True,
+                env={"DBUS_SESSION_BUS_ADDRESS": dbus_address} if dbus_address else None
             )
-
             logger.debug(f"Command output: {result}")
             if result.returncode == 0:
                 return True
             else:
-                logger.error(f"Failed to set CPU quota for {matching_app}")
+                logger.error(f"Failed to set resource for {matching_app}")
                 return False
-
         except Exception as e:
-            logger.error(f"Unexpected error setting CPU quota: {str(e)}")
+            logger.error(f"Set resource failed: {str(e)}")
             return False
 
-    def critical_cpu_throttle(self, app_id: str):
-        """Throttle CPU to 30%."""
-        return self._set_cpu_quota(app_id, quota_percent=30, is_restore=False)
+    # cpu
+    def set_cpu_quota(self, app_id: str, cpu_quota: int, is_restore: bool = False):
+        if is_restore:
+            logger.info(f"Restoring CPU quota for {app_id}")
+            cpu_quota = None
+        else:
+            logger.info(f"Setting CPU quota for {app_id} to {cpu_quota}%")
 
-    def restore_cpu_quota(self, app_id: str):
-        """Restore CPU to 100%."""
-        return self._set_cpu_quota(app_id, quota_percent=100, is_restore=True)
+        return self._set_resource_quota(
+            app_id,
+            cpu_quota=cpu_quota,
+            is_restore=is_restore
+        )
+
+    # mem
+    def set_mem_high(self, app_id: str, mem_high: Optional[str] = None, is_restore: bool = False):
+        if is_restore:
+            logger.info(f"Restoring memory limit for {app_id}")
+            mem_high = None
+        else:
+            logger.info(f"Setting memory limit for {app_id} to {mem_high}")
+
+        return self._set_resource_quota(
+            app_id,
+            mem_high=mem_high,
+            is_restore=is_restore
+        )
+
+    #io
+    def set_io_weight(self, app_id: str, io_weight: Optional[int] = None, is_restore: bool = False):
+        if is_restore:
+            logger.info(f"Restoring IO weight for {app_id}")
+            io_weight = None
+        elif io_weight is not None and not (10 <= io_weight <= 1000):
+            raise ValueError("IOWeight must be 10-1000")
+        else:
+            logger.info(f"Setting IO weight for {app_id} to {io_weight}")
+
+        return self._set_resource_quota(
+            app_id,
+            io_weight=io_weight,
+            is_restore=is_restore
+        )
+
+    # all
+    def set_all_resources(self, app_id: str, cpu_quota: Optional[int] = None, mem_high: Optional[int] = None,
+                          io_weight: Optional[int] = None, is_restore: bool = False):
+        """限制应用资源"""
+        if is_restore:
+            logger.info(f"Restoring ALL resources for {app_id}")
+            cpu_quota = mem_high = io_weight = None
+        else:
+            logger.info(
+                f"Setting resources for {app_id}: "
+                f"CPU={cpu_quota}%, MEM={mem_high}M, IO={io_weight}"
+            )
+
+        return self._set_resource_quota(
+            app_id,
+            cpu_quota=cpu_quota,
+            mem_high=mem_high,
+            io_weight=io_weight,
+            is_restore=is_restore
+        )
 
 
     def set_weight(self, cgroup: str, weight: int) -> bool:

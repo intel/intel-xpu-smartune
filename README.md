@@ -3,7 +3,7 @@ This is multitask resource balancing service (MRB) for AI NAS, which is designed
 for various Apps(AI) based on their priority and system pressure.
 It uses cgroups v2 to manage resources like CPU, memory, and I/O.
 
-# Architecture:
+# Solution:
 
 ![multitask_balance_architect.png](multitask_balance_architect.png)
 

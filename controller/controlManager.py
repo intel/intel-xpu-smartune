@@ -40,22 +40,22 @@ class ControlManager:
             logger.error("Failed to get current pressure level: %s", str(e))
             return "unknown"
 
-    def adjust_resources(self, app_id: str, policy: str):
-        """Adjust resources based on pressure level (or restore)."""
+    def adjust_resources(self, app_id: str, policy: str, **resource_kwargs):
+        """Adjust resources with optional parameters (保持原接口兼容)"""
         try:
             if policy == "restore":
-                return self.controller.restore_cpu_quota(app_id)  # 调用恢复方法
-            else:
-                adjustments = {
-                    'low': self._low_pressure_adjustment,
-                    'medium': self._medium_pressure_adjustment,
-                    'high': self._high_pressure_adjustment,
-                    'critical': self._critical_pressure_adjustment
-                }
-                adjustment_method = adjustments.get(policy, lambda: None)
-                return adjustment_method(app_id)
+                return self.controller.set_all_resources(app_id, is_restore=True)
+
+            logger.info(f"Adjusting resources for app_id={app_id} with policy={policy} and resource_kwargs={resource_kwargs}")
+            adjustments = {
+                'low': self._low_pressure_adjustment,
+                'medium': self._medium_pressure_adjustment,
+                'high': self._high_pressure_adjustment,
+                'critical': lambda: self._critical_pressure_adjustment(app_id, **resource_kwargs),
+            }
+            return adjustments.get(policy, lambda: None)()
         except Exception as e:
-            logger.error("Failed to adjust resources: %s", str(e))
+            logger.error("Adjust failed: %s", str(e))
             return False
 
     def _low_pressure_adjustment(self, app_id: str):
@@ -85,20 +85,27 @@ class ControlManager:
 
         return all(results)
 
-    def _critical_pressure_adjustment(self, app_id: str):
-        """Critical pressure adjustments."""
-        results = [
+    def _critical_pressure_adjustment(self, app_id: str, **kwargs):
+        """Critical调整"""
+        cpu_quota = kwargs.get('cpu_quota', None)
+        mem_high = kwargs.get('mem_high', None)
+        io_weight = kwargs.get('io_weight', None)
+
+        return all([
             self.governor.set_performance(),
-            self.controller.critical_cpu_throttle(app_id),
+            self.controller.set_all_resources(
+                app_id,
+                cpu_quota=int(cpu_quota) if cpu_quota is not None else None,
+                mem_high=int(mem_high) if mem_high is not None else None,
+                io_weight=int(io_weight) if io_weight is not None else None,
+                is_restore=False
+            )
             # self.io.set_weight("best-effort", 10),
             # self.memory.set_limit("best-effort", "high", "20%"),
             # self.io.set_limit("best-effort", "max", "1000"),
             # self.cpu.set_weight("critical", 500),
             # self.memory.protect("critical", "min", "4G")
-        ]
-
-        return all(results)
-
+        ])
 
     def get_app_priority(self, app_id: str = "", app_name: str = "") -> str:
         """Get the priority of an application."""

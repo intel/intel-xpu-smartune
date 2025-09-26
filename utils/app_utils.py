@@ -31,7 +31,8 @@ class ClientCallbackManager:
     def send_callback_notification(self, data: Dict[str, Any], store=False) -> bool:
         """发送回调通知（线程安全）"""
         if not self._registered_url:
-            raise ValueError("No callback URL registered")
+            print("No callback URL registered.")
+            return False
 
         if store:
             try:
@@ -53,7 +54,8 @@ class ClientCallbackManager:
             )
             return response.status_code == 200 and response.json().get("status") == "ok"
         except Exception as e:
-            raise ConnectionError(f"Callback failed: {str(e)}")
+            print(f"Callback notification failed: {str(e)}")
+            return False
 
 
 # 单例实例

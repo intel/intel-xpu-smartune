@@ -32,11 +32,11 @@ class DynamicService:
     def cancel_relaunch(self, app_id):
         return self.balancer.cancel_relaunch_by_app_id(app_id)
 
-    def resource_limit(self, app_id):
-        return self.balancer.set_resource_limit(app_id)
+    def resource_limit(self, app_id, app_name):
+        return self.balancer.set_resource_limit(app_id, app_name)
 
-    def restore_resource(self, app_id):
-        return self.balancer.set_restore_resource(app_id)
+    def restore_resource(self, app_id, app_name):
+        return self.balancer.set_restore_resource(app_id, app_name)
 
     def add_control(self, app_name):
         self.balancer.bpf_monitor.add_to_monitorlist(app_name)
@@ -46,6 +46,9 @@ class DynamicService:
 
     def get_controlled_list(self):
         return self.balancer.bpf_monitor.get_monitored_apps()
+
+    def get_pending_app_priority_value(self, priority_str):
+        return self.balancer.controlManager.get_priority_value(priority_str)
 
     def shutdown(self):
         self.balancer.shutdown()
@@ -415,6 +418,52 @@ def get_controlled_app():
         )
 
 
+@app.route('/app/get_pending_app', methods=['POST'])
+def get_pending_app():
+    """获取所有待启动应用并添加到服务监控列表"""
+    print(">>>> get_pending_app called <<<<")  # 调试日志
+    try:
+        pending_apps = AIAppPriority.query().filter(AIAppPriority.status == "pending")
+
+        if not pending_apps:
+            return construct_response(
+                retcode=RetCode.NOT_EXISTING,
+                retmsg="No pending apps found",
+                data=[]
+            )
+
+        logger.debug(f"Found {len(pending_apps)} pending apps in database, pending_apps: {pending_apps}")
+        # 处理结果并返回全部data
+        result_data = []
+        for app in pending_apps:
+            result_data.append({
+                "app_id": app.app_id,
+                "app_name": app.name,
+                "controlled": app.controlled,
+                "priority": app.priority,
+                "priority_value": _service.get_pending_app_priority_value(app.priority),
+                "cgroup": app.cgroup,
+                "remark": app.remark,
+                "status": app.status
+            })
+
+        # 按priority_value降序排序（数值越大优先级越高）
+        sorted_data = sorted(result_data, key=lambda x: -x["priority_value"])
+        logger.debug(f"Sorted pending apps: {sorted_data}")
+
+        return construct_response(
+            data=result_data,
+            retmsg=f"Found {len(sorted_data)} pending apps (sorted by priority DESC)"
+        )
+    except Exception as e:
+        logger.error(f"Get pending apps failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
 @app.route('/app/cancel_relaunch', methods=['POST'])
 def cancel_relaunch_app():
     """ Cancel relaunch for a specific app by app_id. """
@@ -468,16 +517,17 @@ def app_resource_limit():
     try:
         data = request.get_json()
         app_id = data.get('app_id', "")
+        app_name = data.get('app_name', "")
 
         # 验证必要参数
-        if not app_id:
+        if not app_id and not app_name:
             return construct_response(
                 data={},
                 retcode=RetCode.ARGUMENT_ERROR,
-                retmsg="Either app_id must be provided"
+                retmsg="app_id and app_name must be provided"
             )
 
-        result = _service.resource_limit(app_id)
+        result = _service.resource_limit(app_id, app_name)
 
         if result:
             return construct_response(
@@ -505,16 +555,17 @@ def app_resource_restore():
     try:
         data = request.get_json()
         app_id = data.get('app_id', "")
+        app_name = data.get('app_name', "")
 
         # 验证必要参数
-        if not app_id:
+        if not app_id and not app_name:
             return construct_response(
                 data={},
                 retcode=RetCode.ARGUMENT_ERROR,
-                retmsg="Either app_id must be provided"
+                retmsg="app_id and app_name must be provided"
             )
 
-        result = _service.restore_resource(app_id)
+        result = _service.restore_resource(app_id, app_name)
 
         if result:
             return construct_response(

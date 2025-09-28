@@ -100,6 +100,21 @@ class MABridge:
             print('get_priority_data request error: ', e)
             return {}
 
+    def get_pending_apps(self, url):
+        """ Get pending apps from multi-apps service.
+
+        :return: list of pending apps
+        """
+        try:
+            response = requests.post(url, json={})
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+                return response_data["data"]
+            return []
+        except requests.exceptions.RequestException as e:
+            print('get_controlled_apps request error: ', e)
+            return []
+
     def cancel_relaunch(self, url, app_id):
         """ Cancel relaunch for a specific app.
 
@@ -117,13 +132,13 @@ class MABridge:
             print('cancel_relaunch request error: ', e)
             return False
 
-    def resource_limit(self, url, app_id):
+    def resource_limit(self, url, app_id, app_name):
         """ Resource limit for a specific app.
 
         :param app_id:
         :return:
         """
-        data = {"app_id": app_id}
+        data = {"app_id": app_id, "app_name": app_name}
         try:
             response = requests.post(url, json=data)
             response_data = response.json()
@@ -134,13 +149,14 @@ class MABridge:
             print('resource_limit request error: ', e)
             return False
 
-    def restore_resource(self, url, app_id):
+    def restore_resource(self, url, app_id, app_name):
         """ Restore resource for a specific app.
 
         :param app_id:
+        :param app_name:
         :return:
         """
-        data = {"app_id": app_id}
+        data = {"app_id": app_id, "app_name": app_name}
         try:
             response = requests.post(url, json=data)
             response_data = response.json()

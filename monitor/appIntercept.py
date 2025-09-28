@@ -53,21 +53,37 @@ class AppIntercept(metaclass=SingletonMeta):
     def trace_print(self) -> None:
         self.bpf.trace_print()
 
-
     def get_main_process(self, comm: str, filename: str) -> (bool, str):
         """检查是否是主进程"""
         filename_lower = filename.lower()
         comm_lower = comm.lower()
 
-        app_flag = [(app, app.lower() in filename_lower) for app in self.monitored_apps]
+        # logger.debug(f"\n[DEBUG] Checking process - comm: {comm}, filename: {filename}")
+        # logger.debug(f"[DEBUG] Monitored apps: {self.monitored_apps}")
+
+        #*** Event: PID=97627, type=0 COMM=gio-launch-desk, FILENAME=/usr/bin/gnome-text-editor ***
+        # 'Text Editor'
+        app_flag = [
+            (app, app.lower().replace(" ", "-") in filename_lower or
+             app.lower() in filename_lower)
+            for app in self.monitored_apps
+        ]
+
         special_flag = [x in filename_lower for x in ['/bin/', '/usr/bin/', '/snap/bin/']]
         main_app = [app[0] for app in app_flag if app[1]]
-        is_bash_launch = (comm_lower == 'bash' and
-                          any(app[1] for app in app_flag))
+        is_bash_launch = (comm_lower == 'bash' and any(app[1] for app in app_flag))
 
-        if (any(special_flag) and any(app_flag[1] for app_flag in app_flag)) or is_bash_launch:
-            return True, main_app[0] if main_app else os.path.basename(filename)
+        # logger.debug(f"[DEBUG] app_flag results: {app_flag}")
+        # logger.debug(f"[DEBUG] special_flag: {special_flag}")
+        # logger.debug(f"[DEBUG] main_app: {main_app}")
+        # logger.debug(f"[DEBUG] is_bash_launch: {is_bash_launch}")
 
+        if (any(special_flag) and any(app[1] for app in app_flag)) or is_bash_launch:
+            result = True, main_app[0] if main_app else os.path.basename(filename)
+            # logger.debug(f"[DEBUG] Returning True: {result}")
+            return result
+
+        # logger.debug("[DEBUG] Returning False")
         return False, ""
 
     def is_process_alive(self, pid):
@@ -180,6 +196,7 @@ class AppIntercept(metaclass=SingletonMeta):
                     'status': "pending",
                     'purpose': "app"
                 }, True)
+                app_utils.update_app_status(app_id, "pending")
                 self.app_pending_queue.put(
                     {"pid": pid, "comm": comm, "filename": filename, "app_name": app_name, "app_id": app_id})
 

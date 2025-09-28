@@ -131,6 +131,16 @@ def _process_callback():
         time.sleep(0.1)
 
 
+# 辅助函数（可放在代码开头）
+def get_priority_color(priority):
+    return {
+        "critical": "#d00000",
+        "high": "#ff4b4b",
+        "medium": "#f4c20d",
+        "low": "#34a853"
+    }.get(priority.lower(), "#666666")
+
+
 def app_management(default_apps):
     # 获取当前管控应用
     global controlled_apps
@@ -194,7 +204,72 @@ def app_management(default_apps):
                     st.error("未找到应用ID")
 
     st.divider()
-    st.subheader("管控列表")
+    cols = st.columns([2, 3, 5, 1.5, 1], gap='small')
+    with cols[0]:
+        st.subheader("管控列表")
+    with cols[1]:
+        with st.expander("功能说明", expanded=False):
+            st.markdown("""
+            - 管控应用会在系统资源紧张时有效，以确保高优先级任务的顺利进行。
+            - 取消启动：取消等待应用的自动重启。
+            - 资源限制：在系统资源紧张时，限制应用的资源使用，如果不干涉，待系统资源空闲后会自动恢复。
+            - 恢复正常：手动恢复应用的正常资源使用。
+            - 删除：移除应用的管控状态。
+            """)
+    with cols[2]:
+        pending_queue_holder = st.empty()  # 占位容器
+
+    with cols[3]:
+        if st.button("查看等待队列", key="pending_queue"):
+            # 直接构建要显示的HTML内容
+            html_content = """
+            <style>
+            .task-card { padding: 1px; margin: 1px 0; border-radius: 5px; background: #f0f2f6; }
+            .critical-priority { border-left: 5px solid #d00000; background-color: #ffe6e6; }
+            .high-priority { border-left: 5px solid #ff4b4b; }
+            .medium-priority { border-left: 5px solid #f4c20d; }
+            .low-priority { border-left: 5px solid #34a853; }
+            .priority-label {
+                display: inline-block;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-size: 0.8em;
+                font-weight: bold;
+                margin-left: 8px;
+            }
+            .empty-state { color: #666; font-style: italic; padding: 15px 0; text-align: center; }
+            </style>
+            """
+
+            pending_apps = api.get_pending_apps() or []
+            print(f"pending_apps: {pending_apps}")
+
+            if not pending_apps:
+                html_content += '<div class="empty-state">🕊️ 等待队列为空</div>'
+            else:
+                priority_mapping = {
+                    "critical": "critical-priority",
+                    "high": "high-priority",
+                    "medium": "medium-priority",
+                    "low": "low-priority"
+                }
+
+                for app in pending_apps:
+                    priority = app.get("priority", "medium").lower()
+                    priority_class = priority_mapping.get(priority, "medium-priority")
+
+                    html_content += (
+                        f'<div class="task-card {priority_class}">'
+                        f'🔹 {app["app_name"]}  -  '
+                        f'<span class="priority-label" style="color: {get_priority_color(priority)};">'
+                        f'Priority: {app["priority"]}</span>'
+                        '</div>'
+                    )
+
+            pending_queue_holder.markdown(html_content, unsafe_allow_html=True)
+    with cols[4]:
+        if st.button("刷新", key="refresh_status"):
+            st.rerun()
 
     if not controlled_apps:
         st.info("当前没有管控的应用")
@@ -203,7 +278,7 @@ def app_management(default_apps):
     print(f"Rendering controlled apps: {controlled_apps}")
     for idx, app in enumerate(controlled_apps):
         with st.container(border=True):
-            cols = st.columns([2, 1.5, 1.5, 1, 1, 1, 1, 1])  # 调整列宽比例
+            cols = st.columns([2, 1.5, 1, 1, 1.5, 1.5, 1.5, 1])  # 调整列宽比例
             status = app.get("status", "NA")
 
             # 应用名称
@@ -276,14 +351,14 @@ def app_management(default_apps):
 
                 if st.button(btn_text, key=f"limit_{idx}", type=btn_type, disabled=limit_disabled):
                     if st.session_state[limit_key]:
-                        restore_result = api.restore_resource(app["app_id"])
+                        restore_result = api.restore_resource(app["app_id"], app['app_name'])
                         if restore_result:
                             st.session_state[limit_key] = False
                             st.toast(f'已成功恢复应用{app["app_name"]}的资源!', icon='🎉')
                         else:
                             st.toast(f'恢复应用{app["app_name"]}的资源失败!', icon="❌")
                     else:
-                        limit_result = api.resource_limit(app["app_id"])
+                        limit_result = api.resource_limit(app["app_id"], app['app_name'])
                         if limit_result:
                             st.session_state[limit_key] = True
                             st.toast(f'已成功对应用{app["app_name"]}进行资源限制!', icon='🎉')

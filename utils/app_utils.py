@@ -77,6 +77,24 @@ def get_controlled_apps():
         return None
 
 
+def update_app_status(app_id: str, status: str) -> bool:
+    try:
+        result = AIAppPriority.update_record(
+            id=app_id.replace('.desktop', ''),
+            status=status
+        )
+        if not result:
+            logger.warning(f"No record updated for app_id: {app_id}")
+            return False
+
+        logger.info(f"Status updated - ID: {app_id}, New status: {status}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Update failed: {e}")
+        return False
+
+
 def safe_notify(title, message, icon="dialog-information"):
     try:
         # 方法1：优先尝试原生notify-send

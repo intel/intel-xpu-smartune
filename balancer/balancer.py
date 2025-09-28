@@ -14,6 +14,7 @@ from multiprocessing import JoinableQueue
 import queue
 import heapq
 
+g_limited_apps = {}  # 记录被限制的应用
 
 @dataclass
 class WorkloadGroup:
@@ -126,10 +127,10 @@ class DynamicBalancer:
 
     def _run_monitor_resource_loop(self):
         logger.info("Monitor resource service started")
+        global g_limited_apps
         idle_check_interval = 10  # 2分钟（单位：秒）
         last_check_time = 0
         top_consume_apps = []  # 保存获取到的top应用列表
-        limited_apps = {}  # 记录被限制的应用
         restore_pending = False  # 标记是否有待恢复的应用
         low_pressure_start_time = None  # 记录首次进入low状态的时间
         STABLE_PERIOD = 1800  # 30分钟的稳定期（秒）
@@ -155,7 +156,7 @@ class DynamicBalancer:
                         restore_pending = False
                         if not top_consume_apps:
                             top_consume_apps = self.resource_monitor.get_top_resource_consumers()
-                            print(f"Top resource consumers: {top_consume_apps}")
+                            print(f"Top resource consumers(currently = 1): {top_consume_apps}")
                             """
                               "Top resource consumers": [
                                 {
@@ -188,11 +189,10 @@ class DynamicBalancer:
                                 ...
                               ]                       
                             """
-                            current_app_index = 0  # 重置索引
 
                         if top_consume_apps:
                             # 调用独立的处理函数
-                            should_adjust, app_id = self._handle_critical_pressure(top_consume_apps)
+                            should_adjust, is_controlled, app_id = self._handle_critical_pressure(top_consume_apps)
 
                             if should_adjust and app_id:
                                 # 执行资源调整
@@ -208,7 +208,9 @@ class DynamicBalancer:
                                     is_restore=False,
                                 )
                                 if auto_limit:
-                                    limited_apps[app_id] = app_name
+                                    g_limited_apps[app_id] = app_name
+                                    if is_controlled:
+                                        app_utils.update_app_status(app_id, "limited")
                                     app_utils.callback_manager.send_callback_notification({
                                         'app_id': app_id,
                                         'app_name': app_name,
@@ -227,6 +229,7 @@ class DynamicBalancer:
                         logger.info(
                             f"Starting app: {app_data['app_name']} (PID: {app_data['pid']}, Priority: {priority})")
                         os.kill(app_data['pid'], signal.SIGCONT)
+                        app_utils.update_app_status(app_data['app_id'], "running")
                         app_utils.callback_manager.send_callback_notification({
                             'app_id': app_data['app_id'],
                             'app_name': app_data['app_name'],
@@ -239,7 +242,7 @@ class DynamicBalancer:
                         # 非 critical 状态：每次恢复一个应用
                         # 可能的bug： 需要一段时间后，或者可以判断资源<high后在恢复，不然可能刚限制又恢复了
                         # 或者渐进式恢复？
-                        if pressure == "low" and limited_apps and not restore_pending:
+                        if pressure == "low" and g_limited_apps and not restore_pending:
                             if low_pressure_start_time is None:
                                 # 第一次进入low状态，开始计时
                                 low_pressure_start_time = current_time
@@ -247,10 +250,11 @@ class DynamicBalancer:
                                     f"Low pressure detected, starting {STABLE_PERIOD} sec countdown for restore")
                             elif current_time - low_pressure_start_time >= STABLE_PERIOD:
                                 # 稳定期已过，执行恢复
-                                app_id, app_name = limited_apps.popitem()
+                                app_id, app_name = g_limited_apps.popitem()
                                 logger.info(f"Restoring CPU quota for app: {app_id}, name: {app_name}")
                                 restore_pending = True
                                 if self.controlManager.adjust_resources(app_id, "restore"):
+                                    app_utils.update_app_status(app_id, "running")
                                     app_utils.callback_manager.send_callback_notification({
                                         'app_id': app_id,
                                         'app_name': app_name,
@@ -326,7 +330,7 @@ class DynamicBalancer:
     def _handle_critical_pressure(self, top_consumers):
         """处理资源压力 (单次执行只处理一个app)"""
         if not top_consumers:
-            return False, None
+            return False, False, None
 
         # 记录连续critical次数 (类成员变量)
         if not hasattr(self, '_critical_counter'):
@@ -335,7 +339,7 @@ class DynamicBalancer:
         # 每次取第一个app处理
         app_info = top_consumers[0]
         if not app_info or not app_info.get('app'):
-            return False, None
+            return False, False, None
 
         app_id = app_info['app'].get('id')
         app_name = (app_info.get('process', {}).get('name') or '').lower()
@@ -361,12 +365,12 @@ class DynamicBalancer:
         # 情况1：非管控应用 -> 直接调整
         if not is_controlled:
             self._critical_counter = 0  # 重置计数器
-            return True, app_id
+            return True, is_controlled, app_id
 
         # 情况2：管控但非critical -> 直接调整
         if priority != 'critical':
             self._critical_counter = 0  # 重置计数器
-            return True, app_id
+            return True, is_controlled, app_id
 
         # 情况3：critical管控 -> 不处理，增加计数器
         self._critical_counter += 1
@@ -382,7 +386,7 @@ class DynamicBalancer:
 
             self._critical_counter = 0  # 重置计数器
 
-        return False, None
+        return False, False, None
 
 
     def cancel_relaunch_by_app_id(self, app_id: str) -> bool:
@@ -408,9 +412,12 @@ class DynamicBalancer:
 
         return killed
 
-    def set_resource_limit(self, app_id: str) -> bool:
+    def set_resource_limit(self, app_id: str, app_name: str) -> bool:
         """ 根据 app_id 设置资源限制 """
-        # 获取app_id对应的资源使用情况
+
+        # 将app放入限制列表中，等待监控线程处理，适时自动恢复
+        g_limited_apps[app_id] = app_name
+        app_utils.update_app_status(app_id, "limited")
         return self.controlManager.adjust_resources(
             app_id,
             "critical",
@@ -420,8 +427,12 @@ class DynamicBalancer:
             is_restore=False,
         )
 
-    def set_restore_resource(self, app_id: str) -> bool:
+    def set_restore_resource(self, app_id: str, app_name: str) -> bool:
         """ 根据 app_id 恢复资源限制 """
+
+        # 从限制列表中移除（无论是否存在都尝试移除）
+        g_limited_apps.pop(app_id, None)
+        app_utils.update_app_status(app_id, "running")
         return self.controlManager.adjust_resources(app_id, "restore")
 
     def _execute_task(self, task: WorkloadTask, pressure_level: str) -> bool:

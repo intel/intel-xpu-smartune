@@ -64,6 +64,7 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         self.app_cancel_relaunch_url = MULTIAPPS_URL + '/app/cancel_relaunch'
         self.app_resource_limit_url = MULTIAPPS_URL + '/app/resource_limit'
         self.app_resource_restore_url = MULTIAPPS_URL + '/app/resource_restore'
+        self.app_get_pending_url = MULTIAPPS_URL + '/app/get_pending_app'
         self.app_obtain_url = MULTIAPPS_URL + '/app/get_apps'
         self.app_workload_url = MULTIAPPS_URL + '/task/add_workload'
         self.app_register_callback_url = MULTIAPPS_URL + '/app/register_callback'
@@ -121,19 +122,27 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         """
         return self.ma_bridge.cancel_relaunch(self.app_cancel_relaunch_url, app_id)
 
-    def resource_limit(self, app_id):
+    def resource_limit(self, app_id, app_name):
         """
         :param app_id: according to app_id to do the resource limit.
         :return:
         """
-        return self.ma_bridge.resource_limit(self.app_resource_limit_url, app_id)
+        return self.ma_bridge.resource_limit(self.app_resource_limit_url, app_id, app_name)
 
-    def restore_resource(self, app_id):
+    def restore_resource(self, app_id, app_name):
         """
         :param app_id: according to app_id to do the resource limit.
+        :param app_name:
         :return:
         """
-        return self.ma_bridge.restore_resource(self.app_resource_restore_url, app_id)
+        return self.ma_bridge.restore_resource(self.app_resource_restore_url, app_id, app_name)
+
+    def get_pending_apps(self):
+        """
+        :return: Get all the pending apps.
+        """
+
+        return self.ma_bridge.get_pending_apps(self.app_get_pending_url)
 
     def get_apps(self, store=False):
         """

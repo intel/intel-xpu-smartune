@@ -84,30 +84,49 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
 
 
 # Installation:
-    Build libcgroup wheel from source:
-    1.  pip install Cython
-    2.  sudo apt install libpam-dev flex bison libsystemd-dev
-    3.  git clone https://github.com/libcgroup/libcgroup.git
-    4.  cd libcgroup
-    5.  git checkout v3.2.0 -b v3.2.0
-    6.  ./bootstrap.sh
-    7.  make
-    8.  cd libcgroup/src/python
-    9.  export VERSION_RELEASE="3.2.0"
-    10. python setup.py bdist_wheel
-    11. pip install dist/libcgroup-3.2.0-cp310-cp310-linux_x86_64.whl
+    server:
+        Start a terminal w/o any virtual(like conda) env, then run:
+            sudo pip install psutil>=5.5.1 --break-system-packages
+            sudo pip install peewee==3.17.8 --break-system-packages
+            sudo pip install flask --break-system-packages
+    
+    client: 
+        1.  Start a new terminal to run:
+            bash Miniforge3-Linux-x86_64.sh (Prepare the package)
+            conda create -n mt_py312 python=3.12.7
+            conda activate mt_py312
+            pip install -r requirements.txt
 
-    sudo apt update && sudo apt install linux-tools-common cpufrequtils -y
+        2. pip install dist/libcgroup-3.2.0-cp312-cp312-linux_x86_64.whl(Probably no need, 
+                but if need, please refer to "Other" below to generate whl)
 
-    conda create -n mt_py312 python=3.12.7
-    conda activate mt_py312
-    pip install -r requirements.txt
-    pip install dist/libcgroup-3.2.0-cp310-cp310-linux_x86_64.whl (Refer above "Build libcgroup wheel from source")
-
-
+    Other:
+        Build libcgroup wheel from source:
+        0.  
+            # Go into "base" env, then check python version and upgrade to python3.12.7 with: 
+            # conda install -n base python=3.12.7
+            # pip install --upgrade pip # if need, currently is 25.2
+        1.  pip install Cython
+        2.  sudo apt install libpam-dev flex bison libsystemd-dev cmake build-essential autoconf automake libtool m4
+            sudo apt install linux-tools-common cpufrequtils -y
+        3.  git clone https://github.com/libcgroup/libcgroup.git
+        4.  cd libcgroup
+        5.  git checkout v3.2.0 -b v3.2.0
+        6.  ./bootstrap.sh(sudo apt-get --reinstall install gcc g++ // issue: /usr/include/c++/14/mutex:768:23: internal compiler error: Segmentation fault)
+        7.  make
+        8.  cd libcgroup/src/python
+        9.  export VERSION_RELEASE="3.2.0"
+        10. python setup.py bdist_wheel
+        11. pip install dist/libcgroup-3.2.0-cp312-cp312-linux_x86_64.whl
+ 
 # Start:
-    python BalanceService.py
-    python test/test_bservice.py(testing API.)
+    1. server:
+        sudo python3 BalanceService.py
+    2. client:
+        cd web
+        ./start_webui.sh mt_py312
+        
+        
 
 
 

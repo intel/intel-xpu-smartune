@@ -132,13 +132,13 @@ class MABridge:
             print('cancel_relaunch request error: ', e)
             return False
 
-    def resource_limit(self, url, app_id, app_name):
+    def resource_limit(self, url, app_id, app_name, priority):
         """ Resource limit for a specific app.
 
         :param app_id:
         :return:
         """
-        data = {"app_id": app_id, "app_name": app_name}
+        data = {"app_id": app_id, "app_name": app_name, "priority": priority}
         try:
             response = requests.post(url, json=data)
             response_data = response.json()

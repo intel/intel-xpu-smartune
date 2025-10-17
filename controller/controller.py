@@ -119,13 +119,13 @@ class Controller:
         :param is_restore: 是否恢复默认值
         """
         # 参数范围检查
-        if cpu_quota is not None and not (1 <= cpu_quota <= 100):
-            logger.warning(f"Invalid cpu_quota {cpu_quota}, must be 1-100. Using None.")
-            cpu_quota = 1
+        # if cpu_quota is not None and not (1 <= cpu_quota <= 100):
+        #     logger.warning(f"Invalid cpu_quota {cpu_quota}, must be 1-100. Using None.")
+        #     cpu_quota = 1
 
         if mem_high is not None and mem_high <= 0:
             logger.warning(f"Invalid mem_high {mem_high}, must be >0. Using default 100M.")
-            mem_high = 100
+            mem_high = 10000
 
         if io_weight is not None and not (10 <= io_weight <= 1000):
             logger.warning(f"Invalid io_weight {io_weight}, must be 10-1000. Using default 100.")
@@ -154,10 +154,16 @@ class Controller:
         if not is_restore:
             if cpu_quota is not None:
                 properties.append(f"CPUQuota={cpu_quota}%")
-            if mem_high:
+            else:
+                properties.append("CPUQuota=")
+            if mem_high is not None:
                 properties.append(f"MemoryHigh={mem_high}M")
-            if io_weight:
+            else:
+                properties.append("MemoryHigh=")
+            if io_weight is not None:
                 properties.append(f"IOWeight={io_weight}")
+            else:
+                properties.append("IOWeight=")
         else:
             # 恢复时清除所有限制
             properties.extend([

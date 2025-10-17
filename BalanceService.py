@@ -32,8 +32,8 @@ class DynamicService:
     def cancel_relaunch(self, app_id):
         return self.balancer.cancel_relaunch_by_app_id(app_id)
 
-    def resource_limit(self, app_id, app_name):
-        return self.balancer.set_resource_limit(app_id, app_name)
+    def resource_limit(self, app_id, app_name, priority):
+        return self.balancer.set_resource_limit(app_id, app_name, priority)
 
     def restore_resource(self, app_id, app_name):
         return self.balancer.set_restore_resource(app_id, app_name)
@@ -518,16 +518,17 @@ def app_resource_limit():
         data = request.get_json()
         app_id = data.get('app_id', "")
         app_name = data.get('app_name', "")
+        priority = data.get('priority', "")
 
         # 验证必要参数
-        if not app_id and not app_name:
+        if not app_id and not app_name and not priority:
             return construct_response(
                 data={},
                 retcode=RetCode.ARGUMENT_ERROR,
-                retmsg="app_id and app_name must be provided"
+                retmsg="app_id, app_name and priority must be provided"
             )
 
-        result = _service.resource_limit(app_id, app_name)
+        result = _service.resource_limit(app_id, app_name, priority)
 
         if result:
             return construct_response(

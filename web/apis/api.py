@@ -122,12 +122,12 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         """
         return self.ma_bridge.cancel_relaunch(self.app_cancel_relaunch_url, app_id)
 
-    def resource_limit(self, app_id, app_name):
+    def resource_limit(self, app_id, app_name, priority):
         """
         :param app_id: according to app_id to do the resource limit.
         :return:
         """
-        return self.ma_bridge.resource_limit(self.app_resource_limit_url, app_id, app_name)
+        return self.ma_bridge.resource_limit(self.app_resource_limit_url, app_id, app_name, priority)
 
     def restore_resource(self, app_id, app_name):
         """

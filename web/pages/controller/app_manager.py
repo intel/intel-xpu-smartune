@@ -358,7 +358,7 @@ def app_management(default_apps):
                         else:
                             st.toast(f'恢复应用{app["app_name"]}的资源失败!', icon="❌")
                     else:
-                        limit_result = api.resource_limit(app["app_id"], app['app_name'])
+                        limit_result = api.resource_limit(app["app_id"], app['app_name'], app["priority"])
                         if limit_result:
                             st.session_state[limit_key] = True
                             st.toast(f'已成功对应用{app["app_name"]}进行资源限制!', icon='🎉')

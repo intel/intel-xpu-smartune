@@ -192,9 +192,9 @@ class DynamicBalancer:
 
                         if top_consume_apps:
                             # 调用独立的处理函数
-                            should_adjust, is_controlled, app_id = self._handle_critical_pressure(top_consume_apps)
+                            should_adjust, is_controlled, app_id, limit_rate = self._handle_critical_pressure(top_consume_apps)
 
-                            if should_adjust and app_id:
+                            if should_adjust and app_id and app_id not in g_limited_apps:
                                 # 执行资源调整
                                 target = top_consume_apps[0]
                                 app_name = target.get('process', {}).get('name') or ''
@@ -202,12 +202,13 @@ class DynamicBalancer:
                                 auto_limit = self.controlManager.adjust_resources(
                                     app_id,
                                     "critical",
-                                    cpu_quota=int(target['process']['cpu_avg'] * 0.5),  # 直接计算
-                                    mem_high=int(target['process']['mem_rss'] / 1024 / 1024 * 0.5),
+                                    cpu_quota=int(target['process']['cpu_avg'] * limit_rate),  # 直接计算
+                                    mem_high=int(target['process']['mem_rss'] / 1024 / 1024 * limit_rate),
                                     io_weight=max(200, int(target['process']['io_read_rate'] / 1024 / 1024 * 10)),
                                     is_restore=False,
                                 )
                                 if auto_limit:
+                                    # 记录已限制的应用
                                     g_limited_apps[app_id] = app_name
                                     if is_controlled:
                                         app_utils.update_app_status(app_id, "limited")
@@ -330,7 +331,7 @@ class DynamicBalancer:
     def _handle_critical_pressure(self, top_consumers):
         """处理资源压力 (单次执行只处理一个app)"""
         if not top_consumers:
-            return False, False, None
+            return False, False, None, None
 
         # 记录连续critical次数 (类成员变量)
         if not hasattr(self, '_critical_counter'):
@@ -339,7 +340,7 @@ class DynamicBalancer:
         # 每次取第一个app处理
         app_info = top_consumers[0]
         if not app_info or not app_info.get('app'):
-            return False, False, None
+            return False, False, None, None
 
         app_id = app_info['app'].get('id')
         app_name = (app_info.get('process', {}).get('name') or '').lower()
@@ -365,18 +366,18 @@ class DynamicBalancer:
         # 情况1：非管控应用 -> 直接调整
         if not is_controlled:
             self._critical_counter = 0  # 重置计数器
-            return True, is_controlled, app_id
+            return True, is_controlled, app_id, 0.3
 
         # 情况2：管控但非critical -> 直接调整
         if priority != 'critical':
             self._critical_counter = 0  # 重置计数器
-            return True, is_controlled, app_id
+            return True, is_controlled, app_id, self.get_priority_value(priority)
 
         # 情况3：critical管控 -> 不处理，增加计数器
         self._critical_counter += 1
 
         # 检查是否连续三次critical
-        if self._critical_counter >= 3:
+        if self._critical_counter >= 1:
             app_utils.callback_manager.send_callback_notification({
                 'app_id': "",
                 'app_name': "",
@@ -386,7 +387,7 @@ class DynamicBalancer:
 
             self._critical_counter = 0  # 重置计数器
 
-        return False, False, None
+        return False, False, None, None
 
 
     def cancel_relaunch_by_app_id(self, app_id: str) -> bool:
@@ -412,7 +413,7 @@ class DynamicBalancer:
 
         return killed
 
-    def set_resource_limit(self, app_id: str, app_name: str) -> bool:
+    def set_resource_limit0(self, app_id: str, app_name: str) -> bool:
         """ 根据 app_id 设置资源限制 """
 
         # 将app放入限制列表中，等待监控线程处理，适时自动恢复
@@ -421,9 +422,60 @@ class DynamicBalancer:
         return self.controlManager.adjust_resources(
             app_id,
             "critical",
-            cpu_quota=1,
-            mem_high=20,
+            cpu_quota=100,
+            mem_high=20000,
             io_weight=120,
+            is_restore=False,
+        )
+
+    def get_priority_value(self, priority):
+        if priority.lower() == "critical":
+            return 0.7
+        elif priority.lower() == "high":
+            return 0.6
+        elif priority.lower() == "medium":
+            return 0.5
+        else:
+            return 0.4
+
+    def set_resource_limit(self, app_id: str, app_name: str, priority: str) -> bool:
+        """ 根据 app_id 设置资源限制 """
+
+        limit_rate = self.get_priority_value(priority)
+        # 获取应用程序的实际资源使用情况
+        usage = app_utils.get_app_resource_usage(app_id, app_name)
+
+        if usage is None:
+            print(f"Warning: Could not get resource usage for {app_name} (ID: {app_id}), using default limits")
+            # 默认值
+            cpu_quota = None
+            mem_high = None
+            io_weight = None
+        else:
+            # 计算限制值（使用实际值的50%，如果没查到就先不限制）
+            cpu_quota = int(usage['cpu_percent'] * limit_rate) if usage['cpu_percent'] > 0 else None
+            mem_high = int((usage['mem_bytes'] / (1024 * 1024)) * limit_rate) if usage['mem_bytes'] > 0 else None
+
+            # IOWeight的计算
+            io_activity = (usage['io_read_bytes'] + usage['io_write_bytes']) / (1024 * 1024)
+            io_weight = int(io_activity * limit_rate) if io_activity >= 100 else None
+
+            print("--------------------APP RESOURCE USAGE--------------------")
+            print(f" Setting limits for {app_name} (ID: {app_id}) based on actual usage:")
+            print(f"  CPU: {usage['cpu_percent']:.1f}% -> limit to {cpu_quota}%")
+            print(f"  Memory: {usage['mem_bytes'] / 1024 / 1024:.1f}MB -> limit to {mem_high}MB")
+            print(f"  IO activity: {io_activity:.1f}MB -> weight {io_weight}")
+
+        # 将app放入限制列表中，等待监控线程处理，适时自动恢复
+        g_limited_apps[app_id] = app_name
+        app_utils.update_app_status(app_id, "limited")
+
+        return self.controlManager.adjust_resources(
+            app_id,
+            "critical",
+            cpu_quota=cpu_quota,
+            mem_high=mem_high,
+            io_weight=io_weight,
             is_restore=False,
         )
 

@@ -2,6 +2,7 @@ import os
 import requests
 import subprocess
 import shutil
+import psutil
 from getpass import getuser
 from pwd import getpwnam
 from datetime import datetime
@@ -93,6 +94,60 @@ def update_app_status(app_id: str, status: str) -> bool:
     except Exception as e:
         logger.error(f"Update failed: {e}")
         return False
+
+
+def get_app_resource_usage(app_id: str, app_name: str) -> dict:
+    """查询特定桌面应用程序的实际CPU、内存和IO使用情况
+
+    Args:
+        app_id: 应用程序的.desktop ID (如 org.gnome.Calculator.desktop)
+        app_name: 应用程序的名称 (如 Calculator)
+
+    Returns:
+        包含资源使用情况的字典，格式为:
+        {
+            'cpu_percent': float,  # CPU使用百分比
+            'mem_bytes': int,      # 内存使用字节数
+            'io_read_bytes': int,  # IO读取字节数
+            'io_write_bytes': int  # IO写入字节数
+        }
+    """
+    try:
+        # 获取所有进程信息
+        processes = []
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'memory_info', 'io_counters']):
+            try:
+                # 检查进程是否匹配应用程序名称或.desktop文件
+                if app_name.lower() in proc.name().lower():
+                    processes.append(proc)
+                else:
+                    # 检查命令行是否包含.desktop文件信息
+                    cmdline = " ".join(proc.cmdline())
+                    if app_id.lower() in cmdline.lower():
+                        processes.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if not processes:
+            print(f"No processes found for app {app_name} (ID: {app_id})")
+            return None
+
+        # 计算总资源使用量
+        print(f"processes...... {processes}")
+        cpu_percent = sum(proc.cpu_percent() for proc in processes)
+        mem_bytes = sum(proc.memory_info().rss for proc in processes)
+        io_read_bytes = sum(proc.io_counters().read_bytes for proc in processes if proc.io_counters() is not None)
+        io_write_bytes = sum(proc.io_counters().write_bytes for proc in processes if proc.io_counters() is not None)
+
+        return {
+            'cpu_percent': cpu_percent,
+            'mem_bytes': mem_bytes,
+            'io_read_bytes': io_read_bytes,
+            'io_write_bytes': io_write_bytes
+        }
+    except Exception as e:
+        print(f"Error getting resource usage for {app_name} (ID: {app_id}): {e}")
+        return None
 
 
 def safe_notify(title, message, icon="dialog-information"):

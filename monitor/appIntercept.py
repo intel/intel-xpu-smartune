@@ -28,7 +28,7 @@ class SingletonMeta(type):
 
 class AppIntercept(metaclass=SingletonMeta):
     def __init__(self, c_src_file: str = "bpf_event.c"):
-        self.bpf = BPF(src_file=c_src_file)
+        self.bpf = BPF(src_file=c_src_file, cflags=["-Wno-duplicate-decl-specifier"])
         self.controlManager = ControlManager()
         self.monitored_apps: Set[str] = set()
         self.handled_processes: Set[int] = set()  # 初始化已处理进程集合
@@ -61,13 +61,32 @@ class AppIntercept(metaclass=SingletonMeta):
         # logger.debug(f"\n[DEBUG] Checking process - comm: {comm}, filename: {filename}")
         # logger.debug(f"[DEBUG] Monitored apps: {self.monitored_apps}")
 
-        #*** Event: PID=97627, type=0 COMM=gio-launch-desk, FILENAME=/usr/bin/gnome-text-editor ***
-        # 'Text Editor'
-        app_flag = [
-            (app, app.lower().replace(" ", "-") in filename_lower or
-             app.lower() in filename_lower)
-            for app in self.monitored_apps
-        ]
+        # 定义每个应用的可执行文件名
+        app_executables = {
+            "System Monitor": ["gnome-system-monitor"],
+            "Calculator": ["gnome-calculator"],
+            "VLC media player": ["vlc"],
+            "Text Editor": ["gnome-text-editor"],
+        }
+
+        # 先尝试自定义中匹配
+        app_flag = []
+        for app in self.monitored_apps:
+            # 检查是否有预定义的可执行文件名
+            executables = app_executables.get(app, [])
+            exact_match = any(
+                f"/{exe}" in filename_lower or filename_lower.endswith(f"/{exe}")
+                for exe in executables
+            )
+
+            # 如果没有精确匹配，则使用原来的模糊匹配方式
+            if not exact_match:
+                exact_match = (
+                        app.lower().replace(" ", "-") in filename_lower or
+                        app.lower() in filename_lower
+                )
+
+            app_flag.append((app, exact_match))
 
         special_flag = [x in filename_lower for x in ['/bin/', '/usr/bin/', '/snap/bin/']]
         main_app = [app[0] for app in app_flag if app[1]]

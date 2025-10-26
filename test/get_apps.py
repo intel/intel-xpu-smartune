@@ -5,4 +5,7 @@ from gi.repository import Gio
 
 apps = Gio.AppInfo.get_all()
 for app in apps:
-    print(f"{app.get_name():<30}   |  {app.get_id():<30}   | {app.get_commandline():<30}")
+    name = app.get_name() or "N/A"
+    app_id = app.get_id() or "N/A"
+    commandline = app.get_commandline() or "N/A"
+    print(f"{name:<30}   |  {app_id:<30}   | {commandline:<30}")

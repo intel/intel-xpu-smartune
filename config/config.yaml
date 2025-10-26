@@ -1,13 +1,17 @@
 psi_interval: 2.0
 cgroup_mount: "/sys/fs/cgroup"
 thresholds:
-  medium: 40
-  high: 60
-  critical: 80
+  medium: 60
+  high: 120
+  critical: 160
 weights:
-  cpu: 0.1
-  memory: 0.2
-  io: 20
+  cpu: 3.5
+  memory: 1.2
+  io: 2
+weights_top:
+  cpu: 2
+  memory: 7
+  io: 1
 workloads:
   - name: "critical"
     priority: 100

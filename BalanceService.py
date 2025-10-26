@@ -452,7 +452,7 @@ def get_pending_app():
         logger.debug(f"Sorted pending apps: {sorted_data}")
 
         return construct_response(
-            data=result_data,
+            data=sorted_data,
             retmsg=f"Found {len(sorted_data)} pending apps (sorted by priority DESC)"
         )
     except Exception as e:

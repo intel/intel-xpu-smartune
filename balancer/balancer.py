@@ -198,12 +198,13 @@ class DynamicBalancer:
                                 # 执行资源调整
                                 target = top_consume_apps[0]
                                 app_name = target.get('process', {}).get('name') or ''
+                                total_mem = self.resource_monitor.get_total_memory()
                                 logger.info(f"Adjusting resources for app: {app_id}")
                                 auto_limit = self.controlManager.adjust_resources(
                                     app_id,
                                     "critical",
-                                    cpu_quota=int(target['process']['cpu_avg'] * limit_rate),  # 直接计算
-                                    mem_high=int(target['process']['mem_rss'] / 1024 / 1024 * limit_rate),
+                                    cpu_quota=int(100 * limit_rate),  # 直接计算
+                                    mem_high=int(total_mem * limit_rate),
                                     io_weight=max(200, int(target['process']['io_read_rate'] / 1024 / 1024 * 10)),
                                     is_restore=False,
                                 )
@@ -254,7 +255,7 @@ class DynamicBalancer:
                                 app_id, app_name = g_limited_apps.popitem()
                                 logger.info(f"Restoring CPU quota for app: {app_id}, name: {app_name}")
                                 restore_pending = True
-                                if self.controlManager.adjust_resources(app_id, "restore"):
+                                if self.controlManager.adjust_resources(app_id, "low"):
                                     app_utils.update_app_status(app_id, "running")
                                     app_utils.callback_manager.send_callback_notification({
                                         'app_id': app_id,
@@ -366,7 +367,7 @@ class DynamicBalancer:
         # 情况1：非管控应用 -> 直接调整
         if not is_controlled:
             self._critical_counter = 0  # 重置计数器
-            return True, is_controlled, app_id, 0.3
+            return True, is_controlled, app_id, 0.3  # 非管控应用按照系统的30%限制
 
         # 情况2：管控但非critical -> 直接调整
         if priority != 'critical':
@@ -413,21 +414,6 @@ class DynamicBalancer:
 
         return killed
 
-    def set_resource_limit0(self, app_id: str, app_name: str) -> bool:
-        """ 根据 app_id 设置资源限制 """
-
-        # 将app放入限制列表中，等待监控线程处理，适时自动恢复
-        g_limited_apps[app_id] = app_name
-        app_utils.update_app_status(app_id, "limited")
-        return self.controlManager.adjust_resources(
-            app_id,
-            "critical",
-            cpu_quota=100,
-            mem_high=20000,
-            io_weight=120,
-            is_restore=False,
-        )
-
     def get_priority_value(self, priority):
         if priority.lower() == "critical":
             return 0.7
@@ -444,6 +430,7 @@ class DynamicBalancer:
         limit_rate = self.get_priority_value(priority)
         # 获取应用程序的实际资源使用情况
         usage = app_utils.get_app_resource_usage(app_id, app_name)
+        total_mem = self.resource_monitor.get_total_memory()
 
         if usage is None:
             print(f"Warning: Could not get resource usage for {app_name} (ID: {app_id}), using default limits")
@@ -453,8 +440,8 @@ class DynamicBalancer:
             io_weight = None
         else:
             # 计算限制值（使用实际值的50%，如果没查到就先不限制）
-            cpu_quota = int(usage['cpu_percent'] * limit_rate) if usage['cpu_percent'] > 0 else None
-            mem_high = int((usage['mem_bytes'] / (1024 * 1024)) * limit_rate) if usage['mem_bytes'] > 0 else None
+            cpu_quota = int(100 * limit_rate) if usage['cpu_percent'] > 0 else None
+            mem_high = int(total_mem * limit_rate) if usage['mem_bytes'] > 0 else None
 
             # IOWeight的计算
             io_activity = (usage['io_read_bytes'] + usage['io_write_bytes']) / (1024 * 1024)
@@ -485,7 +472,7 @@ class DynamicBalancer:
         # 从限制列表中移除（无论是否存在都尝试移除）
         g_limited_apps.pop(app_id, None)
         app_utils.update_app_status(app_id, "running")
-        return self.controlManager.adjust_resources(app_id, "restore")
+        return self.controlManager.adjust_resources(app_id, "low")
 
     def _execute_task(self, task: WorkloadTask, pressure_level: str) -> bool:
         """执行任务"""

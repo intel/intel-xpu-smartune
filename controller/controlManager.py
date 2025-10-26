@@ -34,7 +34,7 @@ class ControlManager:
             score = self.analyzer.calculate_pressure_score(psi_data)
             level = self.analyzer.get_pressure_level(score)
             # level = "critical" # debug
-            logger.debug("Current PSI level: %s (score: %.2f)", level, score)
+            logger.debug("Current PSI level: %s (pressure: %.2f)", level, score)
             return level
         except Exception as e:
             logger.error("Failed to get current pressure level: %s", str(e))
@@ -43,12 +43,9 @@ class ControlManager:
     def adjust_resources(self, app_id: str, policy: str, **resource_kwargs):
         """Adjust resources with optional parameters (保持原接口兼容)"""
         try:
-            if policy == "restore":
-                return self.controller.set_all_resources(app_id, is_restore=True)
-
             logger.info(f"Adjusting resources for app_id={app_id} with policy={policy} and resource_kwargs={resource_kwargs}")
             adjustments = {
-                'low': self._low_pressure_adjustment,
+                'low': self._low_pressure_adjustment(app_id),
                 'medium': self._medium_pressure_adjustment,
                 'high': self._high_pressure_adjustment,
                 'critical': lambda: self._critical_pressure_adjustment(app_id, **resource_kwargs),
@@ -62,7 +59,8 @@ class ControlManager:
         """Low pressure adjustments."""
         results = [
             self.governor.set_powersave(),
-            self.controller.restore_cpu_throttle()
+            # self.controller.restore_cpu_throttle()
+            self.controller.set_all_resources(app_id, is_restore=True)
         ]
 
         return all(results)

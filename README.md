@@ -86,9 +86,11 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
 # Installation:
     server:
         Start a terminal w/o any virtual(like conda) env, then run:
+            sudo apt install python3-pip (optional)
             sudo pip install psutil>=5.5.1 --break-system-packages
             sudo pip install peewee==3.17.8 --break-system-packages
             sudo pip install flask --break-system-packages
+            # sudo pip install flask --break-system-packages --ignore-installed blinker(err with "Cannot uninstall blinker...")
     
     client: 
         1.  Start a new terminal to run:

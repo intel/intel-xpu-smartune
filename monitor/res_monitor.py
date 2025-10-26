@@ -16,7 +16,7 @@ class ResourceMonitor:
     def __init__(self, config=None):
         """初始化资源监视器"""
         self.config = config or {
-            'weights': {'cpu': 0.5, 'memory': 0.3, 'io': 0.2},
+            'weights_top': {'cpu': 0.5, 'memory': 0.3, 'io': 0.2},
             'pressure_sensitivity': 0.7,
             'io_threshold': 5e7,  # 50MB
             'blacklist': ['systemd', 'kworker', 'dbus']
@@ -31,7 +31,7 @@ class ResourceMonitor:
             logger.warning(f"Could not load desktop apps: {str(e)}")
             self.desktop_apps = {}
 
-    def _get_top_processes(self, n=1, samples=3, interval=1.0):
+    def _get_top_processes(self, n=1, samples=5, interval=1.0):
         """返回带score的TOP进程数据，同时适配mem_high和io_weight参数需求 for adjustment"""
         cumulative = {}
 
@@ -107,7 +107,7 @@ class ResourceMonitor:
 
     def _adjust_weights_by_pressure(self, psi_data):
         """根据PSI压力动态调整权重"""
-        base_weights = self.config['weights']
+        base_weights = self.config['weights_top']
         return {
             'cpu': base_weights['cpu'] * (1 + psi_data.get('cpu', 0)),
             'memory': base_weights['memory'] * (1 + psi_data.get('memory', 0)),
@@ -119,7 +119,7 @@ class ResourceMonitor:
         """通过systemd-cgls查找进程所属的scope"""
         try:
             result = subprocess.run(
-                ['systemd-cgls', '--no-pager'],
+                ['systemd-cgls', '--no-page'],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -133,7 +133,7 @@ class ResourceMonitor:
                     # 向上查找最近的scope
                     for j in range(i, -1, -1):
                         if 'scope' in lines[j]:
-                            scope = re.search(r'([\w-]+\.scope)', lines[j])
+                            scope = re.search(r"─(.*?\.scope)", lines[j])
                             if scope:
                                 return scope.group(1)
         except Exception as e:
@@ -200,6 +200,11 @@ class ResourceMonitor:
 
         return results
 
+    def get_total_memory(self):
+        """获取系统物理内存总大小（单位：MB）"""
+        mem = psutil.virtual_memory()
+        total_memory_mb = round(mem.total / (1024 ** 2), 2)  # 转换为MB并保留2位小数
+        return total_memory_mb
 
 def main():
     """调试用主函数"""

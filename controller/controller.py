@@ -119,24 +119,27 @@ class Controller:
         :param is_restore: 是否恢复默认值
         """
         # 参数范围检查
-        # if cpu_quota is not None and not (1 <= cpu_quota <= 100):
-        #     logger.warning(f"Invalid cpu_quota {cpu_quota}, must be 1-100. Using None.")
-        #     cpu_quota = 1
+        if cpu_quota is not None and not (1 <= cpu_quota <= 100):
+            logger.warning(f"Invalid cpu_quota {cpu_quota}, must be 1-100. no limit for cpu.")
+            cpu_quota = None
 
         if mem_high is not None and mem_high <= 0:
-            logger.warning(f"Invalid mem_high {mem_high}, must be >0. Using default 100M.")
-            mem_high = 10000
+            logger.warning(f"Invalid mem_high {mem_high}, no limit for mem.")
+            mem_high = None
 
         if io_weight is not None and not (10 <= io_weight <= 1000):
-            logger.warning(f"Invalid io_weight {io_weight}, must be 10-1000. Using default 100.")
-            io_weight = 200
+            logger.warning(f"Invalid io_weight {io_weight}, no limit for io.")
+            io_weight = None
 
         scopes = self.get_user_scopes()
         services = self.get_app_services()
 
+        logger.info(f"scopes----------: {scopes}")
+        logger.info(f"services--------: {services}")
+
         if app_id.endswith('.scope'):
             matching_app = app_id
-            unit_type = 'scope'
+            unit_type = 'scope' if matching_app in scopes else 'service'
         else:
             app_base_name = app_id.replace('.desktop', '').split('.')[-1].lower()
             matching_app = next(
@@ -161,7 +164,8 @@ class Controller:
             else:
                 properties.append("MemoryHigh=")
             if io_weight is not None:
-                properties.append(f"IOWeight={io_weight}")
+                #properties.append(f"IOWeight={io_weight}")
+                properties.append(f"IOWeight=")
             else:
                 properties.append("IOWeight=")
         else:

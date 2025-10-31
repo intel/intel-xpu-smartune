@@ -4,7 +4,6 @@ from typing import Dict, Optional
 
 from controller.controlManager import ControlManager
 from monitor.appIntercept import AppIntercept
-from monitor.res_monitor import ResourceMonitor
 
 from utils.logger import logger
 from utils import app_utils
@@ -15,6 +14,7 @@ import queue
 import heapq
 
 g_limited_apps = {}  # 记录被限制的应用
+is_limited_app_dominant = False  # critical情况下，用于判断拿到的Top进程是否为已限制的进程
 
 @dataclass
 class WorkloadGroup:
@@ -83,9 +83,10 @@ class MaxPriorityQueue:
 
 class DynamicBalancer:
     def __init__(self):
-        self.controlManager = ControlManager()
         self.bpf_monitor = AppIntercept("monitor/bpf_event.c")
-        self.resource_monitor = ResourceMonitor()
+        # self.controlManager = ControlManager()
+        self.controlManager = self.bpf_monitor.controlManager
+        self.resource_monitor = self.controlManager.res
 
         # 资源管理
         self.workload_groups = {}  # 注册的workload类型
@@ -127,13 +128,14 @@ class DynamicBalancer:
 
     def _run_monitor_resource_loop(self):
         logger.info("Monitor resource service started")
-        global g_limited_apps
+        global g_limited_apps, is_limited_app_dominant
         idle_check_interval = 10  # 2分钟（单位：秒）
         last_check_time = 0
         top_consume_apps = []  # 保存获取到的top应用列表
         restore_pending = False  # 标记是否有待恢复的应用
         low_pressure_start_time = None  # 记录首次进入low状态的时间
         STABLE_PERIOD = 1800  # 30分钟的稳定期（秒）
+        reach_threshold = False  # 有些app可能资源占用非常低，限制意义不大
         def reset_state():
             nonlocal top_consume_apps, idle_check_interval, low_pressure_start_time
             top_consume_apps = []
@@ -146,7 +148,7 @@ class DynamicBalancer:
 
                 # 当队列不为空时立即处理，为空时每2分钟检查一次
                 if not self.app_priority_queue.empty() or (current_time - last_check_time) >= idle_check_interval:
-                    pressure = self.controlManager._get_current_pressure_level()
+                    pressure = self.controlManager.get_current_pressure_level()
                     last_check_time = current_time
 
                     if pressure == "critical":
@@ -155,46 +157,52 @@ class DynamicBalancer:
                         # 如果是第一次检测到critical状态，获取top应用列表
                         restore_pending = False
                         if not top_consume_apps:
-                            top_consume_apps = self.resource_monitor.get_top_resource_consumers()
-                            print(f"Top resource consumers(currently = 1): {top_consume_apps}")
+                            top_consume_apps, reach_threshold = self.resource_monitor.get_top_resource_consumers()
+                            # logger.debug(f"Top resource consumers(currently = 1): {top_consume_apps}")
                             """
                               "Top resource consumers": [
                                 {
-                                  "process": {
-                                    "pid": 1790698,
-                                    "name": "python",
-                                    "cmdline": "python MetaSearch_agent.py",
-                                    "cpu": 0.0,
-                                    "memory_mb": 2682.0,
-                                    "score": 1.281
+                                  'process': {
+                                    'pid': 440637,
+                                    'name': 'stress',
+                                    'cmdline': 'stress --cpu 22 --io 3 --vm 3 --vm-bytes 20G',
+                                    'score': 89.88,
+                                    'cpu_avg': 826.1,
+                                    'mem_rss': 27639158374.4,
+                                    'io_read_rate': 8192.0
                                   },
-                                  "app": {
-                                    "type": "systemd",
-                                    "id": "vte-spawn-89f79f2f-8e3f-4995-b0ea-1f56ed046e33.scope",
-                                    "name": "Systemd Scope: vte-spawn-89f79f2f-8e3f-4995-b0ea-1f56ed046e33.scope"
+                                  'app': {
+                                    'type': 'systemd',
+                                    'id': 'vte-spawn-5c914f63-2ec2-4449-a936-b4e3157fdb1a.scope                                                                                                                                ',
+                                    'name': 'Systemd Scope: vte-spawn-5c914f63-2ec2-4449-a936-b4e3157fdb1a.scope'
                                   }
                                 },
                                 {
-                                  "process": {
-                                    "pid": 3748,
-                                    ...
-                                    "score": 0.996
-                                  },
-                                  "app": {
-                                    "type": "desktop",
-                                    "id": "org.gnome.Shell.desktop",
-                                    "name": "GNOME Shell"
-                                  }
+                                  ...
                                 },
                                 ...
                               ]                       
                             """
 
                         if top_consume_apps:
+                            # 判断该进程是否被限制过
+                            for app_info in top_consume_apps:
+                                current_app_id = app_info.get('app', {}).get('id')
+                                current_app_name = app_info.get('process', {}).get('name')
+
+                                if (current_app_id and current_app_id in g_limited_apps) and \
+                                        (current_app_name and current_app_name in g_limited_apps.values()):
+                                    is_limited_app_dominant = True
+                                    break
+                                else:
+                                    is_limited_app_dominant = False
+
+                            logger.debug(f"Balance- was the process limited before? {is_limited_app_dominant}")
+                            self.controlManager.set_limited_app_dominant(is_limited_app_dominant)
                             # 调用独立的处理函数
                             should_adjust, is_controlled, app_id, limit_rate = self._handle_critical_pressure(top_consume_apps)
 
-                            if should_adjust and app_id and app_id not in g_limited_apps:
+                            if not is_limited_app_dominant and reach_threshold and should_adjust and app_id:
                                 # 执行资源调整
                                 target = top_consume_apps[0]
                                 app_name = target.get('process', {}).get('name') or ''
@@ -211,6 +219,7 @@ class DynamicBalancer:
                                 if auto_limit:
                                     # 记录已限制的应用
                                     g_limited_apps[app_id] = app_name
+
                                     if is_controlled:
                                         app_utils.update_app_status(app_id, "limited")
                                     app_utils.callback_manager.send_callback_notification({
@@ -377,7 +386,7 @@ class DynamicBalancer:
         # 情况3：critical管控 -> 不处理，增加计数器
         self._critical_counter += 1
 
-        # 检查是否连续三次critical
+        # 检查是否连续n次critical
         if self._critical_counter >= 1:
             app_utils.callback_manager.send_callback_notification({
                 'app_id': "",
@@ -390,6 +399,27 @@ class DynamicBalancer:
 
         return False, False, None, None
 
+    def restore_all_limited_apps_resources(self):
+        """ 遍历g_limited_apps, 恢复被限制的资源 """
+        global g_limited_apps
+        if not g_limited_apps:
+            logger.info("No limited apps to restore")
+            return
+
+        logger.info(f"Restoring resources for {len(g_limited_apps)} limited apps")
+
+        # 遍历字典的副本以避免修改迭代中的字典
+        for app_id, app_name in list(g_limited_apps.items()):
+            try:
+                logger.info(f"Restoring resources for app: {app_id}, name: {app_name}")
+                self.controlManager.adjust_resources(app_id, "low")
+            except Exception as e:
+                logger.error(f"Failed to restore resources for {app_id}: {str(e)}")
+            finally:
+                # 无论成功与否都移除记录
+                g_limited_apps.pop(app_id, None)
+
+        logger.info("All limited apps resources restoration completed")
 
     def cancel_relaunch_by_app_id(self, app_id: str) -> bool:
         """ 根据 app_id 删除队列中的项目，并杀死对应进程 """
@@ -426,7 +456,7 @@ class DynamicBalancer:
 
     def set_resource_limit(self, app_id: str, app_name: str, priority: str) -> bool:
         """ 根据 app_id 设置资源限制 """
-
+        global g_limited_apps
         limit_rate = self.get_priority_value(priority)
         # 获取应用程序的实际资源使用情况
         usage = app_utils.get_app_resource_usage(app_id, app_name)
@@ -468,7 +498,7 @@ class DynamicBalancer:
 
     def set_restore_resource(self, app_id: str, app_name: str) -> bool:
         """ 根据 app_id 恢复资源限制 """
-
+        global g_limited_apps
         # 从限制列表中移除（无论是否存在都尝试移除）
         g_limited_apps.pop(app_id, None)
         app_utils.update_app_status(app_id, "running")
@@ -523,6 +553,7 @@ class DynamicBalancer:
             return
         self.is_running = False
 
+        self.restore_all_limited_apps_resources()
         if hasattr(self, "monitor_thread"):
             self.monitor_thread.join(timeout=1)  # 等待线程结束
         if hasattr(self, "handle_thread"):

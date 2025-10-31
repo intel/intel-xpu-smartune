@@ -134,8 +134,8 @@ class Controller:
         scopes = self.get_user_scopes()
         services = self.get_app_services()
 
-        logger.info(f"scopes----------: {scopes}")
-        logger.info(f"services--------: {services}")
+        #logger.debug(f"scopes----------: {scopes}")
+        #logger.debug(f"services--------: {services}")
 
         if app_id.endswith('.scope'):
             matching_app = app_id
@@ -193,7 +193,7 @@ class Controller:
             )
 
             cmd = cmd_base + properties
-            logger.debug(f"Executing command: {' '.join(cmd)}")
+            # logger.debug(f"Executing command: {' '.join(cmd)}")
 
             result = subprocess.run(
                 cmd,
@@ -203,7 +203,7 @@ class Controller:
                 check=True,
                 env={"DBUS_SESSION_BUS_ADDRESS": dbus_address} if dbus_address else None
             )
-            logger.debug(f"Command output: {result}")
+            logger.debug(f"Executed result: {result}")
             if result.returncode == 0:
                 return True
             else:

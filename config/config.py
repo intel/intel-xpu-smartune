@@ -11,6 +11,7 @@ class Config:
     workloads: dict = None
     balance_service: dict = None
     app_priority: dict = None
+    blacklist: list = None
 
     @classmethod
     def from_file(cls, path: str):

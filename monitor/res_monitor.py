@@ -3,7 +3,6 @@ import os
 import psutil
 import subprocess
 import re
-import logging
 from gi.repository import Gio
 from collections import defaultdict
 import time
@@ -32,7 +31,7 @@ class ResourceMonitor:
             self.desktop_apps = {}
 
     def _get_top_processes(self, n=1, samples=5, interval=1.0):
-        """返回带score的TOP进程数据，同时适配mem_high和io_weight参数需求 for adjustment"""
+        """返回按 cmdline 分组聚合后的 TOP 进程数据"""
         cumulative = {}
 
         for _ in range(samples):
@@ -46,25 +45,28 @@ class ResourceMonitor:
                     if time.time() - info['create_time'] < 2:
                         continue
 
-                    pid = info['pid']
-                    if pid not in cumulative:
-                        cumulative[pid] = {
+                    # 关键修改：按 cmdline 分组，而非 pid
+                    cmdline = ' '.join(info['cmdline'])
+                    if cmdline not in cumulative:
+                        cumulative[cmdline] = {
                             'cpu_sum': 0,
-                            'mem_percent_sum': 0, # 计算score
-                            'mem_rss_sum': 0,  # 物理内存字节数（用于mem_high）
-                            'io_read_sum': 0,  # 累计读取字节（用于io_weight）
+                            'mem_percent_sum': 0,
+                            'mem_rss_sum': 0,
+                            'io_read_sum': 0,
                             'count': 0,
                             'name': info['name'],
-                            'cmdline': ' '.join(info['cmdline'])
+                            'cmdline': cmdline,
+                            'pids': set()  # 记录关联的 pids
                         }
 
                     # 累计各指标
-                    cumulative[pid]['cpu_sum'] += info['cpu_percent']
-                    cumulative[pid]['mem_percent_sum'] += info['memory_percent']
-                    cumulative[pid]['mem_rss_sum'] += info['memory_info'].rss  # 物理内存
+                    cumulative[cmdline]['cpu_sum'] += info['cpu_percent']
+                    cumulative[cmdline]['mem_percent_sum'] += info['memory_percent']
+                    cumulative[cmdline]['mem_rss_sum'] += info['memory_info'].rss
                     if info['io_counters']:
-                        cumulative[pid]['io_read_sum'] += info['io_counters'].read_bytes
-                    cumulative[pid]['count'] += 1
+                        cumulative[cmdline]['io_read_sum'] += info['io_counters'].read_bytes
+                    cumulative[cmdline]['count'] += 1
+                    cumulative[cmdline]['pids'].add(info['pid'])
 
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
@@ -77,14 +79,14 @@ class ResourceMonitor:
         dynamic_weights = self._adjust_weights_by_pressure(psi_data)
 
         processes = []
-        for pid, data in cumulative.items():
-            if data['count'] > 0:  # 有效采样
-                avg_cpu = data['cpu_sum'] / data['count']
-                avg_mem_percent = data['mem_percent_sum'] / data['count']
-                avg_mem_rss = data['mem_rss_sum'] / data['count']  # 字节单位
-                io_read_rate = data['io_read_sum'] / (data['count'] * interval)  # B/s
-
-                # logger.info(f"PID {pid} - avg_mem_percent: {avg_mem_percent}, avg_mem_rss: {avg_mem_rss}, IO Read Rate: {io_read_rate} B/s")
+        for cmdline, data in cumulative.items():
+            if data['count'] > 0:
+                # if "stress" in cmdline:
+                #     logger.debug(f"data count for {cmdline}: {data['count']}, data = {data}")
+                avg_cpu = data['cpu_sum'] / samples
+                avg_mem_percent = data['mem_percent_sum'] / samples
+                avg_mem_rss = data['mem_rss_sum'] / samples
+                io_read_rate = data['io_read_sum'] / (samples * interval)
 
                 score = (
                         dynamic_weights['cpu'] * min(avg_cpu, 100) +
@@ -93,14 +95,14 @@ class ResourceMonitor:
                 )
 
                 processes.append({
-                    'pid': pid,
+                    'pids': list(data['pids']),  # 返回所有关联的 pids
                     'name': data['name'],
-                    'cmdline': data['cmdline'],
+                    'cmdline': cmdline,
                     'score': round(score, 2),
                     'cpu_avg': round(avg_cpu, 1),
                     'mem_avg': round(avg_mem_percent, 3),
-                    'mem_rss': avg_mem_rss,   # 物理内存字节数
-                    'io_read_rate': io_read_rate  # 读取速率(B/s)
+                    'mem_rss': avg_mem_rss,  # 总物理内存字节数（所有子进程之和）
+                    'io_read_rate': io_read_rate
                 })
 
         return sorted(processes, key=lambda x: x['score'], reverse=True)[:n]
@@ -142,7 +144,7 @@ class ResourceMonitor:
 
     def _try_match_app(self, process_info):
         """尝试匹配桌面应用或systemd scope"""
-        logger.info(f"process_info: {process_info}")
+        # logger.debug(f"process_info: {process_info}")
         # 1. 先尝试匹配桌面应用
         if self.desktop_apps:
             for app_id, app in self.desktop_apps.items():
@@ -167,7 +169,7 @@ class ResourceMonitor:
                     continue
 
         # 2. 尝试通过systemd-cgls查找scope
-        scope = self._find_systemd_scope(process_info['pid'])
+        scope = self._find_systemd_scope(process_info['pids'][0])  # the first PID
         if scope:
             return {
                 'type': 'systemd',
@@ -179,15 +181,22 @@ class ResourceMonitor:
 
     def get_top_resource_consumers(self):
         """获取资源占用最高的3个进程及其应用信息"""
-        processes = self._get_top_processes(n=1)
         results = []
+        reach_threshold = True
+        processes = self._get_top_processes(n=1)
+        logger.debug(f"Top processes: {processes}")
 
-        print(f"Top processes: {processes}")
+        # Return empty list if top process doesn't meet minimum resource thresholds
+        if processes and (processes[0]['cpu_avg'] / self.cpu_cores < 20 # if CPU usage < 20% per core
+                          and processes[0]['mem_rss'] < psutil.virtual_memory().total * 0.05):  # 5% of total memory
+            logger.info(f"Top process - {processes[0]['name']} does not meet minimum resource thresholds")
+            reach_threshold = False
+
         for process in processes:
             app_info = self._try_match_app(process)
             results.append({
                 'process': {
-                    'pid': process['pid'],
+                    'pid': process['pids'][0],  # Use the first PID from 'pids'
                     'name': process['name'],
                     'cmdline': process['cmdline'],
                     'score': round(process['score'], 3),
@@ -198,13 +207,51 @@ class ResourceMonitor:
                 'app': app_info
             })
 
-        return results
+        return results, reach_threshold
 
     def get_total_memory(self):
         """获取系统物理内存总大小（单位：MB）"""
         mem = psutil.virtual_memory()
         total_memory_mb = round(mem.total / (1024 ** 2), 2)  # 转换为MB并保留2位小数
         return total_memory_mb
+
+    def get_resource_usage(self) -> dict:
+        """获取系统整体资源使用率和剩余容量"""
+        # CPU：核心数、使用率（%）
+        cpu_count = psutil.cpu_count(logical=True)
+        cpu_usage = psutil.cpu_percent(interval=0.5)  # 0.5秒采样
+        cpu_available = 100 - cpu_usage  # 剩余CPU百分比
+
+        # 内存：总容量（GB）、使用率（%）、剩余容量占比
+        mem = psutil.virtual_memory()
+        mem_total_gb = mem.total / (1024 **3)
+        mem_usage = mem.percent
+        mem_available_ratio = mem.available / mem.total  # 剩余内存占比
+
+        # IO：磁盘使用率（取根目录）
+        disk = psutil.disk_usage('/')
+        io_usage = disk.percent
+        io_available_ratio = 1 - (disk.used / disk.total)
+
+        return {
+            'cpu': {
+                'count': cpu_count,
+                'usage': cpu_usage,
+                'available': cpu_available,
+                'is_busy': cpu_usage > 90  # 暂定整体使用率 >90% 算busy
+            },
+            'memory': {
+                'total_gb': mem_total_gb,
+                'usage': mem_usage,  # %
+                'available_ratio': mem_available_ratio,
+                'is_busy': mem_usage > 90
+            },
+            'io': {
+                'usage': io_usage,
+                'available_ratio': io_available_ratio,
+                'is_busy': io_usage > 90
+            }
+        }
 
 def main():
     """调试用主函数"""
@@ -216,17 +263,17 @@ def main():
         while True:
             results = monitor.get_top_resource_consumers()
             for i, result in enumerate(results, 1):
-                print(f"\n=== Top Resource Consumer #{i} ===")
-                print(f"Process: {result['process']['name']} (PID: {result['process']['pid']})")
-                print(f"CPU: {result['process']['cpu']}% | Memory: {result['process']['memory_mb']}MB")
-                print(f"Score: {result['process']['score']:.2f}")
-                print(f"Cmd: {result['process']['cmdline'][:100]}...")
+                logger.debug(f"\n=== Top Resource Consumer #{i} ===")
+                logger.debug(f"Process: {result['process']['name']} (PID: {result['process']['pid']})")
+                logger.debug(f"CPU: {result['process']['cpu']}% | Memory: {result['process']['memory_mb']}MB")
+                logger.debug(f"Score: {result['process']['score']:.2f}")
+                logger.debug(f"Cmd: {result['process']['cmdline'][:100]}...")
 
                 if result['app']:
-                    print(f"\nMatched to: {result['app']['name']} ({result['app']['type']})")
-                    print(f"ID: {result['app']['id']}")
+                    logger.debug(f"\nMatched to: {result['app']['name']} ({result['app']['type']})")
+                    logger.debug(f"ID: {result['app']['id']}")
                 else:
-                    print("\nNo matching application found")
+                    logger.debug("\nNo matching application found")
 
             sleep(5)
 

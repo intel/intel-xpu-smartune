@@ -5,13 +5,18 @@ thresholds:
   high: 120
   critical: 160
 weights:
-  cpu: 3.5
-  memory: 1.2
-  io: 2
+  cpu: 2
+  memory: 7
+  io: 1
 weights_top:
   cpu: 2
   memory: 7
   io: 1
+blacklist:
+  - systemd
+  - kworker
+  - dbus
+  - missioncenter
 workloads:
   - name: "critical"
     priority: 100

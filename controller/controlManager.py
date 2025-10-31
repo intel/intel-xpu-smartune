@@ -1,7 +1,9 @@
 import requests
+import time
 
 from utils.logger import logger
 from monitor.psi import PSIMonitor
+from monitor.res_monitor import ResourceMonitor
 from monitor.cgroup import CgroupMonitor
 from monitor.pressure import PressureAnalyzer
 
@@ -17,6 +19,7 @@ class ControlManager:
     def __init__(self, config_file="config/config.yaml"):
         self.config = Config.from_file(config_file)
         self.psi = PSIMonitor()
+        self.res = ResourceMonitor()
         self.cgroup = CgroupMonitor(self.config.cgroup_mount)
         self.analyzer = PressureAnalyzer(self.config)
 
@@ -27,36 +30,63 @@ class ControlManager:
         self.governor = GovernorController(self.config.cgroup_mount)
         self.balance_url = f"{self.config.balance_service['url']}:{self.config.balance_service['port']}"
 
-    def _get_current_pressure_level(self) -> str:
-        """Get the current system pressure level."""
+        self._current_level = None
+        self._last_update_time = 0
+        self._CACHE_TTL = 5
+        self._is_limited_app_dominant = False
+
+    def set_limited_app_dominant(self, is_dominant: bool):
+        """设置受限应用是否占主导状态"""
+        if self._is_limited_app_dominant != is_dominant:
+            self._is_limited_app_dominant = is_dominant
+            self._current_level = None  # 强制下次更新
+
+    def get_current_pressure_level(self) -> str:
+        """获取当前压力等级（无需参数）"""
+        current_time = time.time()
+        if (self._current_level is None or
+                current_time - self._last_update_time > self._CACHE_TTL):
+            self._current_level = self._update_pressure_level()
+        return self._current_level
+
+    def _update_pressure_level(self) -> str:
+        """更新压力等级（使用内部状态）"""
         try:
             psi_data = self.psi.get_current_pressure()
-            score = self.analyzer.calculate_pressure_score(psi_data)
+            usage_data = self.res.get_resource_usage()
+            score = self.analyzer.calculate_pressure_score(
+                psi_data,
+                usage_data,
+                self._is_limited_app_dominant
+            )
             level = self.analyzer.get_pressure_level(score)
-            # level = "critical" # debug
-            logger.debug("Current PSI level: %s (pressure: %.2f)", level, score)
+            logger.debug("Updated PSI level: %s (pressure: %.2f)", level, score)
+            self._last_update_time = time.time()
             return level
         except Exception as e:
-            logger.error("Failed to get current pressure level: %s", str(e))
+            logger.error("Failed to update pressure level: %s", str(e))
             return "unknown"
 
     def adjust_resources(self, app_id: str, policy: str, **resource_kwargs):
         """Adjust resources with optional parameters (保持原接口兼容)"""
         try:
-            logger.info(f"Adjusting resources for app_id={app_id} with policy={policy} and resource_kwargs={resource_kwargs}")
+            logger.info(
+                f"Adjusting resources for app_id={app_id} with policy={policy} and resource_kwargs={resource_kwargs}")
             adjustments = {
-                'low': self._low_pressure_adjustment(app_id),
-                'medium': self._medium_pressure_adjustment,
-                'high': self._high_pressure_adjustment,
+                'low': lambda: self._low_pressure_adjustment(app_id),
+                'medium': lambda: self._medium_pressure_adjustment(app_id),
+                'high': lambda: self._high_pressure_adjustment(app_id),
                 'critical': lambda: self._critical_pressure_adjustment(app_id, **resource_kwargs),
             }
-            return adjustments.get(policy, lambda: None)()
+            adjustment_func = adjustments.get(policy, lambda: None)
+            return adjustment_func()
         except Exception as e:
             logger.error("Adjust failed: %s", str(e))
             return False
 
     def _low_pressure_adjustment(self, app_id: str):
         """Low pressure adjustments."""
+        logger.info("Performing low pressure adjustments for app_id=%s", app_id)
         results = [
             self.governor.set_powersave(),
             # self.controller.restore_cpu_throttle()
@@ -85,6 +115,7 @@ class ControlManager:
 
     def _critical_pressure_adjustment(self, app_id: str, **kwargs):
         """Critical调整"""
+        logger.info("Performing critical pressure adjustments for app_id=%s", app_id)
         cpu_quota = kwargs.get('cpu_quota', None)
         mem_high = kwargs.get('mem_high', None)
         io_weight = kwargs.get('io_weight', None)

@@ -196,7 +196,7 @@ class AppIntercept(metaclass=SingletonMeta):
             os.kill(pid, signal.SIGSTOP)
 
             # 检查系统资源
-            pressure = self.controlManager._get_current_pressure_level()
+            pressure = self.controlManager.get_current_pressure_level()
             print(f"Current system pressure level: {pressure}")
             if pressure != "critical":
                 os.kill(pid, signal.SIGCONT)

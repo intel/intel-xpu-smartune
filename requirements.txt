@@ -12,3 +12,4 @@ streamlit==1.40.0
 streamlit-antd-components==0.3.2
 streamlit-extras==0.4.2
 extra-streamlit-components==0.1.71
+streamlit-autorefresh==1.0.1

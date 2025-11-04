@@ -61,6 +61,7 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         self.app_remove_controlled_url = MULTIAPPS_URL + '/app/remove_from_control'
         self.app_get_priority_url = MULTIAPPS_URL + '/app/get_priority_data'
         self.app_set_priority_url = MULTIAPPS_URL + '/app/set_priority'
+        self.app_set_oom_score_url = MULTIAPPS_URL + '/app/set_oom_score'
         self.app_cancel_relaunch_url = MULTIAPPS_URL + '/app/cancel_relaunch'
         self.app_resource_limit_url = MULTIAPPS_URL + '/app/resource_limit'
         self.app_resource_restore_url = MULTIAPPS_URL + '/app/resource_restore'
@@ -114,6 +115,13 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         :return: Set the priority of an app.
         """
         return self.ma_bridge.set_priority(self.app_set_priority_url, priority_data)
+
+    def keep_alive_app(self, app_id):
+        """
+        :param app_id: used to find the app to keep alive.
+        :return:
+        """
+        return self.ma_bridge.keep_alive_app(self.app_set_oom_score_url, app_id)
 
     def cancel_relaunch(self, app_id):
         """

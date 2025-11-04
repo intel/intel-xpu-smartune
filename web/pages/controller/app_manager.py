@@ -3,6 +3,7 @@ import threading, time
 from typing import Optional, Dict, Any
 
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from apis.api import Client_multiapps_api
 from apis.api import callback_manager
@@ -41,6 +42,10 @@ def init():
 
     if "controlled_apps" not in st.session_state:
         st.session_state.controlled_apps = []
+        st.session_state.controlled_apps_checked = False
+
+    if "pending_apps" not in st.session_state:
+        st.session_state.pending_apps = []
 
 
 def get_all_apps():
@@ -76,7 +81,7 @@ def app_callback_handler(notify_data):
 
 def _process_callback():
     """主线程安全的状态更新处理"""
-    while True:
+    while cb_running:
         try:
             # 非阻塞检查是否有新数据
             if callback_data.data_ready.acquire(blocking=False):
@@ -118,9 +123,11 @@ def _process_callback():
                             f'系统繁忙中，应用 {app_name} 被自动限制了资源使用，它将在系统资源空闲后自动恢复',
                             icon='⚠️')
                         time.sleep(2)
+                    # 可能造成等待队列变化，刷新等待队列显示
+                    st.session_state.pending_apps = api.get_pending_apps()
                     st.toast(f"应用 {app_name} 状态更新为 {new_status}", icon='ℹ️')
-                    time.sleep(0.2)
-                    st.rerun()
+                    # time.sleep(0.2)
+                    # st.rerun()
 
                 if purpose == "notify":
                     if new_status == "manual_app_limit_by_user":
@@ -161,8 +168,11 @@ def app_management(default_apps):
                 [app["name"] for app in default_apps],
                 key="app_select"
             )
-            app_id = next((app["app_id"] for app in default_apps if app["name"] == selected_app), None)
-            print(f"Selected app_id: {app_id}")
+            app_id, app_cmdline = next(
+                ((app["app_id"], app["cmdline"]) for app in default_apps if app["name"] == selected_app),
+                (None, "")
+            )
+            # print(f"Selected app_id: {app_id}, cmdline: {app_cmdline}")
 
         with cols[1]:
             priority = st.selectbox(
@@ -170,7 +180,6 @@ def app_management(default_apps):
                 [p.value[0] for p in PriorityLevel],
                 key="priority_select"
             )
-            print(f"Selected priority: {priority}")
 
         remark = st.text_input("备注", key="remark_input")
 
@@ -184,6 +193,7 @@ def app_management(default_apps):
                         "priority": priority,
                         "controlled": True,
                         "remark": remark,
+                        "cmdline": app_cmdline,
                         "cgroup": "user"
                     })
 
@@ -192,19 +202,22 @@ def app_management(default_apps):
                             "app_id": app_id,
                             "app_name": selected_app,
                             "priority": priority,
+                            "oom_score": 0,
                             "controlled": True,
                             "cgroup": "user",
                             "remark": remark,
+                            "cmdline": app_cmdline,
                             "status": "NA"
                         })
-                        st.rerun()
+                        st.session_state.controlled_apps_checked = False
+                        # st.rerun()
                     else:
                         st.error("添加管控失败")
                 else:
                     st.error("未找到应用ID")
 
     st.divider()
-    cols = st.columns([2, 3, 5, 1.5, 1], gap='small')
+    cols = st.columns([2, 5, 5, 3], gap='small')
     with cols[0]:
         st.subheader("管控列表")
     with cols[1]:
@@ -220,65 +233,62 @@ def app_management(default_apps):
         pending_queue_holder = st.empty()  # 占位容器
 
     with cols[3]:
-        if st.button("查看等待队列", key="pending_queue"):
-            # 直接构建要显示的HTML内容
-            html_content = """
-            <style>
-            .task-card { padding: 1px; margin: 1px 0; border-radius: 5px; background: #f0f2f6; }
-            .critical-priority { border-left: 5px solid #d00000; background-color: #ffe6e6; }
-            .high-priority { border-left: 5px solid #ff4b4b; }
-            .medium-priority { border-left: 5px solid #f4c20d; }
-            .low-priority { border-left: 5px solid #34a853; }
-            .priority-label {
-                display: inline-block;
-                padding: 2px 6px;
-                border-radius: 3px;
-                font-size: 0.8em;
-                font-weight: bold;
-                margin-left: 8px;
+        # if st.button("查看等待队列", key="pending_queue"):
+        # 直接构建要显示的HTML内容
+        html_content = """
+        <style>
+        .task-card { padding: 1px; margin: 1px 0; border-radius: 5px; background: #f0f2f6; }
+        .critical-priority { border-left: 5px solid #d00000; background-color: #ffe6e6; }
+        .high-priority { border-left: 5px solid #ff4b4b; }
+        .medium-priority { border-left: 5px solid #f4c20d; }
+        .low-priority { border-left: 5px solid #34a853; }
+        .priority-label {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.8em;
+            font-weight: bold;
+            margin-left: 8px;
+        }
+        .empty-state { color: #666; font-style: italic; padding: 15px 0; text-align: center; }
+        </style>
+        """
+
+        pending_apps = st.session_state.pending_apps
+        # print(f"pending_apps: {pending_apps}")
+
+        if not pending_apps:
+            html_content += '<div class="empty-state">🕊️ 等待队列为空</div>'
+        else:
+            priority_mapping = {
+                "critical": "critical-priority",
+                "high": "high-priority",
+                "medium": "medium-priority",
+                "low": "low-priority"
             }
-            .empty-state { color: #666; font-style: italic; padding: 15px 0; text-align: center; }
-            </style>
-            """
 
-            pending_apps = api.get_pending_apps() or []
-            print(f"pending_apps: {pending_apps}")
+            for app in pending_apps:
+                priority = app.get("priority", "medium").lower()
+                priority_class = priority_mapping.get(priority, "medium-priority")
 
-            if not pending_apps:
-                html_content += '<div class="empty-state">🕊️ 等待队列为空</div>'
-            else:
-                priority_mapping = {
-                    "critical": "critical-priority",
-                    "high": "high-priority",
-                    "medium": "medium-priority",
-                    "low": "low-priority"
-                }
+                html_content += (
+                    f'<div class="task-card {priority_class}">'
+                    f'🔹 {app["app_name"]}  -  '
+                    f'<span class="priority-label" style="color: {get_priority_color(priority)};">'
+                    f'Priority: {app["priority"]}</span>'
+                    '</div>'
+                )
 
-                for app in pending_apps:
-                    priority = app.get("priority", "medium").lower()
-                    priority_class = priority_mapping.get(priority, "medium-priority")
-
-                    html_content += (
-                        f'<div class="task-card {priority_class}">'
-                        f'🔹 {app["app_name"]}  -  '
-                        f'<span class="priority-label" style="color: {get_priority_color(priority)};">'
-                        f'Priority: {app["priority"]}</span>'
-                        '</div>'
-                    )
-
-            pending_queue_holder.markdown(html_content, unsafe_allow_html=True)
-    with cols[4]:
-        if st.button("刷新", key="refresh_status"):
-            st.rerun()
+        pending_queue_holder.markdown(html_content, unsafe_allow_html=True)
 
     if not controlled_apps:
         st.info("当前没有管控的应用")
         return
 
-    print(f"Rendering controlled apps: {controlled_apps}")
+    # print(f"Rendering controlled apps: {controlled_apps}")
     for idx, app in enumerate(controlled_apps):
         with st.container(border=True):
-            cols = st.columns([2, 1.5, 1, 1, 1.5, 1.5, 1.5, 1])  # 调整列宽比例
+            cols = st.columns([2, 2, 1, 1, 1.5, 1.5, 1.5, 1, 1])  # 调整列宽比例
             status = app.get("status", "NA")
 
             # 应用名称
@@ -301,11 +311,6 @@ def app_management(default_apps):
                     unsafe_allow_html=True
                 )
 
-            # 所属CGroup
-            cols[2].markdown(app.get("cgroup", "user"))
-
-            # 状态
-            print(f"App {app['app_name']} status: {status}")
             with cols[3]:
                 st.markdown(f"{status}")
 
@@ -317,10 +322,11 @@ def app_management(default_apps):
                     cancel_result = api.cancel_relaunch(app["app_id"])
                     if cancel_result:
                         app["status"] = "canceled"
+                        st.session_state.pending_apps = api.get_pending_apps()
                         print(f"App {app['app_name']} relaunch was canceled.")
                         st.toast(f'已取消自动启动应用{app['app_name']}!', icon='🎉')
-                        time.sleep(2)
-                        st.rerun()
+                        # time.sleep(2)
+                        # st.rerun()
                     else:
                         st.toast(f'取消自动启动应用{app['app_name']}失败!', icon="❌")
 
@@ -336,8 +342,8 @@ def app_management(default_apps):
                             break
                     print(f"update priority: st.session_state.controlled_apps: {st.session_state.controlled_apps}")
                     st.toast(f'已成功更新{app['app_name']}的优先级为{new_priority}!', icon='🎉')
-                    time.sleep(2)
-                    st.rerun()
+                    # time.sleep(2)
+                    # st.rerun()
 
             with cols[6]:
                 limit_key = f"resource_limit_{app['app_id']}"
@@ -364,10 +370,21 @@ def app_management(default_apps):
                             st.toast(f'已成功对应用{app["app_name"]}进行资源限制!', icon='🎉')
                         else:
                             st.toast(f'对应用{app["app_name"]}进行资源限制失败!', icon="❌")
-                    time.sleep(1)
-                    st.rerun()
+                    # time.sleep(1)
+                    # st.rerun()
 
-            if cols[7].button("🗑️ 删除", key=f"delete_{app['app_id']}"):
+            with cols[7]:
+                priority = app.get("priority", "Medium").lower()
+                if st.button("💪 保活", key=f"alive_{app['app_id']}", type="primary",
+                             disabled=(priority != "critical" or status != "running")):
+                    keep_alive_result = api.keep_alive_app(app["app_id"])
+                    if keep_alive_result:
+                        st.toast(f'已成功对应用{app["app_name"]}设置保活!', icon='🎉')
+                        print(f"App {app['app_name']} set to keep alive.")
+                    else:
+                        st.toast(f'对应用{app["app_name"]}设置保活失败!', icon="❌")
+
+            if cols[8].button("🗑️ 删除", key=f"delete_{app['app_id']}"):
                 response = api.remove_controlled_apps({
                     "app_id": app["app_id"],
                     "app_name": app["app_name"]
@@ -378,7 +395,7 @@ def app_management(default_apps):
                         if c_app["app_id"] != app["app_id"]
                     ]
                     print(f"remove: st.session_state.controlled_apps: {st.session_state.controlled_apps}")
-                    st.rerun()
+                    # st.rerun()
 
 
 def start_monitor_server():
@@ -402,7 +419,6 @@ def shutdown_monitor_server():
 
 def apps_management():
     init()
-    print("Starting apps management...")
     st.markdown(f"""
     <div style="text-align: center; font-weight: bold; font-size: 30px; margin-bottom: 30px;">
        Multi Apps Management
@@ -410,8 +426,9 @@ def apps_management():
     """, unsafe_allow_html=True)
     if "app_data" not in st.session_state or not st.session_state.app_data:
         st.session_state.app_data = get_all_apps()
-    if not st.session_state.controlled_apps:
+    if not st.session_state.controlled_apps and not st.session_state.controlled_apps_checked:
         st.session_state.controlled_apps = api.get_controlled_apps() or []
+        st.session_state.controlled_apps_checked = True
 
     if 'callback_registered' not in st.session_state:
         callback_manager.add_to_handler(app_callback_handler)
@@ -419,8 +436,9 @@ def apps_management():
 
     # if callback_data := ThreadSafeCallback.get():  # 安全获取最新回调
     #     _process_callback_data(callback_data)
-    print("Rendering app management UI...")
     app_management(st.session_state.app_data)
+    # 增加页面自动刷新配合callback，以实现状态更新，实测不会影响用户操作
+    st_autorefresh(interval=1000, key="autorefresh")
     _process_callback()
-    print("App management UI rendered.")
+
 

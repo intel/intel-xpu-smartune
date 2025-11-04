@@ -183,6 +183,22 @@ class MABridge:
             print('set_priority request error: ', e)
             return {}
 
+    def keep_alive_app(self, url, app_id):
+        """
+        :param app_id: used to find the app to keep alive.
+        :return:
+        """
+        data = {"app_id": app_id}
+        try:
+            response = requests.post(url, json=data)
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+                return True
+            return False
+        except requests.exceptions.RequestException as e:
+            print('set_priority request error: ', e)
+            return False
+
     def get_apps(self, url, store):
         """ Get list of all apps from multi-apps service.
 

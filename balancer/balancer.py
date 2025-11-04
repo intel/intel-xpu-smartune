@@ -318,11 +318,17 @@ class DynamicBalancer:
         print("Ctrl+C to exit")
 
         monitor_apps = app_utils.get_controlled_apps()
+
         if monitor_apps:
             # 将受控应用添加到BPF监控列表
             monitored_names = [app["app_name"] for app in monitor_apps]
             self.bpf_monitor.add_to_monitorlist(monitored_names)
-            print(f"Monitoring execve() for: {', '.join(monitored_names)}")
+            logger.info(f"Monitoring execve() for: {', '.join(monitored_names)}")
+
+            # 为critical应用调整OOM优先级
+            logger.debug(f"monitor_apps: {monitor_apps}")
+            for app in monitor_apps:
+                app_utils.adjust_oom_priority(app["app_id"], app["app_name"], app["priority"], app.get("cmdline", ""))
         else:
             logger.warning("No controlled apps to monitor")
 

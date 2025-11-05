@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import subprocess
 import shutil
@@ -10,6 +11,8 @@ from datetime import datetime
 from utils.logger import logger
 from db.DatabaseModel import AIAppPriority
 from typing import Optional, Dict, Any
+
+_original_oom_scores: dict[str, str] = {}
 
 class ClientCallbackManager:
     """管理客户端回调的全局状态和操作"""
@@ -70,12 +73,131 @@ def get_controlled_apps():
             "app_name": app.name,
             "app_id": app.app_id,
             "controlled": app.controlled,
-            "priority": app.priority
+            "priority": app.priority,
+            "cmdline": app.cmdline,
         } for app in controlled_apps] if controlled_apps else None
 
     except Exception as e:
         logger.error(f"Database query failed: {str(e)}", exc_info=True)
         return None
+
+
+def _get_executable_name(app_name, app_cmdline):
+    if not app_cmdline:
+        return app_name.lower()
+
+    # 1. Handle Snap apps (e.g., "/snap/bin/firefox %u")
+    if "/snap/bin/" in app_cmdline:
+        for part in app_cmdline.split():
+            if "/snap/bin/" in part:
+                return os.path.basename(part)  # "firefox"
+
+    # 2. Handle Flatpak apps (e.g., "flatpak run --command=missioncenter ...")
+    if "flatpak run" in app_cmdline:
+        match = re.search(r"--command=([^\s]+)", app_cmdline)
+        if match:
+            return match.group(1).lower()  # "missioncenter"
+        last_part = app_cmdline.split()[-1]
+        if "." in last_part:
+            return last_part.split(".")[-1].lower()
+
+    # 3. Generic cases (e.g., "/usr/bin/foo")
+    for part in app_cmdline.split():
+        # Skip flags, env vars, and placeholders
+        if part.startswith(("-", "%", "env")):
+            continue
+
+        if "/" in part:
+            return os.path.basename(part)
+        # If no path (e.g., "firefox"), use as-is
+        return part.lower()
+
+    return app_name.lower()
+
+
+def adjust_oom_priority(
+    app_id: str,
+    app_name: str,
+    priority: str,
+    app_cmdline: str,
+    restore: bool = False,
+) -> None:
+    """
+    调整或恢复应用的 OOM 优先级（oom_score_adj）, 主要目的是保活一些特殊的critical的应用
+    :param app_id:
+    :param app_name:
+    :param priority: 仅当为 "critical" 时生效
+    :param app_cmdline: 用于 pgrep 匹配
+    :param restore: 若为 True，则恢复原始值；否则根据 priority 设置
+    :return:
+    """
+    if not restore and priority.lower() != "critical":
+        return  # 非 critical 应用且不强制恢复时跳过
+
+    target_value = 0
+    try:
+        exe_name = _get_executable_name(app_name, app_cmdline)
+        logger.debug(f"Target executable: {exe_name}")
+
+        pgrep_result = subprocess.run(
+            ["pgrep", "-f", exe_name],
+            capture_output=True,
+            text=True,
+        )
+        if pgrep_result.returncode != 0:
+            logger.debug(f"App {app_name} is not running and no OOM adjustment needed.")
+            return
+
+        pids = [pid for pid in pgrep_result.stdout.strip().split("\n") if pid]
+        for pid in pids:
+            oom_file = f"/proc/{pid}/oom_score_adj"
+
+            if restore:
+                if pid not in _original_oom_scores:
+                    logger.warning(f"No original OOM score recorded for PID {pid}. Skipping.")
+                    continue
+                target_value = _original_oom_scores.pop(pid)
+                action = "Restoring"
+            else:
+                # 记录app的默认值
+                if pid not in _original_oom_scores:
+                    with open(oom_file, "r") as f:
+                        _original_oom_scores[pid] = f.read().strip()
+                target_value = "-1000"
+                action = "Setting"
+
+            # 修改 oom_score_adj
+            logger.debug(f"{action} OOM priority for PID {pid} to {target_value}")
+            subprocess.run(
+                ["sudo", "tee", oom_file],
+                input=target_value,
+                text=True,
+                check=True,
+            )
+
+        _update_app_oom_score_adj(app_id, int(target_value))
+        logger.info(f"OOM priority updated for {app_name} (PID(s): {', '.join(pids)})")
+
+    except Exception as e:
+        logger.error(f"Failed to adjust OOM priority for {app_name}: {e}")
+
+
+def _update_app_oom_score_adj(app_id: str, score: int) -> bool:
+    try:
+        result = AIAppPriority.update_record(
+            id=app_id.replace('.desktop', ''),
+            oom_score=score
+        )
+        if not result:
+            logger.warning(f"No record updated for app_id: {app_id}")
+            return False
+
+        logger.info(f"oom_score_adj updated - ID: {app_id}, New score: {score}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Update failed: {e}")
+        return False
 
 
 def update_app_status(app_id: str, status: str) -> bool:

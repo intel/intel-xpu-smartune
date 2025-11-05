@@ -3,7 +3,7 @@ import signal
 import requests
 from balancer.balancer import DynamicBalancer
 from utils.logger import logger
-from utils.app_utils import callback_manager
+from utils.app_utils import callback_manager, adjust_oom_priority
 from flask import Flask, request
 from threading import Lock
 from gi.repository import Gio
@@ -210,6 +210,8 @@ def set_priority():
                 up_time=datetime.now()
             )
 
+        adjust_oom_priority(app_id, app_info.get_name(), priority, app_info.get_commandline())
+
         return construct_response(
             data={},
             retmsg="Priority updated successfully"
@@ -295,6 +297,7 @@ def set_to_control():
         cgroup = data.get('cgroup', '')
         priority = data.get('priority', 0)
         remark = data.get('remark', '')
+        cmdline = data.get('cmdline', '')
 
         _service.add_control(app_name)
 
@@ -316,10 +319,12 @@ def set_to_control():
                 controlled=controlled,
                 cgroup=cgroup,
                 remark=remark,
-                cmdline="",
+                cmdline=cmdline,
                 status="NA",
                 last_update_time=datetime.now()
             )
+
+        adjust_oom_priority(app_id, app_name, priority, cmdline)
 
         return construct_response(
             data={
@@ -355,6 +360,12 @@ def remove_from_control():
 
         # 从监控服务中移除
         _service.remove_control(app_name if app_name else "")
+
+        app_info = AIAppPriority.query().filter(AIAppPriority.app_id == app_id).first()
+
+        logger.debug(f"remove_from_control: app_info: {app_info}")
+        # restore oom score
+        adjust_oom_priority(app_id, app_name, app_info.priority, app_info.cmdline, restore=True)
 
         # 更新数据库记录（将controlled设为False）
         AIAppPriority.update_record(
@@ -400,6 +411,8 @@ def get_controlled_app():
                 "app_name": app.name,
                 "controlled": app.controlled,
                 "priority": app.priority,
+                "oom_score": app.oom_score,
+                "cmdline": app.cmdline,
                 "cgroup": app.cgroup,
                 "remark": app.remark,
                 "status": app.status
@@ -441,6 +454,7 @@ def get_pending_app():
                 "app_name": app.name,
                 "controlled": app.controlled,
                 "priority": app.priority,
+                "oom_score": app.oom_score,
                 "priority_value": _service.get_pending_app_priority_value(app.priority),
                 "cgroup": app.cgroup,
                 "remark": app.remark,
@@ -457,6 +471,40 @@ def get_pending_app():
         )
     except Exception as e:
         logger.error(f"Get pending apps failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/set_oom_score', methods=['POST'])
+def set_oom_score():
+    """设置应用的 OOM 分数，用于保活该应用"""
+    try:
+        data = request.get_json()
+        app_id = data.get('app_id', "")
+
+        # 验证必要参数
+        if not app_id:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="app_id must be provided"
+            )
+
+        app_info = AIAppPriority.query().filter(AIAppPriority.app_id == app_id).first()
+
+        logger.debug(f"set_oom_score: app_info: {app_info}")
+        # restore oom score
+        adjust_oom_priority(app_id, app_info.name, app_info.priority, app_info.cmdline)
+
+        return construct_response(
+            data={},
+            retmsg="App OOM score set successfully"
+        )
+    except Exception as e:
+        logger.error(f"Set OOM score failed: {str(e)}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,

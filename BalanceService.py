@@ -21,6 +21,7 @@ class DynamicService:
 
     def __init__(self):
         self.balancer = DynamicBalancer()
+        self.rebuild_controlled_map()
 
     def start(self):
         self.balancer.start()
@@ -46,6 +47,9 @@ class DynamicService:
 
     def get_controlled_list(self):
         return self.balancer.bpf_monitor.get_monitored_apps()
+
+    def rebuild_controlled_map(self):
+        self.balancer.bpf_monitor.rebuild_controlled_map()
 
     def get_pending_app_priority_value(self, priority_str):
         return self.balancer.controlManager.get_priority_value(priority_str)
@@ -210,6 +214,7 @@ def set_priority():
                 up_time=datetime.now()
             )
 
+        _service.rebuild_controlled_map()
         adjust_oom_priority(app_id, app_info.get_name(), priority, app_info.get_commandline())
 
         return construct_response(
@@ -324,6 +329,7 @@ def set_to_control():
                 last_update_time=datetime.now()
             )
 
+        _service.rebuild_controlled_map()
         adjust_oom_priority(app_id, app_name, priority, cmdline)
 
         return construct_response(
@@ -373,6 +379,7 @@ def remove_from_control():
             controlled=False
         )
 
+        _service.rebuild_controlled_map()
         return construct_response(
             data={
                 "app_id": app_id,
@@ -496,7 +503,7 @@ def set_oom_score():
         app_info = AIAppPriority.query().filter(AIAppPriority.app_id == app_id).first()
 
         logger.debug(f"set_oom_score: app_info: {app_info}")
-        # restore oom score
+        # set oom score
         adjust_oom_priority(app_id, app_info.name, app_info.priority, app_info.cmdline)
 
         return construct_response(

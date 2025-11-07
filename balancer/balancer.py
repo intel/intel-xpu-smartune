@@ -124,7 +124,7 @@ class DynamicBalancer:
         self.app_intercept_thread = threading.Thread(target=self._run_app_intercept_loop, daemon=True)
         self.app_intercept_thread.start()
 
-        print("服务已启动，线程已开始运行")
+        logger.debug("服务已启动，线程已开始运行")
 
     def _run_monitor_resource_loop(self):
         logger.info("Monitor resource service started")
@@ -187,8 +187,8 @@ class DynamicBalancer:
                         if top_consume_apps:
                             # 判断该进程是否被限制过
                             for app_info in top_consume_apps:
-                                current_app_id = app_info.get('app', {}).get('id')
-                                current_app_name = app_info.get('process', {}).get('name')
+                                current_app_id = (app_info.get('app') or {}).get('id')
+                                current_app_name = (app_info.get('process') or {}).get('name')
 
                                 if (current_app_id and current_app_id in g_limited_apps) and \
                                         (current_app_name and current_app_name in g_limited_apps.values()):
@@ -213,7 +213,7 @@ class DynamicBalancer:
                                     "critical",
                                     cpu_quota=int(100 * limit_rate),  # 直接计算
                                     mem_high=int(total_mem * limit_rate),
-                                    io_weight=max(200, int(target['process']['io_read_rate'] / 1024 / 1024 * 10)),
+                                    io_weight=int(10000 * limit_rate),
                                     is_restore=False,
                                 )
                                 if auto_limit:
@@ -302,20 +302,20 @@ class DynamicBalancer:
                 #
                 # # 将任务放入待处理队列
                 priority_num = self.controlManager.get_priority_value(priority)
-                print(f"_run_handle_loop: priority value is {priority_num}")
+                logger.debug(f"_run_handle_loop: priority value is {priority_num}")
                 self.app_priority_queue.put((coming_app, priority_num))
                 logger.info(f"_run_handle_loop: Resource insufficient, {coming_app} app added to pending queue")
 
             except:
                 time.sleep(2)
-        print("退出_run_handle_loop")
+        logger.debug("退出_run_handle_loop")
 
     def _run_app_intercept_loop(self):
         logger.info("Resource app intercept service is wait for processing")
 
         # 打开性能缓冲区
         self.bpf_monitor.bpf["events"].open_perf_buffer(self.bpf_monitor.print_event)
-        print("Ctrl+C to exit")
+        logger.debug("Ctrl+C to exit")
 
         monitor_apps = app_utils.get_controlled_apps()
 
@@ -337,7 +337,7 @@ class DynamicBalancer:
                 # 监控启动事件
                 self.bpf_monitor.bpf.perf_buffer_poll(timeout=100)
             except KeyboardInterrupt:
-                print("\nExiting...")
+                logger.debug("Exiting...")
                 break
             except Exception as e:
                 logger.error(f"App intercept error: {str(e)}")
@@ -469,7 +469,7 @@ class DynamicBalancer:
         total_mem = self.resource_monitor.get_total_memory()
 
         if usage is None:
-            print(f"Warning: Could not get resource usage for {app_name} (ID: {app_id}), using default limits")
+            logger.debug(f"Warning: Could not get resource usage for {app_name} (ID: {app_id}), using default limits")
             # 默认值
             cpu_quota = None
             mem_high = None
@@ -481,13 +481,14 @@ class DynamicBalancer:
 
             # IOWeight的计算
             io_activity = (usage['io_read_bytes'] + usage['io_write_bytes']) / (1024 * 1024)
-            io_weight = int(io_activity * limit_rate) if io_activity >= 100 else None
+            # io_weight = int(io_activity * limit_rate) if io_activity >= 100 else None
+            io_weight = int(10000 * limit_rate) if usage['io_read_bytes'] > 0 else None
 
-            print("--------------------APP RESOURCE USAGE--------------------")
-            print(f" Setting limits for {app_name} (ID: {app_id}) based on actual usage:")
-            print(f"  CPU: {usage['cpu_percent']:.1f}% -> limit to {cpu_quota}%")
-            print(f"  Memory: {usage['mem_bytes'] / 1024 / 1024:.1f}MB -> limit to {mem_high}MB")
-            print(f"  IO activity: {io_activity:.1f}MB -> weight {io_weight}")
+            logger.debug("--------------------APP RESOURCE USAGE--------------------")
+            logger.debug(f" Setting limits for {app_name} (ID: {app_id}) based on actual usage:")
+            logger.debug(f"  CPU: {usage['cpu_percent']:.1f}% -> limit to {cpu_quota}%")
+            logger.debug(f"  Memory: {usage['mem_bytes'] / 1024 / 1024:.1f}MB -> limit to {mem_high}MB")
+            logger.debug(f"  IO activity: {io_activity:.1f}MB -> weight {io_weight}")
 
         # 将app放入限制列表中，等待监控线程处理，适时自动恢复
         g_limited_apps[app_id] = app_name
@@ -545,7 +546,7 @@ class DynamicBalancer:
             "task_id": f"wl_{time.time_ns()}"
         }
         self.push_task(task)
-        print(f"add workload to task: {task}")
+        logger.debug(f"add workload to task: {task}")
         return True
 
 
@@ -553,9 +554,9 @@ class DynamicBalancer:
         """
         停止服务线程，设置运行标志为False，并等待线程结束，同时确保任务队列中的任务都已处理完成
         """
-        print("服务开始停止.............")
+        logger.debug("服务开始停止.............")
         if not self.is_running:
-            print("服务已经停止，无需再次操作")
+            logger.debug("服务已经停止，无需再次操作")
             return
         self.is_running = False
 
@@ -566,4 +567,4 @@ class DynamicBalancer:
             self.handle_thread.join(timeout=1)
         if hasattr(self, "app_intercept_thread"):
             self.app_intercept_thread.join(timeout=1)
-        print("服务已停止，线程已结束")
+        logger.debug("服务已停止，线程已结束")

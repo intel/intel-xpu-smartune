@@ -115,7 +115,7 @@ class Controller:
         安全设置资源限制（CPU/内存/IO）
         :param cpu_quota: CPU百分比（None表示不修改，1-100之间）
         :param mem_high: 内存软限制（如"500M"，必须大于0）
-        :param io_weight: IO权重（10-1000，默认100）
+        :param io_weight: IO权重（1-10000，默认100）
         :param is_restore: 是否恢复默认值
         """
         # 参数范围检查
@@ -127,7 +127,7 @@ class Controller:
             logger.warning(f"Invalid mem_high {mem_high}, no limit for mem.")
             mem_high = None
 
-        if io_weight is not None and not (10 <= io_weight <= 1000):
+        if io_weight is not None and not (1 <= io_weight <= 10000):
             logger.warning(f"Invalid io_weight {io_weight}, no limit for io.")
             io_weight = None
 
@@ -164,8 +164,7 @@ class Controller:
             else:
                 properties.append("MemoryHigh=")
             if io_weight is not None:
-                #properties.append(f"IOWeight={io_weight}")
-                properties.append(f"IOWeight=")
+                properties.append(f"IOWeight={io_weight}")
             else:
                 properties.append("IOWeight=")
         else:
@@ -246,8 +245,8 @@ class Controller:
         if is_restore:
             logger.info(f"Restoring IO weight for {app_id}")
             io_weight = None
-        elif io_weight is not None and not (10 <= io_weight <= 1000):
-            raise ValueError("IOWeight must be 10-1000")
+        elif io_weight is not None and not (1 <= io_weight <= 10000):
+            raise ValueError("IOWeight must be 1-10000")
         else:
             logger.info(f"Setting IO weight for {app_id} to {io_weight}")
 

@@ -18,6 +18,12 @@ callback_semaphore = threading.Semaphore(0)
 
 controlled_apps = []
 
+is_app_status_changed = False
+is_app_resources_limited = False
+is_app_manual_limit_by_user = False
+current_app_name = ""
+
+
 # 优先级枚举定义 (放在模块顶部)
 class PriorityLevel(Enum):
     LOW = ("Low", 1)
@@ -46,7 +52,6 @@ def init():
 
     if "pending_apps" not in st.session_state:
         st.session_state.pending_apps = []
-
 
 def get_all_apps():
     """获取所有可用应用"""
@@ -79,8 +84,22 @@ def app_callback_handler(notify_data):
         print(f"Error in callback handler: {e}")
 
 
+def send_notification():
+    """主线程通知函数"""
+    global is_app_status_changed, is_app_resources_limited, is_app_manual_limit_by_user
+    if is_app_resources_limited:
+        st.toast(f'系统繁忙中，应用 {current_app_name} 被自动限制了资源使用，它将在系统资源空闲后自动恢复', icon='⚠️')
+        is_app_resources_limited = False
+    if is_app_status_changed:
+        st.toast(f"应用 {current_app_name} 状态已更新", icon='ℹ️')
+    if is_app_manual_limit_by_user:
+        st.toast('系统繁忙中，但您管控的应用都很关键，请合理选择应用进行资源限制处理', icon='⚠️')
+        is_app_manual_limit_by_user = False
+
+
 def _process_callback():
     """主线程安全的状态更新处理"""
+    global is_app_status_changed, is_app_resources_limited, is_app_manual_limit_by_user, current_app_name
     while cb_running:
         try:
             # 非阻塞检查是否有新数据
@@ -105,34 +124,24 @@ def _process_callback():
                     print(f"[ERROR] Incomplete callback data: {data}")
                     continue
 
-                # with status_lock:
-                    # updated = False
-
+                current_app_name = app_name
                 if purpose == "app":
                     # 查找目标应用
                     for app in controlled_apps:
                         if app.get('app_id') == app_id or app.get('app_name') == app_name:
                             if app.get('status') != new_status:
                                 app['status'] = new_status
-                                # updated = True
+                                is_app_status_changed = True
                                 print(f"Status updated: {app_name} => {new_status}")
                             break
 
                     if new_status == "limited":
-                        st.toast(
-                            f'系统繁忙中，应用 {app_name} 被自动限制了资源使用，它将在系统资源空闲后自动恢复',
-                            icon='⚠️')
-                        time.sleep(2)
-                    # 可能造成等待队列变化，刷新等待队列显示
-                    st.session_state.pending_apps = api.get_pending_apps()
-                    st.toast(f"应用 {app_name} 状态更新为 {new_status}", icon='ℹ️')
-                    # time.sleep(0.2)
-                    # st.rerun()
+                        is_app_resources_limited = True
 
                 if purpose == "notify":
                     if new_status == "manual_app_limit_by_user":
                         print(f"Notification: System busy, reminder user to limit app.")
-                        st.toast(f'友情提醒：系统繁忙中，建议您选择合适的应用进行资源限制处理', icon='⚠️')
+                        is_app_manual_limit_by_user = True
         except Exception as e:
             print(f"Error processing callback data: {e}")
         time.sleep(0.1)
@@ -150,7 +159,7 @@ def get_priority_color(priority):
 
 def app_management(default_apps):
     # 获取当前管控应用
-    global controlled_apps
+    global controlled_apps, is_app_status_changed
     controlled_apps = st.session_state.controlled_apps
 
     # 添加应用管控区域
@@ -254,10 +263,13 @@ def app_management(default_apps):
         </style>
         """
 
-        pending_apps = st.session_state.pending_apps
-        # print(f"pending_apps: {pending_apps}")
+        if is_app_status_changed:
+            st.session_state.pending_apps = api.get_pending_apps()
+            is_app_status_changed = False
 
-        if not pending_apps:
+        # print(f"pending_apps: {st.session_state.pending_apps}")
+
+        if not st.session_state.pending_apps:
             html_content += '<div class="empty-state">🕊️ 等待队列为空</div>'
         else:
             priority_mapping = {
@@ -267,7 +279,7 @@ def app_management(default_apps):
                 "low": "low-priority"
             }
 
-            for app in pending_apps:
+            for app in st.session_state.pending_apps:
                 priority = app.get("priority", "medium").lower()
                 priority_class = priority_mapping.get(priority, "medium-priority")
 
@@ -436,6 +448,7 @@ def apps_management():
 
     # if callback_data := ThreadSafeCallback.get():  # 安全获取最新回调
     #     _process_callback_data(callback_data)
+    send_notification()
     app_management(st.session_state.app_data)
     # 增加页面自动刷新配合callback，以实现状态更新，实测不会影响用户操作
     st_autorefresh(interval=1000, key="autorefresh")

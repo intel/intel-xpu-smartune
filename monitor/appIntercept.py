@@ -57,7 +57,7 @@ class AppIntercept(metaclass=SingletonMeta):
 
     def _rebuild_index(self):
         self._app_map_index = {
-            app["app_name"].lower(): app for app in self.controlled_app_map
+            app["app_name"].lower(): app for app in (self.controlled_app_map or [])
         }
 
     def trace_print(self) -> None:

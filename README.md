@@ -99,6 +99,14 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
             conda activate mt_py312
             pip install -r requirements.txt
 
+            OR:
+            Create a env w/o conda:
+            cd web/
+            pip install virtualenv
+            python -m virtualenv balancer
+            source balancer/bin/activate
+            pip install -r requirements.txt
+
         2. pip install dist/libcgroup-3.2.0-cp312-cp312-linux_x86_64.whl(Probably no need, 
                 but if need, please refer to "Other" below to generate whl)
 
@@ -126,7 +134,8 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
         sudo python3 BalanceService.py
     2. client:
         cd web
-        ./start_webui.sh mt_py312
+        ./start_webui.sh mt_py312 OR:
+        ./start_webui_env.sh (w/o conda)
         
         
 

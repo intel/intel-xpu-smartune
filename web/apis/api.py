@@ -6,8 +6,8 @@ from flask import Flask, request, jsonify
 from apis.multiapps_bridge import MABridge
 from apis.systools import SingletonMeta
 
-MULTIAPPS_URL = "http://localhost:9001"
-CLIENT_URL = "http://localhost:8656"
+MULTIAPPS_URL = "http://127.0.0.1:9001"
+CLIENT_URL = "http://127.0.0.1:8656"
 
 client_app = Flask(__name__)
 

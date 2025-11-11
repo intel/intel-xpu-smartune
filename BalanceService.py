@@ -87,7 +87,7 @@ def reset_app_status():
             up_time=datetime.now()
         )
         if updated_count == 0:
-            logger.warning("No records were updated (possible database error)")
+            logger.warning("No records were updated currently.")
         else:
             logger.info(f"Reset {updated_count} app statuses to 'NA'")
     except Exception as e:

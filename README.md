@@ -91,6 +91,13 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
             sudo pip install peewee==3.17.8 --break-system-packages
             sudo pip install flask --break-system-packages
             # sudo pip install flask --break-system-packages --ignore-installed blinker(err with "Cannot uninstall blinker...")
+
+        Re-compile kernel by enable CONFIG_IKHEADERS=m (FATAL: Module kheaders not found in directory /lib/modules/6.12.41+)
+        Or, if you have "kheaders.ko",
+            cp kheaders.ko /lib/modules/$(uname -r)/kernel/kernel
+            modprobe kheaders
+
+        If need, please refer to "Other" -> 2. Build bcc and 3. Build cpupower to install bcc and cpupower manually.
     
     client: 
         1.  Start a new terminal to run:
@@ -111,27 +118,55 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
                 but if need, please refer to "Other" below to generate whl)
 
     Other:
-        Build libcgroup wheel from source:
-        0.  
-            # Go into "base" env, then check python version and upgrade to python3.12.7 with: 
-            # conda install -n base python=3.12.7
-            # pip install --upgrade pip # if need, currently is 25.2
-        1.  pip install Cython
-        2.  sudo apt install libpam-dev flex bison libsystemd-dev cmake build-essential autoconf automake libtool m4
-            sudo apt install linux-tools-common cpufrequtils -y
-        3.  git clone https://github.com/libcgroup/libcgroup.git
-        4.  cd libcgroup
-        5.  git checkout v3.2.0 -b v3.2.0
-        6.  ./bootstrap.sh(sudo apt-get --reinstall install gcc g++ // issue: /usr/include/c++/14/mutex:768:23: internal compiler error: Segmentation fault)
-        7.  make
-        8.  cd libcgroup/src/python
-        9.  export VERSION_RELEASE="3.2.0"
-        10. python setup.py bdist_wheel
-        11. pip install dist/libcgroup-3.2.0-cp312-cp312-linux_x86_64.whl
+        1. Build libcgroup wheel from source:
+            If need:
+                # Go into "base" env, then check python version and upgrade to python3.12.7 with:
+                # conda install -n base python=3.12.7
+                # pip install --upgrade pip # if need, currently is 25.2
+            pip install Cython
+            sudo apt install libpam-dev flex bison libsystemd-dev cmake build-essential autoconf automake libtool m4
+                sudo apt install linux-tools-common cpufrequtils -y
+            git clone https://github.com/libcgroup/libcgroup.git
+            cd libcgroup
+            git checkout v3.2.0 -b v3.2.0
+            ./bootstrap.sh(sudo apt-get --reinstall install gcc g++ // issue: /usr/include/c++/14/mutex:768:23: internal compiler error: Segmentation fault)
+            make
+            cd libcgroup/src/python
+            export VERSION_RELEASE="3.2.0"
+            python setup.py bdist_wheel
+            pip install dist/libcgroup-3.2.0-cp312-cp312-linux_x86_64.whl
+
+        2. Build bcc (Refer to: https://github.com/iovisor/bcc/blob/master/INSTALL.md#ubuntu---binary):
+
+            sudo apt install -y zip bison build-essential cmake flex git libedit-dev \
+              libllvm14 llvm-14-dev libclang-14-dev python3 zlib1g-dev libelf-dev libfl-dev python3-setuptools \
+              liblzma-dev libdebuginfod-dev arping netperf iperf
+
+            git clone https://github.com/iovisor/bcc.git
+            mkdir bcc/build; cd bcc/build
+            cmake ..
+            make
+            sudo make install
+            cmake -DPYTHON_CMD=python3 .. # build python3 binding
+            pushd src/python/
+            make
+            sudo make install
+            popd
+
+        3. Build cpupower:
+            git clone https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+            cd linux
+            git checkout v6.12.41 (align to your kernel version)
+            cd tools/power/cpupower
+            apt install libpci-dev gettext
+            make
+            sudo make install
  
 # Start:
     1. server:
         sudo python3 BalanceService.py
+        If you are in "admin" permission, please run: python BalanceService.py
+
     2. client:
         cd web
         ./start_webui.sh mt_py312 OR:

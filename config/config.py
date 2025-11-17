@@ -1,10 +1,12 @@
 import yaml
 from dataclasses import dataclass
 
+
 @dataclass
 class Config:
     psi_interval: float = 5.0
     cgroup_mount: str = "/sys/fs/cgroup"
+    vendor: str = "generic"
     thresholds: dict = None
     weights: dict = None
     weights_top: dict = None
@@ -18,3 +20,7 @@ class Config:
         with open(path) as f:
             data = yaml.safe_load(f)
         return cls(**data)
+
+
+b_config = Config.from_file("config/config.yaml")
+

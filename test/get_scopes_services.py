@@ -23,7 +23,7 @@ def get_user_scopes(uid):
         print(f"An error occurred: {str(e)}")
         return []
 
-def get_app_services(uid):
+def get_app_services1(uid):
     try:
         # Run the command and capture output
         path = '/sys/fs/cgroup/user.slice/user-%s.slice/user@%s.service/app.slice/' % (uid, uid)
@@ -43,6 +43,51 @@ def get_app_services(uid):
     except Exception as e:
         print(f"An error occurred: {str(e)}")
         return []
+
+
+def get_app_services(uid):
+    apps = []
+    try:
+        possible_paths = [
+            f'/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/',
+            f'/sys/fs/cgroup/system.slice/'
+        ]
+
+        for path in possible_paths:
+            try:
+                # Run the command and capture output
+                result = subprocess.run(
+                    ['find', path, '-maxdepth', '1', '-type', 'd'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=True
+                )
+
+                # Process the output for this path
+                path_apps = [
+                    line.replace(path, '')
+                    for line in result.stdout.splitlines()
+                    if line.strip()
+                       and line.replace(path, '')
+                       and not line.endswith('app.slice')
+                ]
+
+                apps.extend(path_apps)
+
+            except subprocess.CalledProcessError:
+                # This path didn't work, try the next one
+                continue
+            except Exception as e:
+                print(f"Unexpected error processing path {path}: {str(e)}")
+                continue
+
+        return list(set(apps))  # Remove duplicates while preserving order
+
+    except Exception as e:
+        print(f"An error occurred in get_app_services(): {str(e)}")
+        return []
+
 
 if __name__ == "__main__":
     # command used to get active user slices

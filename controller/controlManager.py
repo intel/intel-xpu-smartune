@@ -12,22 +12,22 @@ from controller.io import IOController
 from controller.cpu import CPUController
 from controller.memory import MemoryController
 from controller.governor import GovernorController
-from config.config import Config  # Assuming Config is defined in a module named `config`
+from config.config import b_config
 
 
 class ControlManager:
-    def __init__(self, config_file="config/config.yaml"):
-        self.config = Config.from_file(config_file)
+    def __init__(self):
+        self.config = b_config
         self.psi = PSIMonitor()
         self.res = ResourceMonitor()
         self.cgroup = CgroupMonitor(self.config.cgroup_mount)
         self.analyzer = PressureAnalyzer(self.config)
 
-        self.controller = Controller(self.config.cgroup_mount)
+        self.controller = Controller()
         self.io = IOController(self.config.cgroup_mount)
         self.cpu = CPUController(self.config.cgroup_mount)
         self.memory = MemoryController(self.config.cgroup_mount)
-        self.governor = GovernorController(self.config.cgroup_mount)
+        self.governor = GovernorController()
         self.balance_url = f"{self.config.balance_service['url']}:{self.config.balance_service['port']}"
 
         self._current_level = None

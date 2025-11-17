@@ -23,4 +23,4 @@ echo "Starting Streamlit..."
 bash -c "http_proxy= all_proxy= streamlit run --server.enableStaticServing true --server.port 8655 webui.py" &
 streamlit_pid=$!
 
-wait "$streamlit_pid"
+wait $streamlit_pid

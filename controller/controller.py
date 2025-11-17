@@ -5,13 +5,15 @@ from typing import Optional
 
 from utils.logger import logger
 from utils import app_utils
+from config.config import b_config
 
 class Controller:
-    def __init__(self, cgroup_mount: str):
-        self.cgroup_mount = cgroup_mount
+    def __init__(self):
+        self.config = b_config
+        self.cgroup_mount = self.config.cgroup_mount
         self.cpus = os.cpu_count()
         self.uid = self.get_uid()
-        self.default_cpu_max = self.get_cpu_max()
+        # self.default_cpu_max = self.get_cpu_max()
 
     def get_uid(self):
         # command used to get active user slices
@@ -55,7 +57,7 @@ class Controller:
             print(f"An error occurred: {str(e)}")
             return []
 
-    def get_app_services(self):
+    def get_app_services1(self):
         try:
             # Run the command and capture output
             path = '/sys/fs/cgroup/user.slice/user-%s.slice/user@%s.service/app.slice/' % (self.uid, self.uid)
@@ -76,13 +78,58 @@ class Controller:
             print(f"An error occurred: {str(e)}")
             return []
 
+    def get_app_services(uid):
+        apps = []
+        try:
+            possible_paths = [
+                f'/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/',
+                f'/sys/fs/cgroup/system.slice/'
+            ]
+
+            for path in possible_paths:
+                try:
+                    # Run the command and capture output
+                    result = subprocess.run(
+                        ['find', path, '-maxdepth', '1', '-type', 'd'],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=True
+                    )
+
+                    # Process the output for this path
+                    path_apps = [
+                        line.replace(path, '')
+                        for line in result.stdout.splitlines()
+                        if line.strip()
+                           and line.replace(path, '')
+                           and not line.endswith('app.slice')
+                    ]
+
+                    apps.extend(path_apps)
+
+                except subprocess.CalledProcessError:
+                    # This path didn't work, try the next one
+                    continue
+                except Exception as e:
+                    print(f"Unexpected error processing path {path}: {str(e)}")
+                    continue
+
+            return list(set(apps))  # Remove duplicates while preserving order
+
+        except Exception as e:
+            print(f"An error occurred in get_app_services(): {str(e)}")
+            return []
+
     def restore_cpu_throttle(self):
         scopes = self.get_user_scopes()
         services = self.get_app_services()
+        cmd_prefix = ['sudo'] if getattr(self.config, "vendor", "") == "generic" else []
 
         print(f"restore_cpu_throttle scopes = {scopes}, services = {services}")
         for scope in scopes:
-            result = subprocess.run(['sudo', 'systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=100%'],
+            cmd = [*cmd_prefix, 'systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=100%']
+            result = subprocess.run(cmd,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
         for service in services:
@@ -93,10 +140,11 @@ class Controller:
     def high_cpu_throttle(self):
         scopes = self.get_user_scopes()
         services = self.get_app_services()
+        cmd_prefix = ['sudo'] if getattr(self.config, "vendor", "") == "generic" else []
 
         print(f"high_cpu_throttle scopes = {scopes}, services = {services}")
         for scope in scopes:
-            result = subprocess.run(['sudo', 'systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=60%'],
+            result = subprocess.run([*cmd_prefix, 'systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=60%'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
         for service in services:
@@ -118,6 +166,7 @@ class Controller:
         :param io_weight: IO权重（1-10000，默认100）
         :param is_restore: 是否恢复默认值
         """
+        unit_type = "scope"
         # 参数范围检查
         if cpu_quota is not None and not (1 <= cpu_quota <= 100):
             logger.warning(f"Invalid cpu_quota {cpu_quota}, must be 1-100. no limit for cpu.")
@@ -134,20 +183,28 @@ class Controller:
         scopes = self.get_user_scopes()
         services = self.get_app_services()
 
-        #logger.debug(f"scopes----------: {scopes}")
-        #logger.debug(f"services--------: {services}")
+        # logger.debug(f"scopes----------: {scopes}")
+        # logger.debug(f"services--------: {services}")
 
+        # 铁威马系统上service与scope一样的执行cmd，不需要unit_type
         if app_id.endswith('.scope'):
             matching_app = app_id
             unit_type = 'scope' if matching_app in scopes else 'service'
-        else:
+        elif app_id.endswith('.service'):
+            matching_app = app_id
+            unit_type = 'service'
+        elif app_id.endswith('.desktop'):
             app_base_name = app_id.replace('.desktop', '').split('.')[-1].lower()
             matching_app = next(
                 (unit for unit in scopes + services if app_base_name in unit.lower()),
                 None
             )
             unit_type = 'scope' if matching_app in scopes else 'service'
+        else:
+            matching_app = app_id
+            unit_type = 'scope'
 
+        logger.debug(f"matching_app: {matching_app} for app_id: {app_id}")
         if not matching_app:
             logger.warning(f"No matching unit for {app_id}")
             return False
@@ -181,15 +238,23 @@ class Controller:
             if not dbus_address:
                 raise Exception("无法获取DBus会话地址")
 
-            cmd_base = (
-                ['sudo', 'systemctl', 'set-property', '--runtime', matching_app]
-                if unit_type == 'scope' else
-                [
-                    'sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(),
-                    f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',
-                    'systemctl', '--user', 'set-property', '--runtime', matching_app
-                ]
-            )
+            # 铁威马的系统上默认user由管理员权限，如果用sudo需要，sudo -u @user python BalancerService.py运行，不然把sudo去掉运行
+            # ['sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(), 'systemctl', 'set-property', '--runtime', matching_app]
+
+            if getattr(self.config, "vendor", "") == "generic":
+                cmd_base = (
+                    ['sudo', 'systemctl', 'set-property', '--runtime', matching_app]
+                    if unit_type == 'scope' else
+                    [
+                        'sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(),
+                        f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',
+                        'systemctl', '--user', 'set-property', '--runtime', matching_app
+                    ]
+                )
+            else:
+                cmd_base = (
+                    ['systemctl', 'set-property', '--runtime', matching_app]
+                )
 
             cmd = cmd_base + properties
             # logger.debug(f"Executing command: {' '.join(cmd)}")

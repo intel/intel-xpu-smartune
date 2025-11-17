@@ -337,11 +337,11 @@ def app_management(default_apps):
                         app["status"] = "canceled"
                         st.session_state.pending_apps = api.get_pending_apps()
                         print(f"App {app['app_name']} relaunch was canceled.")
-                        st.toast(f'已取消自动启动应用{app['app_name']}!', icon='🎉')
+                        st.toast(f"已取消自动启动应用{app['app_name']}!", icon='🎉')
                         # time.sleep(2)
                         # st.rerun()
                     else:
-                        st.toast(f'取消自动启动应用{app['app_name']}失败!', icon="❌")
+                        st.toast(f"取消自动启动应用{app['app_name']}失败!", icon="❌")
 
             if cols[5].button("📊 更新优先级", key=f"priority_{idx}", type="primary"):
                 if new_priority != current_priority:
@@ -354,7 +354,7 @@ def app_management(default_apps):
                             c_app["priority"] = new_priority
                             break
                     print(f"update priority: st.session_state.controlled_apps: {st.session_state.controlled_apps}")
-                    st.toast(f'已成功更新{app['app_name']}的优先级为{new_priority}!', icon='🎉')
+                    st.toast(f"已成功更新{app['app_name']}的优先级为{new_priority}!", icon='🎉')
                     # time.sleep(2)
                     # st.rerun()
 

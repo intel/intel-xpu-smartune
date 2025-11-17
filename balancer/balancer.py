@@ -14,6 +14,7 @@ import queue
 import heapq
 
 g_limited_apps = {}  # 记录被限制的应用
+g_app_id_mapping = {}  # {app_id: effective_app_id}
 is_limited_app_dominant = False  # critical情况下，用于判断拿到的Top进程是否为已限制的进程
 
 @dataclass
@@ -462,10 +463,18 @@ class DynamicBalancer:
 
     def set_resource_limit(self, app_id: str, app_name: str, priority: str) -> bool:
         """ 根据 app_id 设置资源限制 """
-        global g_limited_apps
+        global g_limited_apps, g_app_id_mapping
         limit_rate = self.get_priority_value(priority)
         # 获取应用程序的实际资源使用情况
         usage = app_utils.get_app_resource_usage(app_id, app_name)
+        # 获取cgroup对应的控制名
+        app_info = self.resource_monitor.try_match_app(usage)
+        if app_info and 'id' in app_info:
+            effective_app_id = app_info['id']
+            logger.debug(f"Matched app ID changed from {app_id} to {effective_app_id}")
+        else:
+            effective_app_id = app_id
+
         total_mem = self.resource_monitor.get_total_memory()
 
         if usage is None:
@@ -475,27 +484,28 @@ class DynamicBalancer:
             mem_high = None
             io_weight = None
         else:
-            # 计算限制值（使用实际值的50%，如果没查到就先不限制）
-            cpu_quota = int(100 * limit_rate) if usage['cpu_percent'] > 0 else None
-            mem_high = int(total_mem * limit_rate) if usage['mem_bytes'] > 0 else None
+            cpu_quota = int(100 * limit_rate) if usage.get('cpu_percent', 0) > 0 else None
+            mem_high = int(total_mem * limit_rate) if usage.get('mem_bytes', 0) > 0 else None
 
             # IOWeight的计算
-            io_activity = (usage['io_read_bytes'] + usage['io_write_bytes']) / (1024 * 1024)
-            # io_weight = int(io_activity * limit_rate) if io_activity >= 100 else None
-            io_weight = int(10000 * limit_rate) if usage['io_read_bytes'] > 0 else None
+            io_read = usage.get('io_read_bytes', 0)
+            io_write = usage.get('io_write_bytes', 0)
+            io_activity = (io_read + io_write) / (1024 * 1024)
+            io_weight = int(10000 * limit_rate) if io_read > 0 else None
 
             logger.debug("--------------------APP RESOURCE USAGE--------------------")
-            logger.debug(f" Setting limits for {app_name} (ID: {app_id}) based on actual usage:")
-            logger.debug(f"  CPU: {usage['cpu_percent']:.1f}% -> limit to {cpu_quota}%")
-            logger.debug(f"  Memory: {usage['mem_bytes'] / 1024 / 1024:.1f}MB -> limit to {mem_high}MB")
+            logger.debug(f" Setting limits for {app_name} (ID: {effective_app_id}) based on actual usage:")
+            logger.debug(f"  CPU: {usage.get('cpu_percent', 0):.1f}% -> limit to {cpu_quota}%")
+            logger.debug(f"  Memory: {usage.get('mem_bytes', 0) / 1024 / 1024:.1f}MB -> limit to {mem_high}MB")
             logger.debug(f"  IO activity: {io_activity:.1f}MB -> weight {io_weight}")
 
         # 将app放入限制列表中，等待监控线程处理，适时自动恢复
-        g_limited_apps[app_id] = app_name
+        g_limited_apps[effective_app_id] = app_name
+        g_app_id_mapping[app_id] = effective_app_id  # 记录映射关系
         app_utils.update_app_status(app_id, "limited")
 
         return self.controlManager.adjust_resources(
-            app_id,
+            effective_app_id,
             "critical",
             cpu_quota=cpu_quota,
             mem_high=mem_high,
@@ -505,11 +515,13 @@ class DynamicBalancer:
 
     def set_restore_resource(self, app_id: str, app_name: str) -> bool:
         """ 根据 app_id 恢复资源限制 """
-        global g_limited_apps
-        # 从限制列表中移除（无论是否存在都尝试移除）
-        g_limited_apps.pop(app_id, None)
+        global g_limited_apps, g_app_id_mapping
+        # 从限制列表中移除
+        effective_app_id = g_app_id_mapping.pop(app_id, app_id)
+        g_limited_apps.pop(effective_app_id, None)
+
         app_utils.update_app_status(app_id, "running")
-        return self.controlManager.adjust_resources(app_id, "low")
+        return self.controlManager.adjust_resources(effective_app_id, "low")
 
     def _execute_task(self, task: WorkloadTask, pressure_level: str) -> bool:
         """执行任务"""

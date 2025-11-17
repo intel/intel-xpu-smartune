@@ -4,11 +4,7 @@ from utils.logger import logger
 class PressureAnalyzer:
     def __init__(self, config):
         self.config = config
-        self.weights = config.weights or {
-            'cpu':    0.3,
-            'memory': 0.7,
-            'io':     0.1
-        }
+        self.weights = config.weights
 
     def calculate_pressure_score(self, psi_data: dict, usage_data, is_limited_app_dominant) -> float:
         """Calculate weighted pressure score"""
@@ -42,13 +38,13 @@ class PressureAnalyzer:
 
     def get_pressure_level(self, score: float) -> str:
         """根据总分判断压力等级（与PSI类STATUS_LEVELS对齐）"""
-        if score >= 1.0:
+        if score >= self.config.thresholds.get('critical', 1.0):
             return "critical"
-        elif score >= 0.8:
+        elif score >= self.config.thresholds.get('high', 0.8):
             return "high"
-        elif score >= 0.6:
+        elif score >= self.config.thresholds.get('medium', 0.6):
             return "medium"
-        elif score >= 0.4:
+        elif score >= self.config.thresholds.get('low', 0.4):
             return "low"
         else:
             return "low"

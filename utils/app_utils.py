@@ -11,6 +11,7 @@ from datetime import datetime
 from utils.logger import logger
 from db.DatabaseModel import AIAppPriority
 from typing import Optional, Dict, Any
+from config.config import b_config
 
 _original_oom_scores: dict[str, str] = {}
 
@@ -168,8 +169,10 @@ def adjust_oom_priority(
 
             # 修改 oom_score_adj
             logger.debug(f"{action} OOM priority for PID {pid} to {target_value}")
+            base_cmd = ["tee", oom_file]
+            cmd = ["sudo", *base_cmd] if getattr(b_config, "vendor", "") == "generic" else base_cmd
             subprocess.run(
-                ["sudo", "tee", oom_file],
+                cmd,
                 input=target_value,
                 text=True,
                 check=True,
@@ -228,6 +231,8 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
     Returns:
         包含资源使用情况的字典，格式为:
         {
+            'pids': list,          # 进程ID列表
+            'name': str,           # 进程名称
             'cpu_percent': float,  # CPU使用百分比
             'mem_bytes': int,      # 内存使用字节数
             'io_read_bytes': int,  # IO读取字节数
@@ -237,31 +242,38 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
     try:
         # 获取所有进程信息
         processes = []
+        pids = []
+        proc_name = None
         for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'memory_info', 'io_counters']):
             try:
                 # 检查进程是否匹配应用程序名称或.desktop文件
                 if app_name.lower() in proc.name().lower():
                     processes.append(proc)
+                    pids.append(proc.pid)
+                    proc_name = proc.name()
                 else:
                     # 检查命令行是否包含.desktop文件信息
                     cmdline = " ".join(proc.cmdline())
                     if app_id.lower() in cmdline.lower():
                         processes.append(proc)
+                        pids.append(proc.pid)
+                        proc_name = proc.name()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
         if not processes:
             print(f"No processes found for app {app_name} (ID: {app_id})")
-            return None
+            return {}
 
         # 计算总资源使用量
-        print(f"processes...... {processes}")
         cpu_percent = sum(proc.cpu_percent() for proc in processes)
         mem_bytes = sum(proc.memory_info().rss for proc in processes)
         io_read_bytes = sum(proc.io_counters().read_bytes for proc in processes if proc.io_counters() is not None)
         io_write_bytes = sum(proc.io_counters().write_bytes for proc in processes if proc.io_counters() is not None)
 
         return {
+            'pids': pids,
+            'name': proc_name if proc_name else app_name,
             'cpu_percent': cpu_percent,
             'mem_bytes': mem_bytes,
             'io_read_bytes': io_read_bytes,
@@ -269,7 +281,7 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
         }
     except Exception as e:
         print(f"Error getting resource usage for {app_name} (ID: {app_id}): {e}")
-        return None
+        return {}
 
 
 def safe_notify(title, message, icon="dialog-information"):

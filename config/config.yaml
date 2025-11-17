@@ -1,9 +1,11 @@
 psi_interval: 2.0
 cgroup_mount: "/sys/fs/cgroup"
+vendor: "admin"
 thresholds:
-  medium: 60
-  high: 120
-  critical: 160
+  low: 0.4
+  medium: 0.6
+  high: 0.8
+  critical: 1.0
 weights:
   cpu: 2
   memory: 7

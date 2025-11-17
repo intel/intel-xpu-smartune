@@ -1,16 +1,18 @@
 import os
 import subprocess
 from utils.logger import logger
+from config.config import b_config
 
 class GovernorController:
-    def __init__(self, cgroup_mount: str):
-        self.cgroup_mount = cgroup_mount
-        #self.cpu = cpuFreq()
+    def __init__(self):
+        self.config = b_config
 
     def __get_governor(self):
         try:
+            base_cmd = ["cpupower", "frequency-info", "-p"]
+            cmd = ["sudo", *base_cmd] if getattr(self.config, "vendor", "") == "generic" else base_cmd
             result = subprocess.run(
-                ["sudo", "cpupower", "frequency-info", "-p"],
+                cmd,
                 capture_output = True,
                 text = True
             )
@@ -26,12 +28,13 @@ class GovernorController:
     def __set_governor(self, governor="performance"):
         curr_governor = self.__get_governor()
         if curr_governor == governor:
-            # logger.info("current gov: %s, target gov: %s", curr_governor, governor)
+            logger.info(f"CPU governor already set to {governor}")
             return
 
+        logger.info(f"Setting CPU governor to {governor}...")
         try:
             subprocess.run(
-                ["sudo", "cpupower", "frequency-set", "-g", governor],
+                ["cpupower", "frequency-set", "-g", governor],
                 check = True,
                 text = True,
                 stdout = subprocess.DEVNULL

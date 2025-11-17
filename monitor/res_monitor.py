@@ -9,17 +9,13 @@ import time
 from time import sleep
 from utils.logger import logger
 from monitor.psi import PSIMonitor
+from config.config import b_config
 
 
 class ResourceMonitor:
-    def __init__(self, config=None):
+    def __init__(self):
         """初始化资源监视器"""
-        self.config = config or {
-            'weights_top': {'cpu': 0.5, 'memory': 0.3, 'io': 0.2},
-            'pressure_sensitivity': 0.7,
-            'io_threshold': 5e7,  # 50MB
-            'blacklist': ['systemd', 'kworker', 'dbus']
-        }
+        self.config = b_config
         self.cpu_cores = os.cpu_count() or 16
 
         # 桌面应用信息
@@ -40,7 +36,7 @@ class ResourceMonitor:
                                              'create_time']):
                 try:
                     info = proc.info
-                    if not info.get('cmdline') or any(b in info.get('name', '') for b in self.config['blacklist']):
+                    if not info.get('cmdline') or any(b in info.get('name', '') for b in self.config.blacklist):
                         continue
                     if time.time() - info['create_time'] < 2:
                         continue
@@ -109,13 +105,12 @@ class ResourceMonitor:
 
     def _adjust_weights_by_pressure(self, psi_data):
         """根据PSI压力动态调整权重"""
-        base_weights = self.config['weights_top']
+        base_weights = self.config.weights_top
         return {
             'cpu': base_weights['cpu'] * (1 + psi_data.get('cpu', 0)),
             'memory': base_weights['memory'] * (1 + psi_data.get('memory', 0)),
             'io': base_weights['io']  # 保留但不再用于进程评分
         }
-
 
     def _find_systemd_scope(self, pid):
         """通过systemd-cgls查找进程所属的scope"""
@@ -142,7 +137,39 @@ class ResourceMonitor:
             logger.warning(f"Failed to find systemd scope: {str(e)}")
         return None
 
-    def _try_match_app(self, process_info):
+    def _find_systemd_unit(self, pid):
+        """通过systemd-cgls查找进程所属的scope, service"""
+        try:
+            result = subprocess.run(
+                ['systemd-cgls', '--no-page'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True
+            )
+
+            # 查找包含指定PID的行及其父unit
+            lines = result.stdout.split('\n')
+            for i, line in enumerate(lines):
+                if f'─{pid} ' in line or f'─{pid}\n' in line:
+                    # 向上查找最近的unit(scope或service)
+                    for j in range(i, -1, -1):
+                        line_content = lines[j]
+                        if '.scope' in line_content or '.service' in line_content:
+                            # 匹配类似 "├─session-c20.scope" 或 "├─fileManage.service"
+                            unit_match = re.search(r"─(.*?\.(?:scope|service))", line_content)
+                            if unit_match:
+                                return unit_match.group(1)
+
+                            # 如果没有匹配到，尝试更宽松的匹配
+                            unit_match = re.search(r"\b([\w-]+\.(?:scope|service))\b", line_content)
+                            if unit_match:
+                                return unit_match.group(1)
+        except Exception as e:
+            logger.warning(f"Failed to find systemd unit: {str(e)}")
+        return None
+
+    def try_match_app(self, process_info):
         """尝试匹配桌面应用或systemd scope"""
         # logger.debug(f"process_info: {process_info}")
         # 1. 先尝试匹配桌面应用
@@ -168,13 +195,13 @@ class ResourceMonitor:
                 except Exception:
                     continue
 
-        # 2. 尝试通过systemd-cgls查找scope
-        scope = self._find_systemd_scope(process_info['pids'][0])  # the first PID
-        if scope:
+        # 2. 尝试通过systemd-cgls查找scope或者service
+        unit = self._find_systemd_unit(process_info['pids'][0])  # the first PID
+        if unit:
             return {
                 'type': 'systemd',
-                'id': scope,
-                'name': f"Systemd Scope: {scope}"
+                'id': unit,
+                'name': f"Systemd cgroup: {unit}"
             }
 
         return None
@@ -193,7 +220,7 @@ class ResourceMonitor:
             reach_threshold = False
 
         for process in processes:
-            app_info = self._try_match_app(process)
+            app_info = self.try_match_app(process)
             results.append({
                 'process': {
                     'pid': process['pids'][0],  # Use the first PID from 'pids'

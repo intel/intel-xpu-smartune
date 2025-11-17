@@ -262,7 +262,8 @@ class AppIntercept(metaclass=SingletonMeta):
                 logger.debug(f"Added '{name}' to monitoring list")
 
         if added_count == 0 and names:
-            logger.debug(f"All {len(names)} app(s) [{', '.join(f"'{name}'" for name in names)}] already in monitoring list")
+            app_str = ', '.join(f"'{name}'" for name in names)
+            logger.debug(f"All {len(names)} app(s) [{app_str}] already in monitoring list")
         elif added_count > 0:
             logger.debug(f"Successfully added {added_count}/{len(names)} new app(s)")
 

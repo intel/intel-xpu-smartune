@@ -88,7 +88,7 @@ def send_notification():
     """主线程通知函数"""
     global is_app_status_changed, is_app_resources_limited, is_app_manual_limit_by_user
     if is_app_resources_limited:
-        st.toast(f'系统繁忙中，应用 {current_app_name} 被自动限制了资源使用，它将在系统资源空闲后自动恢复', icon='⚠️')
+        st.toast(f'系统繁忙中，应用 {current_app_name} 被临时限制了资源使用，它将在系统资源空闲后适时恢复', icon='⚠️')
         is_app_resources_limited = False
     if is_app_status_changed:
         st.toast(f"应用 {current_app_name} 状态已更新", icon='ℹ️')
@@ -232,12 +232,12 @@ def app_management(default_apps):
     with cols[1]:
         with st.expander("Balancer功能说明：", expanded=True):
             st.markdown("""
-            - 三大功能点： 管控，监控和优先级队列
-            - 管控：会在系统资源紧张时有效，对占用系统资源top1的非关键应用进行控制，释放系统资源
-            - 监控：被添加管控的应用的启动和关闭
-            - 优先级队列：当资源紧张时，非关键应用启动将进入优先级队列，等待系统资源空闲后自动启动
-            - 已被添加为critical的管控应用，在启动时会自动保活，保证其持续运行
-            - 资源限制/恢复正常/保活等按钮：用户可手动控制被管控应用
+            - 三大功能点：管控、监控和优先级队列
+            - 管控：在系统资源紧张时，对占用资源最多的非管控或低优先级应用进行限制，释放系统资源，保障关键应用运行。
+            - 监控：实时监控系统资源并进行评分，同时管理被管控应用的启动和关闭状态。
+            - 优先级队列：当资源紧张时，自动暂停非关键应用的启动，将启动请求加入优先级队列，待资源充足后按优先级顺序自动启动。
+            - 保活：对已设为关键的管控应用，启动时自动进入保活状态，确保其持续稳定运行。
+            - 其他功能：支持用户手动管理管控应用，包括更改优先级、取消启动、设置资源限制、恢复正常、保活及删除等操作。
             """)
     with cols[2]:
         pending_queue_holder = st.empty()  # 占位容器

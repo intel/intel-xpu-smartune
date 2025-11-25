@@ -1,26 +1,48 @@
 #!/bin/bash
+set -euo pipefail
 export LANG=en_US.UTF-8
+
+# 获取脚本所在目录
 current_dir=$(dirname "$(realpath "$0")")
-cd "$current_dir"
+cd "$current_dir" || exit 1
+
+# 配置参数
+STREAMLIT_PORT=8655
+FLASK_PORT=8656
+STREAMLIT_CMD="streamlit run --server.enableStaticServing true --server.port $STREAMLIT_PORT webui.py"
 
 cleanup() {
     echo "Cleaning up..." >&2
 
-    # 杀死 Streamlit 及其所有子进程
-    pkill -9 -P $(pgrep -f "streamlit run.*webui.py")
-    pkill -9 -f "streamlit run.*webui.py"
+    # 1. 杀死Streamlit进程
+    if pgrep -f "$STREAMLIT_CMD" >/dev/null; then
+        echo "Killing Streamlit process..."
+        pkill -9 -f "$STREAMLIT_CMD" || true
+    fi
 
-    # 杀死 Flask 端口进程
-    lsof -t -i :8656 -s TCP:LISTEN | xargs -r kill -9
+    # 2. 杀死Flask端口进程
+    if lsof -t -i :$FLASK_PORT -s TCP:LISTEN >/dev/null; then
+        echo "Killing Flask port $FLASK_PORT..."
+        lsof -t -i :$FLASK_PORT -s TCP:LISTEN | xargs -r kill -9 || true
+    fi
 
     exit 1
 }
 
-trap 'cleanup' SIGINT SIGTERM
+# 设置信号捕获
+trap 'cleanup' SIGINT SIGTERM ERR
 
 echo "Starting Streamlit..."
 
-bash -c "http_proxy= all_proxy= streamlit run --server.enableStaticServing true --server.port 8655 webui.py" &
+# 启动Streamlit
+env http_proxy= all_proxy= \
+    bash -c "$STREAMLIT_CMD" &
 streamlit_pid=$!
 
-wait $streamlit_pid
+# 等待进程结束
+wait $streamlit_pid || {
+    echo "Streamlit process exited abnormally" >&2
+    cleanup
+}
+
+exit 0

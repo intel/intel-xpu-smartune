@@ -85,17 +85,23 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
 
 # Installation:
     server:
-        Start a terminal w/o any virtual(like conda) env, then run:
+        #ubuntu:
+
+            Start a terminal w/o any virtual(like conda) env, then run:
             sudo apt install python3-pip (optional)
             sudo pip install psutil>=5.5.1 --break-system-packages
             sudo pip install peewee==3.17.8 --break-system-packages
             sudo pip install flask --break-system-packages
             # sudo pip install flask --break-system-packages --ignore-installed blinker(err with "Cannot uninstall blinker...")
 
-        Re-compile kernel by enable CONFIG_IKHEADERS=m (FATAL: Module kheaders not found in directory /lib/modules/6.12.41+)
-        Or, if you have "kheaders.ko",
-            cp kheaders.ko /lib/modules/$(uname -r)/kernel/kernel
-            modprobe kheaders
+        #Tos:
+            1. Install above packages w/o "sudo".
+            2. Re-compile kernel by enable CONFIG_IKHEADERS=m (FATAL: Module kheaders not found in directory /lib/modules/6.12.41+)
+            Or, if you have "kheaders.ko",
+                mkdir -p /lib/modules/$(uname -r)/kernel/kernel/
+                cp kheaders.ko /lib/modules/$(uname -r)/kernel/kernel/
+                depmod -a
+                modprobe kheaders
 
         If need, please refer to "Other" -> 2. Build bcc and 3. Build cpupower to install bcc and cpupower manually.
     
@@ -112,7 +118,7 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
             pip install virtualenv
             python -m virtualenv balancer
             source balancer/bin/activate
-            pip install -r requirements.txt
+            pip install -r ../requirements.txt
 
         2. pip install dist/libcgroup-3.2.0-cp312-cp312-linux_x86_64.whl(Probably no need, 
                 but if need, please refer to "Other" below to generate whl)
@@ -164,8 +170,8 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
  
 # Start:
     1. server:
-        sudo python3 BalanceService.py
-        If you are in "admin" permission, please run: python BalanceService.py
+        config/config.yaml # vendor: "generic" -> sudo python3 BalanceService.py
+        If you are in "admin" permission, config/config.yaml # vendor: "admin" -> python BalanceService.py
 
     2. client:
         cd web

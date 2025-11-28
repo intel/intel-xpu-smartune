@@ -19,6 +19,11 @@ blacklist:
   - kworker
   - dbus
   - missioncenter
+cooldown_time: 15
+cpu_busy_threshold: 90
+memory_busy_threshold: 90
+disk_utilization_threshold: 90
+regular_update_sys_pressure_time: 5
 workloads:
   - name: "critical"
     priority: 100

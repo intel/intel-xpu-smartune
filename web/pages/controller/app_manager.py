@@ -21,6 +21,7 @@ controlled_apps = []
 is_app_status_changed = False
 is_app_resources_limited = False
 is_app_manual_limit_by_user = False
+is_high_usage_multiple_instances = False
 current_app_name = ""
 
 
@@ -86,20 +87,25 @@ def app_callback_handler(notify_data):
 
 def send_notification():
     """主线程通知函数"""
-    global is_app_status_changed, is_app_resources_limited, is_app_manual_limit_by_user
+    global is_app_status_changed, is_app_resources_limited, is_app_manual_limit_by_user, \
+        is_high_usage_multiple_instances
     if is_app_resources_limited:
         st.toast(f'系统繁忙中，应用 {current_app_name} 被临时限制了资源使用，它将在系统资源空闲后适时恢复', icon='⚠️')
         is_app_resources_limited = False
     if is_app_status_changed:
         st.toast(f"应用 {current_app_name} 状态已更新", icon='ℹ️')
     if is_app_manual_limit_by_user:
-        st.toast('系统繁忙中，但您管控的应用都很关键，请合理选择应用进行资源限制处理', icon='⚠️')
+        st.toast('系统繁忙中，检测到关键管控应用正在运行，建议您手动调整资源分配策略', icon='⚠️')
         is_app_manual_limit_by_user = False
+    if is_high_usage_multiple_instances:
+        st.toast('系统繁忙中, 可能系统运行的应用太多，建议优化应用部署数量', icon='⚠️')
+        is_high_usage_multiple_instances = False
 
 
 def _process_callback():
     """主线程安全的状态更新处理"""
-    global is_app_status_changed, is_app_resources_limited, is_app_manual_limit_by_user, current_app_name
+    global is_app_status_changed, is_app_resources_limited, is_app_manual_limit_by_user, \
+        current_app_name, is_high_usage_multiple_instances
     while cb_running:
         try:
             # 非阻塞检查是否有新数据
@@ -142,6 +148,9 @@ def _process_callback():
                     if new_status == "manual_app_limit_by_user":
                         print(f"Notification: System busy, reminder user to limit app.")
                         is_app_manual_limit_by_user = True
+                    if new_status == "high_usage_by_multiple_instances":
+                        print(f"Notification: System busy, multiple instances consuming high resources.")
+                        is_high_usage_multiple_instances = True
         except Exception as e:
             print(f"Error processing callback data: {e}")
         time.sleep(0.1)

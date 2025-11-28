@@ -213,12 +213,12 @@ class AppIntercept(metaclass=SingletonMeta):
         logger.debug(f"Detected monitored app '{app_name}' (PID: {pid}, COMM: {comm}, FILE: {filename}, app_id: {app_id})")
 
         try:
-            # os.kill(pid, signal.SIGSTOP)
-            # 检查系统资源
+            os.kill(pid, signal.SIGSTOP)
+            # 检查系统资源get_current_pressure_level
             pressure = self.controlManager.get_current_pressure_level()
             logger.debug(f"Current system pressure level: {pressure}")
             if pressure != "critical":
-                # os.kill(pid, signal.SIGCONT)
+                os.kill(pid, signal.SIGCONT)
                 app_utils.callback_manager.send_callback_notification({
                     'app_id': app_id,
                     'app_name': app_name,
@@ -227,8 +227,7 @@ class AppIntercept(metaclass=SingletonMeta):
                 }, True)
             else:
                 logger.debug(f"System resources busy, skipping relaunch of {app_name}")
-                os.kill(pid, signal.SIGSTOP)
-                app_utils.safe_notify("System resources busy", f"已暂停应用{app_name}启动，请前往应用控制中心操作", icon='dialog-warning')
+                app_utils.safe_notify("System resources busy", f"已暂停应用{app_name}启动", icon='dialog-warning')
                 app_utils.callback_manager.send_callback_notification({
                     'app_id': app_id,
                     'app_name': app_name,

@@ -17,6 +17,8 @@ class ResourceMonitor:
         """初始化资源监视器"""
         self.config = b_config
         self.cpu_cores = os.cpu_count() or 16
+        self.prev_io = psutil.disk_io_counters()
+        self.prev_time = time.time()
 
         # 桌面应用信息
         try:
@@ -214,8 +216,10 @@ class ResourceMonitor:
         logger.debug(f"Top processes: {processes}")
 
         # Return empty list if top process doesn't meet minimum resource thresholds
-        if processes and (processes[0]['cpu_avg'] / self.cpu_cores < 20 # if CPU usage < 20% per core
-                          and processes[0]['mem_rss'] < psutil.virtual_memory().total * 0.05):  # 5% of total memory
+        # Since the minimum thresholds is 30% for uncontrolled apps, larger for controlled apps,
+        # we use 25% here to avoid false negatives.
+        if processes and (processes[0]['cpu_avg'] / self.cpu_cores < 25  # if CPU usage < 25% per core
+                          and processes[0]['mem_rss'] < psutil.virtual_memory().total * 0.25):  # 25% of total memory
             logger.info(f"Top process - {processes[0]['name']} does not meet minimum resource thresholds")
             reach_threshold = False
 
@@ -242,6 +246,25 @@ class ResourceMonitor:
         total_memory_mb = round(mem.total / (1024 ** 2), 2)  # 转换为MB并保留2位小数
         return total_memory_mb
 
+    def disk_utilization(self, device='nvme0n1', interval=1):
+        """获取单个磁盘的利用率（%）"""
+        cnt1 = psutil.disk_io_counters(perdisk=True).get(device)
+        time1 = time.time()
+        time.sleep(interval)
+        cnt2 = psutil.disk_io_counters(perdisk=True).get(device)
+        time2 = time.time()
+        if not cnt1 or not cnt2:
+            return 0.0
+        delta_time = (time2 - time1) * 1000  # 毫秒
+        busy_time = (cnt2.read_time - cnt1.read_time) + (cnt2.write_time - cnt1.write_time)
+        return min(100.0, 100 * busy_time / delta_time)
+
+    def get_physical_disks(self):
+        """获取所有物理磁盘设备名"""
+        cmd = "lsblk -d -o NAME,TYPE -n | awk '$2 == \"disk\" {print $1}'"
+        output = subprocess.check_output(cmd, shell=True, text=True).strip()
+        return output.splitlines() if output else []
+
     def get_resource_usage(self) -> dict:
         """获取系统整体资源使用率和剩余容量"""
         # CPU：核心数、使用率（%）
@@ -251,34 +274,106 @@ class ResourceMonitor:
 
         # 内存：总容量（GB）、使用率（%）、剩余容量占比
         mem = psutil.virtual_memory()
-        mem_total_gb = mem.total / (1024 **3)
+        mem_total_gb = round(mem.total / (1024 **3), 2)
         mem_usage = mem.percent
-        mem_available_ratio = mem.available / mem.total  # 剩余内存占比
-
-        # IO：磁盘使用率（取根目录）
-        disk = psutil.disk_usage('/')
-        io_usage = disk.percent
-        io_available_ratio = 1 - (disk.used / disk.total)
+        mem_available_ratio = round(mem.available / mem.total, 2)  # 剩余内存占比
 
         return {
             'cpu': {
                 'count': cpu_count,
                 'usage': cpu_usage,
                 'available': cpu_available,
-                'is_busy': cpu_usage > 90  # 暂定整体使用率 >90% 算busy
+                'is_busy': cpu_usage > self.config.cpu_busy_threshold  # 暂定整体使用率 >90% 算busy
             },
             'memory': {
                 'total_gb': mem_total_gb,
                 'usage': mem_usage,  # %
                 'available_ratio': mem_available_ratio,
-                'is_busy': mem_usage > 90
-            },
-            'io': {
-                'usage': io_usage,
-                'available_ratio': io_available_ratio,
-                'is_busy': io_usage > 90
+                'is_busy': mem_usage > self.config.memory_busy_threshold
             }
         }
+
+    def get_disk_io_usage(self) -> dict:
+        # 获取所有物理磁盘的利用率
+        disks = self.get_physical_disks()
+        disk_utils = {}
+        for disk in disks:
+            disk_utils[disk] = {
+                'utilization': round(self.disk_utilization(disk), 2),
+                'is_busy': False  # 将在下面判断
+            }
+
+        # 判断磁盘是否繁忙（基于利用率）
+        for disk in disk_utils:
+            disk_utils[disk]['is_busy'] = disk_utils[disk]['utilization'] > self.config.disk_utilization_threshold
+
+        return {'disk_io': disk_utils}
+
+    def get_disk_io_speed(self) -> dict:
+        """获取所有物理磁盘的读写速度（KB/s），基于 prev_time/prev_io 模式"""
+        disks = self.get_physical_disks()
+        curr_io = psutil.disk_io_counters(perdisk=True)
+        curr_time = time.time()
+        time_elapsed = curr_time - self.prev_time
+
+        result = {}
+        for disk in disks:
+            # 初始化 prev_io 如果不存在
+            if not hasattr(self, 'prev_io') or disk not in self.prev_io:
+                self.prev_io = curr_io
+                self.prev_time = curr_time
+                result[disk] = {'read_kb_per_sec': 0.0, 'write_kb_per_sec': 0.0}
+                continue
+
+            # 计算读写速度
+            if time_elapsed > 0:
+                read_kb = (curr_io[disk].read_bytes - self.prev_io[disk].read_bytes) / 1024
+                write_kb = (curr_io[disk].write_bytes - self.prev_io[disk].write_bytes) / 1024
+                read_kb_per_sec = read_kb / time_elapsed
+                write_kb_per_sec = write_kb / time_elapsed
+            else:
+                read_kb_per_sec = write_kb_per_sec = 0.0
+
+            result[disk] = {
+                'read_kb_per_sec': round(read_kb_per_sec, 2),
+                'write_kb_per_sec': round(write_kb_per_sec, 2)
+            }
+
+        # 更新状态
+        self.prev_io = curr_io
+        self.prev_time = curr_time
+
+        # logger.debug(f"Disk IO speeds: {result}")
+        return {'disk_io': result}
+
+    def get_disk_stats(self) -> dict:
+        """
+        所有磁盘IO利用率和读写速度的统计结果
+        返回格式:
+        {
+            "disk_io": {
+                "nvme0n1": {
+                    "utilization": 45.2,
+                    "is_busy": True,
+                    "read_kb_per_sec": 1024 kB/s,
+                    "write_kb_per_sec": 512 kB/s,
+                },
+                ...
+            }
+        }
+        """
+        usage_data = self.get_disk_io_usage()['disk_io']
+        speed_data = self.get_disk_io_speed()['disk_io']
+
+        # 合并结果
+        merged_result = {}
+        for disk in usage_data.keys():
+            merged_result[disk] = {
+                **usage_data[disk],  # 包含 utilization 和 is_busy
+                **speed_data.get(disk, {})  # 包含 read/write_kb_per_sec
+            }
+
+        return {'disk_io': merged_result}
 
 def main():
     """调试用主函数"""

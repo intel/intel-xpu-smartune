@@ -7,7 +7,7 @@ from monitor.appIntercept import AppIntercept
 
 from utils.logger import logger
 from utils import app_utils
-from config.config import Config
+from config.config import b_config
 import threading
 from multiprocessing import JoinableQueue
 import queue
@@ -86,6 +86,7 @@ class DynamicBalancer:
     def __init__(self):
         self.bpf_monitor = AppIntercept("monitor/bpf_event.c")
         # self.controlManager = ControlManager()
+        self.config = b_config
         self.controlManager = self.bpf_monitor.controlManager
         self.resource_monitor = self.controlManager.res
 
@@ -201,7 +202,8 @@ class DynamicBalancer:
                             logger.debug(f"Balance- was the process limited before? {is_limited_app_dominant}")
                             self.controlManager.set_limited_app_dominant(is_limited_app_dominant)
                             # 调用独立的处理函数
-                            should_adjust, is_controlled, app_id, limit_rate = self._handle_critical_pressure(top_consume_apps)
+                            should_adjust, is_controlled, app_id, limit_rate = self._handle_critical_pressure(
+                                top_consume_apps, reach_threshold)
 
                             if not is_limited_app_dominant and reach_threshold and should_adjust and app_id:
                                 # 执行资源调整
@@ -232,7 +234,7 @@ class DynamicBalancer:
 
                             # 无论是否处理，都移除已检查的app
                             top_consume_apps.pop(0)
-                            idle_check_interval = 5  # critical下，缩短检测时间
+                            # idle_check_interval = 5  # critical下，缩短检测时间
                         else:
                             reset_state()
                     elif not self.app_priority_queue.empty():
@@ -345,14 +347,19 @@ class DynamicBalancer:
                 time.sleep(3)
                 break
 
-    def _handle_critical_pressure(self, top_consumers):
+    def _handle_critical_pressure(self, top_consumers, reach_threshold):
         """处理资源压力 (单次执行只处理一个app)"""
         if not top_consumers:
             return False, False, None, None
 
+        cooldown_time = self.config.cooldown_time
         # 记录连续critical次数 (类成员变量)
         if not hasattr(self, '_critical_counter'):
             self._critical_counter = 0
+
+        # 初始化最后一次通知时间（如果不存在）
+        if not hasattr(self, '_last_notification_time'):
+            self._last_notification_time = 0
 
         # 每次取第一个app处理
         app_info = top_consumers[0]
@@ -380,6 +387,28 @@ class DynamicBalancer:
             controlled_data = controlled_map.get(app_id) or name_map.get(app_name)
             priority = controlled_data.get('priority') if controlled_data else None
 
+        # 或者系统实际资源使用情况
+        usage_data = self.resource_monitor.get_resource_usage()
+        is_sys_busy = usage_data['cpu']['is_busy'] or usage_data['memory']['is_busy']
+
+        # 情况0：特殊场景处理 - 多个相同应用实例占满内存且限制无意义时
+        # 系统pressure critical + 实际资源使用busy + top1 app资源占用不超过阈值 -> 不限制，发送通知
+        if (is_sys_busy and
+                not reach_threshold):
+            current_time = time.time()
+
+            if current_time - self._last_notification_time >= cooldown_time:  # 避免不停发送消息
+                app_utils.callback_manager.send_callback_notification({
+                    'app_id': "",
+                    'app_name': "",
+                    'status': "high_usage_by_multiple_instances",
+                    'purpose': "notify"
+                }, False)
+                self._last_notification_time = current_time
+
+            self._critical_counter = 0  # 重置计数器
+            return False, False, None, None
+
         # 情况1：非管控应用 -> 直接调整
         if not is_controlled:
             self._critical_counter = 0  # 重置计数器
@@ -395,12 +424,15 @@ class DynamicBalancer:
 
         # 检查是否连续n次critical
         if self._critical_counter >= 1:
-            app_utils.callback_manager.send_callback_notification({
-                'app_id': "",
-                'app_name': "",
-                'status': "manual_app_limit_by_user",
-                'purpose': "notify"
-            }, False)
+            current_time = time.time()
+            if current_time - self._last_notification_time >= cooldown_time:
+                app_utils.callback_manager.send_callback_notification({
+                    'app_id': "",
+                    'app_name': "",
+                    'status': "manual_app_limit_by_user",
+                    'purpose': "notify"
+                }, False)
+                self._last_notification_time = current_time
 
             self._critical_counter = 0  # 重置计数器
 

@@ -1,5 +1,9 @@
+from typing import Tuple
+
 import requests
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from utils.logger import logger
 from monitor.psi import PSIMonitor
@@ -31,41 +35,61 @@ class ControlManager:
         self.balance_url = f"{self.config.balance_service['url']}:{self.config.balance_service['port']}"
 
         self._current_level = None
+        self.score = 0.0
         self._last_update_time = 0
-        self._CACHE_TTL = 5
+        self._CACHE_TTL = self.config.regular_update_sys_pressure_time
         self._is_limited_app_dominant = False
+        self._update_lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=1)
+
+        self._start_auto_refresh_update_system_pressure()
 
     def set_limited_app_dominant(self, is_dominant: bool):
         """设置受限应用是否占主导状态"""
         if self._is_limited_app_dominant != is_dominant:
             self._is_limited_app_dominant = is_dominant
-            self._current_level = None  # 强制下次更新
+
+    def _start_auto_refresh_update_system_pressure(self):
+        """启动定时更新system压力状态"""
+        def refresh_loop():
+            while True:
+                time.sleep(self._CACHE_TTL * 0.9)
+                self._safe_update()
+
+        threading.Thread(target=refresh_loop, daemon=True).start()
+
+    def _safe_update(self):
+        """线程安全的更新操作"""
+        if self._update_lock.acquire(blocking=False):
+            try:
+                self._current_level, self.score = self._update_pressure_level()
+            finally:
+                self._update_lock.release()
 
     def get_current_pressure_level(self) -> str:
         """获取当前压力等级（无需参数）"""
-        current_time = time.time()
-        if (self._current_level is None or
-                current_time - self._last_update_time > self._CACHE_TTL):
-            self._current_level = self._update_pressure_level()
+        logger.debug("Current PSI level: %s (pressure: %.2f)", self._current_level, self.score)
         return self._current_level
 
-    def _update_pressure_level(self) -> str:
+    def _update_pressure_level(self) -> tuple[str, float]:
         """更新压力等级（使用内部状态）"""
         try:
             psi_data = self.psi.get_current_pressure()
             usage_data = self.res.get_resource_usage()
+            disk_io = self.res.get_disk_stats()
             score = self.analyzer.calculate_pressure_score(
                 psi_data,
                 usage_data,
                 self._is_limited_app_dominant
             )
+            logger.debug(f"disk_io={disk_io}")
             level = self.analyzer.get_pressure_level(score)
-            logger.debug("Updated PSI level: %s (pressure: %.2f)", level, score)
+            # logger.debug("Updated PSI level: %s (pressure: %.2f)", level, score)
             self._last_update_time = time.time()
-            return level
+            return level, score
         except Exception as e:
             logger.error("Failed to update pressure level: %s", str(e))
-            return "unknown"
+            return "unknown", 0.0
 
     def adjust_resources(self, app_id: str, policy: str, **resource_kwargs):
         """Adjust resources with optional parameters (保持原接口兼容)"""
@@ -160,3 +184,7 @@ class ControlManager:
         if priority not in self.config.app_priority:
             raise ValueError(f"Invalid priority: {priority_str}")
         return self.config.app_priority[priority]
+
+    def __del__(self):
+        """清理线程池资源"""
+        self._executor.shutdown(wait=False)

@@ -14,6 +14,11 @@ class Config:
     balance_service: dict = None
     app_priority: dict = None
     blacklist: list = None
+    cooldown_time: float = 15
+    cpu_busy_threshold: float = 90
+    memory_busy_threshold: float = 90
+    disk_utilization_threshold: float = 90
+    regular_update_sys_pressure_time: float = 5
 
     @classmethod
     def from_file(cls, path: str):

@@ -66,22 +66,70 @@ class ClientCallbackManager:
 # 单例实例
 callback_manager = ClientCallbackManager()
 
+def get_cgroup_path_by_pid(pid):
+    try:
+        with open(f"/proc/{pid}/cgroup", "r") as f:
+            for line in f:
+                parts = line.strip().split(":")
+                if len(parts) == 3:
+                    # cgroup v2: 0::<path>
+                    return parts[2]
+    except Exception:
+        pass
+    return None
+def get_controlled_apps_config(apps_dict=None):
+    if apps_dict is None:
+        apps_dict = {}
+    # 配置文件 controlled_apps，补充数据库没有的项
+    if hasattr(b_config, 'controlled_apps') and b_config.controlled_apps:
+        for app in b_config.controlled_apps:
+            app_name = app.get("app_name")
+            app_id = app.get("app_id")
+            priority = app.get("priority")
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                if app_name and app_name.lower() in proc.name().lower():
+                    cg_path = get_cgroup_path_by_pid(proc.pid)
+                    if cg_path and app_id in cg_path:
+                        if app_id not in apps_dict:
+                            apps_dict[app_id] = {
+                                "app_name": app_name,
+                                "app_id": app_id,
+                                "priority": priority,
+                                "pid": proc.pid,
+                                "cgroup_path": cg_path,
+                            }
+                        break
 
 def get_controlled_apps():
+    apps_dict = {}
+    # 1. 先查数据库 controlled_apps，优先使用数据库
     try:
         controlled_apps = AIAppPriority.query().filter(AIAppPriority.controlled == True)
-        return [{
-            "app_name": app.name,
-            "app_id": app.app_id,
-            "controlled": app.controlled,
-            "priority": app.priority,
-            "cmdline": app.cmdline,
-        } for app in controlled_apps] if controlled_apps else None
-
+        for app in controlled_apps:
+            app_name = getattr(app, "name", None)
+            app_id = getattr(app, "app_id", None)
+            priority = getattr(app, "priority", None)
+            cmdline = getattr(app, "cmdline", None)
+            pid = None
+            cgroup_path = None
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                if app_name and app_name.lower() in proc.name().lower():
+                    cg_path = get_cgroup_path_by_pid(proc.pid)
+                    if cg_path and app_id in cg_path:
+                        apps_dict[app_id] = {
+                            "app_name": app_name,
+                            "app_id": app_id,
+                            "priority": priority,
+                            "pid": proc.pid,
+                            "cgroup_path": cg_path,
+                        }
+                        break
     except Exception as e:
         logger.error(f"Database query failed: {str(e)}", exc_info=True)
-        return None
 
+    get_controlled_apps_config(apps_dict)
+    # 3. 返回合并后的列表
+    return list(apps_dict.values()) if apps_dict else None
 
 def _get_executable_name(app_name, app_cmdline):
     if not app_cmdline:
@@ -348,4 +396,3 @@ def get_dbus_address():
         pass
 
     return None
-

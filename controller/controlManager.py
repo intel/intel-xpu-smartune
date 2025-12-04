@@ -83,13 +83,26 @@ class ControlManager:
                 self._is_limited_app_dominant
             )
             logger.debug(f"disk_io={disk_io}")
-            level = self.analyzer.get_pressure_level(score)
+            level = self.analyzer.get_pressure_level(score, self.config.thresholds)
             # logger.debug("Updated PSI level: %s (pressure: %.2f)", level, score)
             self._last_update_time = time.time()
             return level, score
         except Exception as e:
             logger.error("Failed to update pressure level: %s", str(e))
             return "unknown", 0.0
+
+    def update_network_pressure_level(self, network_data):
+        """
+        单独更新网络压力等级
+        返回: (tx_level, rx_level)
+        """
+        try:
+            tx_level = self.analyzer.get_pressure_level(network_data['tx'], self.config.network_thresholds)
+            rx_level = self.analyzer.get_pressure_level(network_data['rx'], self.config.network_thresholds)
+            return tx_level, rx_level
+        except Exception as e:
+            logger.error("Failed to update network pressure level: %s", str(e))
+            return ("unknown", "unknown")
 
     def adjust_resources(self, app_id: str, policy: str, **resource_kwargs):
         """Adjust resources with optional parameters (保持原接口兼容)"""

@@ -12,6 +12,9 @@ import threading
 from multiprocessing import JoinableQueue
 import queue
 import heapq
+import subprocess
+from controller.network import NetworkController
+
 
 g_limited_apps = {}  # 记录被限制的应用
 g_app_id_mapping = {}  # {app_id: effective_app_id}
@@ -101,6 +104,8 @@ class DynamicBalancer:
 
         self._init_default_workloads()
 
+        # 网络控制器
+        self.network_controller = NetworkController()
     def _init_default_workloads(self):
         default_groups = [
             WorkloadGroup("critical", 100, 300, 2<<30, 500),
@@ -115,6 +120,7 @@ class DynamicBalancer:
         """
         启动服务，包括启动服务线程来处理任务队列中的任务
         """
+        self.network_controller.setup_tc_classes_and_filters()
         self.is_running = True
 
         self.monitor_thread = threading.Thread(target=self._run_monitor_resource_loop, daemon=True)
@@ -133,6 +139,8 @@ class DynamicBalancer:
         global g_limited_apps, is_limited_app_dominant
         idle_check_interval = 10  # 2分钟（单位：秒）
         last_check_time = 0
+        last_network_sample_time = 0
+        network_sample_interval = 5  # 网络采样间隔（秒）
         top_consume_apps = []  # 保存获取到的top应用列表
         restore_pending = False  # 标记是否有待恢复的应用
         low_pressure_start_time = None  # 记录首次进入low状态的时间
@@ -279,7 +287,29 @@ class DynamicBalancer:
                                 low_pressure_start_time = None  # 重置计时器
                         else:
                             reset_state()
-
+                if self.network_controller.enable_network_control:
+                    self.network_controller.update_app_network_control()
+                    self.network_controller.network.get_tc_class_stats(self.network_controller.IFB_DEV, self.network_controller.handle_id + 1, classids=self.network_controller.ingress_classids, direction="ingress")
+                    self.network_controller.network.get_tc_class_stats(self.network_controller.dev, self.network_controller.handle_id, classids=self.network_controller.egress_classids, direction="egress")
+                self.network_controller.network.sample_network_pressure()
+                if current_time - last_network_sample_time >= network_sample_interval:
+                    # 采样 ingress 流量
+                    last_network_sample_time = current_time
+                    network_data = self.network_controller.network.get_current_pressure()
+                    tx_pressure, rx_pressure = self.controlManager.update_network_pressure_level(network_data)
+                    tx_total_bw = self.network_controller.total_bw * network_data['tx']
+                    rx_total_bw = self.network_controller.total_bw * network_data['rx']
+                    logger.debug(f"NetworkMonitor TX level: {tx_pressure} (pressure: {network_data['tx']:.2f}),"
+                            f" RX level: {rx_pressure} (pressure: {network_data['rx']:.2f})")
+                    if self.network_controller.enable_network_control:
+                        ingress_rates = self.network_controller.network.get_tc_class_stats_rate_ingress()
+                        egress_rates = self.network_controller.network.get_tc_class_stats_rate_egress()
+                        rates = self.network_controller.get_rates(self.network_controller.handle_id, egress_rates, ingress_rates)
+                        logger.debug(f"NetworkMonitor TX_total_BW={tx_total_bw:,.2f}kbit/s (App Class BW: System - {rates["egress_system"]:,.2f},"
+                                f" Critical - {rates["egress_critical"]:,.2f} , High - {rates["egress_high"]:,.2f}, Low - {rates["egress_low"]:,.2f}),"
+                                f" RX_total_BW={rx_total_bw:,.2f}kbit/s (App Class BW: System - {rates["ingress_system"]:,.2f},"
+                                f" Critical - {rates["ingress_critical"]:,.2f} , High - {rates["ingress_high"]:,.2f}, Low - {rates["ingress_low"]:,.2f})")
+                        self.network_controller.handle_network_pressure(tx_pressure, rx_pressure, ingress_rates, egress_rates, network_data)
                 time.sleep(1)
             except Exception as e:
                 logger.error(f"Error in monitor loop: {str(e)}", exc_info=True)
@@ -605,6 +635,7 @@ class DynamicBalancer:
         self.is_running = False
 
         self.restore_all_limited_apps_resources()
+        self.network_controller.clear_network_rules_on_exit()
         if hasattr(self, "monitor_thread"):
             self.monitor_thread.join(timeout=1)  # 等待线程结束
         if hasattr(self, "handle_thread"):

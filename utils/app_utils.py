@@ -12,6 +12,7 @@ from utils.logger import logger
 from db.DatabaseModel import AIAppPriority
 from typing import Optional, Dict, Any
 from config.config import b_config
+from gi.repository import Gio
 
 _original_oom_scores: dict[str, str] = {}
 
@@ -396,3 +397,28 @@ def get_dbus_address():
         pass
 
     return None
+
+
+def fetch_all_apps():
+    app_list = []
+    if hasattr(b_config, 'all_apps'):
+        apps = b_config.all_apps
+        for app in apps:
+            app_data = {
+                "name": app["name"],
+                "app_id": app["id"],
+                "cmdline": app["commandline"],
+                "display_name": app["name"]
+            }
+            app_list.append(app_data)
+    else:
+        apps = Gio.AppInfo.get_all()
+        for app in apps:
+            app_data = {
+                "name": app.get_name(),  # Calculator
+                "app_id": app.get_id(),  # org.gnome.Calculator.desktop
+                "cmdline": app.get_commandline() or "",  # gnome-calculator
+                "display_name": app.get_display_name()
+            }
+            app_list.append(app_data)
+    return app_list

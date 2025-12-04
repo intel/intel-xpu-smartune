@@ -1,16 +1,18 @@
-from bcc import BPF
 import os
 import signal
 import subprocess
 import time
-from threading import Timer
-from typing import List, Set, Dict, Any, Union
-from gi.repository import Gio
-import psutil
 from multiprocessing import JoinableQueue
+from threading import Timer
+from typing import Any, Dict, List, Set, Union
+
+import psutil
+from bcc import BPF
 from controller.controlManager import ControlManager
 from utils import app_utils
+from utils.app_utils import fetch_all_apps
 from utils.logger import logger
+
 
 # 定义与BPF代码中相同的常量
 COMM_LEN = 32
@@ -39,18 +41,6 @@ class AppIntercept(metaclass=SingletonMeta):
         self.monitored_app_launched = {}  # 当前已经启动的监控app
         self.pending_exit_events = {}  # 待处理的退出事件（PID: Timer）
 
-    def build_app_database(self) -> Dict[str, Dict[str, str]]:
-        """构建桌面应用数据库"""
-        db = {}
-        for app in Gio.AppInfo.get_all():
-            app_id = app.get_id()
-            if app_id.endswith('.desktop'):
-                db[app.get_name().lower()] = {
-                    'app_id': app_id,
-                    'command': app.get_commandline() or ''
-                }
-        return db
-
     def rebuild_controlled_map(self):
         self.controlled_app_map = app_utils.get_controlled_apps()
         self._rebuild_index()
@@ -71,14 +61,11 @@ class AppIntercept(metaclass=SingletonMeta):
         # logger.debug(f"\n[DEBUG] Checking process - comm: {comm}, filename: {filename}")
         # logger.debug(f"[DEBUG] Monitored apps: {self.monitored_apps}")
 
-        # 定义每个应用的可执行文件名
+        # 定义一些特殊的应用可执行文件名映射
+        cnf_appname = self.controlManager.config.monitor_apps
         app_executables = {
-            "System Monitor": ["gnome-system-monitor"],
-            "Calculator": ["gnome-calculator"],
-            "VLC media player": ["vlc"],
-            "Text Editor": ["gnome-text-editor"],
+            item['name']: item['bpf_name'] for item in cnf_appname
         }
-
         # 先尝试自定义中匹配
         app_flag = []
         for app in self.monitored_apps:

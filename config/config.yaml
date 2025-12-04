@@ -14,11 +14,29 @@ weights_top:
   cpu: 2
   memory: 7
   io: 1
+all_apps:
+  - name: "Calculator"  # Calculator
+    id: "org.gnome.Calculator.desktop"  # org.gnome.Calculator.desktop
+    commandline: "gnome-calculator"  # gnome-calculator
+  - name: "vlc" # VLC media player
+    id: "vlc.desktop"
+    commandline: "/usr/bin/vlc"
+  - name: "Text Editor" # Text Editor
+    id: "org.gnome.TextEditor.desktop"
+    commandline: "gnome-text-editor %U"
+monitor_apps:  # Applications to monitor for some specific handling
+  - name: "Calculator"
+    bpf_name: ["gnome-calculator"]
+  - name: "VLC media player"
+    bpf_name: ["vlc"]
+  - name: "System Monitor"
+    bpf_name: ["gnome-system-monitor"]
+  - name: "Text Editor"
+    bpf_name: ["gnome-text-editor"]
 blacklist:
   - systemd
   - kworker
   - dbus
-  - missioncenter
 cooldown_time: 15
 cpu_busy_threshold: 90
 memory_busy_threshold: 90

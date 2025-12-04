@@ -39,6 +39,16 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
     └── requirements.txt      # Dependencies
 ```
 
+# Network Control & Monitor Design
+The network control and monitoring module is designed as an independent component, separated from the system resource management logic.
+The main mechanisms are as below:
+    1. Traffic Control using cgroup + iptable/tc for ingress and egress network.
+    2. Periodically samples network interface traffic (currently only supports one network interface), calculates network pressure, and determines the current network pressure level (low/medium/high/critical) based on a moving average window.
+    3. Using tc/htb queues to assign classes for different priorities (low/high/critical/system; medium is treated as low priority), setting minimum bandwidth (rate) and maximum bandwidth (ceil) for each. Dynamically adjusts ceil to implement rate limiting.
+    4. Bandwidth limiting and recovery are both triggered by network pressure levels. When pressure reaches the critical level, limiting starts from the low-priority class by reducing its ceil to either half or the minimum rate, then applies the same strategy to the high-priority class. The critical class is never limited. As soon as the pressure drops below critical, the recovery process begins: first restoring the high-priority class (either fully or partially, based on usage), then the low-priority class, using the same approach. All regulation is based on real-time traffic pressure, not static quotas.
+    5. Assigns dedicated priority classes for common system ports (e.g., 22, 80, 443) to ensure bandwidth for system services.
+    6. Automatically allocates marks for controlled apps, binds them to the corresponding class using iptables + tc filter, and supports automatic rule cleanup when apps exit. All apps not explicitly included in the control list are treated as low-priority by default.
+    7. All parameters can be configured in config.yaml, including enabling/disabling network control, interface name, bandwidth ranges, pressure thresholds, system ports, etc.
 
 # Some useful commands and notes:
 
@@ -60,6 +70,20 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
         systemctl set-property --runtime httpd.service CPUShares=600 MemoryLimit=500M
         systemctl --user set-property --runtime evolution-addressbook-factory.service CPUQuota=50%
 
+    Network related commands:
+        # --- TC (Traffic Control) Class & Filter Inspection ---
+        tc -s class show dev enp1s0        # Show egress class stats for main NIC
+        tc -s class show dev ifb0          # Show ingress class stats for IFB device
+        tc -s filter show dev enp1s0       # Show all filters for main NIC
+
+        # --- TC Queue Discipline (qdisc) Cleanup ---
+        tc qdisc del dev enp1s0 handle 50: root   # Remove root qdisc for main NIC
+        tc qdisc del dev enp1s0 ingress           # Remove ingress qdisc for main NIC
+
+        # --- IPTables Rule Inspection and Cleanup ---
+        sudo iptables -t mangle -L OUTPUT -n --line-numbers   # List all mangle OUTPUT rules with line numbers
+        sudo iptables -t mangle -F OUTPUT                     # Flush all mangle OUTPUT rules
+        sudo iptables -t mangle -D OUTPUT <num>               # Delete specific mangle OUTPUT rule by line number
 
     Note:
     1. https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/6/html/resource_management_guide/starting_a_process
@@ -170,8 +194,11 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
  
 # Start:
     1. server:
-        config/config.yaml # vendor: "generic" -> sudo python3 BalanceService.py
-        If you are in "admin" permission, config/config.yaml # vendor: "admin" -> python BalanceService.py
+        config/config.yaml
+            enable_network_control: true -> default is enabled, disable with false
+            network_interface default use enp1s0, change to your specific interface
+            vendor: "generic" -> sudo python3 BalanceService.py
+            If you are in "admin" permission, config/config.yaml # vendor: "admin" -> python BalanceService.py
 
     2. client:
         cd web

@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 import os
-import psutil
-import subprocess
 import re
-from gi.repository import Gio
-from collections import defaultdict
+import subprocess
 import time
+from collections import defaultdict
 from time import sleep
-from utils.logger import logger
-from monitor.psi import PSIMonitor
+
+import psutil
 from config.config import b_config
+from utils.app_utils import fetch_all_apps
+from utils.logger import logger
+
+from monitor.psi import PSIMonitor
 
 
 class ResourceMonitor:
@@ -22,7 +24,7 @@ class ResourceMonitor:
 
         # 桌面应用信息
         try:
-            self.desktop_apps = {app.get_id(): app for app in Gio.AppInfo.get_all()}
+            self.desktop_apps = {app["app_id"]: app for app in fetch_all_apps()}
             logger.info(f"Loaded {len(self.desktop_apps)} desktop applications")
         except Exception as e:
             logger.warning(f"Could not load desktop apps: {str(e)}")
@@ -179,20 +181,20 @@ class ResourceMonitor:
             for app_id, app in self.desktop_apps.items():
                 try:
                     # 检查应用的可执行文件是否匹配
-                    cmd = app.get_commandline()
+                    cmd = app["commandline"]
                     if cmd and process_info['exe'] and process_info['exe'] in cmd:
                         return {
                             'type': 'desktop',
                             'id': app_id,
-                            'name': app.get_display_name()
+                            'name': app["display_name"]
                         }
 
                     # 检查应用名称是否匹配进程名
-                    if app.get_name().lower() in process_info['name'].lower():
+                    if app["name"].lower() in process_info['name'].lower():
                         return {
                             'type': 'desktop',
                             'id': app_id,
-                            'name': app.get_display_name()
+                            'name': app["display_name"]
                         }
                 except Exception:
                     continue

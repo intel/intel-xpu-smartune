@@ -85,7 +85,7 @@ def app_callback_handler(notify_data):
         print(f"Error in callback handler: {e}")
 
 
-def send_notification():
+def register_notification():
     """主线程通知函数"""
     global is_app_status_changed, is_app_resources_limited, is_app_manual_limit_by_user, \
         is_high_usage_multiple_instances
@@ -458,7 +458,7 @@ def apps_management():
 
     # if callback_data := ThreadSafeCallback.get():  # 安全获取最新回调
     #     _process_callback_data(callback_data)
-    send_notification()
+    register_notification()
     app_management(st.session_state.app_data)
     # 增加页面自动刷新配合callback，以实现状态更新，实测不会影响用户操作
     st_autorefresh(interval=1000, key="autorefresh")

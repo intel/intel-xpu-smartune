@@ -27,6 +27,8 @@ class Config:
     controlled_apps: list = None
     network_burst_map: dict = None
     network_system_ports: list = None
+    monitor_apps: dict = None
+    all_apps: dict = None
 
     @classmethod
     def from_file(cls, path: str):

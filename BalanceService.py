@@ -1,15 +1,17 @@
 import os
 import signal
-import requests
-from balancer.balancer import DynamicBalancer
-from utils.logger import logger
-from utils.app_utils import callback_manager, adjust_oom_priority
-from flask import Flask, request
-from threading import Lock
-from gi.repository import Gio
 from datetime import datetime
-from utils.http_utils import RetCode, construct_response
+from threading import Lock
+
+import requests
+from flask import Flask, request
+
+from balancer.balancer import DynamicBalancer
 from db.DatabaseModel import AIAppPriority, DBStatus, init_database
+from utils.app_utils import adjust_oom_priority, callback_manager, fetch_all_apps
+from utils.http_utils import RetCode, construct_response
+from utils.logger import logger
+
 
 app = Flask(__name__)
 _service_lock = Lock()
@@ -122,21 +124,11 @@ def get_apps():
     try:
         data = request.get_json()
         store = data.get('store', False)
-
-        apps = Gio.AppInfo.get_all()
-        app_list = []
-
-        for app in apps:
-            app_data = {
-                "name": app.get_name(),  # Calculator
-                "app_id": app.get_id(),  # org.gnome.Calculator.desktop
-                "cmdline": app.get_commandline() or ""  # gnome-calculator
-            }
-            app_list.append(app_data)
-
+        app_list = fetch_all_apps()
+        for app in app_list:
             if store:
                 # 检查应用是否已存在
-                app_id = app.get_id()
+                app_id = app["app_id"]
                 existing_app = None
 
                 try:
@@ -149,11 +141,11 @@ def get_apps():
                     AIAppPriority.insert_record(
                         id=app_id.replace('.desktop', ''),
                         app_id=app_id,
-                        name=app.get_name(),
+                        name=app["name"],
                         priority=0,  # 默认优先级
                         controlled=False,
                         remark="",
-                        cmdline=app.get_commandline(),
+                        cmdline=app["commandline"],
                         status="NA",
                         last_update_time=datetime.now()
                     )

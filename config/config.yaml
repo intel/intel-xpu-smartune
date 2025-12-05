@@ -94,3 +94,7 @@ network_system_ports:
   - 80
   - 443
   - 123
+testing_network_app:
+  - app_name: "iperf"
+    app_cgroup: "session-1879.scope"
+    priority: "critical"

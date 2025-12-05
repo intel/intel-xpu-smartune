@@ -32,7 +32,16 @@ class NetworkController:
                 "low": {"min": int(self.total_bw*0.1), "max": int(self.total_bw*0.3)},
                 "system": {"min": 50000, "max": 100000},
             }
+        burst_map = getattr(self.config, "network_burst_map", None)
+        if not burst_map:
+            burst_map = {
+                "critical": "64k",
+                "high": "32k",
+                "low": "16k",
+                "system": "8k"
+            }
         self.config_network_bw = config_network_bw
+        self.network_burst_map = burst_map
         self.ingress_classids = []
         self.egress_classids = []
         self.network = NetworkMonitor(self.config.network_interface,
@@ -132,14 +141,6 @@ class NetworkController:
         dev = self.dev
         IFB_DEV = self.IFB_DEV
         handle_id = self.handle_id
-        burst_map = getattr(self.config, "network_burst_map", None)
-        if not burst_map:
-            burst_map = {
-                "critical": "64k",
-                "high": "32k",
-                "low": "16k",
-                "system": "8k"
-            }
         subprocess.run(f"tc qdisc add dev {dev} root handle {handle_id}: htb default 30", shell=True)
         subprocess.run(f"tc class add dev {dev} parent {handle_id}: classid {handle_id}:1 htb rate {self.total_bw}kbit ceil {self.total_bw}kbit burst 128k cburst 128k", shell=True)
         subprocess.run("modprobe ifb", shell=True)
@@ -152,7 +153,7 @@ class NetworkController:
         for key in ["critical", "high", "low", "system"]:
             classid_egress = self._get_classid(handle_id, key)
             min_bw, max_bw = self._get_class_bandwidth(key)
-            burst = burst_map.get(key, "16k")
+            burst = self.network_burst_map.get(key, "16k")
             subprocess.run(f"tc class add dev {dev} parent {handle_id}:1 classid {classid_egress} htb rate {min_bw}kbit ceil {max_bw}kbit burst {burst} cburst {burst}", shell=True)
             classid_ifb = self._get_classid(handle_id+1, key)
             subprocess.run(f"tc class add dev {IFB_DEV} parent {handle_id+1}:1 classid {classid_ifb} htb rate {min_bw}kbit ceil {max_bw}kbit burst {burst} cburst {burst}", shell=True)
@@ -160,13 +161,13 @@ class NetworkController:
         self.ingress_classids = self._get_all_classids(self.handle_id, direction="ingress")
         self.egress_classids = self._get_all_classids(self.handle_id, direction="egress")
 
-    def _limit_network_class(self, dev, classid, min_bw, max_bw=None, direction="egress", level=None):
+    def _limit_network_class(self, dev, classid, min_bw, max_bw=None, burst="16k", direction="egress", level=None):
         if max_bw is None:
             max_bw = min_bw
-        subprocess.run(f"tc class change dev {dev} classid {classid} htb rate {min_bw}kbit ceil {max_bw}kbit", shell=True)
+        subprocess.run(f"tc class change dev {dev} classid {classid} htb rate {min_bw}kbit ceil {max_bw}kbit burst {burst} cburst {burst}", shell=True)
 
     def update_app_network_control(self):
-        controlled_apps = app_utils.get_controlled_apps() or []
+        controlled_apps = app_utils.get_controlled_apps_net() or []
         handle_id = self.handle_id
         dev = self.dev
         IFB_DEV = self.IFB_DEV
@@ -247,6 +248,7 @@ class NetworkController:
         min_bw = config_network_bw[key]["min"]
         max_bw = config_network_bw[key]["max"]
         classid = self._get_classid(handle, key)
+        burst = self.network_burst_map.get(key, "16k")
         current_class_bw = rates.get(classid, 0)
         half_bw = int((max_bw - min_bw) / 2 + min_bw)
         critical_threshold = self.config.network_thresholds["critical"] * config_total_rate
@@ -261,7 +263,7 @@ class NetworkController:
         # 分级进行恢复，从高到低，每次一个类别 (half -> max)
         if limit_stage > 0:
             if current_class_bw < stage_transition_point * 0.9:
-                self._limit_network_class(dev, classid, min_bw, max_bw, direction=direction, level=key)
+                self._limit_network_class(dev, classid, min_bw, max_bw, burst, direction=direction, level=key)
                 setattr(self, limit_stage_attr, stage_full)
                 logger.info(f"{direction.upper()} 恢复 {key} app class流量，完全放开到 {max_bw} kbit/s")
             else:
@@ -271,10 +273,10 @@ class NetworkController:
                     expected_total_bw = max_bw + actual_total_bw - half_bw
                 if expected_total_bw < critical_threshold:
                     if limit_stage in (4, 2):
-                        self._limit_network_class(dev, classid, min_bw, half_bw, direction=direction, level=key)
+                        self._limit_network_class(dev, classid, min_bw, half_bw, burst, direction=direction, level=key)
                         logger.info(f"{direction.upper()} 恢复 {key} app class 放开一半流量到 {half_bw} kbit/s")
                     else:
-                        self._limit_network_class(dev, classid, min_bw, max_bw, direction=direction, level=key)
+                        self._limit_network_class(dev, classid, min_bw, max_bw, burst, direction=direction, level=key)
                         logger.info(f"{direction.upper()} 恢复 {key} app class流量，完全放开到 {max_bw} kbit/s")
                     setattr(self, limit_stage_attr, stage_half)
                 else:
@@ -293,6 +295,7 @@ class NetworkController:
         min_bw = config_network_bw[key]["min"]
         max_bw = config_network_bw[key]["max"]
         classid = self._get_classid(handle, key)
+        burst = self.network_burst_map.get(key, "16k")
         current_stage_bw = rates.get(classid, 0)
         half_bw = int((max_bw - min_bw) / 2 + min_bw)
         # 限速到哪个阶段
@@ -306,15 +309,15 @@ class NetworkController:
         # 分级进行限速，从低到高，每次一个类别
         if stage in (0, 2):
             if current_stage_bw < stage_transition_point:
-                self._limit_network_class(dev, classid, min_bw, min_bw, direction=direction, level=key)
+                self._limit_network_class(dev, classid, min_bw, min_bw, burst, direction=direction, level=key)
                 setattr(self, limit_stage_attr, stage_full)
                 logger.info(f"{direction.upper()} 限速 {key} class app 流量到 {min_bw}")
             else:
-                self._limit_network_class(dev, classid, min_bw, half_bw, direction=direction, level=key)
+                self._limit_network_class(dev, classid, min_bw, half_bw, burst, direction=direction, level=key)
                 setattr(self, limit_stage_attr, stage_half if half_bw != min_bw else stage_full)
                 logger.info(f"{direction.upper()} 限速 {key} class app 流量到 {half_bw}")
         elif stage in (1, 3):
-            self._limit_network_class(dev, classid, min_bw, min_bw, direction=direction, level=key)
+            self._limit_network_class(dev, classid, min_bw, min_bw, burst, direction=direction, level=key)
             setattr(self, limit_stage_attr, stage_full)
             logger.info(f"{direction.upper()} 再次限速 {key} class app 流量到 {min_bw}")
 

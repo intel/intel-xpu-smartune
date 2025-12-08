@@ -53,7 +53,7 @@ class AppIntercept(metaclass=SingletonMeta):
     def trace_print(self) -> None:
         self.bpf.trace_print()
 
-    def get_main_process(self, comm: str, filename: str) -> (bool, str):
+    def get_main_process(self, comm: str, filename: str) -> tuple[bool, str]:
         """检查是否是主进程"""
         filename_lower = filename.lower()
         comm_lower = comm.lower()

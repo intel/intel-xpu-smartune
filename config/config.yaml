@@ -1,6 +1,6 @@
 psi_interval: 2.0
 cgroup_mount: "/sys/fs/cgroup"
-vendor: "admin"
+vendor: "generic"  # admin, generic
 thresholds:
   low: 0.4
   medium: 0.6
@@ -69,20 +69,20 @@ network_thresholds:
   high: 0.7
   critical: 0.9
 network_interface: "enp1s0" # 请根据实际情况修改为你的网络接口名称
-network_bandwidth_kbit: 1000000  # kbit/s
-config_network_bw: #kbit/s
+network_bandwidth_kbit: 100000  # 当前设置为100Mbps（小了10倍）便于测试，请根据实际带宽调整，单位为kbit/s
+config_network_bw:  # kbit/s, 不同优先级对应的带宽范围设置, 为了便于测试都缩小了10倍
   system:
-    min: 50000
-    max: 100000
+    min: 5000
+    max: 10000
   critical:
-    min: 600000
-    max: 900000
+    min: 60000
+    max: 90000
   high:
-    min: 300000
-    max: 800000
+    min: 30000
+    max: 80000
   low:
-    min: 100000
-    max: 800000
+    min: 10000
+    max: 80000
 network_burst_map:
   critical: "64k"
   high: "32k"

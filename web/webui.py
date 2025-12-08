@@ -26,15 +26,9 @@ if __name__ == "__main__":
 
     try:
         st.set_page_config(
-            page_title="AI NAS Multi-Apps Startup Manager",
             page_icon="🧊",
             initial_sidebar_state="collapsed",  #  'expanded' or 'collapsed'
-            layout="wide",
-            menu_items={
-                'Get Help': 'https://www.intel.com',
-                'Report a bug': "https://www.intel.com",
-                'About': f"""欢迎使用 AI NAS Multi-Apps Startup Manager {VERSION}！"""
-            }
+            layout="wide"
         )
 
         st.markdown("""

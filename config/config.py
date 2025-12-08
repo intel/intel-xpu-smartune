@@ -24,7 +24,7 @@ class Config:
     network_bandwidth_kbit: int = 1000000 #kbit/s
     enable_network_control: bool = True
     config_network_bw: dict = None
-    controlled_apps: list = None
+    testing_network_app: list = None
     network_burst_map: dict = None
     network_system_ports: list = None
     monitor_apps: dict = None

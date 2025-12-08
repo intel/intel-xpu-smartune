@@ -150,7 +150,7 @@ class NetworkMonitor:
                 rates[classid] = delta_bytes * 8 / 1000 / delta_time if delta_time > 0 else 0.0
         return rates
 
-    def get_tc_class_stats(self, dev: str, qdisc_handle: str, classids: list, direction: str = None) -> Dict[str, int]:
+    def get_tc_class_stats(self, dev: str, qdisc_handle: str | int, classids: list, direction: str = None) -> Dict[str, int]:
         """
         读取指定设备和 qdisc handle 下所有 class 的 tx/rx 字节数，并更新滑动窗口
         direction: "ingress" 或 "egress"，必须指定
@@ -219,7 +219,6 @@ class NetworkMonitor:
         获取窗口丢包率（rx/tx），单位时间内错误包占比
         返回(rx_drop_rate, tx_drop_rate)
         """
-        update_drop_stats()
         # errors在第3列，packets在第2列
         rx_drop_rate = self._rx_drop_history.diff_rate(num_idx=2, denom_idx=1)
         tx_drop_rate = self._tx_drop_history.diff_rate(num_idx=2, denom_idx=1)
@@ -261,7 +260,6 @@ class NetworkMonitor:
         计算窗口内TCP重传率
         返回值: float
         """
-        update_tcp_retrans_stats()
         # retrans在第2列，outsegs在第3列
         return self._retrans_history.diff_rate(num_idx=1, denom_idx=2)
 

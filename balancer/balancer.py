@@ -198,10 +198,9 @@ class DynamicBalancer:
                             # 判断该进程是否被限制过
                             for app_info in top_consume_apps:
                                 current_app_id = (app_info.get('app') or {}).get('id')
-                                current_app_name = (app_info.get('process') or {}).get('name')
+                                # current_app_name = (app_info.get('process') or {}).get('name')
 
-                                if (current_app_id and current_app_id in g_limited_apps) and \
-                                        (current_app_name and current_app_name in g_limited_apps.values()):
+                                if current_app_id and current_app_id in g_limited_apps:
                                     is_limited_app_dominant = True
                                     break
                                 else:

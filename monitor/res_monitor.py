@@ -21,7 +21,6 @@ class ResourceMonitor:
         self.cpu_cores = os.cpu_count() or 16
         self.prev_io = psutil.disk_io_counters()
         self.prev_time = time.time()
-
         # 桌面应用信息
         try:
             self.desktop_apps = {app["app_id"]: app for app in fetch_all_apps()}
@@ -31,81 +30,207 @@ class ResourceMonitor:
             self.desktop_apps = {}
 
     def _get_top_processes(self, n=1, samples=5, interval=1.0):
-        """返回按 cmdline 分组聚合后的 TOP 进程数据"""
-        cumulative = {}
+        """获取资源占用最高的应用（基于 cgroup 聚合）"""
+        # Step 1: 采样获取候选进程（考虑权重和进程组）
+        psi_data = PSIMonitor().get_current_pressure()
+        dynamic_weights = self._adjust_weights_by_pressure(psi_data)
+
+        candidate_procs = self._get_candidate_processes(
+            num=3,  # 候选，可能占用资源最高的app
+            samples=samples,
+            interval=interval,
+            dynamic_weights=dynamic_weights
+        )
+
+        # logger.debug(f"Candidate processes for cgroup aggregation: {candidate_procs}")
+        # Step 2: 收集所有不重复的cgroup_path
+        cgroup_paths = set()
+        for proc in candidate_procs:
+            cgroup_path = self._get_process_cgroup(proc['pid'])
+            if cgroup_path:
+                cgroup_paths.add(cgroup_path)
+
+        # Step 3: 按 cgroup 聚合进程（修改字段名，去掉 avg 逻辑）
+        cgroup_data = defaultdict(lambda: {
+            'cpu_total': 0,  # 所有进程 CPU 使用率总和（%）
+            'mem_percent_total': 0,  # 所有进程内存占用百分比总和（%）
+            'mem_rss_total': 0,  # 所有进程 RSS 内存总和（字节）
+            'io_read_total': 0,  # 所有进程 IO 读取总和（字节）
+            'count': 0,
+            'pids': set(),
+            'names': set(),  # 修复字段名（原为 'name'）
+            'cmdlines': set()  # 修复字段名（原为 'cmdline'）
+        })
+
+        # 缓存每个 cgroup 的 pid 列表和 Process 对象
+        cgroup_pids = {}
+        pid_process_map = {}
+
+        # 第一次遍历：初始化 CPU 计时器，并缓存数据
+        for cgroup_path in cgroup_paths:
+            pids_in_cgroup = self._get_pids_in_cgroup(cgroup_path)
+            cgroup_pids[cgroup_path] = pids_in_cgroup
+            for pid in pids_in_cgroup:
+                try:
+                    p = psutil.Process(pid)
+                    p.cpu_percent(interval=None)  # 初始化计时器
+                    pid_process_map[pid] = p  # 缓存 Process 对象
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+        time.sleep(0.1)  # 全局等待 100ms
+
+        # 第二次遍历：直接使用缓存的数据
+        for cgroup_path, pids_in_cgroup in cgroup_pids.items():
+            for pid in pids_in_cgroup:
+                if pid not in pid_process_map:
+                    continue
+                p = pid_process_map[pid]
+                try:
+                    with p.oneshot():
+                        cpu_percent = p.cpu_percent(interval=None)
+                        mem_info = p.memory_info()
+                        mem_percent = p.memory_percent()
+                        io_counters = p.io_counters() if p.io_counters() else None
+
+                    cgroup_data[cgroup_path]['cpu_total'] += cpu_percent
+                    cgroup_data[cgroup_path]['mem_percent_total'] += mem_percent
+                    cgroup_data[cgroup_path]['mem_rss_total'] += mem_info.rss
+                    if io_counters:
+                        cgroup_data[cgroup_path]['io_read_total'] += io_counters.read_bytes
+                    cgroup_data[cgroup_path]['count'] += 1
+                    cgroup_data[cgroup_path]['pids'].add(pid)
+                    cgroup_data[cgroup_path]['names'].add(p.name())
+                    cgroup_data[cgroup_path]['cmdlines'].add(' '.join(p.cmdline()) or p.name())
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+        # Step 4: 计算总分（CPU 按核心数归一化，其他用总量）
+        processes = []
+        for cgroup_path, data in cgroup_data.items():
+            if data['count'] > 0:
+                # CPU 使用率总和按核心数归一化（避免超过 100%）
+                cpu_total_normalized = data['cpu_total'] / self.cpu_cores
+                # 内存 RSS 转换为 GB
+                mem_rss_total_gb = data['mem_rss_total'] / (1024 ** 3)
+                # IO 读取速率转换为 MB/s
+                io_read_rate_mb = data['io_read_total'] / (samples * interval) / (1024 ** 2)
+
+                score = (
+                        dynamic_weights['cpu'] * min(cpu_total_normalized, 100) +
+                        dynamic_weights['memory'] * min(data['mem_percent_total'], 100) +
+                        dynamic_weights['io'] * min(io_read_rate_mb, 100)
+                )
+
+                processes.append({
+                    'pids': list(data['pids']),
+                    'cgroup': cgroup_path,
+                    'score': round(score, 2),
+                    'cpu_avg': round(cpu_total_normalized, 1),  # 归一化后的 CPU
+                    'mem_avg': round(data['mem_percent_total'], 1),
+                    'mem_rss': round(mem_rss_total_gb, 2),  # 单位：GB
+                    'io_read_rate': round(io_read_rate_mb, 2),  # 单位：MB/s
+                    'names': list(data['names']),
+                    'cmdlines': list(data['cmdlines'])
+                })
+
+        # logger.debug(f"Aggregated processes by cgroup: {processes}")
+        # Step 5: 返回评分最高的进程信息列表
+        return sorted(processes, key=lambda x: x['score'], reverse=True)[:n]
+
+    def _get_candidate_processes(self, num, samples, interval, dynamic_weights):
+        """采样获取候选进程（计算score筛选top进程，但只返回pid和name）"""
+        candidates = []
+        seen_pids = set()  # 用于记录已经处理过的PID
 
         for _ in range(samples):
+            current_sample = []
             for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_percent',
                                              'memory_info', 'memory_percent', 'io_counters',
                                              'create_time']):
                 try:
                     info = proc.info
-                    if not info.get('cmdline') or any(b in info.get('name', '') for b in self.config.blacklist):
+                    pid = info['pid']
+
+                    # 跳过已处理过的PID或黑名单进程
+                    if (pid in seen_pids or
+                            any(b in info.get('name', '') for b in self.config.blacklist) or
+                            time.time() - info['create_time'] < 2):
                         continue
-                    if time.time() - info['create_time'] < 2:
-                        continue
 
-                    # 关键修改：按 cmdline 分组，而非 pid
-                    cmdline = ' '.join(info['cmdline'])
-                    if cmdline not in cumulative:
-                        cumulative[cmdline] = {
-                            'cpu_sum': 0,
-                            'mem_percent_sum': 0,
-                            'mem_rss_sum': 0,
-                            'io_read_sum': 0,
-                            'count': 0,
-                            'name': info['name'],
-                            'cmdline': cmdline,
-                            'pids': set()  # 记录关联的 pids
-                        }
+                    seen_pids.add(pid)  # 标记为已处理
 
-                    # 累计各指标
-                    cumulative[cmdline]['cpu_sum'] += info['cpu_percent']
-                    cumulative[cmdline]['mem_percent_sum'] += info['memory_percent']
-                    cumulative[cmdline]['mem_rss_sum'] += info['memory_info'].rss
-                    if info['io_counters']:
-                        cumulative[cmdline]['io_read_sum'] += info['io_counters'].read_bytes
-                    cumulative[cmdline]['count'] += 1
-                    cumulative[cmdline]['pids'].add(info['pid'])
+                    # 计算带权重的实时评分（但不需要返回这些数据）
+                    io_read = info['io_counters'].read_bytes if info['io_counters'] else 0
+                    score = (
+                            dynamic_weights['cpu'] * min(info['cpu_percent'], 100) +
+                            dynamic_weights['memory'] * min(info['memory_percent'], 100) +
+                            dynamic_weights['io'] * min(io_read / 1024 / 1024, 10)
+                    )
 
+                    current_sample.append({
+                        'pid': pid,
+                        'name': info['name'],
+                        'score': score  # 仅用于排序
+                    })
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
 
+            # 按score降序排序，取前num个进程
+            current_sample_sorted = sorted(current_sample, key=lambda x: -x['score'])[:num]
+            candidates.extend(current_sample_sorted)
             if _ != samples - 1:
                 time.sleep(interval)
 
-        # 计算平均值
-        psi_data = PSIMonitor().get_current_pressure()
-        dynamic_weights = self._adjust_weights_by_pressure(psi_data)
+        return [{'pid': p['pid'], 'name': p['name']} for p in candidates]
 
-        processes = []
-        for cmdline, data in cumulative.items():
-            if data['count'] > 0:
-                # if "stress" in cmdline:
-                #     logger.debug(f"data count for {cmdline}: {data['count']}, data = {data}")
-                avg_cpu = data['cpu_sum'] / samples
-                avg_mem_percent = data['mem_percent_sum'] / samples
-                avg_mem_rss = data['mem_rss_sum'] / samples
-                io_read_rate = data['io_read_sum'] / (samples * interval)
+    def _get_process_cgroup(self, pid):
+        """获取进程的 cgroup 路径（从 /proc/<pid>/cgroup 解析）"""
+        try:
+            with open(f'/proc/{pid}/cgroup', 'r') as f:
+                for line in f:
+                    if line.strip():
+                        _, _, cgroup_path = line.strip().split(':', 2)
+                        if cgroup_path and cgroup_path != '/':
+                            return cgroup_path
+        except (FileNotFoundError, PermissionError, ValueError):
+            pass
+        return None
 
-                score = (
-                        dynamic_weights['cpu'] * min(avg_cpu, 100) +
-                        dynamic_weights['memory'] * min(avg_mem_percent, 100) +
-                        dynamic_weights['io'] * min(io_read_rate / 1024 / 1024, 10)
-                )
+    def _get_pids_in_cgroup(self, cgroup_path):
+        """获取指定cgroup下的所有进程PID"""
+        try:
+            result = subprocess.run(
+                ["systemd-cgls", "--no-page", cgroup_path],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            output = result.stdout
 
-                processes.append({
-                    'pids': list(data['pids']),  # 返回所有关联的 pids
-                    'name': data['name'],
-                    'cmdline': cmdline,
-                    'score': round(score, 2),
-                    'cpu_avg': round(avg_cpu, 1),
-                    'mem_avg': round(avg_mem_percent, 3),
-                    'mem_rss': avg_mem_rss,  # 总物理内存字节数（所有子进程之和）
-                    'io_read_rate': io_read_rate
-                })
+            if not output:
+                logger.debug(f"No output from systemd-cgls for cgroup {cgroup_path}")
+                return []
 
-        return sorted(processes, key=lambda x: x['score'], reverse=True)[:n]
+            pids = re.findall(r"[├└]─(\d+)\s+.+", output)
+            filtered_pids = []
+            for pid in map(int, pids):
+                try:
+                    cmdline = psutil.Process(pid).cmdline()
+                    if cmdline and cmdline[0] == "bash":
+                        continue  # Skip processes with cmdline "bash"
+                    filtered_pids.append(pid)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+            return filtered_pids
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Timeout while getting PIDs for cgroup {cgroup_path}")
+            return []
+        except Exception as e:
+            logger.error(f"Error getting PIDs for cgroup {cgroup_path}: {str(e)}")
+            return []
 
     def _adjust_weights_by_pressure(self, psi_data):
         """根据PSI压力动态调整权重"""
@@ -115,31 +240,6 @@ class ResourceMonitor:
             'memory': base_weights['memory'] * (1 + psi_data.get('memory', 0)),
             'io': base_weights['io']  # 保留但不再用于进程评分
         }
-
-    def _find_systemd_scope(self, pid):
-        """通过systemd-cgls查找进程所属的scope"""
-        try:
-            result = subprocess.run(
-                ['systemd-cgls', '--no-page'],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=True
-            )
-
-            # 查找包含指定PID的行及其父scope
-            lines = result.stdout.split('\n')
-            for i, line in enumerate(lines):
-                if f'─{pid} ' in line:
-                    # 向上查找最近的scope
-                    for j in range(i, -1, -1):
-                        if 'scope' in lines[j]:
-                            scope = re.search(r"─(.*?\.scope)", lines[j])
-                            if scope:
-                                return scope.group(1)
-        except Exception as e:
-            logger.warning(f"Failed to find systemd scope: {str(e)}")
-        return None
 
     def _find_systemd_unit(self, pid):
         """通过systemd-cgls查找进程所属的scope, service"""
@@ -175,14 +275,37 @@ class ResourceMonitor:
 
     def try_match_app(self, process_info):
         """尝试匹配桌面应用或systemd scope"""
-        # logger.debug(f"process_info: {process_info}")
-        # 1. 先尝试匹配桌面应用
+        # logger.debug(f"try_match_app process_info: {process_info}")
+        # 1. 先判断process_info中是否有cgroup字段，如果有直接拿出来按照正则表达式获取到名字
+        cgroup = process_info.get('cgroup')
+        if cgroup:
+            scope_name = cgroup.rstrip('/').split('/')[-1]
+            logger.debug(f"Extracted scope name from cgroup: {scope_name}")
+            return {
+                'type': 'cgroup',
+                'id': scope_name,
+                'name': f"CGroup: {scope_name}"
+            }
+
+        # 2. 尝试通过systemd-cgls查找scope或者service
+        if 'pids' in process_info and process_info['pids']:
+            unit = self._find_systemd_unit(process_info['pids'][0])  # the first PID
+            if unit:
+                logger.debug(f"try_match_app Matched systemd unit: {unit}")
+                return {
+                    'type': 'systemd',
+                    'id': unit,
+                    'name': f"Systemd cgroup: {unit}"
+                }
+
+        # 3. 尝试匹配桌面应用，最终还需要拿到cgroup路径
         if self.desktop_apps:
             for app_id, app in self.desktop_apps.items():
                 try:
                     # 检查应用的可执行文件是否匹配
-                    cmd = app["commandline"]
+                    cmd = app["cmdline"]
                     if cmd and process_info['exe'] and process_info['exe'] in cmd:
+                        logger.debug(f"try_match_app Matched desktop app by cmdline: {app_id}")
                         return {
                             'type': 'desktop',
                             'id': app_id,
@@ -191,27 +314,20 @@ class ResourceMonitor:
 
                     # 检查应用名称是否匹配进程名
                     if app["name"].lower() in process_info['name'].lower():
+                        logger.debug(f"try_match_app Matched desktop app by name: {app_id}")
                         return {
                             'type': 'desktop',
                             'id': app_id,
                             'name': app["display_name"]
                         }
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Catch error: {e}")
                     continue
-
-        # 2. 尝试通过systemd-cgls查找scope或者service
-        unit = self._find_systemd_unit(process_info['pids'][0])  # the first PID
-        if unit:
-            return {
-                'type': 'systemd',
-                'id': unit,
-                'name': f"Systemd cgroup: {unit}"
-            }
 
         return None
 
     def get_top_resource_consumers(self):
-        """获取资源占用最高的3个进程及其应用信息"""
+        """获取资源占用最高的1个进程及其应用信息"""
         results = []
         reach_threshold = True
         processes = self._get_top_processes(n=1)
@@ -220,18 +336,22 @@ class ResourceMonitor:
         # Return empty list if top process doesn't meet minimum resource thresholds
         # Since the minimum thresholds is 30% for uncontrolled apps, larger for controlled apps,
         # we use 25% here to avoid false negatives.
-        if processes and (processes[0]['cpu_avg'] / self.cpu_cores < 25  # if CPU usage < 25% per core
+        if processes and (processes[0]['cpu_avg'] < 25  # if CPU usage < 25% per core
                           and processes[0]['mem_rss'] < psutil.virtual_memory().total * 0.25):  # 25% of total memory
-            logger.info(f"Top process - {processes[0]['name']} does not meet minimum resource thresholds")
+            logger.info(f"Top process - {next(iter(processes[0]['names']), "unknown")} corresponding "
+                        f"app does not meet minimum resource thresholds")
             reach_threshold = False
 
         for process in processes:
+            process_name = next(iter(process['names']), "unknown")
+            process_cmdline = next(iter(process['cmdlines']), "unknown")
+
             app_info = self.try_match_app(process)
             results.append({
                 'process': {
-                    'pid': process['pids'][0],  # Use the first PID from 'pids'
-                    'name': process['name'],
-                    'cmdline': process['cmdline'],
+                    'pid': next(iter(process['pids']), None),  # Use the first PID from 'pids'
+                    'name': process_name,
+                    'cmdline': process_cmdline,
                     'score': round(process['score'], 3),
                     'cpu_avg': process['cpu_avg'],
                     'mem_rss': process['mem_rss'],

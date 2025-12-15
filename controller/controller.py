@@ -78,11 +78,11 @@ class Controller:
             print(f"An error occurred: {str(e)}")
             return []
 
-    def get_app_services(uid):
+    def get_app_services(self):
         apps = []
         try:
             possible_paths = [
-                f'/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/',
+                f'/sys/fs/cgroup/user.slice/user-{self.uid}.slice/user@{self.uid}.service/app.slice/',
                 f'/sys/fs/cgroup/system.slice/'
             ]
 

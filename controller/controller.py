@@ -213,7 +213,7 @@ class Controller:
         properties = []
         if not is_restore:
             if cpu_quota is not None:
-                properties.append(f"CPUQuota={cpu_quota}%")
+                properties.append(f"CPUQuota={cpu_quota * self.cpus}%")
             else:
                 properties.append("CPUQuota=")
             if mem_high is not None:

@@ -2,6 +2,7 @@ import os, signal, time
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from collections import OrderedDict
 from controller.controlManager import ControlManager
 from monitor.appIntercept import AppIntercept
 
@@ -16,7 +17,7 @@ import subprocess
 from controller.network import NetworkController
 
 
-g_limited_apps = {}  # 记录被限制的应用
+g_limited_apps = OrderedDict()  # 记录被限制的应用
 g_app_id_mapping = {}  # {app_id: effective_app_id}
 is_limited_app_dominant = False  # critical情况下，用于判断拿到的Top进程是否为已限制的进程
 
@@ -143,14 +144,15 @@ class DynamicBalancer:
         network_sample_interval = 5  # 网络采样间隔（秒）
         top_consume_apps = []  # 保存获取到的top应用列表
         restore_pending = False  # 标记是否有待恢复的应用
-        low_pressure_start_time = None  # 记录首次进入low状态的时间
+        pressure_start_time = None  # 记录压力值进入medium/low的时间
+        current_pressure = None  # 记录当前的压力值，主要用于判断压力状态是否稳定
         STABLE_PERIOD = 1800  # 30分钟的稳定期（秒）
         reach_threshold = False  # 有些app可能资源占用非常低，限制意义不大
         def reset_state():
-            nonlocal top_consume_apps, idle_check_interval, low_pressure_start_time
+            nonlocal top_consume_apps, idle_check_interval, pressure_start_time
             top_consume_apps = []
             idle_check_interval = 10
-            low_pressure_start_time = None  # 重置计时器
+            pressure_start_time = None  # 重置计时器
 
         while self.is_running:
             try:
@@ -163,7 +165,7 @@ class DynamicBalancer:
 
                     if pressure == "critical":
                         # 重置low状态计时器
-                        low_pressure_start_time = None
+                        pressure_start_time = None
                         # 如果是第一次检测到critical状态，获取top应用列表
                         restore_pending = False
                         if not top_consume_apps:
@@ -200,8 +202,9 @@ class DynamicBalancer:
                                 current_app_id = (app_info.get('app') or {}).get('id')
                                 # current_app_name = (app_info.get('process') or {}).get('name')
 
-                                if current_app_id and current_app_id in g_limited_apps:
-                                    is_limited_app_dominant = True
+                                if current_app_id in g_limited_apps:
+                                    _, _, state = g_limited_apps[current_app_id]
+                                    is_limited_app_dominant = (state != "partially_restored")  # 仅当未部分恢复时视为已限制
                                     break
                                 else:
                                     is_limited_app_dominant = False
@@ -228,7 +231,7 @@ class DynamicBalancer:
                                 )
                                 if auto_limit:
                                     # 记录已限制的应用
-                                    g_limited_apps[app_id] = app_name
+                                    g_limited_apps[app_id] = (app_name, limit_rate, None)  # None 表示完全限制
 
                                     if is_controlled:
                                         app_utils.update_app_status(app_id, "limited")
@@ -260,32 +263,65 @@ class DynamicBalancer:
                         # 处理完队列后重置top应用状态
                         reset_state()
                     else:
-                        # 非 critical 状态：每次恢复一个应用
-                        # 可能的bug： 需要一段时间后，或者可以判断资源<high后在恢复，不然可能刚限制又恢复了
-                        # 或者渐进式恢复？
-                        if pressure == "low" and g_limited_apps and not restore_pending:
-                            if low_pressure_start_time is None:
-                                # 第一次进入low状态，开始计时
-                                low_pressure_start_time = current_time
-                                logger.info(
-                                    f"Low pressure detected, starting {STABLE_PERIOD} sec countdown for restore")
-                            elif current_time - low_pressure_start_time >= STABLE_PERIOD:
-                                # 稳定期已过，执行恢复
-                                app_id, app_name = g_limited_apps.popitem()
-                                logger.info(f"Restoring CPU quota for app: {app_id}, name: {app_name}")
-                                restore_pending = True
-                                if self.controlManager.adjust_resources(app_id, "low"):
-                                    app_utils.update_app_status(app_id, "running")
-                                    app_utils.callback_manager.send_callback_notification({
-                                        'app_id': app_id,
-                                        'app_name': app_name,
-                                        'status': "running",
-                                        'purpose': "app"
-                                    }, False)
-                                restore_pending = False
-                                low_pressure_start_time = None  # 重置计时器
-                        else:
-                            reset_state()
+                        # 非 critical 状态：等待 STABLE_PERIOD 后恢复
+                        if g_limited_apps and not restore_pending:
+                            if pressure in ("medium", "low"):
+                                # 压力级别不稳定需要重新计时，只有压力稳定在某个级别才执行对应的动作
+                                if (pressure_start_time is None) or (current_pressure != pressure):
+                                    pressure_start_time = current_time
+                                    current_pressure = pressure
+                                    logger.info(
+                                        f"Pressure level changed to {pressure}. "
+                                        f"Will restore resources after {STABLE_PERIOD} sec if it remains stable."
+                                    )
+
+                                # 检查是否达到稳定期
+                                elif current_time - pressure_start_time >= STABLE_PERIOD:
+                                    restore_pending = True
+
+                                    # 根据压力级别选择恢复策略
+                                    if pressure == "medium":
+                                        # 这时还不能移除，因为还没全部恢复
+                                        app_id, (app_name, limit_rate, state) = next(iter(g_limited_apps.items()))
+                                        if state != "partially_restored":
+                                            total_mem = self.resource_monitor.get_total_memory()
+                                            logger.info(
+                                                f"Pressure remained at 'medium' for {STABLE_PERIOD} sec. "
+                                                f"Partially restoring app {app_id} (twice the rate of limited resources)."
+                                            )
+                                            medium_limit = self.controlManager.adjust_resources(
+                                                app_id,
+                                                "medium",
+                                                cpu_quota=int(100 * limit_rate * 2),  # 直接计算
+                                                mem_high=int(total_mem * limit_rate * 2),
+                                                io_weight=int(10000 * limit_rate * 2),
+                                                is_restore=False,
+                                            )
+                                            if medium_limit:
+                                                g_limited_apps[app_id] = (app_name, limit_rate, "partially_restored")
+                                            g_limited_apps.move_to_end(app_id)  # 移到末尾防止重复限制同一个app
+                                    else:  # pressure == "low"
+                                        # 完全恢复并移除
+                                        app_id, (app_name, _, _) = g_limited_apps.popitem()
+                                        logger.info(
+                                            f"Pressure remained at 'low' for {STABLE_PERIOD} sec. "
+                                            f"Fully restoring app {app_id} (100% resources)."
+                                        )
+                                        low_success = self.controlManager.adjust_resources(app_id, "low")
+                                        # 资源完全恢复后，需要通知用户
+                                        if low_success:
+                                            app_utils.update_app_status(app_id, "running")
+                                            app_utils.callback_manager.send_callback_notification({
+                                                'app_id': app_id,
+                                                'app_name': app_name,
+                                                'status': "running",
+                                                'purpose': "app"
+                                            }, False)
+
+                                    restore_pending = False
+                                    reset_state()  # 重置计时器和当前压力状态
+                            else:
+                                reset_state()
                 if self.network_controller.enable_network_control:
                     self.network_controller.update_app_network_control()
                     self.network_controller.network.get_tc_class_stats(self.network_controller.IFB_DEV, self.network_controller.handle_id + 1, classids=self.network_controller.ingress_classids, direction="ingress")
@@ -477,7 +513,7 @@ class DynamicBalancer:
         logger.info(f"Restoring resources for {len(g_limited_apps)} limited apps")
 
         # 遍历字典的副本以避免修改迭代中的字典
-        for app_id, app_name in list(g_limited_apps.items()):
+        for app_id, (app_name, _, _) in list(g_limited_apps.items()):
             try:
                 logger.info(f"Restoring resources for app: {app_id}, name: {app_name}")
                 self.controlManager.adjust_resources(app_id, "low")
@@ -561,7 +597,7 @@ class DynamicBalancer:
             logger.debug(f"  IO activity: {io_activity:.1f}MB -> weight {io_weight}")
 
         # 将app放入限制列表中，等待监控线程处理，适时自动恢复
-        g_limited_apps[effective_app_id] = app_name
+        g_limited_apps[effective_app_id] = (app_name, limit_rate, None)
         g_app_id_mapping[app_id] = effective_app_id  # 记录映射关系
         app_utils.update_app_status(app_id, "limited")
 

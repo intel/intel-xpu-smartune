@@ -13,9 +13,9 @@ class PressureAnalyzer:
         # 1. 已经被限制的进程仍是top1，则降低cpu/mem/io权重
         weights = self.weights.copy()
         if is_limited_app_dominant and not is_sys_busy:
-            weights['cpu'] = weights['cpu'] / 5    # 降低5倍
-            weights['memory'] = weights['memory'] / 5
-            weights['io'] = weights['io'] / 5
+            weights['cpu'] = round(weights['cpu'] / 3)    # 降低3倍
+            weights['memory'] = round(weights['memory'] / 3)
+            weights['io'] = round(weights['io'] / 3)
 
         base_score = (
             weights['cpu'] * psi_data.get('cpu', 0) +
@@ -26,7 +26,7 @@ class PressureAnalyzer:
         # 2. 查看资源整体使用率，如果剩余较多则把分数降低
         resource_adjust_factor = 1.0
         if is_limited_app_dominant and not is_sys_busy:
-            resource_adjust_factor = 0.5  # 当已经受限的应用占主导，但整体资源并不紧张时，降低分数
+            resource_adjust_factor = 0.6  # 当已经受限的应用占主导，但整体资源并不紧张时，降低分数
 
         # 3. 计算最终分数
         final_score = min(base_score * resource_adjust_factor, 1.0)

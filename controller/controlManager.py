@@ -111,7 +111,7 @@ class ControlManager:
                 f"Adjusting resources for app_id={app_id} with policy={policy} and resource_kwargs={resource_kwargs}")
             adjustments = {
                 'low': lambda: self._low_pressure_adjustment(app_id),
-                'medium': lambda: self._medium_pressure_adjustment(app_id),
+                'medium': lambda: self._medium_pressure_adjustment(app_id, **resource_kwargs),
                 'high': lambda: self._high_pressure_adjustment(app_id),
                 'critical': lambda: self._critical_pressure_adjustment(app_id, **resource_kwargs),
             }
@@ -132,11 +132,22 @@ class ControlManager:
 
         return all(results)
 
-    def _medium_pressure_adjustment(self, app_id: str):
+    def _medium_pressure_adjustment(self, app_id: str, **kwargs):
         """Medium pressure adjustments."""
+        logger.info("Performing medium pressure adjustments for app_id=%s", app_id)
+        cpu_quota = kwargs.get('cpu_quota', None)
+        mem_high = kwargs.get('mem_high', None)
+        io_weight = kwargs.get('io_weight', None)
+
         results = [
-            self.governor.set_powersave(),
-            self.controller.restore_cpu_throttle()
+            self.governor.set_performance(),
+            self.controller.set_all_resources(
+                app_id,
+                cpu_quota=int(cpu_quota) if cpu_quota is not None else None,
+                mem_high=int(mem_high) if mem_high is not None else None,
+                io_weight=int(io_weight) if io_weight is not None else None,
+                is_restore=False
+            )
         ]
 
         return all(results)

@@ -164,7 +164,7 @@ class NetworkMonitor:
                 rates[classid] = delta_bytes * 8 / 1000 / delta_time if delta_time > 0 else 0.0
         return rates
 
-    def get_tc_class_stats(self, dev: str, qdisc_handle: str | int, classids: list, direction: str = None) -> Dict[str, int]:
+    def get_tc_class_stats(self, dev: str, qdisc_handle: int, classids: list, direction: str = None) -> Dict[str, int]:
         """
         读取指定设备和 qdisc handle 下所有 class 的 tx/rx 字节数，并更新滑动窗口
         direction: "ingress" 或 "egress"，必须指定
@@ -213,73 +213,3 @@ class NetworkMonitor:
         """
         rx_avg, tx_avg = self._get_window_average()
         return {'rx': rx_avg, 'tx': tx_avg}
-
-    def update_drop_stats(self, window_sec=None):
-        """
-        采集丢包统计数据并添加到历史
-        """
-        window_sec = window_sec or self._WINDOW_SEC
-        self._rx_drop_history.window_sec = window_sec
-        self._tx_drop_history.window_sec = window_sec
-        # 采集数据
-        rx_packets = int(open(f"/sys/class/net/{self.interface}/statistics/rx_packets").read())
-        rx_errors = int(open(f"/sys/class/net/{self.interface}/statistics/rx_errors").read())
-        tx_packets = int(open(f"/sys/class/net/{self.interface}/statistics/tx_packets").read())
-        tx_errors = int(open(f"/sys/class/net/{self.interface}/statistics/tx_errors").read())
-        self._rx_drop_history.add(rx_packets, rx_errors)
-        self._tx_drop_history.add(tx_packets, tx_errors)
-    def get_drop_rate(self):
-        """
-        获取窗口丢包率（rx/tx），单位时间内错误包占比
-        返回(rx_drop_rate, tx_drop_rate)
-        """
-        # errors在第3列，packets在第2列
-        rx_drop_rate = self._rx_drop_history.diff_rate(num_idx=2, denom_idx=1)
-        tx_drop_rate = self._tx_drop_history.diff_rate(num_idx=2, denom_idx=1)
-        return rx_drop_rate, tx_drop_rate
-
-    def update_tcp_retrans_stats(self, window_sec=None):
-        """
-        采集TCP重传统计数据并添加到历史
-        """
-        window_sec = window_sec or self._WINDOW_SEC
-        self._retrans_history.window_sec = window_sec
-        retrans = None
-        outsegs = None
-        with open("/proc/net/netstat") as f:
-            lines = f.readlines()
-        for i in range(len(lines)):
-            if lines[i].startswith("TcpExt"):
-                keys = lines[i].split()
-                values = lines[i+1].split()
-                if "TCPFastRetrans" in keys:
-                    idx = keys.index("TCPFastRetrans")
-                    retrans = int(values[idx])
-                    break
-        with open("/proc/net/snmp") as f:
-            lines = f.readlines()
-        for i in range(len(lines)):
-            if lines[i].startswith("Tcp:"):
-                keys = lines[i].split()
-                values = lines[i+1].split()
-                if "OutSegs" in keys:
-                    idx = keys.index("OutSegs")
-                    outsegs = int(values[idx])
-                    break
-        if retrans is not None and outsegs is not None:
-            self._retrans_history.add(retrans, outsegs)
-
-    def get_tcp_retrans_rate(self):
-        """
-        计算窗口内TCP重传率
-        返回值: float
-        """
-        # retrans在第2列，outsegs在第3列
-        return self._retrans_history.diff_rate(num_idx=1, denom_idx=2)
-
-    def cleanup(self):
-        """资源清理（无文件描述符）"""
-        pass
-
-    def __del__(self):
-        self.cleanup()

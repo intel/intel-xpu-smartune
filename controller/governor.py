@@ -12,7 +12,6 @@
 #
 
 
-import os
 import subprocess
 from utils.logger import logger
 from config.config import b_config
@@ -53,9 +52,7 @@ class GovernorController:
                 text = True,
                 stdout = subprocess.DEVNULL
             )
-            #print(f"All CPUs set to {governor} mode")
         except subprocess.CalledProcessError as e:
-            #print(f"Error: {e}")
             logger.warning(f"Error: {e}")
 
     def set_performance(self) -> bool:

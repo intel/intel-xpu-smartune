@@ -27,10 +27,6 @@ def test_add_workload():
             "priority": "critical",
             "payload": {"pid": 12345, "task": "high_priority_service"}
         },
-        # {
-        #     "priority": "normal",
-        #     "payload": {"pid": 23456, "task": "regular_service"}
-        # }
     ]
 
     for data in payloads:

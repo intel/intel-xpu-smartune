@@ -13,7 +13,7 @@
 
 
 import subprocess
-from subprocess import check_output, Popen, PIPE
+from subprocess import check_output
 
 def get_user_scopes(uid):
     try:

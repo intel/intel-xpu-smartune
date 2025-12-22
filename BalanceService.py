@@ -12,12 +12,10 @@
 #
 
 
-import os
 import signal
 from datetime import datetime
 from threading import Lock
 
-import requests
 from flask import Flask, request
 
 from balancer.balancer import DynamicBalancer
@@ -85,7 +83,7 @@ def start_service():
             signal.signal(signal.SIGTERM, _handle_signal)
             _service.start()
         else:
-            print(">>>> DynamicService 已经存在，跳过初始化 <<<<")  # 调试日志
+            print(">>>> DynamicService 已经存在，跳过初始化 <<<<")
     return _service
 
 def _handle_signal(signum, frame):

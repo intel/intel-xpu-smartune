@@ -17,7 +17,6 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    psi_interval: float = 5.0
     cgroup_mount: str = "/sys/fs/cgroup"
     vendor: str = "generic"
     thresholds: dict = None

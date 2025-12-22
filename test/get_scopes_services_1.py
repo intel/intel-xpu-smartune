@@ -60,7 +60,7 @@ def get_app_slices(user):
 if __name__ == "__main__":
     # command used to get active user slices
     __slices_cmd = "systemctl list-units user-*.slice | grep -oE 'user-[^ ]*.slice' || [ $? = 1 ]"
-    # command to get scopes of the activae user slices
+    # command to get scopes of the activate user slices
     #__scopes_cmd = "find /sys/fs/cgroup/user.slice/%s -maxdepth 1 -type d" % _slices_cmd
 
     active_user = check_output(__slices_cmd, shell=True, universal_newlines=True).splitlines()

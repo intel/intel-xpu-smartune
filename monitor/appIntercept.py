@@ -14,17 +14,14 @@
 
 import os
 import signal
-import subprocess
-import time
 from multiprocessing import JoinableQueue
 from threading import Timer
-from typing import Any, Dict, List, Set, Union
+from typing import Any, List, Set, Union
 
 import psutil
 from bcc import BPF
 from controller.controlManager import ControlManager
 from utils import app_utils
-from utils.app_utils import fetch_all_apps
 from utils.logger import logger
 
 

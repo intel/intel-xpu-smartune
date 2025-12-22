@@ -12,7 +12,6 @@
 #
 
 
-import queue
 import threading, time
 from typing import Optional, Dict, Any
 
@@ -28,7 +27,6 @@ api = Client_multiapps_api()
 
 cb_running = False
 callback_semaphore = threading.Semaphore(0)
-# new_callback_event = threading.Event()
 
 controlled_apps = []
 
@@ -39,7 +37,6 @@ is_high_usage_multiple_instances = False
 current_app_name = ""
 
 
-# 优先级枚举定义 (放在模块顶部)
 class PriorityLevel(Enum):
     LOW = ("Low", 1)
     MEDIUM = ("Medium", 2)
@@ -71,7 +68,6 @@ def init():
 def get_all_apps():
     """获取所有可用应用"""
     apps = api.get_apps()
-    # print(f"Retrieved apps: {apps}")
     return apps or []
 
 
@@ -86,7 +82,7 @@ class CallbackData:
 callback_data = CallbackData()
 
 
-# ---------- 修改原回调处理器 ----------
+# 回调处理器
 def app_callback_handler(notify_data):
     """替换原来的队列操作"""
     print(f"App callback received: {notify_data}")
@@ -170,7 +166,6 @@ def _process_callback():
         time.sleep(0.1)
 
 
-# 辅助函数（可放在代码开头）
 def get_priority_color(priority):
     return {
         "critical": "#d00000",
@@ -267,7 +262,6 @@ def app_management(default_apps):
 
     with cols[3]:
         # if st.button("查看等待队列", key="pending_queue"):
-        # 直接构建要显示的HTML内容
         html_content = """
         <style>
         .task-card { padding: 1px; margin: 1px 0; border-radius: 5px; background: #f0f2f6; }
@@ -470,8 +464,6 @@ def apps_management():
         callback_manager.add_to_handler(app_callback_handler)
         st.session_state.callback_registered = True
 
-    # if callback_data := ThreadSafeCallback.get():  # 安全获取最新回调
-    #     _process_callback_data(callback_data)
     register_notification()
     app_management(st.session_state.app_data)
     # 增加页面自动刷新配合callback，以实现状态更新，实测不会影响用户操作

@@ -17,7 +17,7 @@ from enum import IntEnum
 import requests
 
 
-class HS_retcode(IntEnum):
+class BAL_retcode(IntEnum):
     SUCCESS = 0
     NOT_EFFECTIVE = 10
     EXCEPTION_ERROR = 100
@@ -44,7 +44,7 @@ class MABridge:
                 timeout=5
             )
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return True
             return False
         except Exception as e:
@@ -59,7 +59,7 @@ class MABridge:
         try:
             response = requests.post(url, json={})
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return response_data["data"]
             return []
         except requests.exceptions.RequestException as e:
@@ -75,7 +75,7 @@ class MABridge:
         try:
             response = requests.post(url, json=app_data)
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return response_data["data"]
             return {}
         except requests.exceptions.RequestException as e:
@@ -91,7 +91,7 @@ class MABridge:
         try:
             response = requests.post(url, json=app_data)
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return response_data["data"]
             return {}
         except requests.exceptions.RequestException as e:
@@ -107,7 +107,7 @@ class MABridge:
         try:
             response = requests.post(url, json=query_data)
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return response_data["data"]
             return {}
         except requests.exceptions.RequestException as e:
@@ -122,7 +122,7 @@ class MABridge:
         try:
             response = requests.post(url, json={})
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return response_data["data"]
             return []
         except requests.exceptions.RequestException as e:
@@ -139,7 +139,7 @@ class MABridge:
         try:
             response = requests.post(url, json=data)
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return True
             return False
         except requests.exceptions.RequestException as e:
@@ -156,7 +156,7 @@ class MABridge:
         try:
             response = requests.post(url, json=data)
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return True
             return False
         except requests.exceptions.RequestException as e:
@@ -174,7 +174,7 @@ class MABridge:
         try:
             response = requests.post(url, json=data)
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return True
             return False
         except requests.exceptions.RequestException as e:
@@ -190,7 +190,7 @@ class MABridge:
         try:
             response = requests.post(url, json=priority_data)
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return response_data["data"]
             return {}
         except requests.exceptions.RequestException as e:
@@ -206,7 +206,7 @@ class MABridge:
         try:
             response = requests.post(url, json=data)
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return True
             return False
         except requests.exceptions.RequestException as e:
@@ -222,7 +222,7 @@ class MABridge:
         try:
             response = requests.get(url, json=data)
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return response_data["data"]
             return []
         except requests.exceptions.RequestException as e:
@@ -238,7 +238,7 @@ class MABridge:
         try:
             response = requests.post(url, json=workload_data)
             response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == HS_retcode.SUCCESS:
+            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
                 return response_data["data"]
             return {}
         except requests.exceptions.RequestException as e:

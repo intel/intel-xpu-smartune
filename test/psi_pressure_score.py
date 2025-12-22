@@ -23,14 +23,12 @@ class WeightedPSIMonitor:
     MEMORY_PRESSURE_FILE = "/proc/pressure/memory"
     IO_PRESSURE_FILE = "/proc/pressure/io"
 
-    # 降低内存触发阈值（更容易检测到压力），IO阈值适当降低
     TRIGGER_CONFIG = {
-        'cpu': (100, 5),      # 5秒内累计100ms压力触发（保持不变）
+        'cpu': (100, 5),      # 5秒内累计100ms压力触发
         'memory': (1, 5),    # 降低内存阈值：5秒内累计50ms即触发
         'io': (100, 5)        # 降低IO阈值：5秒内累计200ms即触发
     }
 
-    # 新增状态等级阈值（基于总分）
     STATUS_LEVELS = {
         'low': 0.4,  # <40% 正常
         'medium': 0.6,  # 40%-60% 中等

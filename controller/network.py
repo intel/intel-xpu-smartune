@@ -12,12 +12,28 @@
 #
 
 
+import os
 import subprocess
 import time
 from utils.logger import logger
 from config.config import b_config
 from monitor.network import NetworkMonitor
 from utils import app_utils
+
+
+class _NoopNetworkMonitor:
+    """Fallback when network interface does not exist.
+
+    Provide only the methods that are called unconditionally in the main loop.
+    """
+
+    enabled = False
+
+    def sample_network_pressure(self):
+        return None
+
+    def get_current_pressure(self):
+        return {"rx": 0.0, "tx": 0.0}
 
 class NetworkController:
     def __init__(self):
@@ -58,8 +74,13 @@ class NetworkController:
         self.network_burst_map = burst_map
         self.ingress_classids = []
         self.egress_classids = []
-        self.network = NetworkMonitor(self.config.network_interface,
-                                      self.config.network_bandwidth_kbit)
+        # Only controller-level gating: if interface missing, skip all network sampling/control.
+        if not self.dev or not os.path.exists(f"/sys/class/net/{self.dev}"):
+            logger.warning(f"Network interface '{self.dev}' does not exist; disable network sampling/control.")
+            self.enable_network_control = False
+            self.network = _NoopNetworkMonitor()
+        else:
+            self.network = NetworkMonitor(self.dev, self.config.network_bandwidth_kbit)
 
     def _allocate_mark(self):
         if self.mark_pool:
@@ -155,6 +176,11 @@ class NetworkController:
         dev = self.dev
         IFB_DEV = self.IFB_DEV
         handle_id = self.handle_id
+
+        subprocess.run(f"tc qdisc del dev {dev} handle {handle_id}: root 2>/dev/null || true", shell=True)
+        subprocess.run(f"tc qdisc del dev {dev} ingress 2>/dev/null || true", shell=True)
+        subprocess.run(f"tc qdisc del dev {IFB_DEV} handle {handle_id+1}: root 2>/dev/null || true", shell=True)
+
         subprocess.run(f"tc qdisc add dev {dev} root handle {handle_id}: htb default 30", shell=True)
         subprocess.run(f"tc class add dev {dev} parent {handle_id}: classid {handle_id}:1 htb rate {self.total_bw}kbit ceil {self.total_bw}kbit burst 128k cburst 128k", shell=True)
         subprocess.run("modprobe ifb", shell=True)

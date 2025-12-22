@@ -12,7 +12,6 @@
 #
 
 
-import math
 from utils.logger import logger
 
 class PressureAnalyzer:

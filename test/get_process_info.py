@@ -36,10 +36,8 @@ def get_process_info(pid: int) -> Dict[str, Any]:
                 "create_time": p.create_time()
             }
     except (psutil.NoSuchProcess, psutil.AccessDenied):
-        return {}  # 忽略已结束或无权限的进程
+        return {}
 
-
-# 这个是实际获取到的process信息，如果考虑给前面的set_all_resources传参，
 
 def monitor_processes(top_n: int = 5) -> None:
     """监控系统进程并打印资源使用TOP N"""

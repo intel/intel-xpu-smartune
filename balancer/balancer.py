@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 from collections import OrderedDict
-from controller.controlManager import ControlManager
 from monitor.appIntercept import AppIntercept
 
 from utils.logger import logger
@@ -27,7 +26,6 @@ import threading
 from multiprocessing import JoinableQueue
 import queue
 import heapq
-import subprocess
 from controller.network import NetworkController
 
 
@@ -103,7 +101,6 @@ class MaxPriorityQueue:
 class DynamicBalancer:
     def __init__(self):
         self.bpf_monitor = AppIntercept("monitor/bpf_event.c")
-        # self.controlManager = ControlManager()
         self.config = b_config
         self.controlManager = self.bpf_monitor.controlManager
         self.resource_monitor = self.controlManager.res
@@ -121,6 +118,7 @@ class DynamicBalancer:
 
         # 网络控制器
         self.network_controller = NetworkController()
+
     def _init_default_workloads(self):
         default_groups = [
             WorkloadGroup("critical", 100, 300, 2<<30, 500),
@@ -152,7 +150,7 @@ class DynamicBalancer:
     def _run_monitor_resource_loop(self):
         logger.info("Monitor resource service started")
         global g_limited_apps, is_limited_app_dominant
-        idle_check_interval = 10  # 2分钟（单位：秒）
+        idle_check_interval = 10  # 单位：秒
         last_check_time = 0
         last_network_sample_time = 0
         network_sample_interval = 5  # 网络采样间隔（秒）
@@ -172,7 +170,7 @@ class DynamicBalancer:
             try:
                 current_time = time.time()
 
-                # 当队列不为空时立即处理，为空时每2分钟检查一次
+                # 当队列不为空时立即处理，为空时每10s检查一次
                 if not self.app_priority_queue.empty() or (current_time - last_check_time) >= idle_check_interval:
                     pressure = self.controlManager.get_current_pressure_level()
                     last_check_time = current_time
@@ -186,35 +184,34 @@ class DynamicBalancer:
                             top_consume_apps, reach_threshold = self.resource_monitor.get_top_resource_consumers()
                             # logger.debug(f"Top resource consumers(currently = 1): {top_consume_apps}")
                             """
-                              "Top resource consumers": [
-                                {
-                                  'process': {
-                                    'pid': 440637,
-                                    'name': 'stress',
-                                    'cmdline': 'stress --cpu 22 --io 3 --vm 3 --vm-bytes 20G',
-                                    'score': 89.88,
-                                    'cpu_avg': 826.1,
-                                    'mem_rss': 27639158374.4,
-                                    'io_read_rate': 8192.0
-                                  },
-                                  'app': {
-                                    'type': 'systemd',
-                                    'id': 'vte-spawn-5c914f63-2ec2-4449-a936-b4e3157fdb1a.scope                                                                                                                                ',
-                                    'name': 'Systemd Scope: vte-spawn-5c914f63-2ec2-4449-a936-b4e3157fdb1a.scope'
-                                  }
-                                },
-                                {
-                                  ...
-                                },
-                                ...
-                              ]                       
+                                Top resource consumers:[
+                                   {
+                                      "process":{
+                                         "pid":5508,
+                                         "name":"stress",
+                                         "cmdline":"stress --cpu 25 --io 30 --vm 3 --vm-bytes 21G",
+                                         "score":469.53,
+                                         "cpu_avg":96.2,
+                                         "mem_rss":16.11,
+                                         "io_read_rate":0.0
+                                      },
+                                      "app":{
+                                         "type":"cgroup",
+                                         "id":"vte-spawn-4573f009-2887-47a4-a7d8-f573b6965109.scope",
+                                         "name":"CGroup: vte-spawn-4573f009-2887-47a4-a7d8-f573b6965109.scope"
+                                      }
+                                   },
+                                   {  # Only top1 currently.
+                                     ...
+                                   },
+                                   ...
+                                ]
                             """
 
                         if top_consume_apps:
                             # 判断该进程是否被限制过
                             for app_info in top_consume_apps:
                                 current_app_id = (app_info.get('app') or {}).get('id')
-                                # current_app_name = (app_info.get('process') or {}).get('name')
 
                                 if current_app_id in g_limited_apps:
                                     _, _, state = g_limited_apps[current_app_id]
@@ -380,8 +377,7 @@ class DynamicBalancer:
                 # priority_value = {"Calculator": 1000, "test2": 1500, "test3": 1300}
                 priority = self.controlManager.get_app_priority(app_name=coming_app["app_name"])
                 logger.info(f"_run_handle_loop: App {coming_app['app_name']} priority is {priority}")
-                # priority = priority_value[coming_app["app_name"]]
-                #
+
                 # # 将任务放入待处理队列
                 priority_num = self.controlManager.get_priority_value(priority)
                 logger.debug(f"_run_handle_loop: priority value is {priority_num}")

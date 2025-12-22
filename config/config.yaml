@@ -1,4 +1,3 @@
-psi_interval: 2.0
 cgroup_mount: "/sys/fs/cgroup"
 vendor: "generic"  # admin, generic
 thresholds:
@@ -42,17 +41,6 @@ cpu_busy_threshold: 90
 memory_busy_threshold: 90
 disk_utilization_threshold: 90
 regular_update_sys_pressure_time: 5
-workloads:
-  - name: "critical"
-    priority: 100
-    cpu_weight: 300
-    memory_min: "2G"
-    io_weight: 500
-  - name: "best-effort"
-    priority: 20
-    cpu_weight: 50
-    memory_min: "0"
-    io_weight: 100
 balance_service:
   url: "http://127.0.0.1"
   port: 9001

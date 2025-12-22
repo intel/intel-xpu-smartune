@@ -16,7 +16,6 @@ import os
 import re
 import requests
 import subprocess
-import shutil
 import psutil
 from getpass import getuser
 from pwd import getpwnam

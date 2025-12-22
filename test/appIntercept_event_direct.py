@@ -95,14 +95,6 @@ class AppIntercept(metaclass=SingletonMeta):
                     self.handle_monitored_app(pid, comm, filename, app_name, desktop_id)
                     self.mark_process_handled(pid)
                 break
-        # is_main_process, app_name = self.get_main_process(filename)
-        # print(f"Is this filename main process? {is_main_process}, app_name={app_name}")
-        # if is_main_process:
-        #     # 防止重复处理同一个进程树
-        #     if not self.is_process_handled(pid):
-        #         desktop_id = self.app_db.get(app_name.lower(), {}).get('desktop_id', '')
-        #         self.handle_monitored_app(pid, comm, filename, app_name, desktop_id)
-        #         self.mark_process_handled(pid)
 
     def is_process_handled(self, pid: int) -> bool:
         """检查该进程是否已经被处理过"""
@@ -139,8 +131,6 @@ class AppIntercept(metaclass=SingletonMeta):
                 return
 
             os.kill(pid, signal.SIGSTOP)
-            # 更温和的终止方式
-            #self.graceful_terminate(pid, timeout=3)
 
             # 检查系统资源
             if self.check_system_resources():
@@ -155,7 +145,6 @@ class AppIntercept(metaclass=SingletonMeta):
                 # 延迟重启，避免频繁操作
                 # time.sleep(1)
                 os.kill(pid, signal.SIGCONT)
-                #self.relaunch(desktop_id or app_name)
             else:
                 print(f"System resources busy, skipping relaunch of {app_name}")
 
@@ -288,28 +277,3 @@ class AppIntercept(metaclass=SingletonMeta):
         except Exception as e:
             print(f"Critical error relaunching {app_name}: {str(e)}")
             return False
-
-
-# if __name__ == "__main__":
-#     # 初始化BPF
-#     bpf_monitor = AppIntercept()
-#
-#     # 添加应用到监控列表
-#     bpf_monitor.add_to_monitorlist("firefox")
-#     bpf_monitor.add_to_monitorlist("Calculator")
-#
-#     # 打开性能缓冲区
-#     bpf_monitor.bpf["events"].open_perf_buffer(bpf_monitor.print_event)
-#     print(f"Monitoring execve() for: {', '.join(bpf_monitor.get_monitored_apps())}")
-#     print("Ctrl+C to exit")
-#
-#     while True:
-#         try:
-#             # 同时处理trace打印和事件
-#             bpf_monitor.bpf.perf_buffer_poll(timeout=100)
-#         except KeyboardInterrupt:
-#             print("\nExiting...")
-#             break
-#         except Exception as e:
-#             print(f"Error: {e}")
-#             break

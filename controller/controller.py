@@ -14,7 +14,7 @@
 
 import os
 import subprocess
-from subprocess import check_output, Popen, PIPE
+from subprocess import check_output
 from typing import Optional
 
 from utils.logger import logger
@@ -27,7 +27,6 @@ class Controller:
         self.cgroup_mount = self.config.cgroup_mount
         self.cpus = os.cpu_count()
         self.uid = self.get_uid()
-        # self.default_cpu_max = self.get_cpu_max()
 
     def get_uid(self):
         # command used to get active user slices
@@ -252,7 +251,7 @@ class Controller:
             if not dbus_address:
                 raise Exception("无法获取DBus会话地址")
 
-            # 铁威马的系统上默认user由管理员权限，如果用sudo需要，sudo -u @user python BalancerService.py运行，不然把sudo去掉运行
+            # TOS的系统上默认user由管理员权限，如果用sudo需要，sudo -u @user python BalancerService.py运行，不然把sudo去掉运行
             # ['sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(), 'systemctl', 'set-property', '--runtime', matching_app]
 
             if getattr(self.config, "vendor", "") == "generic":

@@ -63,7 +63,7 @@ class ResourceMonitor:
             if cgroup_path:
                 cgroup_paths.add(cgroup_path)
 
-        # Step 3: 按 cgroup 聚合进程（修改字段名，去掉 avg 逻辑）
+        # Step 3: 按 cgroup 聚合进程
         cgroup_data = defaultdict(lambda: {
             'cpu_total': 0,  # 所有进程 CPU 使用率总和（%）
             'mem_percent_total': 0,  # 所有进程内存占用百分比总和（%）
@@ -71,8 +71,8 @@ class ResourceMonitor:
             'io_read_total': 0,  # 所有进程 IO 读取总和（字节）
             'count': 0,
             'pids': set(),
-            'names': set(),  # 修复字段名（原为 'name'）
-            'cmdlines': set()  # 修复字段名（原为 'cmdline'）
+            'names': set(),
+            'cmdlines': set()
         })
 
         # 缓存每个 cgroup 的 pid 列表和 Process 对象
@@ -418,7 +418,7 @@ class ResourceMonitor:
                 'count': cpu_count,
                 'usage': cpu_usage,
                 'available': cpu_available,
-                'is_busy': cpu_usage > self.config.cpu_busy_threshold  # 暂定整体使用率 >90% 算busy
+                'is_busy': cpu_usage > self.config.cpu_busy_threshold  # 整体使用率多少算busy
             },
             'memory': {
                 'total_gb': mem_total_gb,
@@ -435,7 +435,7 @@ class ResourceMonitor:
         for disk in disks:
             disk_utils[disk] = {
                 'utilization': round(self.disk_utilization(disk), 2),
-                'is_busy': False  # 将在下面判断
+                'is_busy': False
             }
 
         # 判断磁盘是否繁忙（基于利用率）

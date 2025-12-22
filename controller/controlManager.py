@@ -138,7 +138,6 @@ class ControlManager:
         logger.info("Performing low pressure adjustments for app_id=%s", app_id)
         results = [
             self.governor.set_powersave(),
-            # self.controller.restore_cpu_throttle()
             self.controller.set_all_resources(app_id, is_restore=True)
         ]
 
@@ -182,6 +181,7 @@ class ControlManager:
 
         return all([
             self.governor.set_performance(),
+            # TODO: 分别控制各组件，根据不同的config配置
             self.controller.set_all_resources(
                 app_id,
                 cpu_quota=int(cpu_quota) if cpu_quota is not None else None,
@@ -189,9 +189,6 @@ class ControlManager:
                 io_weight=int(io_weight) if io_weight is not None else None,
                 is_restore=False
             )
-            # self.io.set_weight("best-effort", 10),
-            # self.memory.set_limit("best-effort", "high", "20%"),
-            # self.io.set_limit("best-effort", "max", "1000"),
             # self.cpu.set_weight("critical", 500),
             # self.memory.protect("critical", "min", "4G")
         ])

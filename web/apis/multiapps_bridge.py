@@ -163,14 +163,13 @@ class MABridge:
             print('resource_limit request error: ', e)
             return False
 
-    def restore_resource(self, url, app_id, app_name):
+    def restore_resource(self, url, app_id):
         """ Restore resource for a specific app.
 
         :param app_id:
-        :param app_name:
         :return:
         """
-        data = {"app_id": app_id, "app_name": app_name}
+        data = {"app_id": app_id}
         try:
             response = requests.post(url, json=data)
             response_data = response.json()

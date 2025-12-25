@@ -25,6 +25,7 @@ class Config:
     workloads: dict = None
     balance_service: dict = None
     app_priority: dict = None
+    limit_policy: dict = None
     blacklist: list = None
     cooldown_time: float = 15
     cpu_busy_threshold: float = 90

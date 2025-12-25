@@ -50,8 +50,8 @@ class DynamicService:
     def resource_limit(self, app_id, app_name, priority):
         return self.balancer.set_resource_limit(app_id, app_name, priority)
 
-    def restore_resource(self, app_id, app_name):
-        return self.balancer.set_restore_resource(app_id, app_name)
+    def restore_resource(self, app_id):
+        return self.balancer.set_restore_resource(app_id)
 
     def add_control(self, app_name):
         self.balancer.bpf_monitor.add_to_monitorlist(app_name)
@@ -615,17 +615,16 @@ def app_resource_restore():
     try:
         data = request.get_json()
         app_id = data.get('app_id', "")
-        app_name = data.get('app_name', "")
 
         # 验证必要参数
-        if not app_id and not app_name:
+        if not app_id:
             return construct_response(
                 data={},
                 retcode=RetCode.ARGUMENT_ERROR,
                 retmsg="app_id and app_name must be provided"
             )
 
-        result = _service.restore_resource(app_id, app_name)
+        result = _service.restore_resource(app_id)
 
         if result:
             return construct_response(
@@ -639,6 +638,8 @@ def app_resource_restore():
                 retmsg="No matching app found or failed to restore resource"
             )
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         logger.error(f"Restore resource failed: {str(e)}")
         return construct_response(
             data={},

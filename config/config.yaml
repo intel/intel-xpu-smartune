@@ -50,6 +50,36 @@ app_priority:
   high: 80
   medium: 50
   low: 20
+limit_policy: # 默认对不同优先级应用设置的资源限制比率
+  cpu:  # critical app 不做限制，因此不设置比率
+    enabled: true
+    rate:
+      high: 0.7  # 设置total的70%
+      medium: 0.5
+      low: 0.4
+      undefined: 0.3
+  memory:
+    enabled: true
+    rate:
+      high: 0.7  # MemoryHigh软限制
+      medium: 0.5
+      low: 0.4
+      undefined: 0.3
+  disk_io:  #
+    enabled: true  # 是否启用磁盘 IO 限制，默认不对不同应用做统一的被动限制，推荐通过 API 为各应用配置差异化的主动限制
+    rate:
+      high:
+        write: 50 # 设置默认写入为50MB/s
+        read: 60 # 设置默认读为60MB/s
+      medium:
+        write: 40
+        read: 50
+      low:
+        write: 20
+        read: 30
+      undefined:
+        write: 10
+        read: 20
 enable_network_control: true # 是否启用流量控制
 network_thresholds:
   low: 0.3

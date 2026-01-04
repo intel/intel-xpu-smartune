@@ -40,7 +40,6 @@ class ControlManager:
         self.analyzer = PressureAnalyzer(self.config)
 
         self.controller = Controller()
-        self.io = IOController(self.config.cgroup_mount)
         self.cpu = CPUController(self.config.cgroup_mount)
         self.memory = MemoryController(self.config.cgroup_mount)
         self.governor = GovernorController()

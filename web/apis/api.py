@@ -151,13 +151,12 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         """
         return self.ma_bridge.resource_limit(self.app_resource_limit_url, app_id, app_name, priority)
 
-    def restore_resource(self, app_id, app_name):
+    def restore_resource(self, app_id):
         """
-        :param app_id: according to app_id to do the resource limit.
-        :param app_name:
+        :param app_id: according to app_id to do the resource restore.
         :return:
         """
-        return self.ma_bridge.restore_resource(self.app_resource_restore_url, app_id, app_name)
+        return self.ma_bridge.restore_resource(self.app_resource_restore_url, app_id)
 
     def get_pending_apps(self):
         """

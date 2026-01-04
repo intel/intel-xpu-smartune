@@ -387,7 +387,7 @@ def app_management(default_apps):
 
                 if st.button(btn_text, key=f"limit_{idx}", type=btn_type, disabled=limit_disabled):
                     if st.session_state[limit_key]:
-                        restore_result = api.restore_resource(app["app_id"], app['app_name'])
+                        restore_result = api.restore_resource(app["app_id"])
                         if restore_result:
                             st.session_state[limit_key] = False
                             st.toast(f'已成功恢复应用{app["app_name"]}的资源!', icon='🎉')

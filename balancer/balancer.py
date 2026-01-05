@@ -260,19 +260,20 @@ class DynamicBalancer:
                                 # 磁盘IO限制
                                 io_limits = limit_rates.get("disk_io_rate", {})
                                 if io_limits:
-                                    if 'read' in io_limits:
-                                        io_limited = self.io_ctl.set_read_io_throttle_app(
-                                            app_id, io_limits['read'] * 1024 ** 2
-                                        )
-                                        if not io_limited:
-                                            logger.error(f"Failed to set read IO limit for {app_name}")
-
-                                    if 'write' in io_limits:
-                                        io_limited = self.io_ctl.set_write_io_throttle_app(
-                                            app_id, io_limits['write'] * 1024 ** 2
-                                        )
-                                        if not io_limited:
-                                            logger.error(f"Failed to set write IO limit for {app_name}")
+                                    limits = {
+                                        "default": {  # 如果需要为不同disk设置不同参数，可增加类似"nvme0n1": {...}配置
+                                            "rbps": io_limits['read'] * 1024 ** 2,
+                                            "wbps": io_limits['write'] * 1024 ** 2,
+                                            "wiops": io_limits['write_iops'],
+                                            "riops": io_limits['read_iops']
+                                        }
+                                    }
+                                    io_limited = self.io_ctl.set_disk_io_throttle(
+                                        app_id,
+                                        limits=limits
+                                    )
+                                    if not io_limited:
+                                        logger.error(f"Failed to set write IO limit for {app_name}")
 
                                 # 只要CPU/内存或IO有一个限制成功，就记录到g_limited_apps
                                 if resource_limited or io_limited:
@@ -368,21 +369,23 @@ class DynamicBalancer:
                                                 io_restored = True
                                                 io_limits = limit_rates["disk_io_rate"]
 
-                                                if 'read' in io_limits:
-                                                    if not self.io_ctl.set_read_io_throttle_app(
-                                                            app_id, io_limits['read'] * 2 * 1024 ** 2
-                                                    ):
-                                                        logger.error(
-                                                            f"Failed to partially restore read IO for {app_name}")
-                                                        io_restored = False
+                                                limits = {
+                                                    "default": {  # 如果需要为不同disk设置不同参数，可增加类似"nvme0n1": {...}配置
+                                                        "rbps": io_limits['read'] * 2 * 1024 ** 2,
+                                                        "wbps": io_limits['write'] * 2 * 1024 ** 2,
+                                                        "wiops": io_limits['write_iops'] * 2,
+                                                        "riops": io_limits['read_iops'] * 2
+                                                    }
+                                                }
+                                                io_limited = self.io_ctl.set_disk_io_throttle(
+                                                    app_id,
+                                                    limits=limits
+                                                )
 
-                                                if 'write' in io_limits:
-                                                    if not self.io_ctl.set_write_io_throttle_app(
-                                                            app_id, io_limits['write'] * 2 * 1024 ** 2
-                                                    ):
-                                                        logger.error(
-                                                            f"Failed to partially restore write IO for {app_name}")
-                                                        io_restored = False
+                                                if not io_limited:
+                                                    logger.error(
+                                                        f"Failed to partially restore disk IO for {app_name}")
+                                                    io_restored = False
 
                                                 if not io_restored:
                                                     restore_success = False
@@ -416,8 +419,7 @@ class DynamicBalancer:
                                             io_restored = True
 
                                             # 移除IO限制
-                                            if not (self.io_ctl.restore_write_io_throttle_app(app_id) and
-                                                    self.io_ctl.restore_read_io_throttle_app(app_id)):
+                                            if not self.io_ctl.restore_disk_io_throttle(app_id):
                                                 logger.error(f"Failed to remove IO limits for {app_name}")
                                                 io_restored = False
 
@@ -615,8 +617,7 @@ class DynamicBalancer:
 
                 # 恢复IO限制
                 if limit_parts.get('io_limited', False):
-                    if not (self.io_ctl.restore_write_io_throttle_app(app_id) and
-                            self.io_ctl.restore_read_io_throttle_app(app_id)):
+                    if not self.io_ctl.restore_disk_io_throttle(app_id):
                         logger.error(f"Failed to remove IO limits for {app_id}")
                         restore_success = False
 
@@ -739,22 +740,23 @@ class DynamicBalancer:
 
         # 磁盘IO限制
         if io_limits:
-            if 'read' in io_limits:
-                io_limited = self.io_ctl.set_read_io_throttle_app(
-                    effective_app_id, io_limits['read'] * 1024 ** 2
-                )
-                if not io_limited:
-                    logger.error(f"Failed to set read IO limit for {app_name}")
-
-            if 'write' in io_limits:
-                io_limited = self.io_ctl.set_write_io_throttle_app(
-                    effective_app_id, io_limits['write'] * 1024 ** 2
-                )
-                if not io_limited:
-                    logger.error(f"Failed to set write IO limit for {app_name}")
+            limits = {
+                "default": {  # 如果需要为不同disk设置不同参数，可增加类似"nvme0n1": {...}配置
+                    "rbps": io_limits['read'] * 1024 ** 2,
+                    "wbps": io_limits['write'] * 1024 ** 2,
+                    "wiops": io_limits['write_iops'],
+                    "riops": io_limits['read_iops']
+                }
+            }
+            io_limited = self.io_ctl.set_disk_io_throttle(
+                effective_app_id,
+                limits=limits
+            )
 
             if io_limited:
-                logger.info(f"Successfully set IO limits for {app_name}")
+                logger.info(f"Successfully set disk IO limits for {app_name}")
+            else:
+                logger.error(f"Failed to set disk IO limit for {app_name}")
 
         # 6. 记录限制状态（只要有一个限制成功就记录）
         if resource_limited or io_limited:
@@ -789,8 +791,7 @@ class DynamicBalancer:
 
             # 恢复IO限制
             if limit_parts.get('io_limited', False):
-                if not (self.io_ctl.restore_write_io_throttle_app(effective_app_id) and
-                        self.io_ctl.restore_read_io_throttle_app(effective_app_id)):
+                if not self.io_ctl.restore_disk_io_throttle(effective_app_id):
                     logger.error(f"Failed to remove IO limits for {app_id}")
                     restore_success = False
 

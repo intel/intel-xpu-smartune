@@ -71,15 +71,23 @@ limit_policy: # 默认对不同优先级应用设置的资源限制比率
       high:
         write: 50 # 设置默认写入为50MB/s
         read: 60 # 设置默认读为60MB/s
+        write_iops: 2200 # z 设置默认每秒写操作次数为 2200次/s
+        read_iops: 20000 # z 设置默认每秒读操作次数为 2000次/s
       medium:
         write: 40
         read: 50
+        write_iops: 1600
+        read_iops: 15000
       low:
         write: 20
         read: 30
+        write_iops: 1200
+        read_iops: 11000
       undefined:
         write: 10
         read: 20
+        write_iops: 1000
+        read_iops: 8000
 enable_network_control: true # 是否启用流量控制
 network_thresholds:
   low: 0.3

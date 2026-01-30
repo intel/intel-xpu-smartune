@@ -30,7 +30,7 @@ class Config:
     cooldown_time: float = 15
     cpu_busy_threshold: float = 90
     memory_busy_threshold: float = 90
-    disk_utilization_threshold: float = 90
+    disk_utilization_threshold: float = 100
     regular_update_sys_pressure_time: float = 5
     network_thresholds: dict = None
     network_interface: dict = None

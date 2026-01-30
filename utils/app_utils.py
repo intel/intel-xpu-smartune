@@ -23,11 +23,12 @@ from datetime import datetime
 
 from utils.logger import logger
 from db.DatabaseModel import AIAppPriority
-from typing import Optional, Dict, Any
+from typing import List, Optional, Dict, Any
 from config.config import b_config
 from gi.repository import Gio
 
 _original_oom_scores: dict[str, str] = {}
+
 
 class ClientCallbackManager:
     """管理客户端回调的全局状态和操作"""
@@ -80,6 +81,7 @@ class ClientCallbackManager:
 # 单例实例
 callback_manager = ClientCallbackManager()
 
+
 def get_cgroup_path_by_pid(pid):
     try:
         with open(f"/proc/{pid}/cgroup", "r") as f:
@@ -91,6 +93,8 @@ def get_cgroup_path_by_pid(pid):
     except Exception:
         pass
     return None
+
+
 def get_controlled_apps_config(apps_dict=None):
     if apps_dict is None:
         apps_dict = {}
@@ -117,6 +121,7 @@ def get_controlled_apps_config(apps_dict=None):
             except Exception as e:
                 logger.error(f"Error processing app {app_name}: {str(e)}", exc_info=True)
                 continue
+
 
 def get_controlled_apps_net():
     apps_dict = {}
@@ -149,9 +154,12 @@ def get_controlled_apps_net():
     # 3. 返回合并后的列表
     return list(apps_dict.values()) if apps_dict else None
 
-def get_controlled_apps():
+
+def get_controlled_apps(priority: str = None):
     try:
         controlled_apps = AIAppPriority.query().filter(AIAppPriority.controlled == True)
+        if priority is not None:
+            controlled_apps = controlled_apps.filter(AIAppPriority.priority == priority)
         return [{
             "app_name": app.name,
             "app_id": app.app_id,
@@ -163,6 +171,105 @@ def get_controlled_apps():
     except Exception as e:
         logger.error(f"Database query failed: {str(e)}", exc_info=True)
         return None
+
+
+def get_app_control_info(app_id: str = None, app_name: str = None):
+    """ 获取应用的管控状态和管控数据 """
+    controlled_apps = get_controlled_apps() or []
+    controlled_map = {app['app_id']: app for app in controlled_apps if app.get('app_id')}
+    name_map = {app['app_name'].lower(): app for app in controlled_apps if app.get('app_name')}
+
+    is_controlled = app_id in controlled_map or app_name in name_map
+    controlled_data = None
+    if is_controlled:
+        controlled_data = controlled_map.get(app_id) or name_map.get(app_name)
+
+    return is_controlled, controlled_data
+
+
+def get_app_processes(app_name):
+    """通过pgrep获取应用的所有运行中PID
+    :return:
+        list[int]: 如[1234, 5678]
+    """
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', app_name.lower()],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if result.returncode == 0:
+            return [int(pid) for pid in result.stdout.splitlines() if pid.strip()]
+    except Exception as e:
+        logger.warning(f"pgrep failed for {app_name}: {str(e)}")
+    return []
+
+
+def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.0) -> tuple[bool, str]:
+    """
+        批量检查多PID磁盘IO是否超过阈值，仅返回是否繁忙和异常信息
+    :param running_pids: 某个app对应的PIDs
+    :param threshold_mb: 磁盘IO阈值，单位MB/s
+    :return:
+        tuple(bool, str): (是否繁忙? 异常信息)
+    """
+    try:
+        sample_times, sample_interval = 3, 0.2
+
+        iotop_cmd = ["sudo", "iotop", "-b", "-o", "-k", "-n", str(sample_times), "-d", str(sample_interval)]
+        for pid in running_pids:
+            iotop_cmd.extend(["-p", str(pid)])
+
+        result = subprocess.run(
+            iotop_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="ignore"
+        )
+
+        # 命令执行异常处理
+        if result.returncode != 0:
+            error_msg = result.stderr.strip()
+            if "no such file or directory" in error_msg.lower():
+                raise Exception("未安装iotop，请先安装")
+            elif "permission denied" in error_msg.lower():
+                raise Exception("缺少sudo权限")
+            else:
+                raise Exception(f"iotop执行失败：{error_msg}")
+
+        # 解析输出
+        io_pattern = re.compile(r"(?P<pid>\d+)\s+.+?(?P<read_kb>\d+\.\d+)\s+K/s\s+(?P<write_kb>\d+\.\d+)\s+K/s")
+        pid_io_data = {pid: {"read": [], "write": []} for pid in running_pids}
+
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if not line or "PID" in line or "DISK READ" in line:
+                continue
+            match = io_pattern.search(line)
+            if match:
+                pid = int(match.group("pid"))
+                if pid in pid_io_data:
+                    pid_io_data[pid]["read"].append(float(match.group("read_kb")))
+                    pid_io_data[pid]["write"].append(float(match.group("write_kb")))
+
+        # 计算总IO速率
+        total_io_mb = 0.0
+        for io_data in pid_io_data.values():
+            avg_read = sum(io_data["read"]) / len(io_data["read"]) if io_data["read"] else 0.0
+            avg_write = sum(io_data["write"]) / len(io_data["write"]) if io_data["write"] else 0.0
+            total_io_mb += (avg_read + avg_write) / 1024.0
+
+        logger.debug(f"Total Disk IO for PIDs {running_pids}: {total_io_mb:.2f} MB/s (Threshold: {threshold_mb} MB/s)")
+        # 返回结果：无异常msg为空字符串
+        return total_io_mb > threshold_mb, ""
+    except Exception as e:
+        logger.error(f"Disk IO check failed: {str(e)}", exc_info=True)
+        return False, str(e)
+
 
 def _get_executable_name(app_name, app_cmdline):
     if not app_cmdline:

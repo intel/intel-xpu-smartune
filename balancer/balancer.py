@@ -161,9 +161,12 @@ class DynamicBalancer:
         pressure_start_time = None  # 记录压力值进入medium/low的时间
         current_pressure = None  # 记录当前的压力值，主要用于判断压力状态是否稳定
         STABLE_PERIOD = 1800  # 30分钟的稳定期（秒）
+        disk_io_not_stressed_start_time = None  # 记录Disk IO压力解除的时间
+        STABLE_DISK_IO_PERIOD = 300  # 5分钟的稳定期（秒）
         reach_threshold = False  # 有些app可能资源占用非常低，限制意义不大
         def reset_state():
             nonlocal top_consume_apps, idle_check_interval, pressure_start_time
+            # logger.debug("reset_state called")
             top_consume_apps = []
             idle_check_interval = 10
             pressure_start_time = None  # 重置计时器
@@ -174,42 +177,45 @@ class DynamicBalancer:
 
                 # 当队列不为空时立即处理，为空时每10s检查一次
                 if not self.app_priority_queue.empty() or (current_time - last_check_time) >= idle_check_interval:
-                    pressure = self.controlManager.get_current_pressure_level()
+                    pressure, is_disk_io_stressed = self.controlManager.get_current_pressure_level()
                     last_check_time = current_time
 
-                    if pressure == "critical":
+                    if pressure == "critical" or is_disk_io_stressed:
                         # 重置low状态计时器
-                        pressure_start_time = None
-                        # 如果是第一次检测到critical状态，获取top应用列表
                         restore_pending = False
-                        if not top_consume_apps:
-                            top_consume_apps, reach_threshold = self.resource_monitor.get_top_resource_consumers()
-                            # logger.debug(f"Top resource consumers(currently = 1): {top_consume_apps}")
-                            """
-                                Top resource consumers:[
-                                   {
-                                      "process":{
-                                         "pid":5508,
-                                         "name":"stress",
-                                         "cmdline":"stress --cpu 25 --io 30 --vm 3 --vm-bytes 21G",
-                                         "score":469.53,
-                                         "cpu_avg":96.2,
-                                         "mem_rss":16.11,
-                                         "io_read_rate":0.0
-                                      },
-                                      "app":{
-                                         "type":"cgroup",
-                                         "id":"vte-spawn-4573f009-2887-47a4-a7d8-f573b6965109.scope",
-                                         "name":"CGroup: vte-spawn-4573f009-2887-47a4-a7d8-f573b6965109.scope"
-                                      }
-                                   },
-                                   {  # Only top1 currently.
-                                     ...
-                                   },
-                                   ...
-                                ]
-                            """
 
+                        if not is_disk_io_stressed:
+                            pressure_start_time = None
+                            top_consume_apps, reach_threshold = self.resource_monitor.get_top_resource_consumers()
+                        else:
+                            disk_io_not_stressed_start_time = None
+                            top_consume_apps = self.resource_monitor.get_top_disk_io_consumers()
+                            reach_threshold = True  # IO压力默认视为达到阈值
+                        # logger.debug(f"Top resource consumers(currently = 1): {top_consume_apps}")
+                        """
+                            Top resource consumers:[
+                               {
+                                  "process":{
+                                     "pid":5508,
+                                     "name":"stress",
+                                     "cmdline":"stress --cpu 25 --io 30 --vm 3 --vm-bytes 21G",
+                                     "score":469.53,
+                                     "cpu_avg":96.2,
+                                     "mem_rss":16.11,
+                                     "io_read_rate":0.0
+                                  },
+                                  "app":{
+                                     "type":"cgroup",
+                                     "id":"vte-spawn-4573f009-2887-47a4-a7d8-f573b6965109.scope",
+                                     "name":"CGroup: vte-spawn-4573f009-2887-47a4-a7d8-f573b6965109.scope"
+                                  }
+                               },
+                               {  # Only top1 currently.
+                                 ...
+                               },
+                               ...
+                            ]
+                        """
                         if top_consume_apps:
                             # 判断该进程是否被限制过
                             for app_info in top_consume_apps:
@@ -224,81 +230,29 @@ class DynamicBalancer:
 
                             logger.debug(f"Balance- was the process limited before? {is_limited_app_dominant}")
                             self.controlManager.set_limited_app_dominant(is_limited_app_dominant)
-                            # 调用独立的处理函数
-                            should_adjust, is_controlled, app_id, limit_rates = self._handle_critical_pressure(
-                                top_consume_apps, reach_threshold)
+
+                            if not is_disk_io_stressed:
+                                should_adjust, is_controlled, app_id, limit_rates = self._handle_critical_pressure(
+                                    top_consume_apps, reach_threshold)
+                            else:
+                                should_adjust, is_controlled, app_id, limit_rates = self._handle_disk_io_stressed(
+                                    top_consume_apps)
 
                             if not is_limited_app_dominant and reach_threshold and should_adjust and app_id:
-                                # 执行资源调整
-                                target = top_consume_apps[0]
-                                app_name = target.get('process', {}).get('name') or ''
-                                total_mem = self.resource_monitor.get_total_memory()
-                                logger.info(f"Adjusting resources for app: {app_id}")
-
-                                # 初始化限制结果标志
-                                resource_limited = False
-                                io_limited = False
-
-                                # CPU/内存限制
-                                cpu_rate = int(100 * limit_rates["cpu_rate"]) if limit_rates.get("cpu_rate") else None
-                                mem_rate = int(total_mem * limit_rates["mem_rate"]) if limit_rates.get(
-                                    "mem_rate") else None
-
-                                if cpu_rate is not None or mem_rate is not None:
-                                    auto_limit = self.controlManager.adjust_resources(
-                                        app_id,
-                                        "critical",
-                                        cpu_quota=cpu_rate,
-                                        mem_high=mem_rate,
-                                    )
-                                    if auto_limit:
-                                        resource_limited = True
-                                        logger.info(f"Successfully limited CPU/Memory for {app_name}")
-                                    else:
-                                        logger.warning(f"Failed to limit CPU/Memory for {app_name}")
-
-                                # 磁盘IO限制
-                                io_limits = limit_rates.get("disk_io_rate", {})
-                                if io_limits:
-                                    limits = {
-                                        "default": {  # 如果需要为不同disk设置不同参数，可增加类似"nvme0n1": {...}配置
-                                            "rbps": io_limits['read'] * 1024 ** 2,
-                                            "wbps": io_limits['write'] * 1024 ** 2,
-                                            "wiops": io_limits['write_iops'],
-                                            "riops": io_limits['read_iops']
-                                        }
-                                    }
-                                    io_limited = self.io_ctl.set_disk_io_throttle(
-                                        app_id,
-                                        limits=limits
-                                    )
-                                    if not io_limited:
-                                        logger.error(f"Failed to set write IO limit for {app_name}")
-
-                                # 只要CPU/内存或IO有一个限制成功，就记录到g_limited_apps
-                                if resource_limited or io_limited:
-                                    g_limited_apps[app_id] = (app_name, limit_rates, {
-                                        'cpu_mem_limited': resource_limited,
-                                        'io_limited': io_limited
-                                    }, None)  # None 表示完全限制
-
-                                    if is_controlled:
-                                        app_utils.update_app_status(app_id, "limited")
-
-                                    app_utils.callback_manager.send_callback_notification({
-                                        'app_id': app_id,
-                                        'app_name': app_name,
-                                        'status': "limited",
-                                        'purpose': "app"
-                                    }, False)
-                                else:
-                                    logger.warning(f"No resource limits successfully applied for {app_name}")
+                                self._apply_resource_limits(
+                                    top_consume_apps[0],
+                                    app_id,
+                                    limit_rates,
+                                    is_controlled,
+                                    is_disk_io_stressed=is_disk_io_stressed  # 标记是否为Disk IO压力场景
+                                )
 
                             # 无论是否处理，都移除已检查的app
                             top_consume_apps.pop(0)
                             # idle_check_interval = 5  # critical下，缩短检测时间
                         else:
                             reset_state()
+
                     elif not self.app_priority_queue.empty():
                         # 处理队列中的应用
                         app_data, priority = self.app_priority_queue.get()
@@ -315,119 +269,80 @@ class DynamicBalancer:
                         # 处理完队列后重置top应用状态
                         reset_state()
                     else:
-                        # 非 critical 状态：等待 STABLE_PERIOD 后恢复
                         if g_limited_apps and not restore_pending:
-                            if pressure in ("medium", "low"):
-                                # 压力级别不稳定需要重新计时，只有压力稳定在某个级别才执行对应的动作
-                                if (pressure_start_time is None) or (current_pressure != pressure):
-                                    pressure_start_time = current_time
-                                    current_pressure = pressure
-                                    logger.info(
-                                        f"Pressure level changed to {pressure}. "
-                                        f"Will restore resources after {STABLE_PERIOD} sec if it remains stable."
-                                    )
+                            should_check_pressure = (pressure in ("medium", "low") and
+                                                     any(app_data[2].get('cpu_mem_limited', False) for app_data in
+                                                         g_limited_apps.values()))
+                            should_check_io = (not is_disk_io_stressed and
+                                               any(app_data[2].get('io_limited', False) for app_data in
+                                                   g_limited_apps.values()))
+                            if should_check_pressure or should_check_io:
+                                # 压力级别不稳定需要重新计时
+                                logger.info(f"pressure_start_time: {pressure_start_time}, "
+                                            f"current_pressure: {current_pressure}, pressure: {pressure}")
+                                if should_check_pressure:
+                                    if (pressure_start_time is None) or (current_pressure != pressure):
+                                        pressure_start_time = current_time
+                                        current_pressure = pressure
+                                        logger.info(
+                                            f"Pressure level changed to {pressure}. "
+                                            f"Will restore resources after {STABLE_PERIOD} sec if it remains stable.")
+
+                                if should_check_io:
+                                    if disk_io_not_stressed_start_time is None:
+                                        disk_io_not_stressed_start_time = current_time
+                                        logger.info(
+                                            f"Disk IO stress resolved. Will consider for restoration after {STABLE_DISK_IO_PERIOD} sec if it remains stable.")
+
+                                pressure_stable = (should_check_pressure and
+                                                   (current_time - pressure_start_time >= STABLE_PERIOD))
+                                io_stable = (should_check_io and
+                                             (current_time - disk_io_not_stressed_start_time >= STABLE_DISK_IO_PERIOD))
+                                io_double_stable = (should_check_io and
+                                             (current_time - disk_io_not_stressed_start_time >= STABLE_DISK_IO_PERIOD * 2))
+
+                                logger.info(f"pressure_stable: {pressure_stable}, io_stable: {io_stable}, io_double_stable: {io_double_stable}")
 
                                 # 检查是否达到稳定期
-                                elif current_time - pressure_start_time >= STABLE_PERIOD:
+                                if pressure_stable and pressure == "medium":
                                     restore_pending = True
-
-                                    # 根据压力级别选择恢复策略
-                                    if pressure == "medium":
-                                        # 这时还不能移除，因为还没全部恢复
-                                        app_id, (app_name, limit_rates, limit_parts, state) = next(iter(g_limited_apps.items()))
-                                        if state != "partially_restored":
-                                            total_mem = self.resource_monitor.get_total_memory()
-                                            logger.info(
-                                                f"Pressure remained at 'medium' for {STABLE_PERIOD} sec. "
-                                                f"Partially restoring app {app_id} (twice the rate of limited resources)."
-                                            )
-
-                                            restore_success = True
-
-                                            # 恢复CPU/内存（如果之前限制了）
-                                            if limit_parts.get('cpu_mem_limited', False):
-                                                cpu_restore = int(100 * limit_rates[
-                                                    "cpu_rate"] * 2) if "cpu_rate" in limit_rates else None
-                                                mem_restore = int(total_mem * limit_rates[
-                                                    "mem_rate"] * 2) if "mem_rate" in limit_rates else None
-
-                                                if cpu_restore is not None or mem_restore is not None:
-                                                    cpu_mem_restored = self.controlManager.adjust_resources(
-                                                        app_id,
-                                                        "medium",
-                                                        cpu_quota=cpu_restore,
-                                                        mem_high=mem_restore,
-                                                        is_restore=False,
-                                                    )
-                                                    if not cpu_mem_restored:
-                                                        logger.error(
-                                                            f"Failed to partially restore CPU/Memory for {app_name}")
-                                                        restore_success = False
-
-                                            # 恢复IO限制（如果之前限制了）
-                                            if limit_parts.get('io_limited', False) and "disk_io_rate" in limit_rates:
-                                                io_restored = True
-                                                io_limits = limit_rates["disk_io_rate"]
-
-                                                limits = {
-                                                    "default": {  # 如果需要为不同disk设置不同参数，可增加类似"nvme0n1": {...}配置
-                                                        "rbps": io_limits['read'] * 2 * 1024 ** 2,
-                                                        "wbps": io_limits['write'] * 2 * 1024 ** 2,
-                                                        "wiops": io_limits['write_iops'] * 2,
-                                                        "riops": io_limits['read_iops'] * 2
-                                                    }
-                                                }
-                                                io_limited = self.io_ctl.set_disk_io_throttle(
-                                                    app_id,
-                                                    limits=limits
-                                                )
-
-                                                if not io_limited:
-                                                    logger.error(
-                                                        f"Failed to partially restore disk IO for {app_name}")
-                                                    io_restored = False
-
-                                                if not io_restored:
-                                                    restore_success = False
-
-                                            # 更新状态
-                                            if restore_success:
-                                                g_limited_apps[app_id] = (
-                                                app_name, limit_rates, limit_parts, "partially_restored")
-                                            else:
-                                                logger.warning(f"Partial restore failed for {app_name}")
-
-                                            g_limited_apps.move_to_end(app_id)  # 移到末尾防止重复限制同一个app
-                                    else:  # pressure == "low"
-                                        # 完全恢复并移除
-                                        app_id, (app_name, _, limit_parts, _) = g_limited_apps.popitem()
+                                    app_id, (app_name, limit_rates, limit_parts, state) = next(
+                                        iter(g_limited_apps.items()))
+                                    if state != "partially_restored":
                                         logger.info(
-                                            f"Pressure remained at 'low' for {STABLE_PERIOD} sec. "
-                                            f"Fully restoring app {app_id} (100% resources)."
-                                        )
+                                            f"Pressure remained at 'medium' for {STABLE_PERIOD} sec. "
+                                            f"Partially restoring app {app_id}.")
+                                        if self.restore_resources(app_id, app_name, limit_rates, limit_parts, "partial"):
+                                            g_limited_apps[app_id] = (
+                                            app_name, limit_rates, limit_parts, "partially_restored")
+                                        else:
+                                            logger.warning(f"Partial restore failed for {app_name}")
+                                        g_limited_apps.move_to_end(app_id)
+                                elif io_stable and not io_double_stable:
+                                    restore_pending = True
+                                    app_id, (app_name, limit_rates, limit_parts, state) = next(
+                                        iter(g_limited_apps.items()))
+                                    if state != "partially_restored":
+                                        logger.info(f"Disk IO stress resolved. Partially restoring app {app_id}.")
+                                        if self.restore_resources(app_id, app_name, limit_rates, limit_parts, "partial"):
+                                            g_limited_apps[app_id] = (
+                                            app_name, limit_rates, limit_parts, "partially_restored")
+                                        else:
+                                            logger.warning(f"Partial restore failed for {app_name}")
+                                        g_limited_apps.move_to_end(app_id)
+                                elif (pressure_stable and pressure == "low") or io_double_stable:
+                                    restore_pending = True
+                                    app_id, (app_name, limit_rates, limit_parts, state) = next(
+                                        iter(g_limited_apps.items()))
 
-                                        restore_success = True
-
-                                        # 恢复CPU/内存（如果之前限制了）
-                                        if limit_parts.get('cpu_mem_limited', False):
-                                            if not self.controlManager.adjust_resources(app_id, "low"):
-                                                logger.error(f"Failed to fully restore CPU/Memory for {app_name}")
-                                                restore_success = False
-
-                                        # 恢复IO限制（如果之前限制了）
-                                        if limit_parts.get('io_limited', False):
-                                            io_restored = True
-
-                                            # 移除IO限制
-                                            if not self.io_ctl.restore_disk_io_throttle(app_id):
-                                                logger.error(f"Failed to remove IO limits for {app_name}")
-                                                io_restored = False
-
-                                            if not io_restored:
-                                                restore_success = False
-
-                                        # 资源完全恢复后，需要通知用户
-                                        if restore_success:
+                                    # 执行恢复操作
+                                    success = self.restore_resources(app_id, app_name, limit_rates, limit_parts,
+                                                                     "full")
+                                    if success:
+                                        updated_limits = g_limited_apps[app_id][2]
+                                        is_fully_restored = not (
+                                                    updated_limits.get('cpu_mem_limited') or updated_limits.get('io_limited'))
+                                        if is_fully_restored:
                                             app_utils.update_app_status(app_id, "running")
                                             app_utils.callback_manager.send_callback_notification({
                                                 'app_id': app_id,
@@ -435,11 +350,20 @@ class DynamicBalancer:
                                                 'status': "running",
                                                 'purpose': "app"
                                             }, False)
-                                        else:
-                                            logger.error(f"Failed to fully restore resources for {app_name}")
+                                            g_limited_apps.pop(app_id, None)
+                                            logger.info(f"Fully restored app {app_id}, removed from limited apps")
 
-                                    restore_pending = False
-                                    reset_state()  # 重置计时器和当前压力状态
+                                            # 仅在完全恢复且IO稳定时重置计时器
+                                            if io_double_stable:
+                                                disk_io_not_stressed_start_time = None
+                                                logger.debug("Reset IO stress timer after full restoration")
+                                        else:
+                                            g_limited_apps.move_to_end(app_id)
+                                            logger.info(f"Partial restore for app {app_id}, moved to end of queue")
+                                    else:
+                                        logger.error(f"Failed to restore resources for app {app_id}")
+                                        g_limited_apps.move_to_end(app_id)
+                                restore_pending = False
                             else:
                                 reset_state()
                 if self.network_controller.enable_network_control:
@@ -531,6 +455,178 @@ class DynamicBalancer:
                 time.sleep(3)
                 break
 
+    def _apply_resource_limits(self, target_app, app_id, limit_rates, is_controlled, is_disk_io_stressed=False):
+        """应用资源限制（公共逻辑）"""
+        app_name = target_app.get('process', {}).get('name') or ''
+        total_mem = self.resource_monitor.get_total_memory()
+        logger.info(f"Adjusting resources for app: {app_id}")
+
+        # 初始化限制结果标志
+        resource_limited = False
+        io_limited = False
+
+        # CPU/内存限制（仅非IO压力场景处理）
+        if not is_disk_io_stressed:
+            cpu_rate = int(100 * limit_rates["cpu_rate"]) if limit_rates.get("cpu_rate") else None
+            mem_rate = int(total_mem * limit_rates["mem_rate"]) if limit_rates.get("mem_rate") else None
+
+            if cpu_rate is not None or mem_rate is not None:
+                auto_limit = self.controlManager.adjust_resources(
+                    app_id,
+                    "critical",
+                    cpu_quota=cpu_rate,
+                    mem_high=mem_rate,
+                )
+                if auto_limit:
+                    resource_limited = True
+                    logger.info(f"Successfully limited CPU/Memory for {app_name}")
+
+        # 磁盘IO限制
+        if is_disk_io_stressed and limit_rates.get("disk_io_rate"):
+            io_limits = limit_rates.get("disk_io_rate", {})
+            if io_limits:
+                limits = {
+                    "default": { # 如果需要为不同disk设置不同参数，可增加类似"nvme0n1": {...}配置
+                        "rbps": io_limits['read'] * 1024 ** 2,
+                        "wbps": io_limits['write'] * 1024 ** 2,
+                        "wiops": io_limits['write_iops'],
+                        "riops": io_limits['read_iops']
+                    }
+                }
+                io_limited = self.io_ctl.set_disk_io_throttle(app_id, limits=limits)
+                if not io_limited:
+                    logger.error(f"Failed to set IO limit for {app_name}")
+
+        # 记录限制结果
+        if resource_limited or io_limited:
+            g_limited_apps[app_id] = (
+                app_name,
+                limit_rates,
+                {'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
+                None  # None表示完全限制
+            )
+
+            if is_controlled:
+                app_utils.update_app_status(app_id, "limited")
+
+            app_utils.callback_manager.send_callback_notification({
+                'app_id': app_id,
+                'app_name': app_name,
+                'status': "limited",
+                'purpose': "app"
+            }, False)
+
+    def restore_resources(self, app_id, app_name, limit_rates, limit_parts, restore_type):
+        """
+        通用资源恢复逻辑
+        :param app_id: 应用ID
+        :param app_name: 应用名称
+        :param limit_rates: 限制速率配置
+        :param limit_parts: 限制部分标志
+        :param restore_type: 恢复类型（"partial" 或 "full"）
+        :return: 是否恢复成功，以及恢复的部分详情
+        """
+        global g_limited_apps
+        restore_success = True
+
+        # 恢复CPU/内存
+        if limit_parts.get('cpu_mem_limited', False):
+            if restore_type == "partial":
+                cpu_restore = int(100 * limit_rates["cpu_rate"] * 2) if "cpu_rate" in limit_rates else None
+                mem_restore = int(self.resource_monitor.get_total_memory() * limit_rates[
+                    "mem_rate"] * 2) if "mem_rate" in limit_rates else None
+                if not self.controlManager.adjust_resources(
+                    app_id, "medium", cpu_quota=cpu_restore, mem_high=mem_restore, is_restore=False
+                ):
+                    logger.error(f"Failed to partially restore CPU/Memory for {app_name}")
+                    restore_success = False
+            else:  # full restore
+                cpu_mem_restored = self.controlManager.adjust_resources(app_id, "low")
+                if not cpu_mem_restored:
+                    logger.error(f"Failed to fully restore CPU/Memory for {app_name}")
+                    restore_success = False
+                else:
+                    g_limited_apps[app_id] = (app_name, limit_rates, {
+                        'cpu_mem_limited': False,
+                        'io_limited': limit_parts['io_limited']
+                    }, None)
+        # 恢复IO限制
+        if limit_parts.get('io_limited', False):
+            if restore_type == "partial" and "disk_io_rate" in limit_rates:
+                io_limits = limit_rates["disk_io_rate"]
+                limits = {
+                    "default": {
+                        "rbps": io_limits['read'] * 2 * 1024 ** 2,
+                        "wbps": io_limits['write'] * 2 * 1024 ** 2,
+                        "wiops": io_limits['write_iops'] * 2,
+                        "riops": io_limits['read_iops'] * 2
+                    }
+                }
+                if not self.io_ctl.set_disk_io_throttle(app_id, limits=limits):
+                    logger.error(f"Failed to partially restore disk IO for {app_name}")
+                    restore_success = False
+            elif restore_type == "full":
+                if not self.io_ctl.restore_disk_io_throttle(app_id):
+                    logger.error(f"Failed to fully restore disk IO for {app_name}")
+                    restore_success = False
+                else:
+                    g_limited_apps[app_id] = (app_name, limit_rates, {
+                        'cpu_mem_limited': limit_parts['cpu_mem_limited'],
+                        'io_limited': False
+                    }, None)
+
+        return restore_success
+
+    def _handle_disk_io_stressed(self, top_consumers):
+        """
+            Disk IO压力场景处理策略
+            Disk IO管控机制与cpu/mem管控不太一样：
+            1. 非管控应用：在使用Disk IO造成压力大时，只要管控应用未运行或运行但极少占用I/O，则不干预；否则需让步。
+            2. 管控应用：在使用Disk IO造成压力大时，只需要检查critical应用的状态
+            3. 关键应用：使用Disk IO时不受干预
+        """
+        app_info = top_consumers[0] if top_consumers else None
+        if not app_info:
+            return False, False, None, None
+
+        # 获取管控状态（复用之前抽离的函数）
+        app_id = app_info['app'].get('id') if app_info.get('app') else None
+        app_name = (app_info.get('process', {}).get('name') or '').lower()
+
+        is_controlled, controlled_data = app_utils.get_app_control_info(app_id, app_name)
+        priority = controlled_data.get('priority') if controlled_data else None
+
+        # 场景1：当前进程是非管控应用
+        if not is_controlled:
+            controlled_apps = app_utils.get_controlled_apps() or []
+            logger.debug(f"Disk IO stressed - checking controlled apps: {controlled_apps}")
+            for controlled_app in controlled_apps:
+                # 检查该管控应用是否在运行且占用高IO
+                running_pids = app_utils.get_app_processes(controlled_app['app_name'])
+                logger.debug(f"Disk IO stressed - controlled app {controlled_app['app_name']} running PIDs: {running_pids}")
+                if running_pids:
+                    # 检查这些PID的磁盘IO占用是否超过阈值或者能否通过PID看到有没有cpu IOwait(不支持)
+                    # iotop -b -p <pid> -o -k -n 3 -d 1
+                    is_high_io, msg = app_utils.check_pids_disk_io_usage(running_pids, threshold_mb=100)  # 假设阈值100MB/s
+
+                    if is_high_io:  # 非管控应用对disk IO的使用需要让步
+                        return True, False, app_id, self.get_limited_rates("undefined")
+                    else:
+                        logger.info(f"Disk IO stressed - No controlled app with high IO usage found.")
+            return False, False, None, None
+
+        # 场景2：当前进程是管控应用，只需要判断critical的app是否在运行且占用IO高
+        elif priority != 'critical':
+            critical_apps = app_utils.get_controlled_apps(priority="Critical") or []
+            for critical_app in critical_apps:
+                running_pids = app_utils.get_app_processes(critical_app['app_name'])
+                if running_pids:
+                    is_high_io = app_utils.check_pids_disk_io_usage([running_pids], threshold_mb=100)
+                    if is_high_io:
+                        return True, True, app_id, self.get_limited_rates(priority or "undefined")
+
+        return False, False, None, None
+
     def _handle_critical_pressure(self, top_consumers, reach_threshold):
         """处理资源压力 (单次执行只处理一个app)"""
         if not top_consumers or not top_consumers[0]:
@@ -544,16 +640,8 @@ class DynamicBalancer:
         app_id = app_info['app'].get('id') if app_info.get('app') else None
         app_name = (app_info.get('process', {}).get('name') or '').lower()
 
-        # 获取管控应用数据
-        controlled_apps = app_utils.get_controlled_apps() or []
-        controlled_map = {app['app_id']: app for app in controlled_apps if app.get('app_id')}
-        name_map = {app['app_name'].lower(): app for app in controlled_apps if app.get('app_name')}
-
-        is_controlled = app_id in controlled_map or app_name in name_map
-        priority = None
-        if is_controlled:
-            controlled_data = controlled_map.get(app_id) or name_map.get(app_name)
-            priority = controlled_data.get('priority') if controlled_data else None
+        is_controlled, controlled_data = app_utils.get_app_control_info(app_id, app_name)
+        priority = controlled_data.get('priority') if controlled_data else None
 
         # 系统资源使用情况
         usage_data = self.resource_monitor.get_resource_usage()

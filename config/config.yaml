@@ -14,7 +14,7 @@ weights_top:
   memory: 7
   io: 1
 all_apps:
-  - name: "Calculator"  # Calculator
+  - name: "calculator"  # calculator
     id: "org.gnome.Calculator.desktop"  # org.gnome.Calculator.desktop
     commandline: "gnome-calculator"  # gnome-calculator
   - name: "vlc" # VLC media player
@@ -37,9 +37,6 @@ blacklist:
   - kworker
   - dbus
 cooldown_time: 15
-cpu_busy_threshold: 90
-memory_busy_threshold: 90
-disk_utilization_threshold: 90
 regular_update_sys_pressure_time: 5
 balance_service:
   url: "http://127.0.0.1"
@@ -50,6 +47,9 @@ app_priority:
   high: 80
   medium: 50
   low: 20
+cpu_busy_threshold: 90
+memory_busy_threshold: 90
+disk_utilization_threshold: 95
 limit_policy: # 默认对不同优先级应用设置的资源限制比率
   cpu:  # critical app 不做限制，因此不设置比率
     enabled: true
@@ -94,7 +94,7 @@ network_thresholds:
   medium: 0.5
   high: 0.7
   critical: 0.9
-network_interface: "enp1s0" # 请根据实际情况修改为你的网络接口名称
+network_interface: "enp9s0" # 请根据实际情况修改为你的网络接口名称
 network_bandwidth_kbit: 100000  # 当前设置为100Mbps（小了10倍）便于测试，请根据实际带宽调整，单位为kbit/s
 config_network_bw:  # kbit/s, 不同优先级对应的带宽范围设置, 为了便于测试都缩小了10倍
   system:

@@ -42,8 +42,13 @@ class ResourceMonitor:
             logger.warning(f"Could not load desktop apps: {str(e)}")
             self.desktop_apps = {}
 
-    def _get_top_processes(self, n=1, samples=5, interval=1.0):
-        """获取资源占用最高的应用（基于 cgroup 聚合）"""
+    def _get_top_processes(self, n=1, samples=3, interval=1.0, mode='default'):
+        """获取资源占用最高的应用（基于 cgroup 聚合）
+        :param n: 返回前 n 个进程
+        :param samples: 对top process进行采样的次数
+        :param interval: 采样间隔时间（秒）
+        :param mode: 采样模式，默认default - 按 CPU/内存综合评分; 'io' - 仅按 IO 读写量排序
+        """
         # Step 1: 采样获取候选进程（考虑权重和进程组）
         psi_data = PSIMonitor().get_current_pressure()
         dynamic_weights = self._adjust_weights_by_pressure(psi_data)
@@ -69,6 +74,7 @@ class ResourceMonitor:
             'mem_percent_total': 0,  # 所有进程内存占用百分比总和（%）
             'mem_rss_total': 0,  # 所有进程 RSS 内存总和（字节）
             'io_read_total': 0,  # 所有进程 IO 读取总和（字节）
+            'io_write_total': 0,  # 所有进程 IO 写入总和（字节）
             'count': 0,
             'pids': set(),
             'names': set(),
@@ -79,19 +85,21 @@ class ResourceMonitor:
         cgroup_pids = {}
         pid_process_map = {}
 
-        # 第一次遍历：初始化 CPU 计时器，并缓存数据
+        # 第一次遍历：初始化 CPU 计时器，并缓存数据，default模式
         for cgroup_path in cgroup_paths:
             pids_in_cgroup = self._get_pids_in_cgroup(cgroup_path)
             cgroup_pids[cgroup_path] = pids_in_cgroup
             for pid in pids_in_cgroup:
                 try:
                     p = psutil.Process(pid)
-                    p.cpu_percent(interval=None)  # 初始化计时器
-                    pid_process_map[pid] = p  # 缓存 Process 对象
+                    if mode == 'default':
+                        p.cpu_percent(interval=None)  # 仅default模式需要初始化CPU计时器
+                    pid_process_map[pid] = p
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
 
-        time.sleep(0.1)  # 全局等待 100ms
+        if mode == 'default':
+            time.sleep(0.1)  # 仅default模式需要等待CPU计时
 
         # 第二次遍历：直接使用缓存的数据
         for cgroup_path, pids_in_cgroup in cgroup_pids.items():
@@ -101,9 +109,9 @@ class ResourceMonitor:
                 p = pid_process_map[pid]
                 try:
                     with p.oneshot():
-                        cpu_percent = p.cpu_percent(interval=None)
+                        cpu_percent = p.cpu_percent(interval=None) if mode == 'default' else 0
+                        mem_percent = p.memory_percent() if mode == 'default' else 0
                         mem_info = p.memory_info()
-                        mem_percent = p.memory_percent()
                         io_counters = p.io_counters() if p.io_counters() else None
 
                     cgroup_data[cgroup_path]['cpu_total'] += cpu_percent
@@ -111,6 +119,7 @@ class ResourceMonitor:
                     cgroup_data[cgroup_path]['mem_rss_total'] += mem_info.rss
                     if io_counters:
                         cgroup_data[cgroup_path]['io_read_total'] += io_counters.read_bytes
+                        cgroup_data[cgroup_path]['io_write_total'] += io_counters.write_bytes
                     cgroup_data[cgroup_path]['count'] += 1
                     cgroup_data[cgroup_path]['pids'].add(pid)
                     cgroup_data[cgroup_path]['names'].add(p.name())
@@ -118,31 +127,31 @@ class ResourceMonitor:
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
 
-        # Step 4: 计算总分（CPU 按核心数归一化，其他用总量）
+        # Step 4: 根据模式计算评分
         processes = []
         for cgroup_path, data in cgroup_data.items():
             if data['count'] > 0:
-                # CPU 使用率总和按核心数归一化（避免超过 100%）
-                cpu_total_normalized = data['cpu_total'] / self.cpu_cores
-                # 内存 RSS 转换为 GB
-                mem_rss_total_gb = data['mem_rss_total'] / (1024 ** 3)
-                # IO 读取速率转换为 MB/s
-                io_read_rate_mb = data['io_read_total'] / (samples * interval) / (1024 ** 2)
-
-                score = (
-                        dynamic_weights['cpu'] * min(cpu_total_normalized, 100) +
-                        dynamic_weights['memory'] * min(data['mem_percent_total'], 100) +
-                        dynamic_weights['io'] * min(io_read_rate_mb, 100)
-                )
+                if mode == 'io':
+                    # IO模式：按读写总量排序（MB/s）
+                    io_total_mb = (data['io_read_total'] + data['io_write_total']) / (1024 ** 2)
+                    score = io_total_mb  # 直接使用IO总量作为评分
+                else:
+                    # Default模式：CPU+内存
+                    cpu_total_normalized = data['cpu_total'] / self.cpu_cores
+                    score = (
+                            dynamic_weights['cpu'] * min(cpu_total_normalized, 100) +
+                            dynamic_weights['memory'] * min(data['mem_percent_total'], 100)
+                    )
 
                 processes.append({
                     'pids': list(data['pids']),
                     'cgroup': cgroup_path,
                     'score': round(score, 2),
-                    'cpu_avg': round(cpu_total_normalized, 1),  # 归一化后的 CPU
-                    'mem_avg': round(data['mem_percent_total'], 1),
-                    'mem_rss': round(mem_rss_total_gb, 2),  # 单位：GB
-                    'io_read_rate': round(io_read_rate_mb, 2),  # 单位：MB/s
+                    'cpu_avg': round(data['cpu_total'] / self.cpu_cores, 1) if mode == 'default' else 0,
+                    'mem_avg': round(data['mem_percent_total'], 1) if mode == 'default' else 0,
+                    'mem_rss': round(data['mem_rss_total'] / (1024 ** 3), 2),
+                    'io_read_rate': round(data['io_read_total'] / (samples * interval) / (1024 ** 2), 2),
+                    'io_write_rate': round(data['io_write_total'] / (samples * interval) / (1024 ** 2), 2),
                     'names': list(data['names']),
                     'cmdlines': list(data['cmdlines'])
                 })
@@ -158,8 +167,7 @@ class ResourceMonitor:
 
         for _ in range(samples):
             current_sample = []
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_percent',
-                                             'memory_info', 'memory_percent', 'io_counters',
+            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent',
                                              'create_time']):
                 try:
                     info = proc.info
@@ -174,11 +182,9 @@ class ResourceMonitor:
                     seen_pids.add(pid)  # 标记为已处理
 
                     # 计算带权重的实时评分（但不需要返回这些数据）
-                    io_read = info['io_counters'].read_bytes if info['io_counters'] else 0
                     score = (
                             dynamic_weights['cpu'] * min(info['cpu_percent'], 100) +
-                            dynamic_weights['memory'] * min(info['memory_percent'], 100) +
-                            dynamic_weights['io'] * min(io_read / 1024 / 1024, 10)
+                            dynamic_weights['memory'] * min(info['memory_percent'], 100)
                     )
 
                     current_sample.append({
@@ -375,6 +381,31 @@ class ResourceMonitor:
 
         return results, reach_threshold
 
+    def get_top_disk_io_consumers(self):
+        """获取disk io占用最高的1个进程及其应用信息"""
+        results = []
+        processes = self._get_top_processes(n=1, mode="io")
+        logger.debug(f"Top processes: {processes}")
+
+        for process in processes:
+            process_name = next(iter(process['names']), "unknown")
+            process_cmdline = next(iter(process['cmdlines']), "unknown")
+
+            app_info = self.try_match_app(process)
+            results.append({
+                'process': {
+                    'pid': next(iter(process['pids']), None),  # Use the first PID from 'pids'
+                    'name': process_name,
+                    'cmdline': process_cmdline,
+                    'score': round(process['score'], 3),
+                    'io_read_rate': process['io_read_rate'],
+                    'io_write_rate': process['io_write_rate']
+                },
+                'app': app_info
+            })
+
+        return results
+
     def get_total_memory(self):
         """获取系统物理内存总大小（单位：MB）"""
         mem = psutil.virtual_memory()
@@ -484,7 +515,7 @@ class ResourceMonitor:
     def get_disk_stats(self) -> dict:
         """
         所有磁盘IO利用率和读写速度的统计结果
-        返回格式:
+        :return:
         {
             "disk_io": {
                 "nvme0n1": {
@@ -509,6 +540,52 @@ class ResourceMonitor:
             }
 
         return {'disk_io': merged_result}
+
+    def is_disk_io_stressed(self, device: str = None, threshold: float = None) -> dict:
+        """
+        判断磁盘 I/O 是否紧张
+        :param device: 指定磁盘（如 'nvme0n1'），默认检查所有磁盘
+        :param threshold: 自定义是否紧张阈值，否则用config中的配置
+
+        :return:
+            {
+                "is_stressed": bool,               # 整体是否紧张
+                "stressed_disks": list[str],       # 紧张的磁盘列表
+                "iowait": float,                   # CPU 的 I/O 等待时间（%）
+                "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec}}
+            }
+        """
+        disk_stats = self.get_disk_stats()["disk_io"]
+
+        # CPU iowait
+        iowait = psutil.cpu_times_percent().iowait
+
+        busy_threshold = threshold or self.config.disk_utilization_threshold
+        speed_threshold = 100 * 1024  # 100 MB/s = 102400 KB/s（可根据需求调整）
+
+        stressed_disks = []
+        details = {}
+        for disk, stats in disk_stats.items():
+            # 如果指定了 device，只检查该设备
+            if device and disk != device:
+                continue
+
+            is_busy = (
+                    stats["utilization"] > busy_threshold and  # 利用率高
+                    (stats["read_kb_per_sec"] + stats["write_kb_per_sec"]) > speed_threshold  # 吞吐量高
+            )
+            details[disk] = {**stats, "is_busy": is_busy}
+            if is_busy:
+                stressed_disks.append(disk)
+
+        is_stressed = bool(stressed_disks) and iowait > 10  # 10%
+
+        return {
+            "is_stressed": is_stressed,
+            "stressed_disks": stressed_disks,
+            "iowait": iowait,
+            "details": details,
+        }
 
 def main():
     """调试用主函数"""

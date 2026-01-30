@@ -46,6 +46,7 @@ class ControlManager:
         self.balance_url = f"{self.config.balance_service['url']}:{self.config.balance_service['port']}"
 
         self._current_level = None
+        self.is_current_disk_io_stressed = False
         self.score = 0.0
         self._last_update_time = 0
         self._CACHE_TTL = self.config.regular_update_sys_pressure_time
@@ -73,21 +74,22 @@ class ControlManager:
         """线程安全的更新操作"""
         if self._update_lock.acquire(blocking=False):
             try:
-                self._current_level, self.score = self._update_pressure_level()
+                self._current_level, self.score, self.is_current_disk_io_stressed = self._update_pressure_level()
             finally:
                 self._update_lock.release()
 
-    def get_current_pressure_level(self) -> str:
+    def get_current_pressure_level(self) -> tuple[str, bool]:
         """获取当前压力等级（无需参数）"""
-        logger.debug("Current PSI level: %s (pressure: %.2f)", self._current_level, self.score)
-        return self._current_level
+        logger.debug("Current PSI level: %s (pressure: %.2f), disk io stressed: %s", self._current_level, self.score,
+                     self.is_current_disk_io_stressed)
+        return self._current_level, self.is_current_disk_io_stressed
 
-    def _update_pressure_level(self) -> tuple[str, float]:
+    def _update_pressure_level(self) -> tuple[str, float, bool]:
         """更新压力等级（使用内部状态）"""
         try:
             psi_data = self.psi.get_current_pressure()
             usage_data = self.res.get_resource_usage()
-            disk_io = self.res.get_disk_stats()
+            disk_io = self.res.is_disk_io_stressed()
             score = self.analyzer.calculate_pressure_score(
                 psi_data,
                 usage_data,
@@ -97,10 +99,10 @@ class ControlManager:
             level = self.analyzer.get_pressure_level(score, self.config.thresholds)
             # logger.debug("Updated PSI level: %s (pressure: %.2f)", level, score)
             self._last_update_time = time.time()
-            return level, score
+            return level, score, disk_io.get("is_stressed", False)
         except Exception as e:
             logger.error("Failed to update pressure level: %s", str(e))
-            return "unknown", 0.0
+            return "unknown", 0.0, False
 
     def update_network_pressure_level(self, network_data):
         """

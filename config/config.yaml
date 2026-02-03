@@ -9,10 +9,9 @@ weights:
   cpu: 2
   memory: 7
   io: 1
-weights_top:
-  cpu: 2
-  memory: 7
-  io: 1
+cpu_busy_threshold: 90
+memory_busy_threshold: 90
+disk_utilization_threshold: 95
 all_apps:
   - name: "calculator"  # calculator
     id: "org.gnome.Calculator.desktop"  # org.gnome.Calculator.desktop
@@ -23,7 +22,11 @@ all_apps:
   - name: "Text Editor" # Text Editor
     id: "org.gnome.TextEditor.desktop"
     commandline: "gnome-text-editor %U"
-monitor_apps:  # Applications to monitor for some specific handling
+weights_top:
+  cpu: 2
+  memory: 7
+  io: 1
+monitor_apps:  # Some specific apps to monitor by BPF
   - name: "Calculator"
     bpf_name: ["gnome-calculator"]
   - name: "VLC media player"
@@ -36,7 +39,7 @@ blacklist:
   - systemd
   - kworker
   - dbus
-cooldown_time: 15
+cooldown_time: 15 # 避免频繁通知的冷却时间
 regular_update_sys_pressure_time: 5
 balance_service:
   url: "http://127.0.0.1"
@@ -47,13 +50,11 @@ app_priority:
   high: 80
   medium: 50
   low: 20
-cpu_busy_threshold: 90
-memory_busy_threshold: 90
-disk_utilization_threshold: 95
 limit_policy: # 默认对不同优先级应用设置的资源限制比率
-  cpu:  # critical app 不做限制，因此不设置比率
+  policy: "combined"  # combined: cpu/mem/disk IO同一条件限制，separated: cpu/mem与disk IO分开判断限制条件
+  cpu:
     enabled: true
-    rate:
+    rate: # critical app不做限制，因此不设置比率
       high: 0.7  # 设置total的70%
       medium: 0.5
       low: 0.4

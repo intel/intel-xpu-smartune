@@ -147,7 +147,7 @@ class DynamicBalancer:
         self.app_intercept_thread = threading.Thread(target=self._run_app_intercept_loop, daemon=True)
         self.app_intercept_thread.start()
 
-        logger.debug("服务已启动，线程已开始运行")
+        logger.info("服务已启动，线程已开始运行")
 
     def _run_monitor_resource_loop(self):
         logger.info("Monitor resource service started")
@@ -863,7 +863,7 @@ class DynamicBalancer:
         # 场景1：当前进程是非管控应用
         if not is_controlled:
             controlled_apps = app_utils.get_controlled_apps() or []
-            logger.debug(f"Disk IO stressed - checking controlled apps: {controlled_apps}")
+            # logger.debug(f"Disk IO stressed - checking controlled apps: {controlled_apps}")
             for controlled_app in controlled_apps:
                 # 检查该管控应用是否在运行且占用高IO
                 running_pids = app_utils.get_app_processes(controlled_app['app_name'])
@@ -1199,7 +1199,7 @@ class DynamicBalancer:
         """
         停止服务线程，设置运行标志为False，并等待线程结束，同时确保任务队列中的任务都已处理完成
         """
-        logger.debug("服务开始停止.............")
+        logger.info("服务开始停止.")
         if not self.is_running:
             logger.debug("服务已经停止，无需再次操作")
             return
@@ -1213,4 +1213,4 @@ class DynamicBalancer:
             self.handle_thread.join(timeout=1)
         if hasattr(self, "app_intercept_thread"):
             self.app_intercept_thread.join(timeout=1)
-        logger.debug("服务已停止，线程已结束")
+        logger.info("服务已停止，线程已结束")

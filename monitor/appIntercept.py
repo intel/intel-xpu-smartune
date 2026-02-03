@@ -224,7 +224,7 @@ class AppIntercept(metaclass=SingletonMeta):
                     'purpose': "app"
                 }, True)
             else:
-                logger.debug(f"System resources busy, skipping relaunch of {app_name}")
+                logger.info(f"System resources busy, skipping relaunch of {app_name}")
                 app_utils.safe_notify("System resources busy", f"已暂停应用{app_name}启动", icon='dialog-warning')
                 app_utils.callback_manager.send_callback_notification({
                     'app_id': app_id,

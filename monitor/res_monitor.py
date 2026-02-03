@@ -324,7 +324,7 @@ class ResourceMonitor:
                     # 检查应用的可执行文件是否匹配
                     cmd = app["cmdline"]
                     if cmd and process_info['exe'] and process_info['exe'] in cmd:
-                        logger.debug(f"try_match_app Matched desktop app by cmdline: {app_id}")
+                        logger.debug(f"try_match_app matched desktop app by cmdline: {app_id}")
                         return {
                             'type': 'desktop',
                             'id': app_id,
@@ -333,7 +333,7 @@ class ResourceMonitor:
 
                     # 检查应用名称是否匹配进程名
                     if app["name"].lower() in process_info['name'].lower():
-                        logger.debug(f"try_match_app Matched desktop app by name: {app_id}")
+                        logger.debug(f"try_match_app matched desktop app by name: {app_id}")
                         return {
                             'type': 'desktop',
                             'id': app_id,

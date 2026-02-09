@@ -21,7 +21,7 @@ from time import sleep
 
 import psutil
 from config.config import b_config
-from utils.app_utils import fetch_all_apps
+from utils.app_utils import fetch_all_apps, get_cgroup_path_by_pid, get_pids_in_cgroup
 from utils.logger import logger
 
 from monitor.psi import PSIMonitor
@@ -64,7 +64,7 @@ class ResourceMonitor:
         # Step 2: 收集所有不重复的cgroup_path
         cgroup_paths = set()
         for proc in candidate_procs:
-            cgroup_path = self._get_process_cgroup(proc['pid'])
+            cgroup_path = get_cgroup_path_by_pid(proc['pid'])
             if cgroup_path:
                 cgroup_paths.add(cgroup_path)
 
@@ -87,7 +87,7 @@ class ResourceMonitor:
 
         # 第一次遍历：初始化 CPU 计时器，并缓存数据，default模式
         for cgroup_path in cgroup_paths:
-            pids_in_cgroup = self._get_pids_in_cgroup(cgroup_path)
+            pids_in_cgroup = get_pids_in_cgroup(cgroup_path)
             cgroup_pids[cgroup_path] = pids_in_cgroup
             for pid in pids_in_cgroup:
                 try:
@@ -202,54 +202,6 @@ class ResourceMonitor:
                 time.sleep(interval)
 
         return [{'pid': p['pid'], 'name': p['name']} for p in candidates]
-
-    def _get_process_cgroup(self, pid):
-        """获取进程的 cgroup 路径（从 /proc/<pid>/cgroup 解析）"""
-        try:
-            with open(f'/proc/{pid}/cgroup', 'r') as f:
-                for line in f:
-                    if line.strip():
-                        _, _, cgroup_path = line.strip().split(':', 2)
-                        if cgroup_path and cgroup_path != '/':
-                            return cgroup_path
-        except (FileNotFoundError, PermissionError, ValueError):
-            pass
-        return None
-
-    def _get_pids_in_cgroup(self, cgroup_path):
-        """获取指定cgroup下的所有进程PID"""
-        try:
-            result = subprocess.run(
-                ["systemd-cgls", "--no-page", cgroup_path],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            output = result.stdout
-
-            if not output:
-                logger.debug(f"No output from systemd-cgls for cgroup {cgroup_path}")
-                return []
-
-            pids = re.findall(r"[├└]─(\d+)\s+.+", output)
-            filtered_pids = []
-            for pid in map(int, pids):
-                try:
-                    cmdline = psutil.Process(pid).cmdline()
-                    if cmdline and cmdline[0] == "bash":
-                        continue  # Skip processes with cmdline "bash"
-                    filtered_pids.append(pid)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-
-            return filtered_pids
-
-        except subprocess.TimeoutExpired:
-            logger.warning(f"Timeout while getting PIDs for cgroup {cgroup_path}")
-            return []
-        except Exception as e:
-            logger.error(f"Error getting PIDs for cgroup {cgroup_path}: {str(e)}")
-            return []
 
     def _adjust_weights_by_pressure(self, psi_data):
         """根据PSI压力动态调整权重"""

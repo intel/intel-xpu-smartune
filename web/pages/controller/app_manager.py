@@ -122,23 +122,18 @@ def _process_callback():
             if callback_data.data_ready.acquire(blocking=False):
                 print("New callback data available.")
                 with callback_data.lock:
-                    data = callback_data.latest_data
+                    notify_data = callback_data.latest_data
                     callback_data.latest_data = None
                     callback_data.has_new_data = False
 
-                if not data:
+                if not notify_data:
                     print("[WARNING] Empty callback data received")
                     continue
 
-                app_id = data.get('app_id')
-                app_name = data.get('app_name')
-                new_status = data.get('status')
-                purpose = data.get('purpose')
-
-                print(f"Callback data: {data}")
-                if not all([app_id, app_name, new_status, purpose]):
-                    print(f"[ERROR] Incomplete callback data: {data}")
-                    continue
+                app_id = notify_data.get('app_id')
+                app_name = notify_data.get('app_name')
+                new_status = notify_data.get('status')
+                purpose = notify_data.get('purpose')
 
                 current_app_name = app_name
                 if purpose == "app":
@@ -153,6 +148,8 @@ def _process_callback():
 
                     if new_status == "limited":
                         is_app_resources_limited = True
+                    else:
+                        is_app_resources_limited = False
 
                 if purpose == "notify":
                     if new_status == "manual_app_limit_by_user":
@@ -377,23 +374,34 @@ def app_management(default_apps):
 
             with cols[6]:
                 limit_key = f"resource_limit_{app['app_id']}"
-                if limit_key not in st.session_state:
-                    st.session_state[limit_key] = False  # False表示"限制"状态，True表示"恢复"状态
 
-                btn_text = "🔄 恢复正常" if st.session_state[limit_key] else "⛔ 资源限制"
-                btn_type = "secondary" if st.session_state[limit_key] else "primary"
+                if status in ["limited", "a_limited"]:
+                    btn_text = "🔄 恢复正常"
+                    btn_type = "secondary"
+                    btn_disabled = False
+                    st.session_state[limit_key] = True
+                elif status == "running":
+                    btn_text = "⛔ 资源限制"
+                    btn_type = "primary"
+                    btn_disabled = False
+                    st.session_state[limit_key] = False
+                else:  # "NA" 或 "pending"
+                    btn_text = "⛔ 资源限制"
+                    btn_type = "primary"
+                    btn_disabled = True
 
-                limit_disabled = (status != "running") and not st.session_state[limit_key]
+                    if limit_key not in st.session_state:
+                        st.session_state[limit_key] = False
 
-                if st.button(btn_text, key=f"limit_{idx}", type=btn_type, disabled=limit_disabled):
-                    if st.session_state[limit_key]:
+                if st.button(btn_text, key=f"limit_{idx}", type=btn_type, disabled=btn_disabled):
+                    if status in ["limited", "a_limited"]:
                         restore_result = api.restore_resource(app["app_id"])
                         if restore_result:
                             st.session_state[limit_key] = False
                             st.toast(f'已成功恢复应用{app["app_name"]}的资源!', icon='🎉')
                         else:
                             st.toast(f'恢复应用{app["app_name"]}的资源失败!', icon="❌")
-                    else:
+                    elif status == "running":
                         limit_result = api.resource_limit(app["app_id"], app['app_name'], app["priority"])
                         if limit_result:
                             st.session_state[limit_key] = True

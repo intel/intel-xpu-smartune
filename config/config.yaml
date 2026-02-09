@@ -19,9 +19,15 @@ all_apps:
   - name: "vlc" # VLC media player
     id: "vlc.desktop"
     commandline: "/usr/bin/vlc"
+  - name: "ollama serve" # ollama qwen
+    id: "start-ollama.sh"
+    commandline: "./start-ollama.sh"
   - name: "Text Editor" # Text Editor
     id: "org.gnome.TextEditor.desktop"
     commandline: "gnome-text-editor %U"
+  - name: "llama-server" # llama-server
+    id: "llama-server"
+    commandline: "./llama-server -m"
 weights_top:
   cpu: 2
   memory: 7
@@ -35,6 +41,10 @@ monitor_apps:  # Some specific apps to monitor by BPF
     bpf_name: ["gnome-system-monitor"]
   - name: "Text Editor"
     bpf_name: ["gnome-text-editor"]
+  - name: "ollama serve"
+    bpf_name: [ "start-ollama.sh" ]
+  - name: "llama-server"
+    bpf_name: [ "llama-server" ]
 blacklist:
   - systemd
   - kworker

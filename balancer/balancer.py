@@ -1047,51 +1047,56 @@ class DynamicBalancer:
         """设置应用资源限制（平衡版）"""
         global g_limited_apps, g_app_id_mapping
 
-        # 1. 处理优先级
+        # Get limit rates based on priority
         priority = priority or "undefined"
         limit_rates = self.get_limited_rates(priority)
         if not limit_rates:
             logger.error(f"No limit rates defined for priority: {priority}")
             return False
 
-        # 2. 获取应用信息
+        # Get app resource usage data.
         usage = app_utils.get_app_resource_usage(app_id, app_name)
         if usage is None:
             logger.warning(f"No resource usage data for {app_name}, using empty defaults")
             usage = {}
 
-        # 3. 确定有效应用ID
-        app_info = self.resource_monitor.try_match_app(usage)
-        effective_app_id = app_info.get('id', app_id) if app_info else app_id
-        if app_info and 'id' in app_info:
-            logger.debug(f"App ID mapped from {app_id} to {effective_app_id}")
+        effective_app_id = os.path.basename(usage.get("cgroup_path", ""))
+        cpu_usage_percent = usage.get("cpu_percent", 0) if usage.get("cpu_percent", 0) > 10 else 0
+        mem_current = usage.get("mem_current", 0)
+        io_read_mb = usage.get("io_read_mb", 0)
+        io_write_mb = usage.get("io_write_mb", 0)
+        is_io_limit = False if (io_read_mb + io_write_mb) < 100 else True  # 假设100MB/s作为IO压力的阈值
 
-        # 4. 计算限制值
-        total_mem = self.resource_monitor.get_total_memory()
-        cpu_quota = int(100 * limit_rates["cpu_rate"]) if limit_rates.get("cpu_rate") else None
-        mem_high = int(total_mem * limit_rates["mem_rate"]) if limit_rates.get("mem_rate") else None
+        # Set limits based on usage and configured rates
+        cpu_quota = int(cpu_usage_percent * limit_rates["cpu_rate"]) if (limit_rates.get("cpu_rate") and
+                                                                         cpu_usage_percent > 0) else None
+        mem_high = int(mem_current * limit_rates["mem_rate"]) if limit_rates.get("mem_rate") else None
         io_limits = limit_rates.get("disk_io_rate", {})
 
-        logger.debug(f"Calculated limits - CPU: {cpu_quota}%, Memory: {mem_high} bytes, IO: {io_limits}")
+        logger.debug(f"Calculated limits - CPU: {cpu_quota if cpu_quota else 'No Limit'}, "
+                     f"Memory: {mem_high if mem_high else 'No Limit'}, is_io_limit: {is_io_limit}")
 
         # 5. 应用资源限制
         resource_limited = False
         io_limited = False
 
         # CPU/内存限制
-        if cpu_quota is not None or mem_high is not None:
+        if (cpu_quota is not None or mem_high is not None) and self.is_running:
             if self.controlManager.adjust_resources(
                     effective_app_id, "critical",
                     cpu_quota=cpu_quota,
                     mem_high=mem_high
             ):
                 resource_limited = True
+                # The memory limit will affect the data of PSI, causing misjudgment of the system pressure,
+                # and it is necessary to reduce the effect of data on psi
+                self.controlManager.set_limited_app_dominant(True)
                 logger.info(f"Successfully set CPU/Memory limits for {app_name}")
             else:
                 logger.error(f"Failed to set CPU/Memory limits for {app_name}")
 
         # 磁盘IO限制
-        if io_limits:
+        if is_io_limit and io_limits and self.is_running:
             limits = {
                 "default": {  # 如果需要为不同disk设置不同参数，可增加类似"nvme0n1": {...}配置
                     "rbps": io_limits['read'] * 1024 ** 2,
@@ -1117,7 +1122,13 @@ class DynamicBalancer:
                 'io_limited': io_limited
             }, None)  # None 表示完全限制
             g_app_id_mapping[app_id] = effective_app_id
-            app_utils.update_app_status(app_id, "limited")
+            app_utils.update_app_status(app_id, "a_limited")
+            app_utils.callback_manager.send_callback_notification({
+                'app_id': app_id,
+                'app_name': app_name,
+                'status': "a_limited",
+                'purpose': "app"
+            }, False)
             logger.info(f"Recorded resource limits for {app_name}")
             return True
 
@@ -1148,7 +1159,14 @@ class DynamicBalancer:
                     restore_success = False
 
             if restore_success:
+                self.controlManager.set_limited_app_dominant(False)
                 app_utils.update_app_status(app_id, "running")
+                app_utils.callback_manager.send_callback_notification({
+                    'app_id': app_id,
+                    'app_name': app_name,
+                    'status': "running",
+                    'purpose': "app"
+                }, False)
                 logger.info(f"Resources restored for {app_id}")
 
             return restore_success

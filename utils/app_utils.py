@@ -67,6 +67,7 @@ class ClientCallbackManager:
                 print(f"Database update error: {db_error}")
 
         try:
+            logger.info("Send a notification to client.")
             response = requests.post(
                 self._registered_url,
                 json=data,
@@ -271,6 +272,42 @@ def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.
         return False, str(e)
 
 
+def get_pids_in_cgroup(cgroup_path):
+    """获取指定cgroup下的所有进程PID"""
+    try:
+        result = subprocess.run(
+            ["systemd-cgls", "--no-page", cgroup_path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        output = result.stdout
+
+        if not output:
+            logger.debug(f"No output from systemd-cgls for cgroup {cgroup_path}")
+            return []
+
+        pids = re.findall(r"[├└]─(\d+)\s+.+", output)
+        filtered_pids = []
+        for pid in map(int, pids):
+            try:
+                cmdline = psutil.Process(pid).cmdline()
+                if cmdline and cmdline[0] == "bash":
+                    continue  # Skip processes with cmdline "bash"
+                filtered_pids.append(pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        return filtered_pids
+
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Timeout while getting PIDs for cgroup {cgroup_path}")
+        return []
+    except Exception as e:
+        logger.error(f"Error getting PIDs for cgroup {cgroup_path}: {str(e)}")
+        return []
+
+
 def _get_executable_name(app_name, app_cmdline):
     if not app_cmdline:
         return app_name.lower()
@@ -410,62 +447,81 @@ def update_app_status(app_id: str, status: str) -> bool:
 
 
 def get_app_resource_usage(app_id: str, app_name: str) -> dict:
-    """查询特定桌面应用程序的实际CPU、内存和IO使用情况
-
-    Args:
-        app_id: 应用程序的.desktop ID (如 org.gnome.Calculator.desktop)
-        app_name: 应用程序的名称 (如 Calculator)
-
-    Returns:
-        包含资源使用情况的字典，格式为:
-        {
-            'pids': list,          # 进程ID列表
-            'name': str,           # 进程名称
-            'cpu_percent': float,  # CPU使用百分比
-            'mem_bytes': int,      # 内存使用字节数
-            'io_read_bytes': int,  # IO读取字节数
-            'io_write_bytes': int  # IO写入字节数
-        }
-    """
+    """Query the actual CPU, memory, and IO usage of a specific application"""
     try:
-        # 获取所有进程信息
-        processes = []
-        pids = []
-        proc_name = None
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'memory_info', 'io_counters']):
-            try:
-                # 检查进程是否匹配应用程序名称或.desktop文件
-                if app_name.lower() in proc.name().lower():
-                    processes.append(proc)
-                    pids.append(proc.pid)
-                    proc_name = proc.name()
-                else:
-                    # 检查命令行是否包含.desktop文件信息
-                    cmdline = " ".join(proc.cmdline())
-                    if app_id.lower() in cmdline.lower():
-                        processes.append(proc)
-                        pids.append(proc.pid)
-                        proc_name = proc.name()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
+        base_cgroup = "/sys/fs/cgroup"
+        if hasattr(b_config, 'cgroup_mount') and b_config.cgroup_mount:
+            base_cgroup = b_config.cgroup_mount
 
-        if not processes:
+        # Get all PIDs associated with the app name
+        pids = get_app_processes(app_name)
+        if not pids:
             print(f"No processes found for app {app_name} (ID: {app_id})")
             return {}
 
-        # 计算总资源使用量
-        cpu_percent = sum(proc.cpu_percent() for proc in processes)
-        mem_bytes = sum(proc.memory_info().rss for proc in processes)
-        io_read_bytes = sum(proc.io_counters().read_bytes for proc in processes if proc.io_counters() is not None)
-        io_write_bytes = sum(proc.io_counters().write_bytes for proc in processes if proc.io_counters() is not None)
+        # Since application should be in the same cgroup, we can take the first PID to find the cgroup path
+        cgroup_path = get_cgroup_path_by_pid(pids[0])
+        if not cgroup_path:
+            print(f"No cgroup found for PID {pids[0]} of app {app_name}")
+            return {}
 
+        all_pids = get_pids_in_cgroup(cgroup_path)
+
+        cgroup_mem_current_file = os.path.join(base_cgroup, cgroup_path.lstrip('/'), "memory.current")
+        with open(cgroup_mem_current_file, 'r') as f:
+            cgroup_mem_total = int(f.read().strip())
+
+        logger.debug(f"App {app_name} (ID: {app_id}) - Found PIDs in cgroup: {all_pids}")
+
+        cpu_total = 0.0
+        mem_rss_total = 0
+        io_read_total = 0
+        io_write_total = 0
+        process_names = set()
+
+        # Acquire resource usage for all PIDs
+        for pid in all_pids:
+            try:
+                with psutil.Process(pid).oneshot():
+                    proc = psutil.Process(pid)
+                    cpu_total += proc.cpu_percent(interval=None)
+                    mem_info = proc.memory_info()
+                    mem_rss_total += mem_info.rss
+
+                    try:
+                        io_counters = proc.io_counters()
+                        if io_counters:
+                            io_read_total += io_counters.read_bytes
+                            io_write_total += io_counters.write_bytes
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+
+                    process_names.add(proc.name())
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if not process_names:
+            print(f"No valid processes found for app {app_name} (ID: {app_id})")
+            return {}
+
+        mem_current_mb = cgroup_mem_total / (1024 ** 2)  # MB
+        mem_rss_mb = mem_rss_total / (1024 ** 2)  # MB
+        io_read_mb = io_read_total / (1024 ** 2)  # MB
+        io_write_mb = io_write_total / (1024 ** 2)  # MB
+
+        logger.debug(f"Resource usage for {app_name} (ID: {app_id}): CPU={cpu_total:.1f}%, Memory_current={mem_current_mb:.2f}"
+                     f"MB (RSS={mem_rss_mb:.2f}MB), IO Read={io_read_mb:.2f}MB, IO Write={io_write_mb:.2f}MB")
         return {
-            'pids': pids,
-            'name': proc_name if proc_name else app_name,
-            'cpu_percent': cpu_percent,
-            'mem_bytes': mem_bytes,
-            'io_read_bytes': io_read_bytes,
-            'io_write_bytes': io_write_bytes
+            'pids': list(all_pids),
+            'name': app_name,
+            'cgroup_path': cgroup_path,
+            'cpu_percent': round(cpu_total, 1),
+            'mem_current': round(mem_current_mb, 2),
+            'mem_rss_mb': round(mem_rss_mb, 2),
+            'io_read_mb': round(io_read_mb, 2),
+            'io_write_mb': round(io_write_mb, 2),
+            'process_names': list(process_names)
         }
     except Exception as e:
         print(f"Error getting resource usage for {app_name} (ID: {app_id}): {e}")

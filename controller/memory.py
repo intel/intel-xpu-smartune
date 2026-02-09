@@ -14,16 +14,34 @@
 
 import os
 from controller.base import ControllerBase
-import shutil
-from typing import Optional
+import subprocess
+
 from utils.logger import logger
 
 # Reserved
 class MemoryController(ControllerBase):
     def __init__(self, cgroup_mount: str):
         super().__init__(cgroup_mount)
+        self.set_managed_oom_pressure()
     def controller_type(self) -> str:
         return "memory"
+
+    def set_managed_oom_pressure(self, user_service: str = "user@1000.service", oom_pressure: str = "auto") -> bool:
+        """systemd OOM的控制将于Balancer接管，因此设置默认值从kill到auto"""
+        try:
+            cmd = [
+                'sudo', 'systemctl', 'set-property', '--runtime',
+                user_service, f'ManagedOOMMemoryPressure={oom_pressure}'
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                return True
+            logger.info(f"Failed to set ManagedOOMMemoryPressure: {result.stderr.strip()}")
+            return False
+        except:
+            logger.error("Exception occurred while setting ManagedOOMMemoryPressure")
+            return False
 
     def set_parameter(self, cgroup: str, param: str, value: str) -> bool:
         try:
@@ -50,4 +68,3 @@ class MemoryController(ControllerBase):
         """检查是否触发过OOM"""
         status = self.get_parameter(cgroup, "memory.oom_control")
         return "under_oom 1" in status if status else False
-

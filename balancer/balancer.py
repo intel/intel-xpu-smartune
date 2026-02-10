@@ -31,6 +31,7 @@ from controller.io import IOController
 
 
 g_limited_apps = OrderedDict()  # 记录被限制的应用
+g_limited_apps_manual = OrderedDict()  # 记录被限制的应用
 g_app_id_mapping = {}  # {app_id: effective_app_id}
 is_limited_app_dominant = False  # critical情况下，用于判断拿到的Top进程是否为已限制的进程
 
@@ -947,39 +948,48 @@ class DynamicBalancer:
         return False, False, None, None
 
     def restore_all_limited_apps_resources(self):
-        """ 遍历g_limited_apps, 恢复被限制的资源 """
-        global g_limited_apps
-        if not g_limited_apps:
+        """Restore all limited apps resources"""
+        global g_limited_apps, g_limited_apps_manual
+        if not g_limited_apps and not g_limited_apps_manual:
             logger.info("No limited apps to restore")
             return
 
-        logger.info(f"Restoring resources for {len(g_limited_apps)} limited apps")
+        logger.info(
+            f"Restoring resources for {len(g_limited_apps)} limited apps and "
+            f"{len(g_limited_apps_manual)} manual limited apps")
 
-        # 遍历字典的副本以避免修改迭代中的字典
-        for app_id, (app_name, _, limit_parts, _) in list(g_limited_apps.items()):
+        all_limited_apps = {}
+        all_limited_apps.update(g_limited_apps)
+        all_limited_apps.update(g_limited_apps_manual)
+
+        for app_id, (app_name, _, limit_parts, _) in list(all_limited_apps.items()):
             try:
-                logger.info(f"Restoring resources for app: {app_id}, name: {app_name}")
+                app_source = "manual" if app_id in g_limited_apps_manual else "auto"
+                logger.info(f"Restoring resources for {app_source} limited app: {app_id}, name: {app_name}")
                 restore_success = True
 
-                # 恢复CPU/内存
+                # Restore CPU/Memory limits
                 if limit_parts.get('cpu_mem_limited', False):
                     if not self.controlManager.adjust_resources(app_id, "low"):
-                        logger.error(f"Failed to restore CPU/Memory for {app_id}")
+                        logger.error(f"Failed to restore CPU/Memory for {app_source} limited app {app_id}")
                         restore_success = False
 
-                # 恢复IO限制
+                # Restore IO limits
                 if limit_parts.get('io_limited', False):
                     if not self.io_ctl.restore_disk_io_throttle(app_id):
-                        logger.error(f"Failed to remove IO limits for {app_id}")
+                        logger.error(f"Failed to remove IO limits for {app_source} limited app {app_id}")
                         restore_success = False
 
                 if restore_success:
-                    logger.info("All limited apps resources restoration completed")
+                    logger.info(f"{app_source.capitalize()} limited app resources restoration completed")
             except Exception as e:
-                logger.error(f"Failed to restore resources for {app_id}: {str(e)}")
+                logger.error(f"Failed to restore resources for app {app_id}: {str(e)}")
             finally:
-                # 无论成功与否都移除记录
+                # Remove app from tracking regardless of restore success to avoid repeated attempts on failure
                 g_limited_apps.pop(app_id, None)
+                g_limited_apps_manual.pop(app_id, None)
+
+        logger.info("All limited apps resources restoration completed")
 
     def cancel_relaunch_by_app_id(self, app_id: str) -> bool:
         """ 根据 app_id 删除队列中的项目，并杀死对应进程 """
@@ -1045,7 +1055,7 @@ class DynamicBalancer:
 
     def set_resource_limit(self, app_id: str, app_name: str, priority: str = None) -> bool:
         """设置应用资源限制（平衡版）"""
-        global g_limited_apps, g_app_id_mapping
+        global g_limited_apps_manual, g_app_id_mapping
 
         # Get limit rates based on priority
         priority = priority or "undefined"
@@ -1117,7 +1127,7 @@ class DynamicBalancer:
 
         # 6. 记录限制状态（只要有一个限制成功就记录）
         if resource_limited or io_limited:
-            g_limited_apps[effective_app_id] = (app_name, limit_rates, {
+            g_limited_apps_manual[effective_app_id] = (app_name, limit_rates, {
                 'cpu_mem_limited': resource_limited,
                 'io_limited': io_limited
             }, None)  # None 表示完全限制
@@ -1137,11 +1147,11 @@ class DynamicBalancer:
 
     def set_restore_resource(self, app_id: str) -> bool:
         """根据 app_id 恢复资源限制"""
-        global g_limited_apps, g_app_id_mapping
+        global g_limited_apps_manual, g_app_id_mapping
 
         # 获取有效应用ID
         effective_app_id = g_app_id_mapping.pop(app_id, app_id)
-        app_name, _, limit_parts, _ = g_limited_apps.pop(effective_app_id, None)
+        app_name, _, limit_parts, _ = g_limited_apps_manual.pop(effective_app_id, None)
         restore_success = True
         try:
             logger.info(f"Restoring resources for app: {app_id}, name: {app_name}")
@@ -1159,7 +1169,6 @@ class DynamicBalancer:
                     restore_success = False
 
             if restore_success:
-                self.controlManager.set_limited_app_dominant(False)
                 app_utils.update_app_status(app_id, "running")
                 app_utils.callback_manager.send_callback_notification({
                     'app_id': app_id,
@@ -1173,6 +1182,10 @@ class DynamicBalancer:
         except Exception as e:
             logger.error(f"Failed to restore resources for {app_id}: {str(e)}")
             return False
+        finally:
+            # PSI data is may not right, so we need to delay the reset of dominant status.
+            time.sleep(self.config.regular_update_sys_pressure_time)
+            self.controlManager.set_limited_app_dominant(False)
 
     def _execute_task(self, task: WorkloadTask, pressure_level: str) -> bool:
         """执行任务"""

@@ -27,7 +27,7 @@ class MemoryController(ControllerBase):
         return "memory"
 
     def set_managed_oom_pressure(self, user_service: str = "user@1000.service", oom_pressure: str = "auto") -> bool:
-        """systemd OOM的控制将于Balancer接管，因此设置默认值从kill到auto"""
+        """Control of systemd OOM will take over in the Balancer, so set the default value from kill to auto"""
         try:
             cmd = [
                 'sudo', 'systemctl', 'set-property', '--runtime',

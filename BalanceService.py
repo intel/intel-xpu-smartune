@@ -151,7 +151,7 @@ def get_apps():
                 if not existing_app:
                     # 仅当应用不存在时才插入
                     AIAppPriority.insert_record(
-                        id=app_id.replace('.desktop', ''),
+                        id=app_id,
                         app_id=app_id,
                         name=app["name"],
                         priority=0,  # 默认优先级
@@ -189,37 +189,27 @@ def set_priority():
                 retmsg="Missing required parameters"
             )
 
-        app_info = Gio.DesktopAppInfo.new(app_id)
-        if not app_info:
-            return construct_response(
-                data={},
-                retcode=RetCode.NOT_EXISTING,
-                retmsg="Application not found"
-            )
-
-        # 使用新的update_record方法
         result = AIAppPriority.update_record(
-            id=app_id.replace('.desktop', ''),
+            id=app_id,
             priority=priority,
             up_time=datetime.now()
         )
 
-        logger.info(f"result : {result}")
+        logger.info(f"Set priority result for app_id={app_id}: {result}")
+
         if result == DBStatus.NOT_FOUND:
-            # 如果记录不存在则创建
-            AIAppPriority.insert_record(
-                id=app_id.replace('.desktop', ''),
-                app_id=app_id,
-                name=app_info.get_name(),
-                priority=priority,
-                cgroup="user",
-                remark="",
-                cmdline=app_info.get_commandline(),
-                up_time=datetime.now()
+            return construct_response(
+                data={},
+                retcode=RetCode.NOT_EXISTING,
+                retmsg="Application record not found in database"
             )
 
         _service.rebuild_controlled_map()
-        adjust_oom_priority(app_id, app_info.get_name(), priority, app_info.get_commandline())
+        app_record = AIAppPriority.query().where(AIAppPriority.app_id == app_id).get()
+        if app_record:
+            logger.debug(f"Updating OOM priority for app_id={app_id}, name={app_record.name}, priority={priority}, "
+                         f"cmdline={app_record.cmdline}")
+            adjust_oom_priority(app_id, app_record.name, priority, app_record.cmdline)
 
         return construct_response(
             data={},
@@ -269,7 +259,6 @@ def get_priority_data():
                 retmsg=not_found_msg
             )
 
-
         # 返回标准化数据结构
         priority_data = {
             "id": record.id,
@@ -312,7 +301,7 @@ def set_to_control():
 
         # 更新或创建数据库记录
         result = AIAppPriority.update_record(
-            id=app_id.replace('.desktop', ''),
+            id=app_id,
             controlled=controlled,
             priority=priority,
             cgroup=cgroup,
@@ -321,7 +310,7 @@ def set_to_control():
 
         if result == DBStatus.NOT_FOUND:
             AIAppPriority.insert_record(
-                id=app_id.replace('.desktop', ''),
+                id=app_id,
                 app_id=app_id,
                 name=app_name,
                 priority=priority,  # 默认优先级
@@ -379,7 +368,7 @@ def remove_from_control():
 
         # 更新数据库记录（将controlled设为False）
         AIAppPriority.update_record(
-            id=app_id.replace('.desktop', '') if app_id else "",
+            id=app_id if app_id else "",
             controlled=False
         )
 
@@ -542,7 +531,7 @@ def cancel_relaunch_app():
 
         try:
             update_db_result = AIAppPriority.update_record(
-                id=app_id.replace('.desktop', ''),
+                id=app_id,
                 status="stopped",
                 up_time=datetime.now()
             )

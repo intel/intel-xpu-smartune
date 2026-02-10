@@ -57,7 +57,7 @@ class ClientCallbackManager:
         if store:
             try:
                 result = AIAppPriority.update_record(
-                    id=data['app_id'].replace('.desktop', ''),
+                    id=data['app_id'],
                     status=data['status'],
                     up_time=datetime.now()
                 )
@@ -413,7 +413,7 @@ def adjust_oom_priority(
 def _update_app_oom_score_adj(app_id: str, score: int) -> bool:
     try:
         result = AIAppPriority.update_record(
-            id=app_id.replace('.desktop', ''),
+            id=app_id,
             oom_score=score
         )
         if not result:
@@ -431,7 +431,7 @@ def _update_app_oom_score_adj(app_id: str, score: int) -> bool:
 def update_app_status(app_id: str, status: str) -> bool:
     try:
         result = AIAppPriority.update_record(
-            id=app_id.replace('.desktop', ''),
+            id=app_id,
             status=status
         )
         if not result:

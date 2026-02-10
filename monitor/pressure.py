@@ -39,7 +39,7 @@ class PressureAnalyzer:
         # 2. 查看资源整体使用率，如果剩余较多则把分数降低
         resource_adjust_factor = 1.0
         if is_limited_app_dominant and not is_sys_busy:
-            resource_adjust_factor = 0.6  # 当已经受限的应用占主导，但整体资源并不紧张时，降低分数
+            resource_adjust_factor = 0.5  # 当已经受限的应用占主导，但整体资源并不紧张时，降低分数
 
         # 3. 计算最终分数
         final_score = min(base_score * resource_adjust_factor, 1.0)

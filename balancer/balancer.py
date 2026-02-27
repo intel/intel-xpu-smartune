@@ -672,7 +672,7 @@ class DynamicBalancer:
                 # 从DB中获取coming_app priority,如没有设置，就是low
                 # priority = "1000"  # critical
                 # priority_value = {"Calculator": 1000, "test2": 1500, "test3": 1300}
-                priority = self.controlManager.get_app_priority(app_name=coming_app["app_name"])
+                priority = app_utils.get_app_priority(app_name=coming_app["app_name"])
                 logger.info(f"_run_handle_loop: App {coming_app['app_name']} priority is {priority}")
 
                 # # 将任务放入待处理队列

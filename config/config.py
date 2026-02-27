@@ -23,7 +23,6 @@ class Config:
     weights: dict = None
     weights_top: dict = None
     workloads: dict = None
-    balance_service: dict = None
     app_priority: dict = None
     limit_policy: dict = None
     blacklist: list = None

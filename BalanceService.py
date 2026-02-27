@@ -12,6 +12,7 @@
 #
 
 
+import os
 import signal
 from datetime import datetime
 from threading import Lock
@@ -20,12 +21,16 @@ from flask import Flask, request
 
 from balancer.balancer import DynamicBalancer
 from db.DatabaseModel import AIAppPriority, DBStatus, init_database
-from utils.app_utils import adjust_oom_priority, callback_manager, fetch_all_apps
+from utils.app_utils import adjust_oom_priority, callback_manager, fetch_all_apps, get_priority_value
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
 
 
 app = Flask(__name__)
+
+CERT_FILE = './b_server.crt'
+KEY_FILE = './b_server.key'
+
 _service_lock = Lock()
 _service = None  # 单例服务实例
 
@@ -64,9 +69,6 @@ class DynamicService:
 
     def rebuild_controlled_map(self):
         self.balancer.bpf_monitor.rebuild_controlled_map()
-
-    def get_pending_app_priority_value(self, priority_str):
-        return self.balancer.controlManager.get_priority_value(priority_str)
 
     def shutdown(self):
         self.balancer.shutdown()
@@ -455,7 +457,7 @@ def get_pending_app():
                 "controlled": app.controlled,
                 "priority": app.priority,
                 "oom_score": app.oom_score,
-                "priority_value": _service.get_pending_app_priority_value(app.priority),
+                "priority_value": get_priority_value(app.priority),
                 "cgroup": app.cgroup,
                 "remark": app.remark,
                 "status": app.status
@@ -664,13 +666,20 @@ def register_callback():
 
 
 def main():
-    print("Starting Balance Service...")
-    init_database()
-    if not hasattr(app, "_service_initialized"):  # 确保只初始化一次
-        start_service()
-        app._service_initialized = True  # 标记已初始化
-    app.run(host="0.0.0.0", port=9001, debug=False, use_reloader=False)
+    logger.info("Starting Balance Service...")
+    # 检查证书文件是否存在
+    if not os.path.exists(CERT_FILE) or not os.path.exists(KEY_FILE):
+        logger.error(f"Certificate files not found: {CERT_FILE}, {KEY_FILE}, "
+                     f"please check 'start_balancer.sh' to generate them.")
+        return
 
+    init_database()
+    if not hasattr(app, "_service_initialized"):  # Make sure the service is only initialized once
+        start_service()
+        app._service_initialized = True
+
+    ssl_context = (CERT_FILE, KEY_FILE)
+    app.run(host="0.0.0.0", port=9001, debug=False, use_reloader=False, ssl_context=ssl_context)
 
 if __name__ == "__main__":
     main()

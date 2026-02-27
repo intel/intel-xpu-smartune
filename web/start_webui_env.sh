@@ -3,8 +3,13 @@ set -euo pipefail
 export LANG=en_US.UTF-8
 
 # 获取脚本所在目录
+project_root=$(dirname "$(dirname "$(realpath "$0")")")
 current_dir=$(dirname "$(realpath "$0")")
+
 cd "$current_dir" || exit 1
+
+# 设置环境变量
+export B_CERT_FILE="$project_root/b_server.crt"
 
 # 配置参数
 STREAMLIT_PORT=8655
@@ -16,7 +21,7 @@ cleanup() {
 
     # 1. 杀死Streamlit进程
     if pgrep -f "$STREAMLIT_CMD" >/dev/null; then
-        echo "Killing Streamlit process..."
+        echo "Killing Client process..."
         pkill -9 -f "$STREAMLIT_CMD" || true
     fi
 
@@ -32,7 +37,7 @@ cleanup() {
 # 设置信号捕获
 trap 'cleanup' SIGINT SIGTERM ERR
 
-echo "Starting Streamlit..."
+echo "Starting UI..."
 
 # 启动Streamlit
 env http_proxy= all_proxy= \
@@ -41,7 +46,7 @@ streamlit_pid=$!
 
 # 等待进程结束
 wait $streamlit_pid || {
-    echo "Streamlit process exited abnormally" >&2
+    echo "Client UI process exited abnormally" >&2
     cleanup
 }
 

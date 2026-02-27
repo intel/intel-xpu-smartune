@@ -27,13 +27,19 @@ from typing import List, Optional, Dict, Any
 from config.config import b_config
 from gi.repository import Gio
 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import urllib3
+
 _original_oom_scores: dict[str, str] = {}
 
+B_CERT_FILE = os.getenv('CERT_FILE')
 
 class ClientCallbackManager:
     """管理客户端回调的全局状态和操作"""
     _instance = None
     _registered_url: Optional[str] = None
+    _session = False
 
     def __new__(cls):
         if cls._instance is None:
@@ -47,6 +53,31 @@ class ClientCallbackManager:
     def register_callback_url(self, url: str) -> None:
         """注册全局回调地址"""
         self._registered_url = url
+        self._session = self._create_session()
+
+    def _create_session(self):
+        """Create a requests session with retry strategy and SSL configuration."""
+        session = requests.Session()
+
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["POST", "GET"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+
+        if B_CERT_FILE and os.path.exists(B_CERT_FILE):
+            session.verify = B_CERT_FILE
+            print(f"Using custom certificate for SSL verification: {B_CERT_FILE}")
+        else:
+            print(f"Warning: Certificate file {B_CERT_FILE} not found. SSL verification is disabled.")
+            session.verify = False
+            # Disable ssl
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        return session
 
     def send_callback_notification(self, data: Dict[str, Any], store=False) -> bool:
         """发送回调通知（线程安全）"""
@@ -68,11 +99,13 @@ class ClientCallbackManager:
 
         try:
             logger.info("Send a notification to client.")
-            response = requests.post(
+            response = self._session.post(
                 self._registered_url,
                 json=data,
                 timeout=5
             )
+            response.raise_for_status()
+
             return response.status_code == 200 and response.json().get("status") == "ok"
         except Exception as e:
             print(f"Callback notification failed: {str(e)}")
@@ -124,7 +157,47 @@ def get_controlled_apps_config(apps_dict=None):
                 continue
 
 
+def get_app_priority(app_id: str = "", app_name: str = "") -> str:
+    """Get the priority of an application."""
+    try:
+        # 构建 OR 查询条件
+        query = AIAppPriority.query()
+        conditions = []
+        if app_id:
+            conditions.append(AIAppPriority.app_id == app_id)
+        if app_name:
+            conditions.append(AIAppPriority.name == app_name)
+
+        if not conditions:
+            return "low"
+
+        query = query.where(conditions[0])
+        record = query.first()
+
+        if record:
+            return record.priority or "low"
+        else:
+            return "low"
+
+    except Exception as e:
+        logger.error("Failed to get app priority from db: %s", str(e))
+        return "low"
+
+
+def get_priority_value(priority_str: str = "") -> int:
+    """
+    :param priority_str: e.g. critical
+    :return: 100
+    """
+    priority = priority_str.lower()
+    print(f"Getting priority for: {priority}, is: {b_config.app_priority}")
+    if priority not in b_config.app_priority:
+        raise ValueError(f"Invalid priority: {priority_str}")
+    return b_config.app_priority[priority]
+
+
 def get_controlled_apps_net():
+    """ Get the list of all controlled apps with their network-related info (cgroup path, pid, etc.) """
     apps_dict = {}
     # 1. 先查数据库 controlled_apps，优先使用数据库
     try:
@@ -157,6 +230,7 @@ def get_controlled_apps_net():
 
 
 def get_controlled_apps(priority: str = None):
+    """ Get the list of all controlled apps with basic info (without dynamic data like pid/cgroup) """
     try:
         controlled_apps = AIAppPriority.query().filter(AIAppPriority.controlled == True)
         if priority is not None:

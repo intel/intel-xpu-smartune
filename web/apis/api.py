@@ -12,6 +12,7 @@
 #
 
 
+import os
 import requests
 import threading
 from typing import Optional, Dict, Any
@@ -20,8 +21,15 @@ from flask import Flask, request, jsonify
 from apis.multiapps_bridge import MABridge
 from apis.systools import SingletonMeta
 
-MULTIAPPS_URL = "http://127.0.0.1:9001"
-CLIENT_URL = "http://127.0.0.1:8656"
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import urllib3
+
+MULTIAPPS_URL = "https://127.0.0.1:9001"
+B_CERT_FILE = os.getenv('B_CERT_FILE')
+B_CERT_KEY = os.getenv('B_CERT_KEY')
+
+CLIENT_URL = "https://127.0.0.1:8656"
 
 client_app = Flask(__name__)
 
@@ -84,6 +92,31 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         self.app_workload_url = MULTIAPPS_URL + '/task/add_workload'
         self.app_register_callback_url = MULTIAPPS_URL + '/app/register_callback'
 
+        self.session = self._create_session()
+
+    def _create_session(self):
+        """Create a requests session with retry strategy and SSL configuration."""
+        session = requests.Session()
+
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["POST", "GET"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+
+        if B_CERT_FILE and os.path.exists(B_CERT_FILE):
+            session.verify = B_CERT_FILE
+            print(f"Using custom certificate for SSL verification: {B_CERT_FILE}")
+        else:
+            print(f"Warning: Certificate file {B_CERT_FILE} not found. SSL verification is disabled.")
+            session.verify = False
+            # Disable ssl
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        return session
 
 # Multi-apps API:
     def register_callback(self):
@@ -91,22 +124,21 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         :param app_name:
         :return:
         """
-        return self.ma_bridge.register_callback(self.app_register_callback_url, f"{CLIENT_URL}/callback")
+        return self.ma_bridge.register_callback(self.app_register_callback_url, f"{CLIENT_URL}/callback", self.session)
 
     def get_controlled_apps(self):
         """
         :return: Get all the controlled apps.
         """
 
-        return self.ma_bridge.get_controlled_apps(self.app_get_controlled_url)
-
+        return self.ma_bridge.get_controlled_apps(self.app_get_controlled_url, self.session)
 
     def set_controlled_apps(self, app_data):
         """
         :param app_data: Dictionary containing app control data.
         :return: Set the control status of an app.
         """
-        res_data = self.ma_bridge.set_controlled_apps(self.app_set_controlled_url, app_data)
+        res_data = self.ma_bridge.set_controlled_apps(self.app_set_controlled_url, app_data, self.session)
         return res_data
 
     def remove_controlled_apps(self, app_data):
@@ -114,69 +146,62 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         :param app_data: Dictionary containing app control data.
         :return: Remove the control status of an app.
         """
-        return self.ma_bridge.remove_controlled_apps(self.app_remove_controlled_url, app_data)
+        return self.ma_bridge.remove_controlled_apps(self.app_remove_controlled_url, app_data, self.session)
 
     def get_priority_data(self, query_data):
         """
         :param query_data: Dictionary containing app_id or app_name.
         :return: Get priority data for a specific app.
         """
-        return self.ma_bridge.get_priority_data(self.app_get_priority_url, query_data)
+        return self.ma_bridge.get_priority_data(self.app_get_priority_url, query_data, self.session)
 
     def set_priority(self, priority_data):
         """
         :param priority_data: Dictionary containing app_id, priority, and optional cgroup.
         :return: Set the priority of an app.
         """
-        return self.ma_bridge.set_priority(self.app_set_priority_url, priority_data)
+        return self.ma_bridge.set_priority(self.app_set_priority_url, priority_data, self.session)
 
     def keep_alive_app(self, app_id):
         """
         :param app_id: used to find the app to keep alive.
         :return:
         """
-        return self.ma_bridge.keep_alive_app(self.app_set_oom_score_url, app_id)
+        return self.ma_bridge.keep_alive_app(self.app_set_oom_score_url, app_id, self.session)
 
     def cancel_relaunch(self, app_id):
         """
         :param app_id: according to app_id to cancel relaunch.
         :return: success or not
         """
-        return self.ma_bridge.cancel_relaunch(self.app_cancel_relaunch_url, app_id)
+        return self.ma_bridge.cancel_relaunch(self.app_cancel_relaunch_url, app_id, self.session)
 
     def resource_limit(self, app_id, app_name, priority):
         """
         :param app_id: according to app_id to do the resource limit.
         :return:
         """
-        return self.ma_bridge.resource_limit(self.app_resource_limit_url, app_id, app_name, priority)
+        return self.ma_bridge.resource_limit(self.app_resource_limit_url, app_id, app_name, priority, self.session)
 
     def restore_resource(self, app_id):
         """
         :param app_id: according to app_id to do the resource restore.
         :return:
         """
-        return self.ma_bridge.restore_resource(self.app_resource_restore_url, app_id)
+        return self.ma_bridge.restore_resource(self.app_resource_restore_url, app_id, self.session)
 
     def get_pending_apps(self):
         """
         :return: Get all the pending apps.
         """
 
-        return self.ma_bridge.get_pending_apps(self.app_get_pending_url)
+        return self.ma_bridge.get_pending_apps(self.app_get_pending_url, self.session)
 
     def get_apps(self, store=False):
         """
         :return: Get the list of all apps.
         """
-        return self.ma_bridge.get_apps(self.app_obtain_url, store)
-
-    def add_workload(self, workload_data):
-        """
-        :param workload_data: Dictionary containing workload details.
-        :return: Add workload to the system.
-        """
-        return self.ma_bridge.add_workload(self.app_workload_url, workload_data)
+        return self.ma_bridge.get_apps(self.app_obtain_url, store, self.session)
 
 
     def start_client_callback(self) -> bool:
@@ -188,9 +213,10 @@ class Client_multiapps_api(metaclass=SingletonMeta):
 
         # 启动线程
         try:
+            c_ssl_context = (B_CERT_FILE, B_CERT_KEY)
             self._callback_thread = threading.Thread(
                 target=client_app.run,
-                kwargs={"host": "0.0.0.0", "port": self._port, "debug": False},
+                kwargs={"host": "0.0.0.0", "port": self._port, "debug": False, "ssl_context": c_ssl_context},
                 daemon=True
             )
             self._callback_thread.start()

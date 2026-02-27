@@ -10,6 +10,7 @@ cd "$current_dir" || exit 1
 
 # 设置环境变量
 export B_CERT_FILE="$project_root/b_server.crt"
+export B_CERT_KEY="$project_root/b_server.key"
 
 # 配置参数
 STREAMLIT_PORT=8655

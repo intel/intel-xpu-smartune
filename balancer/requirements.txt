@@ -2,7 +2,7 @@
 PyYAML >= 6.0.2
 psutil >= 5.5.1
 #cpufreq >= 0.3.5
-requests==2.32.3
+requests==2.33.0
 peewee==3.17.8
 bcc==0.1.10
 pytest==8.4.1

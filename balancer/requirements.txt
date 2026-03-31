@@ -8,7 +8,7 @@ bcc==0.1.10
 pytest==8.4.1
 flask
 
-streamlit==1.40.0
+streamlit==1.54.0
 streamlit-antd-components==0.3.2
 streamlit-extras==0.4.2
 extra-streamlit-components==0.1.71

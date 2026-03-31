@@ -1,16 +1,5 @@
-#
-#  Copyright (C) 2025 Intel Corporation
-#
-#  This software and the related documents are Intel copyrighted materials,
-#  and your use of them is governed by the express license under which they
-#  were provided to you ("License"). Unless the License provides otherwise,
-#  you may not use, modify, copy, publish, distribute, disclose or transmit
-#  his software or the related documents without Intel's prior written permission.
-#
-#  This software and the related documents are provided as is, with no express
-#  or implied warranties, other than those that are expressly stated in the License.
-#
-
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
 import os, signal, time
 from dataclasses import dataclass
@@ -203,10 +192,10 @@ class DynamicBalancer:
                     rates = self.network_controller.get_rates(self.network_controller.handle_id, egress_rates,
                                                               ingress_rates)
                     logger.debug(
-                        f"NetworkMonitor {self.network_controller.dev} TX_total_BW={tx_total_bw:,.2f}kbit/s (App Class BW: System - {rates["egress_system"]:,.2f},"
-                        f" Critical - {rates["egress_critical"]:,.2f} , High - {rates["egress_high"]:,.2f}, Low - {rates["egress_low"]:,.2f}),"
-                        f" RX_total_BW={rx_total_bw:,.2f}kbit/s (App Class BW: System - {rates["ingress_system"]:,.2f},"
-                        f" Critical - {rates["ingress_critical"]:,.2f} , High - {rates["ingress_high"]:,.2f}, Low - {rates["ingress_low"]:,.2f})")
+                        f"NetworkMonitor {self.network_controller.dev} TX_total_BW={tx_total_bw:,.2f}kbit/s (App Class BW: System - {rates['egress_system']:,.2f},"
+                        f" Critical - {rates['egress_critical']:,.2f} , High - {rates['egress_high']:,.2f}, Low - {rates['egress_low']:,.2f}),"
+                        f" RX_total_BW={rx_total_bw:,.2f}kbit/s (App Class BW: System - {rates['ingress_system']:,.2f},"
+                        f" Critical - {rates['ingress_critical']:,.2f} , High - {rates['ingress_high']:,.2f}, Low - {rates['ingress_low']:,.2f})")
                     self.network_controller.handle_network_pressure(tx_pressure, rx_pressure, ingress_rates,
                                                                     egress_rates, network_data)
         while self.is_running:
@@ -676,7 +665,7 @@ class DynamicBalancer:
                 logger.info(f"_run_handle_loop: App {coming_app['app_name']} priority is {priority}")
 
                 # # 将任务放入待处理队列
-                priority_num = self.controlManager.get_priority_value(priority)
+                priority_num = app_utils.get_priority_value(priority)
                 logger.debug(f"_run_handle_loop: priority value is {priority_num}")
                 self.app_priority_queue.put((coming_app, priority_num))
                 logger.info(f"_run_handle_loop: Resource insufficient, {coming_app} app added to pending queue")

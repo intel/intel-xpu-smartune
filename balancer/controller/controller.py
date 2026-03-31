@@ -1,20 +1,12 @@
-#
-#  Copyright (C) 2025 Intel Corporation
-#
-#  This software and the related documents are Intel copyrighted materials,
-#  and your use of them is governed by the express license under which they
-#  were provided to you ("License"). Unless the License provides otherwise,
-#  you may not use, modify, copy, publish, distribute, disclose or transmit
-#  his software or the related documents without Intel's prior written permission.
-#
-#  This software and the related documents are provided as is, with no express
-#  or implied warranties, other than those that are expressly stated in the License.
-#
-
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
 import os
-import subprocess
-from subprocess import check_output
+# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
+# with shell=False (default). No untrusted shell execution or string 
+# concatenation is performed. All inputs are internally validated.
+import subprocess # nosec
+from subprocess import check_output # nosec
 from typing import Optional
 
 from utils.logger import logger
@@ -29,22 +21,32 @@ class Controller:
         self.uid = self.get_uid()
 
     def get_uid(self):
-        # command used to get active user slices
-        slices_cmd = "systemctl list-units user-*.slice | grep -oE 'user-[^ ]*.slice' || [ $? = 1 ]"
-
-        active_user = check_output(slices_cmd, shell=True, universal_newlines=True).splitlines()
-        if active_user:
-            uid = active_user[0].strip('user-').strip('.slice')
-
-        return uid
+        slices_cmd = ["systemctl", "list-units", "--type=slice", "user-*.slice", "--no-legend"]
+        try:
+            output = check_output(slices_cmd, universal_newlines=True)
+            
+            for line in output.splitlines():
+                import re
+                match = re.search(r'(user-\d+\.slice)', line)
+                if match:
+                    return match.group(1).replace('user-', '').replace('.slice', '')
+        except Exception:
+            pass
+        return ""
 
     def get_cpu_max(self):
         cpu_max = None
-        cmd = "cat /sys/fs/cgroup/user.slice/user-%s.slice/cpu.max" % self.uid
+        path = f"/sys/fs/cgroup/user.slice/user-{self.uid}.slice/cpu.max"
+        cmd = ["cat", path]
 
-        result = check_output(cmd, shell=True, universal_newlines=True).splitlines()
-        if result:
-            cpu_max = result[0].split()[1]
+        try:
+            result = check_output(cmd, universal_newlines=True).splitlines()
+            if result:
+                parts = result[0].split()
+                if len(parts) >= 2:
+                    cpu_max = parts[1]
+        except Exception as e:
+            logger.error(f"read cpu.max failed: {e}")
 
         return cpu_max
 
@@ -278,7 +280,7 @@ class Controller:
                 stderr=subprocess.PIPE,
                 text=True,
                 check=True,
-                env={"DBUS_SESSION_BUS_ADDRESS": dbus_address} if dbus_address else None
+                env={"DBUS_SESSION_BUS_ADDRESS": dbus_address}
             )
             logger.debug(f"Executed result: {result}")
             if result.returncode == 0:

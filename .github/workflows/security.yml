@@ -1,0 +1,30 @@
+# .github/workflows/security.yml
+name: Security Scanning
+run-name: "Security Scanning by @${{ github.actor }}"
+on:
+  workflow_dispatch:
+jobs:
+  security:
+    runs-on: ["innersource.prod.amr.dind"]
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: SDL302 Task
+        uses: intel-innersource/applications.security.monitoring.cas@v3.0.0
+        with:
+          sdl-tasks: "SDL302"
+        continue-on-error: true
+
+      - name: SDL441 Task
+        uses: intel-innersource/applications.security.monitoring.cas@v3.0.0
+        with:
+          sdl-tasks: "SDL441"
+        continue-on-error: true
+
+      - name: SDL448 Task
+        uses: intel-innersource/applications.security.monitoring.cas@v3.0.0
+        with:
+          sdl-tasks: "SDL448"
+        continue-on-error: true

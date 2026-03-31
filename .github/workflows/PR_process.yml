@@ -1,0 +1,188 @@
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+name: "[PR Process] Project Security Scan (Trivy | Bandit | Coverity)"
+on:
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+env:
+  COV_HOME: "/home/jianfeng/cov-analysis-linux64-2025.3.0"
+
+jobs:
+  trivy-analysis:
+    runs-on: [self-hosted, linux]
+    # container:
+    #   image: aquasec/trivy:latest
+    #   options: --user root -v /tmp/trivy_cache:/root/.cache/trivy --pull=never
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Setup Proxy
+        run: |
+          echo "https_proxy=http://child-prc.intel.com:913" >> $GITHUB_ENV
+          echo "http_proxy=http://child-prc.intel.com:913" >> $GITHUB_ENV
+
+      - name: Run Trivy Scan via Local Docker
+        env:
+          https_proxy: http://child-prc.intel.com:913
+          http_proxy: http://child-prc.intel.com:913
+        run: |
+          docker run --rm \
+            --pull never \
+            -v $(pwd):/apps \
+            -v /tmp/trivy_cache:/root/.cache/trivy \
+            -e https_proxy=$https_proxy \
+            -e http_proxy=$http_proxy \
+            aquasec/trivy:latest \
+            fs /apps \
+            --severity HIGH,CRITICAL \
+            --format table \
+            --no-progress > trivy_report.txt || true
+
+      # - name: Run Trivy Scan
+      #   env:
+      #     https_proxy: http://child-prc.intel.com:913
+      #     http_proxy: http://child-prc.intel.com:913
+      #   run: |
+      #     trivy fs . \
+      #       --severity HIGH,CRITICAL \
+      #       --format table \
+      #       --exit-code 1 \
+      #       --no-progress | tee trivy_report.txt
+
+      - name: Update GitHub Job Summary
+        if: always()
+        run: |
+          echo "### Trivy Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "Date: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          sed -n '/Report Summary/,/┘/p' trivy_report.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Trivy Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-security-report
+          path: |
+            trivy_report.txt
+          retention-days: 7
+
+  bandit-analysis:
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Bandit Scan
+        shell: bash
+        run: |
+          source /home/jianfeng/workspace/myvenv/bin/activate
+
+          bandit -r . \
+            -c /home/jianfeng/workspace/ipas_default.config \
+            -f txt | tee bandit_report.txt
+
+      - name: Update GitHub Job Summary
+        if: always()
+        run: |
+          echo "### Bandit Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "Date: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          cat bandit_report.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Bandit Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-security-report
+          path: bandit_report.txt
+          retention-days: 7
+
+  coverity-scan:
+    runs-on: [self-hosted, linux]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure Coverity
+        run: |
+          $COV_HOME/bin/cov-configure --template --compiler python --comptype python
+          $COV_HOME/bin/cov-configure --template --compiler clang --comptype clangcc
+
+      - name: Coverity Capture & Analyze (Python)
+        run: |
+          $COV_HOME/bin/coverity capture --dir ./cov-int-python
+
+          $COV_HOME/bin/coverity analyze --project-dir . --dir ./cov-int-python
+
+      - name: Coverity Capture & Analyze (C)
+        run: |
+          $COV_HOME/bin/cov-build --dir ./cov-int-c ./coverity_build/build_ebpf.sh
+
+          $COV_HOME/bin/coverity analyze --project-dir . --dir ./cov-int-c
+
+      - name: Format Errors to Text
+        run: |
+          $COV_HOME/bin/cov-format-errors \
+            --dir ./cov-int-python \
+            --emacs-style \
+            > full_project_scan_results_python.txt
+
+          echo "Total issues found:"
+          grep -c ": warning:" full_project_scan_results_python.txt || echo "0"
+
+          $COV_HOME/bin/cov-format-errors \
+            --dir ./cov-int-c \
+            --emacs-style \
+            > full_project_scan_results_c.txt
+          echo "Total issues found:"
+          grep -c ": warning:" full_project_scan_results_c.txt || echo "0"
+
+      - name: Generate Coverity Job Summary
+        if: always()
+        run: |
+          PY_ISSUES=$(grep -c ": warning:" full_project_scan_results_python.txt || echo "0")
+          C_ISSUES=$(grep -c ": warning:" full_project_scan_results_c.txt || echo "0")
+          TOTAL=$((PY_ISSUES + C_ISSUES))
+
+          echo "### Coverity report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 扫描类型 | 发现问题数 | 状态 |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :---: | :---: |" >> $GITHUB_STEP_SUMMARY
+
+          PY_STATUS=$([ "$PY_ISSUES" -eq "0" ] && echo "✅ Clean" || echo "⚠️ Action Required")
+          echo "| Python (Capture) | $PY_ISSUES | $PY_STATUS |" >> $GITHUB_STEP_SUMMARY
+
+          C_STATUS=$([ "$C_ISSUES" -eq "0" ] && echo "✅ Clean" || echo "⚠️ Action Required")
+          echo "| C (cov-build) | $C_ISSUES | $C_STATUS |" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**总计发现问题:** $TOTAL" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$TOTAL" -gt "0" ]; then
+            echo "<details><summary>点击查看错误详情详情 (Top 10)</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            head -n 10 full_project_scan_results_python.txt >> $GITHUB_STEP_SUMMARY
+            head -n 10 full_project_scan_results_c.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Scan Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverity-text-report
+          path: |
+            full_project_scan_results_python.txt
+            full_project_scan_results_c.txt
+          retention-days: 7

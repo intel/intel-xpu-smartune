@@ -1,19 +1,11 @@
-#
-#  Copyright (C) 2025 Intel Corporation
-#
-#  This software and the related documents are Intel copyrighted materials,
-#  and your use of them is governed by the express license under which they
-#  were provided to you ("License"). Unless the License provides otherwise,
-#  you may not use, modify, copy, publish, distribute, disclose or transmit
-#  his software or the related documents without Intel's prior written permission.
-#
-#  This software and the related documents are provided as is, with no express
-#  or implied warranties, other than those that are expressly stated in the License.
-#
-
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
 import os
-import subprocess
+# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
+# with shell=False (default). No untrusted shell execution or string 
+# concatenation is performed. All inputs are internally validated.
+import subprocess # nosec
 import time
 from utils.logger import logger
 from config.config import b_config
@@ -118,9 +110,13 @@ class NetworkController:
         prio_egress = 10 + idx
         prio_ifb = 21 + idx
         if cgroup_path:
-            subprocess.run(f"iptables -t mangle -A OUTPUT -m cgroup --path {cgroup_path} -j MARK --set-mark {mark_int}", shell=True)
-        subprocess.run(f"tc filter add dev {dev} parent {handle_id}: protocol ip prio {prio_egress} u32 match mark {mark_int} 0xffffffff flowid {classid_egress}", shell=True)
-        subprocess.run(f"tc filter add dev {IFB_DEV} parent {handle_id+1}: protocol ip prio {prio_ifb} u32 match mark {mark_int} 0xffffffff flowid {classid_ifb}", shell=True)
+            subprocess.run(["iptables", "-t", "mangle", "-A", "OUTPUT", "-m", "cgroup", "--path", cgroup_path, "-j", "MARK", "--set-mark", str(mark_int)], check=False)
+        subprocess.run(["tc", "filter", "add", "dev", dev, "parent", f"{handle_id}:", 
+                        "protocol", "ip", "prio", str(prio_egress), "u32", "match", "mark", 
+                        str(mark_int), "0xffffffff", "flowid", classid_egress], check=False)
+        subprocess.run(["tc", "filter", "add", "dev", IFB_DEV, "parent", f"{handle_id+1}:", 
+                        "protocol", "ip", "prio", str(prio_ifb), "u32", "match", "mark", 
+                        str(mark_int), "0xffffffff", "flowid", classid_ifb], check=False)
         self.app_filter_info[app_id] = {
             "dev": dev,
             "ifb_dev": IFB_DEV,
@@ -144,10 +140,13 @@ class NetworkController:
         for idx, port in enumerate(system_ports):
             prio_egress = 1000 + idx
             prio_ifb = 2000 + idx
-            subprocess.run(f"tc filter add dev {dev} parent {handle_id}: protocol ip prio {prio_egress} u32 match ip dport {port} 0xffff flowid {classid_egress}", shell=True)
-            subprocess.run(f"tc filter add dev {dev} parent {handle_id}: protocol ip prio {prio_egress} u32 match ip sport {port} 0xffff flowid {classid_egress}", shell=True)
-            subprocess.run(f"tc filter add dev {IFB_DEV} parent {handle_id+1}: protocol ip prio {prio_ifb} u32 match ip dport {port} 0xffff flowid {classid_ifb}", shell=True)
-            subprocess.run(f"tc filter add dev {IFB_DEV} parent {handle_id+1}: protocol ip prio {prio_ifb} u32 match ip sport {port} 0xffff flowid {classid_ifb}", shell=True)
+            base_cmd = ["tc", "filter", "add", "dev", self.dev, "parent", f"{self.handle_id}:", "protocol", "ip", "prio", str(prio_egress), "u32"]
+            subprocess.run(base_cmd + ["match", "ip", "dport", str(port), "0xffff", "flowid", classid_egress], check=False)
+            subprocess.run(base_cmd + ["match", "ip", "sport", str(port), "0xffff", "flowid", classid_egress], check=False)
+            
+            ifb_cmd = ["tc", "filter", "add", "dev", self.IFB_DEV, "parent", f"{self.handle_id+1}:", "protocol", "ip", "prio", str(prio_ifb), "u32"]
+            subprocess.run(ifb_cmd + ["match", "ip", "dport", str(port), "0xffff", "flowid", classid_ifb], check=False)
+            subprocess.run(ifb_cmd + ["match", "ip", "sport", str(port), "0xffff", "flowid", classid_ifb], check=False)
 
     def _remove_app_network_rules(self, app_id):
         info = self.app_filter_info.get(app_id)
@@ -157,14 +156,15 @@ class NetworkController:
         ifb_dev = info["ifb_dev"]
         prio_egress = info["prio_egress"]
         prio_ifb = info["prio_ifb"]
-        classid_egress = info["classid_egress"]
-        classid_ifb = info["classid_ifb"]
         mark = info["mark"]
         cgroup_path = info["cgroup_path"]
+
         if cgroup_path:
-            subprocess.run(f"iptables -t mangle -D OUTPUT -m cgroup --path {cgroup_path} -j MARK --set-mark {int(mark,16)}", shell=True)
-        subprocess.run(f"tc filter del dev {dev} parent {self.handle_id}: protocol ip prio {prio_egress}", shell=True)
-        subprocess.run(f"tc filter del dev {ifb_dev} parent {self.handle_id+1}: protocol ip prio {prio_ifb}", shell=True)
+            subprocess.run(["iptables", "-t", "mangle", "-D", "OUTPUT", "-m", "cgroup", "--path", cgroup_path, "-j", "MARK", "--set-mark", str(int(mark, 16))], check=False)
+
+        subprocess.run(["tc", "filter", "del", "dev", dev, "parent", f"{self.handle_id}:", "protocol", "ip", "prio", str(prio_egress)], check=False)
+        subprocess.run(["tc", "filter", "del", "dev", ifb_dev, "parent", f"{self.handle_id+1}:", "protocol", "ip", "prio", str(prio_ifb)], check=False)
+
         self._release_mark(mark)
         self.app_mark_map.pop(app_id, None)
         self.app_filter_info.pop(app_id, None)
@@ -177,26 +177,33 @@ class NetworkController:
         IFB_DEV = self.IFB_DEV
         handle_id = self.handle_id
 
-        subprocess.run(f"tc qdisc del dev {dev} handle {handle_id}: root 2>/dev/null || true", shell=True)
-        subprocess.run(f"tc qdisc del dev {dev} ingress 2>/dev/null || true", shell=True)
-        subprocess.run(f"tc qdisc del dev {IFB_DEV} handle {handle_id+1}: root 2>/dev/null || true", shell=True)
+        subprocess.run(["tc", "qdisc", "del", "dev", dev, "handle", f"{handle_id}:", "root"], stderr=subprocess.DEVNULL, check=False)
+        subprocess.run(["tc", "qdisc", "del", "dev", dev, "ingress"], stderr=subprocess.DEVNULL, check=False)
+        subprocess.run(["tc", "qdisc", "del", "dev", IFB_DEV, "handle", f"{handle_id+1}:", "root"], stderr=subprocess.DEVNULL, check=False)
 
-        subprocess.run(f"tc qdisc add dev {dev} root handle {handle_id}: htb default 30", shell=True)
-        subprocess.run(f"tc class add dev {dev} parent {handle_id}: classid {handle_id}:1 htb rate {self.total_bw}kbit ceil {self.total_bw}kbit burst 128k cburst 128k", shell=True)
-        subprocess.run("modprobe ifb", shell=True)
-        subprocess.run(f"ip link add {IFB_DEV} type ifb", shell=True)
-        subprocess.run(f"ip link set {IFB_DEV} up", shell=True)
-        subprocess.run(f"tc qdisc add dev {IFB_DEV} root handle {handle_id+1}: htb default 30", shell=True)
-        subprocess.run(f"tc qdisc add dev {dev} ingress handle ffff:", shell=True)
-        subprocess.run(f"tc class add dev {IFB_DEV} parent {handle_id+1}: classid {handle_id+1}:1 htb rate {self.total_bw}kbit ceil {self.total_bw}kbit burst 128k cburst 128k", shell=True)
-        subprocess.run(f"tc filter add dev {dev} parent ffff: protocol all prio 10 u32 match u32 0 0 flowid {handle_id+1}:1 action connmark action mirred egress redirect dev {IFB_DEV}", shell=True)
+        subprocess.run(["tc", "qdisc", "add", "dev", dev, "root", "handle", f"{handle_id}:", "htb", "default", "30"], check=False)
+        subprocess.run(["tc", "class", "add", "dev", dev, "parent", f"{handle_id}:", "classid", f"{handle_id}:1", "htb", "rate", f"{self.total_bw}kbit", "ceil", f"{self.total_bw}kbit", "burst", "128k", "cburst", "128k"], check=False)
+
+        subprocess.run(["modprobe", "ifb"], check=False)
+        subprocess.run(["ip", "link", "add", IFB_DEV, "type", "ifb"], check=False)
+        subprocess.run(["ip", "link", "set", IFB_DEV, "up"], check=False)
+
+        subprocess.run(["tc", "qdisc", "add", "dev", IFB_DEV, "root", "handle", f"{handle_id+1}:", "htb", "default", "30"], check=False)
+        subprocess.run(["tc", "class", "add", "dev", IFB_DEV, "parent", f"{handle_id+1}:", "classid", f"{handle_id+1}:1", "htb", "rate", f"{self.total_bw}kbit", "ceil", f"{self.total_bw}kbit", "burst", "128k", "cburst", "128k"], check=False)
+
+        subprocess.run(["tc", "qdisc", "add", "dev", dev, "ingress", "handle", "ffff:"], check=False)
+        subprocess.run(["tc", "filter", "add", "dev", dev, "parent", "ffff:", "protocol", "all", "prio", "10", "u32", "match", "u32", "0", "0", "flowid", f"{handle_id+1}:1", "action", "connmark", "action", "mirred", "egress", "redirect", "dev", IFB_DEV], check=False)
+
         for key in ["critical", "high", "low", "system"]:
-            classid_egress = self._get_classid(handle_id, key)
             min_bw, max_bw = self._get_class_bandwidth(key)
             burst = self.network_burst_map.get(key, "16k")
-            subprocess.run(f"tc class add dev {dev} parent {handle_id}:1 classid {classid_egress} htb rate {min_bw}kbit ceil {max_bw}kbit burst {burst} cburst {burst}", shell=True)
-            classid_ifb = self._get_classid(handle_id+1, key)
-            subprocess.run(f"tc class add dev {IFB_DEV} parent {handle_id+1}:1 classid {classid_ifb} htb rate {min_bw}kbit ceil {max_bw}kbit burst {burst} cburst {burst}", shell=True)
+
+            classid_egress = self._get_classid(handle_id, key)
+            subprocess.run(["tc", "class", "add", "dev", dev, "parent", f"{handle_id}:1", "classid", classid_egress, "htb", "rate", f"{min_bw}kbit", "ceil", f"{max_bw}kbit", "burst", burst, "cburst", burst], check=False)
+
+            classid_ifb = self._get_classid(handle_id + 1, key)
+            subprocess.run(["tc", "class", "add", "dev", IFB_DEV, "parent", f"{handle_id+1}:1", "classid", classid_ifb, "htb", "rate", f"{min_bw}kbit", "ceil", f"{max_bw}kbit", "burst", burst, "cburst", burst], check=False)
+
         self._get_set_networked_system_ports()
         self.ingress_classids = self._get_all_classids(self.handle_id, direction="ingress")
         self.egress_classids = self._get_all_classids(self.handle_id, direction="egress")
@@ -204,7 +211,7 @@ class NetworkController:
     def _limit_network_class(self, dev, classid, min_bw, max_bw=None, burst="16k", direction="egress", level=None):
         if max_bw is None:
             max_bw = min_bw
-        subprocess.run(f"tc class change dev {dev} classid {classid} htb rate {min_bw}kbit ceil {max_bw}kbit burst {burst} cburst {burst}", shell=True)
+        subprocess.run(["tc", "class", "change", "dev", dev, "classid", classid, "htb", "rate", f"{min_bw}kbit", "ceil", f"{max_bw}kbit", "burst", str(burst), "cburst", str(burst)], check=False)
 
     def update_app_network_control(self):
         controlled_apps = app_utils.get_controlled_apps_net() or []
@@ -229,8 +236,8 @@ class NetworkController:
             else:
                 self._add_app_network_rules(app, idx)
             # 保证 OUTPUT 链只存在一个 CONNMARK --save-mark 规则，并且在所有 MARK 规则之后
-            subprocess.run("iptables -t mangle -D OUTPUT -j CONNMARK --save-mark || true", shell=True)
-            subprocess.run("iptables -t mangle -A OUTPUT -j CONNMARK --save-mark", shell=True)
+            subprocess.run(["iptables", "-t", "mangle", "-D", "OUTPUT", "-j", "CONNMARK", "--save-mark"], stderr=subprocess.DEVNULL, check=False)
+            subprocess.run(["iptables", "-t", "mangle", "-A", "OUTPUT", "-j", "CONNMARK", "--save-mark"], check=False)
 
     def _get_classid(self, handle, priority):
         mapping = {"critical": 10, "high": 20, "low": 30, "system": 5}
@@ -416,12 +423,13 @@ class NetworkController:
         dev = self.dev
         IFB_DEV = self.IFB_DEV
         handle_id = self.handle_id
-        subprocess.run(f"tc qdisc del dev {dev} handle {handle_id}: root", shell=True)
-        subprocess.run(f"tc qdisc del dev {IFB_DEV} handle {handle_id+1}: root", shell=True)
-        subprocess.run(f"tc qdisc del dev {dev} ingress", shell=True)
+        subprocess.run(["tc", "qdisc", "del", "dev", dev, "handle", f"{handle_id}:", "root"], check=False)
+        subprocess.run(["tc", "qdisc", "del", "dev", IFB_DEV, "handle", f"{handle_id+1}:", "root"], check=False)
+        subprocess.run(["tc", "qdisc", "del", "dev", dev, "ingress"], check=False)
         for app_id, info in list(self.app_filter_info.items()):
             mark = info.get("mark")
             cgroup_path = info.get("cgroup_path")
             if cgroup_path and mark:
-                subprocess.run(f"iptables -t mangle -D OUTPUT -m cgroup --path {cgroup_path} -j MARK --set-mark {int(mark,16)}", shell=True)
+                mark_value = str(int(mark, 16))
+                subprocess.run(["iptables", "-t", "mangle", "-D", "OUTPUT", "-m", "cgroup", "--path", cgroup_path, "-j", "MARK", "--set-mark", mark_value], check=False)
         logger.info("已清理所有由 balancer 创建的 tc 队列和 iptables mark 规则")

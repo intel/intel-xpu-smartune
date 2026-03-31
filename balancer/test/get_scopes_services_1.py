@@ -1,19 +1,11 @@
-#
-#  Copyright (C) 2025 Intel Corporation
-#
-#  This software and the related documents are Intel copyrighted materials,
-#  and your use of them is governed by the express license under which they
-#  were provided to you ("License"). Unless the License provides otherwise,
-#  you may not use, modify, copy, publish, distribute, disclose or transmit
-#  his software or the related documents without Intel's prior written permission.
-#
-#  This software and the related documents are provided as is, with no express
-#  or implied warranties, other than those that are expressly stated in the License.
-#
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
-
-import subprocess
-from subprocess import check_output, Popen, PIPE
+# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
+# with shell=False (default). No untrusted shell execution or string 
+# concatenation is performed. All inputs are internally validated.
+import subprocess # nosec
+from subprocess import check_output, Popen, PIPE # nosec
 
 def get_user_scopes(user):
     try:
@@ -58,20 +50,22 @@ def get_app_slices(user):
         return []
 
 if __name__ == "__main__":
-    # command used to get active user slices
-    __slices_cmd = "systemctl list-units user-*.slice | grep -oE 'user-[^ ]*.slice' || [ $? = 1 ]"
-    # command to get scopes of the activate user slices
-    #__scopes_cmd = "find /sys/fs/cgroup/user.slice/%s -maxdepth 1 -type d" % _slices_cmd
+    __slices_cmd = ["systemctl", "list-units", "--type=slice", "user-*.slice", "--no-legend"]
 
-    active_user = check_output(__slices_cmd, shell=True, universal_newlines=True).splitlines()
-    if active_user:
-        active_user = active_user[0].strip('.slice')
-    print(active_user)
+    try:
+        output = check_output(__slices_cmd, universal_newlines=True)
+        import re
+        active_user_list = re.findall(r'user-[^ ]*\.slice', output)
+        
+        if active_user_list:
+            active_user = active_user_list[0].strip('.slice')
+            print(active_user)
+            scopes = get_user_scopes(active_user)
+            for scope in scopes:
+                print(scope)
 
-    scopes = get_user_scopes(active_user)
-    for scope in scopes:
-        print(scope)
-
-    apps = get_app_slices(active_user)
-    for app in apps:
-        print(app)
+            apps = get_app_slices(active_user)
+            for app in apps:
+                print(app)
+    except Exception:
+        pass

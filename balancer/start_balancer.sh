@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 export CERT_FILE="./b_server.crt"
 export KEY_FILE="./b_server.key"
 

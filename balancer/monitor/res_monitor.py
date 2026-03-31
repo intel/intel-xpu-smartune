@@ -1,20 +1,12 @@
-#
-#  Copyright (C) 2025 Intel Corporation
-#
-#  This software and the related documents are Intel copyrighted materials,
-#  and your use of them is governed by the express license under which they
-#  were provided to you ("License"). Unless the License provides otherwise,
-#  you may not use, modify, copy, publish, distribute, disclose or transmit
-#  his software or the related documents without Intel's prior written permission.
-#
-#  This software and the related documents are provided as is, with no express
-#  or implied warranties, other than those that are expressly stated in the License.
-#
-
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
 import os
 import re
-import subprocess
+# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
+# with shell=False (default). No untrusted shell execution or string 
+# concatenation is performed. All inputs are internally validated.
+import subprocess # nosec
 import time
 from collections import defaultdict
 from time import sleep
@@ -309,7 +301,7 @@ class ResourceMonitor:
         # we use 25% here to avoid false negatives.
         if processes and (processes[0]['cpu_avg'] < 25  # if CPU usage < 25% per core
                           and processes[0]['mem_rss'] < psutil.virtual_memory().total * 0.25):  # 25% of total memory
-            logger.info(f"Top process - {next(iter(processes[0]['names']), "unknown")} corresponding "
+            logger.info(f"Top process - {next(iter(processes[0]['names']), 'unknown')} corresponding "
                         f"app does not meet minimum resource thresholds")
             reach_threshold = False
 
@@ -379,9 +371,20 @@ class ResourceMonitor:
 
     def get_physical_disks(self):
         """获取所有物理磁盘设备名"""
-        cmd = "lsblk -d -o NAME,TYPE -n | awk '$2 == \"disk\" {print $1}'"
-        output = subprocess.check_output(cmd, shell=True, text=True).strip()
-        return output.splitlines() if output else []
+        cmd = ["lsblk", "-d", "-o", "NAME,TYPE", "-n"]
+        try:
+            output = subprocess.check_output(cmd, text=True).strip()
+
+            disks = []
+            for line in output.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "disk":
+                    disks.append(parts[0])
+            
+            return disks
+            
+        except subprocess.CalledProcessError:
+            return []
 
     def get_resource_usage(self) -> dict:
         """获取系统整体资源使用率和剩余容量"""

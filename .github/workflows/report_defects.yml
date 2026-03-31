@@ -1,0 +1,105 @@
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+name: "Upload and Generate SDL Report"
+run-name: "Manual Coverity | Trivy Upload and Generate report by @${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+
+env:
+  COV_HOME: "/home/jianfeng/cov-analysis-linux64-2025.3.0"
+  COV_SERVER_URL: "https://coverityent.devtools.intel.com/prod3"
+  COV_AUTH_KEY: ${{ secrets.COV_AUTH_KEY }}
+
+jobs:
+  coverity-scan:
+    runs-on: [self-hosted, linux]
+
+    steps:
+      - name: Cleanup Workspace Permissions
+        run: |
+          echo "Fixing workspace permissions for self-hosted runner..."
+          sudo chown -R $USER:$USER $GITHUB_WORKSPACE || true
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure Coverity
+        run: |
+          $COV_HOME/bin/cov-configure --template --compiler python --comptype python
+          $COV_HOME/bin/cov-configure --template --compiler clang --comptype clangcc
+
+      - name: Create auth key file
+        run: |
+          echo "${COV_AUTH_KEY}" > cov_auth_key_file
+          chmod 700 cov_auth_key_file
+
+      - name: Coverity Capture & Analyze (Python)
+        run: |
+          $COV_HOME/bin/coverity capture --dir ./cov-int-python
+          $COV_HOME/bin/coverity analyze --project-dir . --dir ./cov-int-python
+          $COV_HOME/bin/cov-commit-defects --dir ./cov-int-python --stream "Stream_1" --url $COV_SERVER_URL --auth-key-file cov_auth_key_file
+
+      - name: Coverity Capture & Analyze (C)
+        run: |
+          $COV_HOME/bin/cov-build --dir ./cov-int-c ./coverity_build/build_ebpf.sh
+          
+          $COV_HOME/bin/coverity analyze --project-dir . --dir ./cov-int-c | tee c_analysis_log.txt
+          
+          $COV_HOME/bin/cov-commit-defects --dir ./cov-int-c --stream "Stream_2" --url $COV_SERVER_URL --auth-key-file cov_auth_key_file
+
+      - name: Generate GitHub Step Summary
+        if: always()
+        run: |
+          echo "### 🔍 Coverity Scan Summary (C/eBPF)" >> $GITHUB_STEP_SUMMARY
+          if [ -f c_analysis_log.txt ]; then
+            echo "\`\`\`text" >> $GITHUB_STEP_SUMMARY
+            sed -n '/Analysis summary report:/,$p' c_analysis_log.txt >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Analysis log not found." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Wait for Report Generation
+        run: sleep 60
+
+      - name: Install Report Tool Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r /home/jianfeng/applications.analyzers.code.static.coverity-support/Scripts/Evidence/requirements.txt
+
+      - name: Generate SDL coverity report
+        continue-on-error: true
+        run: |
+          TOOL_DIR="/home/jianfeng/applications.analyzers.code.static.coverity-support/Scripts/Evidence"
+          python ${TOOL_DIR}/IPAS_SAST_Report_Tool.py \
+            ${TOOL_DIR}/covreport.yml \
+            --output Intel_XPU_SmarTune.html \
+            --auth-key-file cov_auth_key_file
+
+      - name: Run Trivy Scan generate report
+        run: |
+          trivy fs . --list-all-pkgs --format template --template "@/home/jianfeng/actions-runner/csv.tpl" --output ./trivy-report.csv
+
+      - name: Upload Scan Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverity-text-report
+          path: |
+            Intel_XPU_SmarTune.html
+            Intel_XPU_SmarTune.csv
+            Intel_XPU_SmarTune.json
+            trivy-report.csv
+
+      - name: Remove auth key file
+        if: always()
+        run: |
+          rm -f cov_auth_key_file

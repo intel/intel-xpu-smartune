@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 # Ignore all of .idea folder by default for pycharm
 .idea/*
 

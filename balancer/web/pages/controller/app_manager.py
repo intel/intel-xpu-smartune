@@ -1,22 +1,10 @@
-#
-#  Copyright (C) 2025 Intel Corporation
-#
-#  This software and the related documents are Intel copyrighted materials,
-#  and your use of them is governed by the express license under which they
-#  were provided to you ("License"). Unless the License provides otherwise,
-#  you may not use, modify, copy, publish, distribute, disclose or transmit
-#  his software or the related documents without Intel's prior written permission.
-#
-#  This software and the related documents are provided as is, with no express
-#  or implied warranties, other than those that are expressly stated in the License.
-#
-
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
 import threading, time
 from typing import Optional, Dict, Any
 
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 from apis.api import Client_multiapps_api
 from apis.api import callback_manager
@@ -474,8 +462,6 @@ def apps_management():
 
     register_notification()
     app_management(st.session_state.app_data)
-    # 增加页面自动刷新配合callback，以实现状态更新，实测不会影响用户操作
-    st_autorefresh(interval=1000, key="autorefresh")
     _process_callback()
 
 

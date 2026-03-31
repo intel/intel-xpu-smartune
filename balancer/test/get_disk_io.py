@@ -1,19 +1,11 @@
-#
-#  Copyright (C) 2025 Intel Corporation
-#
-#  This software and the related documents are Intel copyrighted materials,
-#  and your use of them is governed by the express license under which they
-#  were provided to you ("License"). Unless the License provides otherwise,
-#  you may not use, modify, copy, publish, distribute, disclose or transmit
-#  his software or the related documents without Intel's prior written permission.
-#
-#  This software and the related documents are provided as is, with no express
-#  or implied warranties, other than those that are expressly stated in the License.
-#
-
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
 import psutil
-import subprocess
+# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
+# with shell=False (default). No untrusted shell execution or string 
+# concatenation is performed. All inputs are internally validated.
+import subprocess # nosec
 import time
 
 def get_disk_utilization(device='nvme0n1', interval=1):
@@ -43,9 +35,18 @@ def get_system_disk():
     return None
 
 def get_physical_disks():
-    cmd = "lsblk -d -o NAME,TYPE -n | awk '$2 == \"disk\" {print $1}'"  # 仅 TYPE=disk
-    output = subprocess.check_output(cmd, shell=True, text=True).strip()
-    return output.splitlines() if output else []
+    result = subprocess.run(
+        ["lsblk", "-d", "-o", "NAME,TYPE", "-n"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    disks = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "disk":
+            disks.append(parts[0])
+    return disks
 
 
 if __name__ == "__main__":

@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 # 清除缓存
 echo "Clean cache."
 sync; echo 3 | sudo tee /proc/sys/vm/drop_caches

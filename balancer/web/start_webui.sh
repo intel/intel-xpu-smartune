@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 export LANG=en_US.UTF-8
 
 if [ -z "$1" ]; then

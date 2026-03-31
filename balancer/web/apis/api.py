@@ -1,16 +1,5 @@
-#
-#  Copyright (C) 2025 Intel Corporation
-#
-#  This software and the related documents are Intel copyrighted materials,
-#  and your use of them is governed by the express license under which they
-#  were provided to you ("License"). Unless the License provides otherwise,
-#  you may not use, modify, copy, publish, distribute, disclose or transmit
-#  his software or the related documents without Intel's prior written permission.
-#
-#  This software and the related documents are provided as is, with no express
-#  or implied warranties, other than those that are expressly stated in the License.
-#
-
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
 import os
 import requests
@@ -107,14 +96,19 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         adapter = HTTPAdapter(max_retries=retry_strategy)
         session.mount("https://", adapter)
 
-        if B_CERT_FILE and os.path.exists(B_CERT_FILE):
-            session.verify = B_CERT_FILE
-            print(f"Using custom certificate for SSL verification: {B_CERT_FILE}")
-        else:
-            print(f"Warning: Certificate file {B_CERT_FILE} not found. SSL verification is disabled.")
-            session.verify = False
-            # Disable ssl
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        if not B_CERT_FILE:
+            raise EnvironmentError(
+                "B_CERT_FILE environment variable is not set. "
+                "TLS certificate verification cannot be enabled."
+            )
+        if not os.path.exists(B_CERT_FILE):
+            raise FileNotFoundError(
+                f"Certificate file '{B_CERT_FILE}' not found. "
+                "TLS certificate verification cannot be enabled. "
+                "Please check 'start_webui_env.sh' to export B_CERT_FILE."
+            )
+        session.verify = B_CERT_FILE
+        print(f"TLS certificate verification enabled using: {B_CERT_FILE}")
 
         return session
 
@@ -216,7 +210,7 @@ class Client_multiapps_api(metaclass=SingletonMeta):
             c_ssl_context = (B_CERT_FILE, B_CERT_KEY)
             self._callback_thread = threading.Thread(
                 target=client_app.run,
-                kwargs={"host": "0.0.0.0", "port": self._port, "debug": False, "ssl_context": c_ssl_context},
+                kwargs={"host": "127.0.0.1", "port": self._port, "debug": False, "ssl_context": c_ssl_context},
                 daemon=True
             )
             self._callback_thread.start()

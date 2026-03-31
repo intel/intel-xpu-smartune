@@ -1,0 +1,23 @@
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+version: 2
+updates:
+  # npm example
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 10
+    
+  # Python pip example
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      
+  # Maven example
+  - package-ecosystem: "maven"
+    directory: "/"
+    schedule:
+      interval: "daily"

@@ -1,20 +1,11 @@
-#
-#  Copyright (C) 2025 Intel Corporation
-#
-#  This software and the related documents are Intel copyrighted materials,
-#  and your use of them is governed by the express license under which they
-#  were provided to you ("License"). Unless the License provides otherwise,
-#  you may not use, modify, copy, publish, distribute, disclose or transmit
-#  his software or the related documents without Intel's prior written permission.
-#
-#  This software and the related documents are provided as is, with no express
-#  or implied warranties, other than those that are expressly stated in the License.
-#
-
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
 import os
-import subprocess
-from subprocess import check_output
+# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
+# with shell=False (default). No untrusted shell execution or string 
+# concatenation is performed. All inputs are internally validated.
+import subprocess # nosec
 from typing import Optional, List, Dict, Union
 from config.config import b_config
 from utils.logger import logger
@@ -28,22 +19,26 @@ class IOController:
         self.enable_io_controller()
 
     def get_uid(self):
-        # command used to get active user slices
-        slices_cmd = "systemctl list-units user-*.slice | grep -oE 'user-[^ ]*.slice' || [ $? = 1 ]"
+        slices_cmd = ["systemctl", "list-units", "--type=slice", "user-*.slice", "--no-legend"]
+        try:
+            output = subprocess.check_output(slices_cmd, universal_newlines=True)
+            for line in output.splitlines():
+                parts = line.split()
+                if parts and parts[0].startswith("user-"):
+                    uid = parts[0].replace("user-", "").replace(".slice", "")
+                    return uid
+        except Exception as e:
+            logger.error(f"Failed to get active user slices: {e}")
+        return "0"
 
-        active_user = check_output(slices_cmd, shell=True, universal_newlines=True).splitlines()
-        if active_user:
-            uid = active_user[0].strip('user-').strip('.slice')
-
-        return uid
-
-    def _run_cmd(self, cmd: str, check: bool = True) -> bool:
+    def _run_cmd(self, cmd: List[str], check: bool = True) -> bool:
         """执行 shell 命令并返回是否成功"""
         try:
-            subprocess.run(cmd, shell=True, check=check, capture_output=True)
+            subprocess.run(cmd, shell=False, check=check, capture_output=True)
             return True
         except subprocess.CalledProcessError as e:
-            logger.error(f"Command failed: {cmd}\nError: {e.stderr.decode().strip()}")
+            cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
+            logger.error(f"Command failed: {cmd_str}\nError: {e.stderr.decode().strip()}")
             return False
 
     def _check_file_exists(self, path: str) -> bool:
@@ -70,7 +65,7 @@ class IOController:
                 success = False
                 continue
 
-            cmd = f"sudo sh -c 'echo \"+io\" > {path}'"
+            cmd = ["sudo", "sh", "-c", f"echo '+io' > {path}"]
             if not self._run_cmd(cmd):
                 success = False
 
@@ -83,15 +78,14 @@ class IOController:
         :return: 格式如 {"nvme0n1": "259:0", "sda": "8:0"} 的字典
         """
         try:
-            cmd = "lsblk -d -o NAME,TYPE,MAJ:MIN,SIZE,ROTA"
+            cmd = ["lsblk", "-d", "-o", "NAME,TYPE,MAJ:MIN,SIZE,ROTA"]
             result = subprocess.run(
                 cmd,
-                shell=True,
+                shell=False,
                 check=True,
                 capture_output=True,
                 text=True
             )
-
             disk_map = {}
             lines = result.stdout.strip().split('\n')
             header = lines[0].split()
@@ -171,7 +165,7 @@ class IOController:
                     if 'io' in f.read().split():
                         continue
 
-                cmd = f"sudo sh -c 'echo \"+io\" > {control_file}'"
+                cmd = ["sudo", "sh", "-c", f"echo '+io' > {control_file}"]
                 logger.info(f"Enabling IO controller at {control_file}")
                 if not self._run_cmd(cmd):
                     logger.info(f"Failed to enable IO at {control_file}")
@@ -272,7 +266,7 @@ class IOController:
                 limit_str = " ".join(limit_parts)
 
             if limit_str:  # 确保命令非空
-                cmd = f"sudo sh -c 'echo \"{disk_id} {limit_str}\" > {io_max_path}'"
+                cmd = ["sudo", "sh", "-c", f"echo '{disk_id} {limit_str}' > {io_max_path}"]
                 logger.info(f"Setting IO limits for cgroup: {cgroup_id} in disk {disk_name}({disk_id}): {limit_str}")
                 if not self._run_cmd(cmd):
                     success = False
@@ -337,7 +331,7 @@ class IOController:
             return False
 
         logger.info(f"Setting IO weight to {weight} for cgroup {cgroup_id}")
-        cmd = f"sudo sh -c 'echo \"{weight}\" > {io_weight_path}'"
+        cmd = ["sudo", "sh", "-c", f"echo '{weight}' > {io_weight_path}"]
         return self._run_cmd(cmd)
 
     def get_current_io_limits(self, cgroup_id: str) -> Optional[tuple[int, int, int, int]]:

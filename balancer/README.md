@@ -176,7 +176,7 @@ separated from the system resource management logic. The main mechanisms are as 
             pip install virtualenv
             python -m virtualenv balancer
             source balancer/bin/activate
-            pip install -r ../requirements.txt
+            pip install -r ../../requirements.txt
 
         2. pip install dist/libcgroup-3.2.0-cp312-cp312-linux_x86_64.whl(Probably no need, 
                 but if need, please refer to "Other" below to generate whl)
@@ -231,7 +231,7 @@ separated from the system resource management logic. The main mechanisms are as 
         config/config.yaml
             enable_network_control: true -> default is enabled, disable with false
             network_interface default use enp1s0, change to your specific interface
-            vendor: "generic" -> sudo python3 BalanceService.py
+            vendor: "generic" -> bash start_balancer.sh
             If you are in "admin" permission, config/config.yaml # vendor: "admin" -> python BalanceService.py
 
     2. client:

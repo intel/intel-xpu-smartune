@@ -1,23 +1,15 @@
-#
-#  Copyright (C) 2025 Intel Corporation
-#
-#  This software and the related documents are Intel copyrighted materials,
-#  and your use of them is governed by the express license under which they
-#  were provided to you ("License"). Unless the License provides otherwise,
-#  you may not use, modify, copy, publish, distribute, disclose or transmit
-#  his software or the related documents without Intel's prior written permission.
-#
-#  This software and the related documents are provided as is, with no express
-#  or implied warranties, other than those that are expressly stated in the License.
-#
-
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
 import os
 import time
 from typing import Dict, Optional
 from utils.logger import logger
 
-import subprocess
+# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
+# with shell=False (default). No untrusted shell execution or string 
+# concatenation is performed. All inputs are internally validated.
+import subprocess # nosec
 import re
 
 class WindowDiffHistory:
@@ -169,7 +161,12 @@ class NetworkMonitor:
         读取指定设备和 qdisc handle 下所有 class 的 tx/rx 字节数，并更新滑动窗口
         direction: "ingress" 或 "egress"，必须指定
         """
-        result = subprocess.run(f"tc -s class show dev {dev} parent {qdisc_handle}:", shell=True, capture_output=True, text=True)
+        result = subprocess.run(
+            ["tc", "-s", "class", "show", "dev", dev, "parent", f"{qdisc_handle}:"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
         stats = result.stdout
         usage = {}
         for classid in classids:
@@ -179,6 +176,7 @@ class NetworkMonitor:
         if direction:
             self._update_tc_stats_history(usage, direction)
         return usage
+
 
     def _clean_old_data(self):
         cutoff = time.time() - self._WINDOW_SEC

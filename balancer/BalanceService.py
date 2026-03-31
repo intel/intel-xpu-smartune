@@ -1,18 +1,8 @@
-#
-#  Copyright (C) 2025 Intel Corporation
-#
-#  This software and the related documents are Intel copyrighted materials,
-#  and your use of them is governed by the express license under which they
-#  were provided to you ("License"). Unless the License provides otherwise,
-#  you may not use, modify, copy, publish, distribute, disclose or transmit
-#  his software or the related documents without Intel's prior written permission.
-#
-#  This software and the related documents are provided as is, with no express
-#  or implied warranties, other than those that are expressly stated in the License.
-#
-
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
 import os
+import hashlib
 import signal
 from datetime import datetime
 from threading import Lock
@@ -41,6 +31,17 @@ class DynamicService:
     def __init__(self):
         self.balancer = DynamicBalancer()
         self.rebuild_controlled_map()
+        self.secret_hash = self._generate_secret_hash()  # Generate and store the hash
+        logger.info("Service secret hash generated.")
+
+    def _generate_secret_hash(self):
+        """Generate a random number and hash it using SHA256."""
+        random_number = os.urandom(16)  # Generate a secure random number
+        return hashlib.sha256(random_number).hexdigest()
+
+    def get_secret_hash(self):
+        """Return the stored hash."""
+        return self.secret_hash
 
     def start(self):
         self.balancer.start()
@@ -108,6 +109,41 @@ def reset_app_status():
             logger.info(f"Reset {updated_count} app statuses to 'NA'")
     except Exception as e:
         logger.error(f"Failed to reset app statuses: {str(e)}")
+
+
+@app.route('/auth/login', methods=['POST'])
+def login():
+    """Validate the user-provided token against the stored hash."""
+    try:
+        data = request.get_json()
+        token = data.get('pwd')
+
+        if not token:
+            return construct_response(
+                data={"authenticated": False},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="Token is required"
+            )
+
+        # Hash the provided token and compare it with the stored hash
+        hashed_token = hashlib.sha256(token.encode()).hexdigest()
+        if hashed_token == _service.get_secret_hash():
+            return construct_response(
+                data={"authenticated": True},
+                retmsg="Authentication successful"
+            )
+        else:
+            return construct_response(
+                data={"authenticated": False},
+                retmsg="Invalid token"
+            )
+    except Exception as e:
+        logger.error(f"Login failed: {str(e)}")
+        return construct_response(
+            data={"authenticated": False},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
 
 
 @app.route('/task/add_workload', methods=['POST'])
@@ -679,7 +715,7 @@ def main():
         app._service_initialized = True
 
     ssl_context = (CERT_FILE, KEY_FILE)
-    app.run(host="0.0.0.0", port=9001, debug=False, use_reloader=False, ssl_context=ssl_context)
+    app.run(host="127.0.0.1", port=9001, debug=False, use_reloader=False, ssl_context=ssl_context)
 
 if __name__ == "__main__":
     main()

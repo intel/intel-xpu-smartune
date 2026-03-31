@@ -1,0 +1,20 @@
+[server]
+headless = false
+maxMessageSize = 10000
+
+[browser]
+serverAddress = "127.0.0.1"
+
+[ui]
+hideTopBar = true
+hideSidebarNav = true
+
+[client]
+showSidebarNavigation = false
+
+[theme]
+primaryColor = "#1E90FF"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#000000"
+font = "sans serif"

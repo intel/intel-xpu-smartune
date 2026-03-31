@@ -1,0 +1,133 @@
+cgroup_mount: "/sys/fs/cgroup"
+vendor: "generic"  # admin, generic
+thresholds:
+  low: 0.4
+  medium: 0.6
+  high: 0.8
+  critical: 1.0
+weights:
+  cpu: 2
+  memory: 7
+  io: 1
+cpu_busy_threshold: 90
+memory_busy_threshold: 90
+disk_utilization_threshold: 95
+all_apps:
+  - name: "calculator"  # calculator
+    id: "org.gnome.Calculator.desktop"  # org.gnome.Calculator.desktop
+    commandline: "gnome-calculator"  # gnome-calculator
+  - name: "vlc" # VLC media player
+    id: "vlc.desktop"
+    commandline: "/usr/bin/vlc"
+  - name: "ollama serve" # ollama qwen
+    id: "start-ollama.sh"
+    commandline: "./start-ollama.sh"
+  - name: "Text Editor" # Text Editor
+    id: "org.gnome.TextEditor.desktop"
+    commandline: "gnome-text-editor %U"
+  - name: "llama-server" # llama-server
+    id: "llama-server"
+    commandline: "./llama-server -m"
+weights_top:
+  cpu: 2
+  memory: 7
+  io: 1
+monitor_apps:  # Some specific apps to monitor by BPF
+  - name: "Calculator"
+    bpf_name: ["gnome-calculator"]
+  - name: "VLC media player"
+    bpf_name: ["vlc"]
+  - name: "System Monitor"
+    bpf_name: ["gnome-system-monitor"]
+  - name: "Text Editor"
+    bpf_name: ["gnome-text-editor"]
+  - name: "ollama serve"
+    bpf_name: [ "start-ollama.sh" ]
+  - name: "llama-server"
+    bpf_name: [ "llama-server" ]
+blacklist:
+  - systemd
+  - kworker
+  - dbus
+cooldown_time: 15 # 避免频繁通知的冷却时间
+regular_update_sys_pressure_time: 5
+app_priority:
+  critical: 100
+  high: 80
+  medium: 50
+  low: 20
+limit_policy: # 默认对不同优先级应用设置的资源限制比率
+  policy: "combined"  # combined: cpu/mem/disk IO同一条件限制，separated: cpu/mem与disk IO分开判断限制条件
+  cpu:
+    enabled: true
+    rate: # critical app不做限制，因此不设置比率
+      high: 0.7  # 设置total的70%
+      medium: 0.5
+      low: 0.4
+      undefined: 0.3
+  memory:
+    enabled: true
+    rate:
+      high: 0.7  # MemoryHigh软限制
+      medium: 0.5
+      low: 0.4
+      undefined: 0.3
+  disk_io:  #
+    enabled: true  # 是否启用磁盘 IO 限制，默认不对不同应用做统一的被动限制，推荐通过 API 为各应用配置差异化的主动限制
+    rate:
+      high:
+        write: 50 # 设置默认写入为50MB/s
+        read: 60 # 设置默认读为60MB/s
+        write_iops: 2200 # z 设置默认每秒写操作次数为 2200次/s
+        read_iops: 20000 # z 设置默认每秒读操作次数为 2000次/s
+      medium:
+        write: 40
+        read: 50
+        write_iops: 1600
+        read_iops: 15000
+      low:
+        write: 20
+        read: 30
+        write_iops: 1200
+        read_iops: 11000
+      undefined:
+        write: 10
+        read: 20
+        write_iops: 1000
+        read_iops: 8000
+enable_network_control: true # 是否启用流量控制
+network_thresholds:
+  low: 0.3
+  medium: 0.5
+  high: 0.7
+  critical: 0.9
+network_interface: "enp9s0" # 请根据实际情况修改为你的网络接口名称
+network_bandwidth_kbit: 100000  # 当前设置为100Mbps（小了10倍）便于测试，请根据实际带宽调整，单位为kbit/s
+config_network_bw:  # kbit/s, 不同优先级对应的带宽范围设置, 为了便于测试都缩小了10倍
+  system:
+    min: 5000
+    max: 10000
+  critical:
+    min: 60000
+    max: 90000
+  high:
+    min: 30000
+    max: 80000
+  low:
+    min: 10000
+    max: 80000
+network_burst_map:
+  critical: "64k"
+  high: "32k"
+  low: "16k"
+  system: "8k"
+network_system_ports:
+  - 22
+  - 53
+  - 80
+  - 443
+  - 123
+testing_network_app:
+  - app_name: "iperf"
+    app_cgroup: "session-1879.scope"
+    priority: "critical"

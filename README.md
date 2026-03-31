@@ -2,7 +2,10 @@
 
 ## Overview
 
-A platform solution with balancer to control system resources, and monitor to capture Intel XPU platform metrics.
+Intel XPU SmarTune is a collection of platform tools and services designed to optimize and enhance the system operational efficiency of AI NAS, it comprises two components: Balancer and Monitor.
+
+- Balancer [User Guide](https://github.com/intel/intel-xpu-smartune/tree/main/balancer#readme) is designed primarily for platform resource governance and application priority management.
+- Monitor [User Guide](https://github.com/intel/intel-xpu-smartune/tree/main/monitor#readme) provides a unified solution for collecting and visualizing the status of Intel platform XPUs (including CPU, iGPU, NPU, etc.) and system resources.
 
 ## License
 

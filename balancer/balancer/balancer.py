@@ -1583,6 +1583,13 @@ class DynamicBalancer:
             for extra_id in extra_effective_ids:
                 self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
+        # Manual limits go to g_limited_apps_manual and should NOT be auto-restored.
+        # Remove from g_limited_apps if it was previously auto-limited to prevent
+        # the monitoring loop from auto-restoring a manually-limited app.
+        if effective_app_id in g_limited_apps:
+            g_limited_apps.pop(effective_app_id, None)
+            logger.info(f"Removed {app_name} from auto-limited apps (now manually limited)")
+
         # 6. Record the limit state (as long as at least one limit succeeded)
         if resource_limited or io_limited:
             g_limited_apps_manual[effective_app_id] = (app_name, limit_rates, {

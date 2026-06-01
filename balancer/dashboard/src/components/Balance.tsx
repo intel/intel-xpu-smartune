@@ -16,7 +16,6 @@ import {
   message,
   Switch,
   InputNumber,
-  Divider,
   Tabs,
 } from 'antd'
 import {
@@ -414,7 +413,7 @@ export default function Balance({ active }: Props) {
       const priority = rowPriorities[limitDialog.app.app_id] ?? limitDialog.app.priority ?? 'medium'
       const isMultiTarget = limitForm.cgroupIds.length > 1
 
-      if (isMultiTarget) {
+      if (isMultiTarget && !useInlineProcessHint) {
         const selectedTarget = activeLimitTarget || limitForm.cgroupIds[0]
         const form = perTargetForms[selectedTarget] ?? limitForm
         await api.resourceLimit({
@@ -702,6 +701,11 @@ export default function Balance({ active }: Props) {
       label: procNames.length === cgIds.length ? procNames[i] : cg,
     }))
   }, [limitForm.cgroupIds, limitForm.processNames])
+  const inlineProcessNames = useMemo(
+    () => limitForm.processNames.map((name) => name.trim()).filter(Boolean),
+    [limitForm.processNames]
+  )
+  const useInlineProcessHint = inlineProcessNames.length > 1
 
   // renderLimitSettings accepts a form snapshot and a typed setter so each
   // context (single-cgroup or per-tab) can be fully independent.
@@ -775,8 +779,6 @@ export default function Balance({ active }: Props) {
           <Text type="secondary">%</Text>
         </div>
       </div>
-
-      <Divider style={{ margin: '4px 0' }} />
 
       <div>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -1063,12 +1065,13 @@ export default function Balance({ active }: Props) {
         onOk={submitResourceLimit}
         okText="Apply Limit"
         confirmLoading={limitDialog.submitting}
+        maskClosable={false}
         width={760}
         destroyOnClose
       >
         <div style={{ opacity: limitDialog.loadingProfile ? 0.6 : 1, pointerEvents: limitDialog.loadingProfile ? 'none' : 'auto' }}>
           <Space direction="vertical" size={12} style={{ width: '100%' }}>
-            {tabTargets.length > 1 && (
+            {tabTargets.length > 1 && !useInlineProcessHint && (
               <Tabs
                 activeKey={activeLimitTarget || tabTargets[0].key}
                 onChange={setActiveLimitTarget}
@@ -1089,6 +1092,11 @@ export default function Balance({ active }: Props) {
                 }))}
               />
             )}
+            {useInlineProcessHint && (
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                Target Processes: {inlineProcessNames.join(' | ')}
+              </Text>
+            )}
 
             {tabTargets.length === 0 && limitForm.cgroupIds.length === 1 && (
               <div>
@@ -1102,7 +1110,7 @@ export default function Balance({ active }: Props) {
                 </div>
               </div>
             )}
-            {tabTargets.length <= 1 && renderLimitSettings(limitForm, setLimitForm)}
+            {(tabTargets.length <= 1 || useInlineProcessHint) && renderLimitSettings(limitForm, setLimitForm)}
           </Space>
         </div>
       </Modal>

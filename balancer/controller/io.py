@@ -282,11 +282,8 @@ class IOController:
                         success = False
                         continue
 
-                # Build command based on vendor config
-                if getattr(self.config, "vendor", "generic") == "generic":
-                    cmd = f"sudo sh -c 'echo \"{disk_id} {limit_str}\" > {io_max_path}'"
-                else:
-                    cmd = f"sh -c 'echo \"{disk_id} {limit_str}\" > {io_max_path}'"
+                # Build command using the utility function
+                cmd = build_sudo_shell_redirect(f"{disk_id} {limit_str}", io_max_path)
                 logger.info(f"Setting IO limits for cgroup: {cgroup_id} in disk {disk_name}({disk_id}): {limit_str}")
 
                 if is_restore:
@@ -294,7 +291,7 @@ class IOController:
                     # "io.max disappeared between the existence check and the write" (TOCTOU)
                     # from a genuine permission failure, without emitting a misleading ERROR.
                     try:
-                        result = subprocess.run(cmd, shell=True, check=False, capture_output=True)
+                        result = subprocess.run(cmd, shell=False, check=False, capture_output=True)
                         if result.returncode != 0:
                             if not os.path.exists(io_max_path):
                                 logger.warning(
@@ -302,8 +299,9 @@ class IOController:
                                     f"mid-restore — IO controller was disabled, limits already cleared (benign)"
                                 )
                             else:
+                                cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
                                 logger.error(
-                                    f"Command failed: {cmd}\nError: {result.stderr.decode().strip()}"
+                                    f"Command failed: {cmd_str}\nError: {result.stderr.decode().strip()}"
                                 )
                                 success = False
                     except Exception as e:

@@ -339,7 +339,9 @@ def detect_gpu_devices():
             if (Path(SYSFS_EVENT_SOURCE) / fallback).exists():
                 device_name = fallback
             else:
-                continue
+                # Xe can work without PMU (fdinfo + sysfs mode)
+                if driver != "xe":
+                    continue
 
         # Intel iGPU is always at bus 00, device 02 (e.g. 0000:00:02.0)
         is_integrated = False
@@ -1670,4 +1672,3 @@ class GPUMonitor:
     def close(self):
         for m in self.monitors:
             m.close()
-

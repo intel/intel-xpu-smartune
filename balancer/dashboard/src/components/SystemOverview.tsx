@@ -456,14 +456,35 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
     })
   }
 
+  // Deduplicate: if multiple entries share the same PCI address, keep the one
+  // with richer data (has qdev / engine data).  This guards against transient
+  // state during startup where static and dynamic sources momentarily disagree.
+  const seenPci = new Map<string, number>()
+  const deduped: GpuDeviceView[] = []
+  for (const d of devices) {
+    const pciKey = (d.pci && d.pci !== 'N/A') ? d.pci : d.cardKey
+    const existing = seenPci.get(pciKey)
+    if (existing != null) {
+      const prev = deduped[existing]
+      const prevScore = (prev.available ? 2 : 0) + (prev.engines.length ? 1 : 0)
+      const curScore = (d.available ? 2 : 0) + (d.engines.length ? 1 : 0)
+      if (curScore > prevScore) {
+        deduped[existing] = d
+      }
+    } else {
+      seenPci.set(pciKey, deduped.length)
+      deduped.push(d)
+    }
+  }
+
   // Use the actual kernel DRM card identifier (card0, card1, …) in the display
   // label so it matches the sysfs naming shown in tooltips and logs.
-  devices.forEach((d) => {
+  deduped.forEach((d) => {
     const role = d.label === 'iGPU' ? 'iGPU' : 'dGPU'
     d.displayLabel = `${role} (${d.cardKey})`
   })
 
-  return devices
+  return deduped
 }
 
 function Sparkline({

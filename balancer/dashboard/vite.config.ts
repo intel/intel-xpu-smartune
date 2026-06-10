@@ -12,6 +12,23 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
         secure: false,
+        ws: true,
+        configure: (proxy) => {
+          proxy.on('error', (err, req, res) => {
+            console.warn(`[proxy] ${req?.method} ${req?.url} -> ${(err as NodeJS.ErrnoException).code || err.message}`)
+            if (res && 'writeHead' in res && !res.headersSent) {
+              try {
+                res.writeHead(502, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ error: 'upstream_unavailable', detail: err.message }))
+              } catch { /* socket already gone */ }
+            }
+          })
+          proxy.on('proxyReq', (proxyReq) => {
+            proxyReq.on('error', (e) => {
+              console.warn('[proxy] proxyReq error:', (e as NodeJS.ErrnoException).code || e.message)
+            })
+          })
+        },
       },
     },
   },

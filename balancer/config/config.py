@@ -27,6 +27,7 @@ class Config:
     disk_iowait_threshold: float = 10
     disk_io_throughput_threshold_kb: float = 102400  # KB/s, i.e. 100 MB/s
     regular_update_sys_pressure_time: float = 5
+    monitor_idle_check_interval: float = 10
     network_thresholds: dict = None
     network_interface: dict = None
     network_bandwidth_kbit: int = 1000000 #kbit/s

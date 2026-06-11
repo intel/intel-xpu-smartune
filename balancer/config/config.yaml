@@ -82,6 +82,7 @@ blacklist:
   - dbus
 cooldown_time: 15 # 避免频繁通知的冷却时间
 regular_update_sys_pressure_time: 5
+monitor_idle_check_interval: 10  # balancer 空闲时的压力检查周期（秒）
 app_priority:
   critical: 100
   high: 80

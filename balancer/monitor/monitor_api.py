@@ -960,7 +960,9 @@ class SystemPressureMonitor:
         self.score = 0.0
         self._disk_io_stress: dict = {}
         self._last_update_time = 0
-        self._CACHE_TTL = config.regular_update_sys_pressure_time
+        _MIN_PRESSURE_UPDATE = 1.0   # seconds
+        _MAX_PRESSURE_UPDATE = 60.0  # seconds
+        self._CACHE_TTL = max(_MIN_PRESSURE_UPDATE, min(_MAX_PRESSURE_UPDATE, config.regular_update_sys_pressure_time))
         self._is_limited_app_dominant = False
         self._update_lock = threading.Lock()
 

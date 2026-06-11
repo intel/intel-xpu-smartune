@@ -393,6 +393,10 @@ export interface HistoryData {
   limit: number
   start_time?: number | null
   end_time?: number | null
+  // Server-side "now" at the moment of this query, in unix seconds.
+  // The UI uses this to detect client/server clock skew rather than trusting
+  // Date.now() on a possibly-misconfigured client.
+  server_time?: number
   count: number
   items: HistorySnapshotItem[]
 }
@@ -402,6 +406,11 @@ export interface HistoryQueryOptions {
   limit?: number
   startTime?: number | null
   endTime?: number | null
+  // Preset window length in seconds.  When set (and startTime/endTime are
+  // omitted) the server anchors the window to its own clock, immune to a
+  // skewed client wall clock.  Per-client value: a tab choosing 1 h does not
+  // affect another tab still on 15 min.
+  rangeSeconds?: number | null
 }
 
 export interface HistoryRetentionData {
@@ -409,4 +418,16 @@ export interface HistoryRetentionData {
   default_days: number
   min_days: number
   max_days: number
+  updated_at?: number
 }
+
+export interface WeightsTopData {
+  cpu: number
+  memory: number
+  gpu: number
+  updated_at?: number
+}
+
+export type SaveResult<TOk> =
+  | { status: 'ok'; data: TOk }
+  | { status: 'conflict'; current: any; message: string }

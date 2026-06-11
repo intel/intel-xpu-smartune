@@ -5,3 +5,7 @@
 __pycache__/
 *.log
 *.db
+
+# Per-deployment runtime state written by the dashboard (retention setting,
+# optimistic-concurrency timestamps).  Lives under config/ but is not source.
+config/runtime_state.json

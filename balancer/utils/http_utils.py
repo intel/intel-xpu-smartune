@@ -34,6 +34,7 @@ class RetCode(IntEnum, CustomEnum):
     AUTHENTICATION_ERROR = 109
     UNAUTHORIZED = 401
     NOT_EXISTING = 404
+    CONFLICT = 409
     SERVER_ERROR = 500
 
 def get_json_result(retcode=RetCode.SUCCESS, retmsg='success',

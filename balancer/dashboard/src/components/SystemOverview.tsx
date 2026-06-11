@@ -46,10 +46,10 @@ import '../styles/performance.css'
 const { Text, Title } = Typography
 
 // UI-selectable refresh intervals for dynamic_info polling.
-// The backend pre-caches data every ~2 s, so polls at any interval are cheap.
+// The backend pre-caches data every ~2 s, so 2 s is the freshness lower bound;
+// larger intervals trade UI render rate / trend granularity for less work.
 const DEFAULT_REFRESH_INTERVAL_MS = 2000
 const REFRESH_INTERVAL_OPTIONS = [
-  { label: '1s', value: 1000 },
   { label: '2s', value: 2000 },
   { label: '3s', value: 3000 },
   { label: '5s', value: 5000 },

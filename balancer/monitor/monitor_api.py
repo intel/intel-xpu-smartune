@@ -203,14 +203,100 @@ _SNAPSHOT_RETENTION_MIN_DAYS: int = 1
 _SNAPSHOT_RETENTION_MAX_DAYS: int = 7
 _SNAPSHOT_CLEANUP_INTERVAL_SEC: float = 300.0  # run cleanup every 5 minutes
 
-# Path of the settings file — stored in the project root alongside the database.
-_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "monitor_settings.json")
+# Path of the runtime-state file — stored next to config.yaml so all
+# locally-tunable state lives under config/.  Holds dashboard-driven values
+# (snapshot retention) plus optimistic-concurrency timestamps.  Listed in
+# balancer/.gitignore since it is per-deployment runtime state, not source.
+_SETTINGS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "config", "runtime_state.json"
+)
 _SETTINGS_LOCK = threading.Lock()
 
 # In-memory copy; populated by _load_retention_settings() on first use.
 _retention_days: Optional[int] = None
 _cleanup_started = False
 _cleanup_start_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Optimistic-concurrency timestamps for shared (global) configuration
+# ---------------------------------------------------------------------------
+# Both /config/weights_top and /history/retention are global state: any client
+# can change them and every other client is affected.  To prevent silent
+# last-write-wins overwrites, each settable section carries an `updated_at`
+# unix timestamp.  GET returns it, POST must echo it back as
+# `expected_updated_at`; if the value on disk has moved on (someone else
+# saved meanwhile) the server returns RetCode.CONFLICT with the current
+# state so the UI can prompt the user to reload.
+_CONFIG_TS_KEYS = {
+    "weights_top": "weights_top_updated_at",
+    "retention":   "retention_updated_at",
+}
+
+
+def _read_settings_file() -> Dict[str, Any]:
+    """Load the raw monitor_settings.json contents (or {} on any failure)."""
+    try:
+        with open(_SETTINGS_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_settings_file(updates: Dict[str, Any]) -> None:
+    """Merge ``updates`` into monitor_settings.json atomically."""
+    existing = _read_settings_file()
+    existing.update(updates)
+    tmp = _SETTINGS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(existing, fh)
+    os.replace(tmp, _SETTINGS_FILE)
+
+
+def _get_config_updated_at(section: str) -> int:
+    """Return the persisted updated_at (unix seconds) for a config section.
+
+    Returns 0 if the section has never been saved through this API — clients
+    sending expected_updated_at=0 (or None) for a never-written section will
+    therefore be accepted on first write.
+    """
+    key = _CONFIG_TS_KEYS.get(section)
+    if not key:
+        return 0
+    with _SETTINGS_LOCK:
+        raw = _read_settings_file().get(key, 0)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bump_config_updated_at(section: str) -> int:
+    """Persist a fresh updated_at for ``section`` and return the new value."""
+    key = _CONFIG_TS_KEYS.get(section)
+    if not key:
+        return 0
+    new_ts = int(time.time())
+    with _SETTINGS_LOCK:
+        _write_settings_file({key: new_ts})
+    return new_ts
+
+
+def _coerce_expected_ts(value: Any) -> Optional[int]:
+    """Best-effort cast of ``expected_updated_at`` from the request body.
+
+    Returns ``None`` when the caller omitted the field (treated as "first
+    write — accept unconditionally" only when the server side is also 0).
+    Returns ``-1`` when the field was provided but malformed; the caller
+    surfaces this as ARGUMENT_ERROR rather than CONFLICT.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
 
 
 def _load_retention_settings() -> int:
@@ -230,26 +316,32 @@ def _load_retention_settings() -> int:
         return days
 
 
-def _save_retention_settings(days: int) -> None:
-    """Persist retention days to the settings file and update the in-memory value."""
+def _save_retention_settings(days: int) -> int:
+    """Persist retention days to the settings file and update the in-memory value.
+
+    Returns the new ``updated_at`` unix timestamp written for this section so
+    callers can echo it back to the client.  A fresh timestamp is written even
+    if the value did not change, because the act of "save" itself is a write
+    that other clients should reload past.
+    """
     global _retention_days
     days = max(_SNAPSHOT_RETENTION_MIN_DAYS, min(int(days), _SNAPSHOT_RETENTION_MAX_DAYS))
+    new_ts = int(time.time())
+    ts_key = _CONFIG_TS_KEYS["retention"]
     with _SETTINGS_LOCK:
         _retention_days = days
         try:
-            existing: Dict[str, Any] = {}
-            try:
-                with open(_SETTINGS_FILE, "r", encoding="utf-8") as fh:
-                    existing = json.load(fh)
-            except Exception:
-                pass
+            existing = _read_settings_file()
             existing["snapshot_retention_days"] = days
+            existing[ts_key] = new_ts
             tmp = _SETTINGS_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(existing, fh)
             os.replace(tmp, _SETTINGS_FILE)
         except Exception as exc:
             logger.warning("Failed to save monitor settings: %s", exc)
+            return 0
+    return new_ts
 
 
 def _run_snapshot_cleanup() -> None:
@@ -587,6 +679,14 @@ def get_history():
 
         start_raw = (request.args.get('start_time') or '').strip()
         end_raw = (request.args.get('end_time') or '').strip()
+        # range_seconds: client picks a preset window length but lets the
+        # server anchor the window to its own clock.  This avoids "no data"
+        # when a client's wall clock is skewed from the server (e.g. NTP
+        # not synced) — the snapshots are written using server time, so
+        # querying with a client-derived end_time can land in an empty
+        # interval.  start_time/end_time still take precedence for custom
+        # ranges where the user picked specific timestamps.
+        range_seconds_raw = (request.args.get('range_seconds') or '').strip()
 
         start_time = None
         end_time = None
@@ -610,6 +710,25 @@ def get_history():
                     retcode=RetCode.ARGUMENT_ERROR,
                     retmsg="end_time must be a unix timestamp (seconds)"
                 )
+
+        if start_time is None and end_time is None and range_seconds_raw:
+            try:
+                range_seconds = int(range_seconds_raw)
+            except (TypeError, ValueError):
+                return construct_response(
+                    data={},
+                    retcode=RetCode.ARGUMENT_ERROR,
+                    retmsg="range_seconds must be an integer"
+                )
+            if range_seconds <= 0:
+                return construct_response(
+                    data={},
+                    retcode=RetCode.ARGUMENT_ERROR,
+                    retmsg="range_seconds must be positive"
+                )
+            server_now = int(time.time())
+            end_time = server_now
+            start_time = server_now - range_seconds
 
         if start_time is not None and end_time is not None and start_time > end_time:
             return construct_response(
@@ -652,6 +771,10 @@ def get_history():
                 'limit': limit,
                 'start_time': start_time,
                 'end_time': end_time,
+                # server_time lets the client detect clock skew and warn the
+                # user; it's the authoritative reference for "now" used to
+                # resolve range_seconds above.
+                'server_time': int(time.time()),
                 'count': len(items),
                 'items': items,
             },
@@ -675,7 +798,8 @@ def get_history_retention():
             "retention_days": <int>,        // current setting (1-7)
             "default_days": <int>,          // built-in default (3)
             "min_days": <int>,              // minimum allowed (1)
-            "max_days": <int>               // maximum allowed (7)
+            "max_days": <int>,              // maximum allowed (7)
+            "updated_at": <int>             // unix seconds; 0 if never written via API
         }
     """
     _start_snapshot_cleanup_task()
@@ -685,6 +809,7 @@ def get_history_retention():
             'default_days': _SNAPSHOT_RETENTION_DEFAULT_DAYS,
             'min_days': _SNAPSHOT_RETENTION_MIN_DAYS,
             'max_days': _SNAPSHOT_RETENTION_MAX_DAYS,
+            'updated_at': _get_config_updated_at("retention"),
         },
         retmsg="Successfully retrieved retention settings"
     )
@@ -696,13 +821,26 @@ def set_history_retention():
 
     Request body:
         {
-            "retention_days": <int>   // required, 1-7
+            "retention_days": <int>,                // required, 1-7
+            "expected_updated_at": <int> (optional) // unix ts from prior GET
         }
 
-    Response data:
+    Optimistic concurrency: see /config/weights_top — same scheme, mismatch
+    is reported with ``RetCode.CONFLICT`` and a ``current`` payload.
+
+    Response (success):
         {
             "retention_days": <int>,
-            "deleted": <int>          // rows deleted by the immediate cleanup sweep
+            "deleted": <int>,         // rows deleted by the immediate cleanup sweep
+            "updated_at": <int>
+        }
+    Response (409 conflict):
+        {
+            "current": {
+                "retention_days": <int>,
+                "updated_at": <int>,
+                ...
+            }
         }
     """
     try:
@@ -729,16 +867,61 @@ def set_history_retention():
                 retmsg=f"retention_days must be between {_SNAPSHOT_RETENTION_MIN_DAYS} and {_SNAPSHOT_RETENTION_MAX_DAYS}"
             )
 
-        _save_retention_settings(days)
+        client_addr = request.remote_addr
+        expected_ts = _coerce_expected_ts(body.get("expected_updated_at"))
+        if expected_ts == -1:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="expected_updated_at must be an integer"
+            )
+        current_ts = _get_config_updated_at("retention")
+
+        def _conflict_payload() -> Dict[str, Any]:
+            return {
+                "current": {
+                    "retention_days": _load_retention_settings(),
+                    "default_days": _SNAPSHOT_RETENTION_DEFAULT_DAYS,
+                    "min_days": _SNAPSHOT_RETENTION_MIN_DAYS,
+                    "max_days": _SNAPSHOT_RETENTION_MAX_DAYS,
+                    "updated_at": current_ts,
+                }
+            }
+
+        if expected_ts is None:
+            if current_ts != 0:
+                logger.info(
+                    "retention conflict (no expected_updated_at) from %s; current_ts=%d",
+                    client_addr, current_ts,
+                )
+                return construct_response(
+                    data=_conflict_payload(),
+                    retcode=RetCode.CONFLICT,
+                    retmsg="Retention was modified by another client; please reload."
+                )
+        elif expected_ts != current_ts:
+            logger.info(
+                "retention conflict from %s: expected=%d current=%d",
+                client_addr, expected_ts, current_ts,
+            )
+            return construct_response(
+                data=_conflict_payload(),
+                retcode=RetCode.CONFLICT,
+                retmsg="Retention was modified by another client; please reload."
+            )
+
+        new_ts = _save_retention_settings(days)
         _start_snapshot_cleanup_task()
 
         # Run an immediate cleanup sweep so the new policy takes effect right away.
         deleted = MonitorSnapshot.delete_older_than(days)
-        if deleted:
-            logger.info("Retention updated to %d day(s); immediate cleanup deleted %d row(s)", days, deleted)
+        logger.info(
+            "retention accepted from %s: days=%d updated_at=%d deleted=%d",
+            client_addr, days, new_ts, deleted,
+        )
 
         return construct_response(
-            data={'retention_days': days, 'deleted': deleted},
+            data={'retention_days': days, 'deleted': deleted, 'updated_at': new_ts},
             retmsg=f"Retention set to {days} day(s)"
         )
     except Exception as e:
@@ -940,12 +1123,14 @@ def get_weights_top():
             "cpu": int,
             "memory": int,
             "io": int,
-            "gpu": int
+            "gpu": int,
+            "updated_at": int        // unix seconds; 0 if never written via API
         }
     """
     try:
         from config.config import b_config
-        weights = b_config.weights_top or {}
+        weights = dict(b_config.weights_top or {})
+        weights["updated_at"] = _get_config_updated_at("weights_top")
         return construct_response(
             data=weights,
             retmsg="Successfully retrieved weights_top configuration"
@@ -967,16 +1152,30 @@ def update_weights_top():
         {
             "cpu": int (optional),
             "memory": int (optional),
-            "gpu": int (optional)
+            "gpu": int (optional),
+            "expected_updated_at": int (optional)   // unix ts from prior GET
         }
+
+    Optimistic concurrency: when ``expected_updated_at`` is provided, it must
+    match the server's current updated_at; otherwise the request is rejected
+    with ``RetCode.CONFLICT`` and the response payload includes the latest
+    state so the client can prompt the user to reload.  Omitting the field
+    is allowed only when the server side has never been written through this
+    API (i.e. updated_at == 0), so first-time saves still work.
 
     Note: I/O weight is not configurable via this API as Disk I/O ranking
     uses pure throughput (MB/s) without weight adjustment.
 
-    Response:
+    Response (success):
         {
             "success": bool,
-            "updated_weights": dict
+            "updated_weights": dict,
+            "updated_at": int
+        }
+    Response (409 conflict):
+        {
+            "success": false,
+            "current": dict,        // latest weights including updated_at
         }
     """
     try:
@@ -1017,26 +1216,67 @@ def update_weights_top():
                 retmsg="No valid weight updates provided"
             )
 
-        # Update the configuration
-        logger.info(f"Updating weights_top configuration: {updates}")
-        success = b_config.update_config_section('weights_top', updates)
-
-        if success:
-            logger.info(f"Successfully updated weights_top to: {b_config.weights_top}")
-            return construct_response(
-                data={
-                    "success": True,
-                    "updated_weights": b_config.weights_top
-                },
-                retmsg="Successfully updated weights_top configuration"
-            )
-        else:
-            logger.error("Failed to update weights_top configuration")
+        client_addr = request.remote_addr
+        expected_ts = _coerce_expected_ts(data.get("expected_updated_at"))
+        if expected_ts == -1:
             return construct_response(
                 data={"success": False},
-                retcode=RetCode.EXCEPTION_ERROR,
-                retmsg="Failed to update configuration"
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="expected_updated_at must be an integer"
             )
+        current_ts = _get_config_updated_at("weights_top")
+        # None ⇒ caller did not send the field; only acceptable when server
+        # side has also never been written (cold-start path).
+        if expected_ts is None:
+            if current_ts != 0:
+                logger.info(
+                    "weights_top conflict (no expected_updated_at) from %s; current_ts=%d",
+                    client_addr, current_ts,
+                )
+                current = dict(b_config.weights_top or {})
+                current["updated_at"] = current_ts
+                return construct_response(
+                    data={"success": False, "current": current},
+                    retcode=RetCode.CONFLICT,
+                    retmsg="Configuration was modified by another client; please reload."
+                )
+        elif expected_ts != current_ts:
+            logger.info(
+                "weights_top conflict from %s: expected=%d current=%d",
+                client_addr, expected_ts, current_ts,
+            )
+            current = dict(b_config.weights_top or {})
+            current["updated_at"] = current_ts
+            return construct_response(
+                data={"success": False, "current": current},
+                retcode=RetCode.CONFLICT,
+                retmsg="Configuration was modified by another client; please reload."
+            )
+
+        # Update the configuration.  update_config_section returns False both
+        # for failures and for "no values changed" — treat the latter as a
+        # successful no-op so that Save without edits doesn't surface as an
+        # error.  We still bump updated_at so other clients reload past this
+        # write.
+        logger.info("Updating weights_top from %s: %s (expected_ts=%s)",
+                    client_addr, updates, expected_ts)
+        b_config.update_config_section('weights_top', updates)
+
+        new_ts = _bump_config_updated_at("weights_top")
+        updated = dict(b_config.weights_top or {})
+        updated["updated_at"] = new_ts
+        logger.info(
+            "weights_top accepted from %s: %s -> updated_at=%d",
+            client_addr, b_config.weights_top, new_ts,
+        )
+        return construct_response(
+            data={
+                "success": True,
+                "updated_weights": updated,
+                "updated_at": new_ts,
+            },
+            retmsg="Successfully updated weights_top configuration"
+        )
 
     except Exception as e:
         logger.error(f"update_weights_top failed: {str(e)}")

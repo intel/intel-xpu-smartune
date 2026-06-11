@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import { Alert, Button, Card, Checkbox, DatePicker, Divider, Dropdown, Empty, Popover, Segmented, Select, Space, Tooltip as AntTooltip, Typography, message } from 'antd'
+import { Alert, Button, Card, Checkbox, DatePicker, Divider, Dropdown, Empty, Modal, Popover, Segmented, Select, Space, Tooltip as AntTooltip, Typography, message } from 'antd'
 import { DownloadOutlined, FilterOutlined, ReloadOutlined, SettingOutlined, DownOutlined } from '@ant-design/icons'
 import ExcelJS from 'exceljs'
 import {
@@ -1358,6 +1358,13 @@ export default function HistoryDashboard({ active }: Props) {
   const [savingRetention, setSavingRetention] = useState(false)
   const [messageApi, messageContextHolder] = message.useMessage()
 
+  // Client/server clock skew (seconds, signed: positive = server ahead of
+  // client).  Updated from the server_time field every successful fetch.
+  // Only surfaced when |skew| exceeds the threshold below to avoid noise on
+  // healthy deployments.
+  const [clockSkewSec, setClockSkewSec] = useState<number | null>(null)
+  const CLOCK_SKEW_WARN_SEC = 60
+
   const customRangeReady = useMemo(() => {
     if (rangePreset !== 'custom') return true
     const start = customRange?.[0]
@@ -1371,11 +1378,17 @@ export default function HistoryDashboard({ active }: Props) {
     setLoading(true)
     setHistory(null)
 
-    const nowSec = Math.floor(Date.now() / 1000)
     let startTime: number | null = null
     let endTime: number | null = null
+    let rangeSeconds: number | null = null
 
     if (rangePreset === 'custom') {
+      // Custom range: caller picked specific timestamps in the date picker;
+      // pass them through verbatim.  Skew correction is intentionally not
+      // applied here — if the user typed "16:00 today" they meant their own
+      // wall clock, not server time, so honoring their input is least
+      // surprising.  The skew banner (below) signals when the chart's time
+      // axis won't match what the user expected.
       const start = customRange?.[0]
       const end = customRange?.[1]
       if (start && end) {
@@ -1383,10 +1396,11 @@ export default function HistoryDashboard({ active }: Props) {
         endTime = end.unix()
       }
     } else {
+      // Preset path: ask the server to anchor the window to its own clock.
+      // This is per-request: another tab on a different preset still gets
+      // its own range_seconds → its own window.
       const preset = rangePreset as Exclude<RangePreset, 'custom'>
-      const seconds = RANGE_SECONDS[preset]
-      startTime = nowSec - seconds
-      endTime = nowSec
+      rangeSeconds = RANGE_SECONDS[preset]
     }
 
     const queryLimit = estimateRequiredLimit(rangePreset, customRange)
@@ -1397,10 +1411,15 @@ export default function HistoryDashboard({ active }: Props) {
         limit: queryLimit,
         startTime,
         endTime,
+        rangeSeconds,
       })
       setHistory(data)
       setError(null)
       setLastFetchAt(dayjs().format('YYYY-MM-DD HH:mm:ss'))
+      if (typeof data.server_time === 'number' && Number.isFinite(data.server_time)) {
+        const clientNow = Math.floor(Date.now() / 1000)
+        setClockSkewSec(data.server_time - clientNow)
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Failed to fetch history data')
     } finally {
@@ -1434,11 +1453,43 @@ export default function HistoryDashboard({ active }: Props) {
     if (pendingRetentionDays === null) return
     setSavingRetention(true)
     try {
-      const result = await api.setHistoryRetention(pendingRetentionDays)
-      setRetention((prev) => prev ? { ...prev, retention_days: result.retention_days } : prev)
-      const msg = result.deleted
-        ? `Retention set to ${result.retention_days} day(s). ${result.deleted} old record(s) deleted.`
-        : `Retention set to ${result.retention_days} day(s).`
+      const result = await api.setHistoryRetention(pendingRetentionDays, retention?.updated_at)
+
+      if (result.status === 'conflict') {
+        const current = (result.current ?? {}) as HistoryRetentionData
+        const newTs = current.updated_at
+        const tsLabel = newTs
+          ? new Date(newTs * 1000).toLocaleString()
+          : 'unknown time'
+        Modal.confirm({
+          title: 'Retention changed by another client',
+          content: (
+            <div>
+              <p>
+                Retention was updated to <b>{current.retention_days} day(s)</b> at <b>{tsLabel}</b> while you were editing.
+                Reloading will replace the form with the latest server value.
+              </p>
+            </div>
+          ),
+          okText: 'Reload latest values',
+          cancelText: 'Cancel',
+          onOk: () => {
+            setRetention((prev) => prev ? { ...prev, ...current } : current)
+            setPendingRetentionDays(current.retention_days)
+          },
+        })
+        return
+      }
+
+      const data = result.data
+      setRetention((prev) =>
+        prev
+          ? { ...prev, retention_days: data.retention_days, updated_at: data.updated_at }
+          : prev,
+      )
+      const msg = data.deleted
+        ? `Retention set to ${data.retention_days} day(s). ${data.deleted} old record(s) deleted.`
+        : `Retention set to ${data.retention_days} day(s).`
       messageApi.success(msg)
       // Refresh history so the UI reflects any newly-removed rows.
       fetchHistory()
@@ -1447,7 +1498,7 @@ export default function HistoryDashboard({ active }: Props) {
     } finally {
       setSavingRetention(false)
     }
-  }, [pendingRetentionDays, messageApi, fetchHistory])
+  }, [pendingRetentionDays, retention?.updated_at, messageApi, fetchHistory])
 
   const dynamicItems = useMemo<HistorySnapshotItem[]>(
     () => (history?.items ?? []).filter((item: HistorySnapshotItem) => item.snapshot_type === 'dynamic'),
@@ -1884,6 +1935,20 @@ export default function HistoryDashboard({ active }: Props) {
         />
       )}
 
+      {clockSkewSec !== null && Math.abs(clockSkewSec) >= CLOCK_SKEW_WARN_SEC && (
+        <Alert
+          message="Client/server clock skew detected"
+          description={(() => {
+            const ahead = clockSkewSec > 0 ? 'ahead of' : 'behind'
+            const mins = Math.round(Math.abs(clockSkewSec) / 60)
+            return `Server clock is ${ahead} this device by about ${mins} minute(s). Preset ranges (15 min / 1 h / ...) use server time, so the data shown is correct; only the date picker for "custom" still uses your local clock.`
+          })()}
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
+      )}
+
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
         <Title level={5} style={{ color: COLORS.text, margin: 0 }}>
           History Trends
@@ -1955,6 +2020,10 @@ export default function HistoryDashboard({ active }: Props) {
 
           <Popover
             trigger="click"
+            // Re-fetch on open so a stale tab picks up another client's changes
+            // before showing the form.  Without this, Save stays disabled when
+            // the local pending value matches the server's pre-change value.
+            onOpenChange={(open) => { if (open) fetchRetention() }}
             title="History Data Retention"
             content={
               <div style={{ minWidth: 260 }}>
@@ -1991,6 +2060,11 @@ export default function HistoryDashboard({ active }: Props) {
                     Save
                   </Button>
                 </Space>
+                <Text style={{ color: COLORS.textMuted, fontSize: 11, display: 'block', marginTop: 8 }}>
+                  Last updated: {retention?.updated_at
+                    ? new Date(retention.updated_at * 1000).toLocaleString()
+                    : 'Not yet saved'}
+                </Text>
               </div>
             }
           >

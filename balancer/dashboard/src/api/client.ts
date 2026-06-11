@@ -10,12 +10,19 @@ import type {
   HistoryData,
   HistoryQueryOptions,
   HistoryRetentionData,
+  SaveResult,
   SetControlPayload,
   AppIdPayload,
   SetPriorityPayload,
   ResourceLimitPayload,
   ResourceLimitProfileData,
+  WeightsTopData,
 } from './types'
+
+// Server uses RetCode.CONFLICT (409) for optimistic-concurrency mismatches
+// on shared global config (weights_top, history retention).  Kept in sync
+// with balancer/utils/http_utils.py.
+const RETCODE_CONFLICT = 409
 
 const client = axios.create({
   baseURL: '/api',
@@ -35,6 +42,21 @@ async function post<T>(url: string, body: object = {}): Promise<T> {
   return res.data.data
 }
 
+// post-with-conflict: same as post() but returns a tagged union instead of
+// throwing on 409 so the UI can prompt the user to reload latest values.
+// Other non-zero retcodes still throw, matching the legacy contract.
+async function postWithConflict<TOk>(url: string, body: object): Promise<SaveResult<TOk>> {
+  const res = await client.post<ApiResponse<TOk & { current?: unknown }>>(url, body)
+  if (res.data.retcode === 0) {
+    return { status: 'ok', data: res.data.data as TOk }
+  }
+  if (res.data.retcode === RETCODE_CONFLICT) {
+    const payload = (res.data.data ?? {}) as { current?: unknown }
+    return { status: 'conflict', current: payload.current ?? null, message: res.data.retmsg }
+  }
+  throw new Error(res.data.retmsg)
+}
+
 export const api = {
   getAppResourceStats: (n = 10) => get<AppResourceStatsData>(`/monitor/app_resource_stats?n=${n}`),
   getAppDiskIoStats: (n = 10) => get<AppDiskIoStatsData>(`/monitor/app_disk_io_stats?n=${n}`),
@@ -50,19 +72,37 @@ export const api = {
       limit: String(limit),
     })
 
+    const hasExplicitRange =
+      (typeof options.startTime === 'number' && Number.isFinite(options.startTime)) ||
+      (typeof options.endTime === 'number' && Number.isFinite(options.endTime))
+
     if (typeof options.startTime === 'number' && Number.isFinite(options.startTime)) {
       params.set('start_time', String(Math.floor(options.startTime)))
     }
     if (typeof options.endTime === 'number' && Number.isFinite(options.endTime)) {
       params.set('end_time', String(Math.floor(options.endTime)))
     }
+    // range_seconds is only meaningful when the caller did not pin
+    // start_time/end_time (custom range path).  The server gives explicit
+    // timestamps precedence anyway, but skipping the param keeps URLs tidy.
+    if (
+      !hasExplicitRange &&
+      typeof options.rangeSeconds === 'number' &&
+      Number.isFinite(options.rangeSeconds) &&
+      options.rangeSeconds > 0
+    ) {
+      params.set('range_seconds', String(Math.floor(options.rangeSeconds)))
+    }
 
     return get<HistoryData>(`/monitor/history?${params.toString()}`)
   },
 
   getHistoryRetention: () => get<HistoryRetentionData>('/monitor/history/retention'),
-  setHistoryRetention: (days: number) =>
-    post<{ retention_days: number; deleted: number }>('/monitor/history/retention', { retention_days: days }),
+  setHistoryRetention: (days: number, expectedUpdatedAt?: number) =>
+    postWithConflict<{ retention_days: number; deleted: number; updated_at: number }>(
+      '/monitor/history/retention',
+      { retention_days: days, expected_updated_at: expectedUpdatedAt },
+    ),
 
   checkRunningApps: () => post<AppListData>('/app/check_running_apps'),
   getApps: () => post<AppListData>('/app/get_apps'),
@@ -93,7 +133,14 @@ export const api = {
     post<ResourceLimitProfileData>('/app/resource_limit_profile', payload),
   resourceRestore: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<void>('/app/resource_restore', payload),
-  getWeightsTop: () => get<{ cpu: number; memory: number; gpu: number }>('/monitor/config/weights_top'),
-  updateWeightsTop: (weights: { cpu?: number; memory?: number; gpu?: number }) =>
-    post<{ success: boolean; updated_weights: { cpu: number; memory: number; gpu: number } }>('/monitor/config/weights_top', weights),
+  getWeightsTop: () => get<WeightsTopData>('/monitor/config/weights_top'),
+  updateWeightsTop: (
+    weights: { cpu?: number; memory?: number; gpu?: number },
+    expectedUpdatedAt?: number,
+  ) =>
+    postWithConflict<{
+      success: boolean
+      updated_weights: WeightsTopData
+      updated_at: number
+    }>('/monitor/config/weights_top', { ...weights, expected_updated_at: expectedUpdatedAt }),
 }

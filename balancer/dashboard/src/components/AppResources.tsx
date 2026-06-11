@@ -20,7 +20,7 @@ import { ReloadOutlined, ThunderboltOutlined, SettingOutlined, SaveOutlined } fr
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
 import { api } from '../api/client'
-import type { AppResourceEntry, AppDiskIoEntry } from '../api/types'
+import type { AppResourceEntry, AppDiskIoEntry, WeightsTopData } from '../api/types'
 import { usePolling } from '../hooks/usePolling'
 
 const { Text, Title } = Typography
@@ -74,42 +74,98 @@ interface SettingsModalProps {
   onClose: () => void
 }
 
+function formatRelativeAge(ts: number | undefined | null): string {
+  if (!ts) return 'never'
+  const ageSec = Math.max(0, Math.floor(Date.now() / 1000 - ts))
+  if (ageSec < 5) return 'just now'
+  if (ageSec < 60) return `${ageSec}s ago`
+  if (ageSec < 3600) return `${Math.floor(ageSec / 60)}m ago`
+  if (ageSec < 86400) return `${Math.floor(ageSec / 3600)}h ago`
+  return `${Math.floor(ageSec / 86400)}d ago`
+}
+
+function formatTimestamp(ts: number | undefined | null): string {
+  if (!ts) return 'Not yet saved'
+  return new Date(ts * 1000).toLocaleString()
+}
+
 function SettingsModal({ visible, onClose }: SettingsModalProps) {
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [initialValues, setInitialValues] = useState<WeightsConfig | null>(null)
+  const [updatedAt, setUpdatedAt] = useState<number | undefined>(undefined)
 
-  useEffect(() => {
-    if (visible) {
-      loadWeights()
-    }
-  }, [visible])
-
-  const loadWeights = async () => {
+  const loadWeights = useCallback(async () => {
     setLoading(true)
     try {
       const weights = await api.getWeightsTop()
-      setInitialValues(weights)
-      form.setFieldsValue(weights)
+      const { updated_at, ...rest } = weights
+      const config: WeightsConfig = {
+        cpu: rest.cpu ?? 0,
+        memory: rest.memory ?? 0,
+        gpu: rest.gpu ?? 0,
+      }
+      setInitialValues(config)
+      setUpdatedAt(updated_at)
+      form.setFieldsValue(config)
     } catch (error) {
       message.error('Failed to load weights configuration')
       console.error(error)
     } finally {
       setLoading(false)
     }
-  }
+  }, [form])
+
+  useEffect(() => {
+    if (visible) {
+      loadWeights()
+    }
+  }, [visible, loadWeights])
 
   const handleSave = async () => {
     try {
       const values = await form.validateFields()
       setSaving(true)
 
-      const response = await api.updateWeightsTop(values)
+      const result = await api.updateWeightsTop(values, updatedAt)
 
+      if (result.status === 'conflict') {
+        const current = (result.current ?? {}) as WeightsTopData
+        const newTs = current.updated_at
+        const tsLabel = newTs ? formatTimestamp(newTs) : 'unknown time'
+        Modal.confirm({
+          title: 'Settings changed by another client',
+          content: (
+            <div>
+              <p>
+                These weights were updated at <b>{tsLabel}</b> while you were editing.
+                Reloading will replace the form with the latest server values.
+              </p>
+            </div>
+          ),
+          okText: 'Reload latest values',
+          cancelText: 'Cancel',
+          onOk: async () => {
+            const next: WeightsConfig = {
+              cpu: current.cpu ?? 0,
+              memory: current.memory ?? 0,
+              gpu: current.gpu ?? 0,
+            }
+            setInitialValues(next)
+            setUpdatedAt(newTs)
+            form.setFieldsValue(next)
+          },
+        })
+        return
+      }
+
+      const response = result.data
       if (response.success) {
         message.success('Weights configuration updated successfully')
-        setInitialValues(response.updated_weights)
+        const w = response.updated_weights
+        setInitialValues({ cpu: w.cpu, memory: w.memory, gpu: w.gpu })
+        setUpdatedAt(response.updated_at)
         onClose()
       } else {
         message.error('Failed to update weights configuration')
@@ -122,10 +178,10 @@ function SettingsModal({ visible, onClose }: SettingsModalProps) {
     }
   }
 
+  // Re-fetch the latest server values.  Useful both for "discard my edits"
+  // and "pick up another client's changes without closing the modal".
   const handleReset = () => {
-    if (initialValues) {
-      form.setFieldsValue(initialValues)
-    }
+    loadWeights()
   }
 
   return (
@@ -164,6 +220,9 @@ function SettingsModal({ visible, onClose }: SettingsModalProps) {
         </Text>
         <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
           Note: Disk I/O is ranked separately in the Top Disk I/O Consumer section and does not use these weights.
+        </Text>
+        <Text type="secondary" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
+          Last updated: {formatTimestamp(updatedAt)}{updatedAt ? ` (${formatRelativeAge(updatedAt)})` : ''}
         </Text>
       </div>
 

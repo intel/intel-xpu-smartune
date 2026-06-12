@@ -1,0 +1,19 @@
+[Unit]
+Description=Intel XPU SmarTune Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/nas/intel-xpu-smartune/balancer
+ExecStart=/home/nas/intel-xpu-smartune/balancer/start_smartune_service.sh
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+StandardOutput=append:/home/nas/intel-xpu-smartune/balancer/logs/smartune.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

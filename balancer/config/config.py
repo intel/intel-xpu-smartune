@@ -15,6 +15,7 @@ class Config:
     thresholds: dict = None
     weights: dict = None
     weights_top: dict = None
+    passive_resource_control: dict = None
     dominant_app_reduce_factor: float = 3.0
     workloads: dict = None
     app_priority: dict = None

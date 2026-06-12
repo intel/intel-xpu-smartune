@@ -32,7 +32,7 @@ import {
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
 import { api } from '../api/client'
-import type { AppInfo, ResourceLimitProfileData } from '../api/types'
+import type { AppInfo, ResourceLimitProfileData, PassiveControlData } from '../api/types'
 import { useAppEvents } from '../hooks/useAppEvents'
 
 const { Text } = Typography
@@ -122,6 +122,133 @@ function PriorityTag({ priority }: { priority?: string }) {
     >
       {priority ?? 'N/A'}
     </Tag>
+  )
+}
+
+function formatPassiveControlTimestamp(ts: number | undefined | null): string {
+  if (!ts) return 'unknown time'
+  return new Date(ts * 1000).toLocaleString()
+}
+
+interface PassiveControlPanelProps {
+  active: boolean
+}
+
+// Compact card with a single Switch that gates the balancer's pressure-driven
+// auto-limit/auto-restore loop.  Network shaping and manual per-app limits are
+// not affected; flipping this only stops the passive top-consumer hunt.
+function PassiveControlPanel({ active }: PassiveControlPanelProps) {
+  const [enabled, setEnabled] = useState<boolean | null>(null)
+  const [updatedAt, setUpdatedAt] = useState<number | undefined>(undefined)
+  const [loading, setLoading] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const data = await api.getPassiveControl()
+      setEnabled(Boolean(data.enabled))
+      setUpdatedAt(data.updated_at)
+    } catch (e) {
+      console.error('[Balance] load passive control failed:', e)
+      message.error('Failed to load passive control state')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (active) load()
+  }, [active, load])
+
+  const handleToggle = async (checked: boolean) => {
+    setSaving(true)
+    try {
+      const result = await api.updatePassiveControl(checked, updatedAt)
+      if (result.status === 'conflict') {
+        const current = (result.current ?? {}) as PassiveControlData
+        const newTs = current.updated_at
+        const tsLabel = formatPassiveControlTimestamp(newTs)
+        Modal.confirm({
+          title: 'Setting changed by another client',
+          content: (
+            <div>
+              <p>
+                Passive resource control was updated to{' '}
+                <b>{current.enabled ? 'enabled' : 'disabled'}</b> at <b>{tsLabel}</b>.
+                Reload to pick up the latest value before changing it again.
+              </p>
+            </div>
+          ),
+          okText: 'Reload latest value',
+          cancelText: 'Cancel',
+          onOk: () => {
+            setEnabled(Boolean(current.enabled))
+            setUpdatedAt(newTs)
+          },
+        })
+        return
+      }
+      const response = result.data
+      if (response.success) {
+        setEnabled(response.enabled)
+        setUpdatedAt(response.updated_at)
+        message.success(
+          response.enabled
+            ? 'Passive resource control enabled'
+            : 'Passive resource control disabled'
+        )
+      } else {
+        message.error('Failed to update passive control state')
+      }
+    } catch (e) {
+      console.error('[Balance] update passive control failed:', e)
+      message.error('Failed to update passive control state')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Card
+      style={{
+        background: COLORS.panelBg,
+        border: `1px solid ${COLORS.border}`,
+        borderRadius: 6,
+        marginBottom: 12,
+      }}
+      bodyStyle={{ padding: '12px 16px' }}
+    >
+      <Row gutter={[12, 8]} align="middle" justify="space-between">
+        <Col flex="auto">
+          <Space size={8} align="center">
+            <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
+              Passive Resource Control
+            </Text>
+            <Tooltip title="When ON, the balancer monitors system pressure and automatically limits/restores the top resource consumers. When OFF, network shaping and manual per-app limits still work, but the pressure-driven auto-limit loop is paused.">
+              <QuestionCircleOutlined style={{ color: COLORS.textMuted }} />
+            </Tooltip>
+          </Space>
+          <div style={{ marginTop: 2 }}>
+            <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>
+              {updatedAt
+                ? `Last changed: ${formatPassiveControlTimestamp(updatedAt)}`
+                : 'Never changed via dashboard'}
+            </Text>
+          </div>
+        </Col>
+        <Col>
+          <Switch
+            checked={Boolean(enabled)}
+            disabled={loading || saving || enabled === null}
+            loading={saving}
+            onChange={handleToggle}
+            checkedChildren="On"
+            unCheckedChildren="Off"
+          />
+        </Col>
+      </Row>
+    </Card>
   )
 }
 
@@ -872,6 +999,8 @@ export default function Balance({ active }: Props) {
           style={{ marginBottom: 12 }}
         />
       )}
+
+      <PassiveControlPanel active={active} />
 
       {/* Add App Section */}
       <Card

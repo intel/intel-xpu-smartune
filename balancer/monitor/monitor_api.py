@@ -229,8 +229,9 @@ _cleanup_start_lock = threading.Lock()
 # saved meanwhile) the server returns RetCode.CONFLICT with the current
 # state so the UI can prompt the user to reload.
 _CONFIG_TS_KEYS = {
-    "weights_top": "weights_top_updated_at",
-    "retention":   "retention_updated_at",
+    "weights_top":              "weights_top_updated_at",
+    "retention":                "retention_updated_at",
+    "passive_resource_control": "passive_resource_control_updated_at",
 }
 
 
@@ -380,6 +381,186 @@ def _start_snapshot_cleanup_task() -> None:
     t.start()
 
 
+# Numeric ordering for pressure levels used by the peak-latch logic.
+# Higher numbers represent higher pressure.  "unknown" ranks below every
+# real level so that it never masks a valid reading.
+_LEVEL_ORDER: Dict[str, int] = {
+    "unknown":  -1,
+    "low":       0,
+    "medium":    1,
+    "high":      2,
+    "critical":  3,
+}
+
+
+class SystemPressureMonitor:
+    """ Manages overall system pressure state based on PSI and resource usage,
+    with auto-refresh and disk I/O stress tracking."""
+    def __init__(self, config):
+        self.config = config
+        self.psi = PSIMonitor()
+        self.res = ResourceMonitor()
+        self.analyzer = PressureAnalyzer(config)
+
+        self._current_level = None
+        self.is_current_disk_io_stressed = False
+        self.score = 0.0
+        self._disk_io_stress: dict = {}
+        self._last_update_time = 0
+        _MIN_PRESSURE_UPDATE = 1.0   # seconds
+        _MAX_PRESSURE_UPDATE = 60.0  # seconds
+        self._CACHE_TTL = max(_MIN_PRESSURE_UPDATE, min(_MAX_PRESSURE_UPDATE, config.regular_update_sys_pressure_time))
+        self._is_limited_app_dominant = False
+        self._update_lock = threading.Lock()
+
+        # Peak-latch fields: track the highest pressure seen since the balancer
+        # last called consume_peak_pressure_level().  They only rise (never fall)
+        # during each refresh cycle so that transient spikes cannot be silently
+        # skipped by the balancer's idle_check_interval gate.
+        self._peak_level = None
+        self._peak_disk_io_stressed = False
+
+        # Listeners notified when the system transitions into or out of the
+        # "critical" pressure level.  Each entry is a callable(is_critical: bool).
+        self._critical_state_listeners: list[Callable[[bool], None]] = []
+
+        self._start_auto_refresh()
+
+    def register_critical_state_listener(self, callback) -> None:
+        """Register a callback invoked when system pressure enters or leaves the
+        "critical" level.
+
+        The callback receives a single bool: ``True`` when entering critical,
+        ``False`` when leaving.  Callbacks are fired from the auto-refresh
+        thread, so they must be thread-safe and non-blocking.
+        """
+        self._critical_state_listeners.append(callback)
+
+    def set_limited_app_dominant(self, is_dominant: bool):
+        """Set whether the rate-limited app is currently dominant."""
+        if self._is_limited_app_dominant != is_dominant:
+            self._is_limited_app_dominant = is_dominant
+
+    def _start_auto_refresh(self):
+        """Start the background thread that periodically refreshes system pressure state."""
+        def refresh_loop():
+            while True:
+                time.sleep(self._CACHE_TTL * 0.9)
+                self._safe_update()
+
+        threading.Thread(target=refresh_loop, daemon=True).start()
+
+    def _safe_update(self):
+        """Thread-safe pressure level update."""
+        if self._update_lock.acquire(blocking=False):
+            try:
+                new_level, score, disk_io_stressed, disk_io_stress = self._update_pressure_level()
+                old_level = self._current_level
+                self._current_level = new_level
+                self.score = score
+                self.is_current_disk_io_stressed = disk_io_stressed
+                self._disk_io_stress = disk_io_stress
+                # Peak latch: only raise the peak, never lower it.  The balancer
+                # resets the peak via consume_peak_pressure_level().
+                if _LEVEL_ORDER.get(new_level, -1) > _LEVEL_ORDER.get(self._peak_level, -1):
+                    self._peak_level = new_level
+                if disk_io_stressed:
+                    self._peak_disk_io_stressed = True
+            finally:
+                self._update_lock.release()
+
+            # Notify listeners outside the lock to avoid re-entrant deadlock.
+            # We compare the old and new levels after releasing the lock; the
+            # transition flags are local, so they are safe to use here.
+            was_critical = (old_level == "critical")
+            is_critical = (new_level == "critical")
+            if was_critical != is_critical:
+                for cb in self._critical_state_listeners:
+                    try:
+                        cb(is_critical)
+                    except Exception as exc:
+                        logger.error("Critical state listener raised an error: %s", exc)
+
+    def _update_pressure_level(self) -> tuple[str, float, bool, dict]:
+        """Recompute the current pressure level using internal state."""
+        try:
+            psi_data = self.psi.get_current_pressure()
+            usage_data = self.res.get_resource_usage()
+            disk_io = self.res.is_disk_io_stressed()
+            score = self.analyzer.calculate_pressure_score(
+                psi_data,
+                usage_data,
+                self._is_limited_app_dominant
+            )
+            logger.debug(f"disk_io={disk_io}")
+            level = self.analyzer.get_pressure_level(score, self.config.thresholds)
+            self._last_update_time = time.time()
+            return level, score, disk_io.get("is_stressed", False), disk_io
+        except Exception as e:
+            logger.error("Failed to update pressure level: %s", str(e))
+            return "unknown", 0.0, False, {}
+
+
+    def get_current_pressure_level(self) -> tuple:
+        """Return the current pressure level as (level, score, is_disk_io_stressed)."""
+        logger.debug("Current PSI level: %s (pressure: %.2f), disk io stressed: %s", self._current_level, self.score,
+                     self.is_current_disk_io_stressed)
+        return self._current_level, self.score, self.is_current_disk_io_stressed
+
+    def consume_peak_pressure_level(self) -> tuple:
+        """Return the highest pressure level seen since the last call, then reset the peak.
+
+        Returns (peak_level, score, peak_disk_io_stressed).
+
+        The balancer calls this instead of get_current_pressure_level() so that
+        transient spikes (e.g. a brief "critical" window that resolves before the
+        idle_check_interval gate opens) are never silently dropped.  The peak is
+        reset to the current instantaneous level after each call, so the next call
+        starts fresh.  This decouples correctness from the relationship between
+        idle_check_interval, regular_update_sys_pressure_time, and the UI poll
+        interval — no dynamic coupling between those three clocks is required.
+
+        Note: get_current_pressure_level() is intentionally kept separate and is
+        still used by display/point-in-time paths (UI, appIntercept) that must NOT
+        consume or reset the peak.
+        """
+        with self._update_lock:
+            peak_level = self._peak_level if self._peak_level is not None else self._current_level
+            peak_disk_io = self._peak_disk_io_stressed
+            # Reset peak to current instantaneous values ready for the next window.
+            self._peak_level = self._current_level
+            self._peak_disk_io_stressed = self.is_current_disk_io_stressed
+        logger.debug(
+            "consume_peak: peak_level=%s, peak_disk_io=%s (current=%s)",
+            peak_level, peak_disk_io, self._current_level,
+        )
+        return peak_level, self.score, peak_disk_io
+
+    def get_disk_io_stress(self) -> dict:
+        """Return the cached disk IO stress details from the most recent update.
+
+        The dict format matches ResourceMonitor.is_disk_io_stressed:
+        {
+            "is_stressed": bool,
+            "stressed_disks": list[str],
+            "iowait": float,
+            "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec, read_iops, write_iops, is_busy}}
+        }
+        """
+        return self._disk_io_stress
+
+    def update_network_pressure_level(self, network_data):
+        """Update the network pressure level independently.
+
+        Returns: (tx_level, rx_level, tx_value, rx_value)
+        """
+        try:
+            tx_level = self.analyzer.get_pressure_level(network_data['tx'], self.config.network_thresholds)
+            rx_level = self.analyzer.get_pressure_level(network_data['rx'], self.config.network_thresholds)
+            return tx_level, rx_level, network_data['tx'], network_data['rx']
+        except Exception as e:
+            logger.error("Failed to update network pressure level: %s", str(e))
+            return "unknown", "unknown", 0.0, 0.0
 
 
 @monitor_bp.route('/app_resource_stats', methods=['GET'])
@@ -933,189 +1114,6 @@ def set_history_retention():
         )
 
 
-
-# Numeric ordering for pressure levels used by the peak-latch logic.
-# Higher numbers represent higher pressure.  "unknown" ranks below every
-# real level so that it never masks a valid reading.
-_LEVEL_ORDER: Dict[str, int] = {
-    "unknown":  -1,
-    "low":       0,
-    "medium":    1,
-    "high":      2,
-    "critical":  3,
-}
-
-
-class SystemPressureMonitor:
-    """ Manages overall system pressure state based on PSI and resource usage,
-    with auto-refresh and disk I/O stress tracking."""
-    def __init__(self, config):
-        self.config = config
-        self.psi = PSIMonitor()
-        self.res = ResourceMonitor()
-        self.analyzer = PressureAnalyzer(config)
-
-        self._current_level = None
-        self.is_current_disk_io_stressed = False
-        self.score = 0.0
-        self._disk_io_stress: dict = {}
-        self._last_update_time = 0
-        _MIN_PRESSURE_UPDATE = 1.0   # seconds
-        _MAX_PRESSURE_UPDATE = 60.0  # seconds
-        self._CACHE_TTL = max(_MIN_PRESSURE_UPDATE, min(_MAX_PRESSURE_UPDATE, config.regular_update_sys_pressure_time))
-        self._is_limited_app_dominant = False
-        self._update_lock = threading.Lock()
-
-        # Peak-latch fields: track the highest pressure seen since the balancer
-        # last called consume_peak_pressure_level().  They only rise (never fall)
-        # during each refresh cycle so that transient spikes cannot be silently
-        # skipped by the balancer's idle_check_interval gate.
-        self._peak_level = None
-        self._peak_disk_io_stressed = False
-
-        # Listeners notified when the system transitions into or out of the
-        # "critical" pressure level.  Each entry is a callable(is_critical: bool).
-        self._critical_state_listeners: list[Callable[[bool], None]] = []
-
-        self._start_auto_refresh()
-
-    def register_critical_state_listener(self, callback) -> None:
-        """Register a callback invoked when system pressure enters or leaves the
-        "critical" level.
-
-        The callback receives a single bool: ``True`` when entering critical,
-        ``False`` when leaving.  Callbacks are fired from the auto-refresh
-        thread, so they must be thread-safe and non-blocking.
-        """
-        self._critical_state_listeners.append(callback)
-
-    def set_limited_app_dominant(self, is_dominant: bool):
-        """Set whether the rate-limited app is currently dominant."""
-        if self._is_limited_app_dominant != is_dominant:
-            self._is_limited_app_dominant = is_dominant
-
-    def _start_auto_refresh(self):
-        """Start the background thread that periodically refreshes system pressure state."""
-        def refresh_loop():
-            while True:
-                time.sleep(self._CACHE_TTL * 0.9)
-                self._safe_update()
-
-        threading.Thread(target=refresh_loop, daemon=True).start()
-
-    def _safe_update(self):
-        """Thread-safe pressure level update."""
-        if self._update_lock.acquire(blocking=False):
-            try:
-                new_level, score, disk_io_stressed, disk_io_stress = self._update_pressure_level()
-                old_level = self._current_level
-                self._current_level = new_level
-                self.score = score
-                self.is_current_disk_io_stressed = disk_io_stressed
-                self._disk_io_stress = disk_io_stress
-                # Peak latch: only raise the peak, never lower it.  The balancer
-                # resets the peak via consume_peak_pressure_level().
-                if _LEVEL_ORDER.get(new_level, -1) > _LEVEL_ORDER.get(self._peak_level, -1):
-                    self._peak_level = new_level
-                if disk_io_stressed:
-                    self._peak_disk_io_stressed = True
-            finally:
-                self._update_lock.release()
-
-            # Notify listeners outside the lock to avoid re-entrant deadlock.
-            # We compare the old and new levels after releasing the lock; the
-            # transition flags are local, so they are safe to use here.
-            was_critical = (old_level == "critical")
-            is_critical = (new_level == "critical")
-            if was_critical != is_critical:
-                for cb in self._critical_state_listeners:
-                    try:
-                        cb(is_critical)
-                    except Exception as exc:
-                        logger.error("Critical state listener raised an error: %s", exc)
-
-    def _update_pressure_level(self) -> tuple[str, float, bool, dict]:
-        """Recompute the current pressure level using internal state."""
-        try:
-            psi_data = self.psi.get_current_pressure()
-            usage_data = self.res.get_resource_usage()
-            disk_io = self.res.is_disk_io_stressed()
-            score = self.analyzer.calculate_pressure_score(
-                psi_data,
-                usage_data,
-                self._is_limited_app_dominant
-            )
-            logger.debug(f"disk_io={disk_io}")
-            level = self.analyzer.get_pressure_level(score, self.config.thresholds)
-            self._last_update_time = time.time()
-            return level, score, disk_io.get("is_stressed", False), disk_io
-        except Exception as e:
-            logger.error("Failed to update pressure level: %s", str(e))
-            return "unknown", 0.0, False, {}
-
-
-    def get_current_pressure_level(self) -> tuple:
-        """Return the current pressure level as (level, score, is_disk_io_stressed)."""
-        logger.debug("Current PSI level: %s (pressure: %.2f), disk io stressed: %s", self._current_level, self.score,
-                     self.is_current_disk_io_stressed)
-        return self._current_level, self.score, self.is_current_disk_io_stressed
-
-    def consume_peak_pressure_level(self) -> tuple:
-        """Return the highest pressure level seen since the last call, then reset the peak.
-
-        Returns (peak_level, score, peak_disk_io_stressed).
-
-        The balancer calls this instead of get_current_pressure_level() so that
-        transient spikes (e.g. a brief "critical" window that resolves before the
-        idle_check_interval gate opens) are never silently dropped.  The peak is
-        reset to the current instantaneous level after each call, so the next call
-        starts fresh.  This decouples correctness from the relationship between
-        idle_check_interval, regular_update_sys_pressure_time, and the UI poll
-        interval — no dynamic coupling between those three clocks is required.
-
-        Note: get_current_pressure_level() is intentionally kept separate and is
-        still used by display/point-in-time paths (UI, appIntercept) that must NOT
-        consume or reset the peak.
-        """
-        with self._update_lock:
-            peak_level = self._peak_level if self._peak_level is not None else self._current_level
-            peak_disk_io = self._peak_disk_io_stressed
-            # Reset peak to current instantaneous values ready for the next window.
-            self._peak_level = self._current_level
-            self._peak_disk_io_stressed = self.is_current_disk_io_stressed
-        logger.debug(
-            "consume_peak: peak_level=%s, peak_disk_io=%s (current=%s)",
-            peak_level, peak_disk_io, self._current_level,
-        )
-        return peak_level, self.score, peak_disk_io
-
-    def get_disk_io_stress(self) -> dict:
-        """Return the cached disk IO stress details from the most recent update.
-
-        The dict format matches ResourceMonitor.is_disk_io_stressed:
-        {
-            "is_stressed": bool,
-            "stressed_disks": list[str],
-            "iowait": float,
-            "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec, read_iops, write_iops, is_busy}}
-        }
-        """
-        return self._disk_io_stress
-
-    def update_network_pressure_level(self, network_data):
-        """Update the network pressure level independently.
-
-        Returns: (tx_level, rx_level, tx_value, rx_value)
-        """
-        try:
-            tx_level = self.analyzer.get_pressure_level(network_data['tx'], self.config.network_thresholds)
-            rx_level = self.analyzer.get_pressure_level(network_data['rx'], self.config.network_thresholds)
-            return tx_level, rx_level, network_data['tx'], network_data['rx']
-        except Exception as e:
-            logger.error("Failed to update network pressure level: %s", str(e))
-            return "unknown", "unknown", 0.0, 0.0
-
-
 @monitor_bp.route('/config/weights_top', methods=['GET'])
 def get_weights_top():
     """Get current weights_top configuration.
@@ -1282,6 +1280,167 @@ def update_weights_top():
 
     except Exception as e:
         logger.error(f"update_weights_top failed: {str(e)}")
+        return construct_response(
+            data={"success": False},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@monitor_bp.route('/config/passive_control', methods=['GET'])
+def get_passive_control():
+    """Get the current passive resource-control switch state.
+
+    When ``enabled`` is False the balancer's _run_monitor_resource_loop skips
+    its pressure-driven auto-limit/auto-restore work; the network controller
+    and manual per-app limits remain active.
+
+    Response:
+        {
+            "enabled": bool,
+            "updated_at": int        // unix seconds; 0 if never written via API
+        }
+    """
+    try:
+        from config.config import b_config
+        prc = dict(b_config.passive_resource_control or {})
+        return construct_response(
+            data={
+                "enabled": bool(prc.get("enabled", True)),
+                "updated_at": _get_config_updated_at("passive_resource_control"),
+            },
+            retmsg="Successfully retrieved passive_resource_control configuration"
+        )
+    except Exception as e:
+        logger.error(f"get_passive_control failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@monitor_bp.route('/config/passive_control', methods=['POST'])
+def update_passive_control():
+    """Toggle the passive resource-control switch.
+
+    Request body:
+        {
+            "enabled": bool,                          // required
+            "expected_updated_at": int (optional)     // unix ts from prior GET
+        }
+
+    Optimistic concurrency follows the same scheme as /config/weights_top:
+    if the server's updated_at has moved on, the request is rejected with
+    ``RetCode.CONFLICT`` and the latest state.
+
+    Response (success):
+        {
+            "success": true,
+            "enabled": bool,
+            "updated_at": int
+        }
+    Response (409 conflict):
+        {
+            "success": false,
+            "current": { "enabled": bool, "updated_at": int }
+        }
+    """
+    try:
+        from config.config import b_config
+
+        data = request.get_json()
+        if not isinstance(data, dict):
+            return construct_response(
+                data={"success": False},
+                retcode=RetCode.PARAM_ERROR,
+                retmsg="Request body must be a JSON object"
+            )
+
+        if "enabled" not in data:
+            return construct_response(
+                data={"success": False},
+                retcode=RetCode.PARAM_ERROR,
+                retmsg="enabled is required"
+            )
+        # Accept native bools and the common string forms used by some clients.
+        raw = data["enabled"]
+        if isinstance(raw, bool):
+            enabled = raw
+        elif isinstance(raw, str):
+            enabled = raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+        else:
+            try:
+                enabled = bool(int(raw))
+            except (TypeError, ValueError):
+                return construct_response(
+                    data={"success": False},
+                    retcode=RetCode.PARAM_ERROR,
+                    retmsg="enabled must be a boolean"
+                )
+
+        client_addr = request.remote_addr
+        expected_ts = _coerce_expected_ts(data.get("expected_updated_at"))
+        if expected_ts == -1:
+            return construct_response(
+                data={"success": False},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="expected_updated_at must be an integer"
+            )
+        current_ts = _get_config_updated_at("passive_resource_control")
+
+        def _conflict_payload() -> Dict[str, Any]:
+            prc = dict(b_config.passive_resource_control or {})
+            return {
+                "success": False,
+                "current": {
+                    "enabled": bool(prc.get("enabled", True)),
+                    "updated_at": current_ts,
+                },
+            }
+
+        if expected_ts is None:
+            if current_ts != 0:
+                logger.info(
+                    "passive_control conflict (no expected_updated_at) from %s; current_ts=%d",
+                    client_addr, current_ts,
+                )
+                return construct_response(
+                    data=_conflict_payload(),
+                    retcode=RetCode.CONFLICT,
+                    retmsg="Configuration was modified by another client; please reload."
+                )
+        elif expected_ts != current_ts:
+            logger.info(
+                "passive_control conflict from %s: expected=%d current=%d",
+                client_addr, expected_ts, current_ts,
+            )
+            return construct_response(
+                data=_conflict_payload(),
+                retcode=RetCode.CONFLICT,
+                retmsg="Configuration was modified by another client; please reload."
+            )
+
+        logger.info("Updating passive_resource_control from %s: enabled=%s (expected_ts=%s)",
+                    client_addr, enabled, expected_ts)
+        b_config.update_config_section('passive_resource_control', {'enabled': enabled})
+
+        new_ts = _bump_config_updated_at("passive_resource_control")
+        logger.info(
+            "passive_control accepted from %s: enabled=%s -> updated_at=%d",
+            client_addr, enabled, new_ts,
+        )
+        return construct_response(
+            data={
+                "success": True,
+                "enabled": enabled,
+                "updated_at": new_ts,
+            },
+            retmsg="Successfully updated passive_resource_control configuration"
+        )
+
+    except Exception as e:
+        logger.error(f"update_passive_control failed: {str(e)}")
         return construct_response(
             data={"success": False},
             retcode=RetCode.EXCEPTION_ERROR,

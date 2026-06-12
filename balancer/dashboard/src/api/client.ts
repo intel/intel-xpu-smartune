@@ -17,6 +17,7 @@ import type {
   ResourceLimitPayload,
   ResourceLimitProfileData,
   WeightsTopData,
+  PassiveControlData,
 } from './types'
 
 // Server uses RetCode.CONFLICT (409) for optimistic-concurrency mismatches
@@ -143,4 +144,12 @@ export const api = {
       updated_weights: WeightsTopData
       updated_at: number
     }>('/monitor/config/weights_top', { ...weights, expected_updated_at: expectedUpdatedAt }),
+
+  getPassiveControl: () => get<PassiveControlData>('/monitor/config/passive_control'),
+  updatePassiveControl: (enabled: boolean, expectedUpdatedAt?: number) =>
+    postWithConflict<{
+      success: boolean
+      enabled: boolean
+      updated_at: number
+    }>('/monitor/config/passive_control', { enabled, expected_updated_at: expectedUpdatedAt }),
 }

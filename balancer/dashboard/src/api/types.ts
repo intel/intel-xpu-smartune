@@ -428,6 +428,11 @@ export interface WeightsTopData {
   updated_at?: number
 }
 
+export interface PassiveControlData {
+  enabled: boolean
+  updated_at?: number
+}
+
 export type SaveResult<TOk> =
   | { status: 'ok'; data: TOk }
   | { status: 'conflict'; current: any; message: string }

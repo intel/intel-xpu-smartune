@@ -76,6 +76,8 @@ weights_top:
   cpu: 2
   memory: 7
   gpu: 5  #added to the default score as a secondary factor after GPU data is collected
+passive_resource_control:
+  enabled: false  #关闭后系统压力升高时不再自动监测/限流top应用；网络控制与手动限流不受影响
 blacklist:
   - systemd
   - kworker

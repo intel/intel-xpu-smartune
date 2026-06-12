@@ -296,6 +296,13 @@ class DynamicBalancer:
 
         def _on_critical_state_changed(is_critical):
             if is_critical:
+                # Skip the prefetch when passive control is off — _get_top_resource_consumers
+                # is a multi-second CPU+IO+GPU sampling pipeline whose only purpose is to
+                # feed the auto-limit decision, which is itself disabled.
+                prc = self.config.passive_resource_control or {}
+                if not bool(prc.get('enabled', True)):
+                    logger.debug("Critical-state listener fired but passive control disabled: skipping prefetch")
+                    return
                 logger.debug("Critical-state listener fired: triggering top-consumer prefetch")
                 _start_top_prefetch("critical_listener")
 
@@ -340,6 +347,15 @@ class DynamicBalancer:
             try:
                 current_time = time.time()
 
+                # Re-read every iteration so the UI Switch toggle takes effect without
+                # restarting the service.  When disabled, only the "find a new top
+                # consumer and limit it" branches are skipped; pressure sampling,
+                # already-limited-app restoration, pending-queue processing, and
+                # network shaping all keep running so previously limited apps still
+                # converge back to normal as system pressure subsides.
+                _prc = self.config.passive_resource_control or {}
+                passive_enabled = bool(_prc.get('enabled', True))
+
                 # Process immediately when the queue is non-empty; poll every 10s otherwise
                 if not self.app_priority_queue.empty() or (current_time - last_check_time) >= idle_check_interval:
                     # Use consume_peak_pressure_level() instead of get_current_pressure_level()
@@ -352,35 +368,48 @@ class DynamicBalancer:
                         is_disk_io_stressed = False
 
                     last_check_time = current_time
-                    # Edge trigger: prefetch whenever pressure enters the high band from
-                    # any other state (low/medium below, critical above). This is the
-                    # core mechanism — by the time we reach critical the cache is warm.
-                    # Sustained high stays cached. The critical-state listener is a
-                    # backstop for non-high→critical direct jumps.
-                    if pressure == "high" and prev_pressure != "high":
-                        logger.debug(
-                            f"Pressure edge {prev_pressure}→high: triggering top-consumer prefetch"
-                        )
-                        _start_top_prefetch("entering_high")
-
-                    # Sustained-critical recheck: if critical persists for N iters, the
-                    # original top1 has had ample time to settle under its limit. Refresh
-                    # top in background to catch a new dominant app that may have taken
-                    # over. Counter resets whenever pressure drops out of critical.
-                    if pressure == "critical":
-                        sustained_critical_iters += 1
-                        if sustained_critical_iters >= SUSTAINED_CRITICAL_REFRESH_ITERS:
+                    # Top-consumer prefetch / recheck only exist to warm the cache for the
+                    # auto-limit path.  When passive control is off we are not going to
+                    # apply any auto-limit, so skip the multi-second sampling pipeline.
+                    if passive_enabled:
+                        # Edge trigger: prefetch whenever pressure enters the high band from
+                        # any other state (low/medium below, critical above). This is the
+                        # core mechanism — by the time we reach critical the cache is warm.
+                        # Sustained high stays cached. The critical-state listener is a
+                        # backstop for non-high→critical direct jumps.
+                        if pressure == "high" and prev_pressure != "high":
                             logger.debug(
-                                f"Sustained critical for {sustained_critical_iters} iters: "
-                                f"triggering background top-consumer recheck"
+                                f"Pressure edge {prev_pressure}→high: triggering top-consumer prefetch"
                             )
-                            _start_top_prefetch("sustained_critical_recheck")
+                            _start_top_prefetch("entering_high")
+
+                        # Sustained-critical recheck: if critical persists for N iters, the
+                        # original top1 has had ample time to settle under its limit. Refresh
+                        # top in background to catch a new dominant app that may have taken
+                        # over. Counter resets whenever pressure drops out of critical.
+                        if pressure == "critical":
+                            sustained_critical_iters += 1
+                            if sustained_critical_iters >= SUSTAINED_CRITICAL_REFRESH_ITERS:
+                                logger.debug(
+                                    f"Sustained critical for {sustained_critical_iters} iters: "
+                                    f"triggering background top-consumer recheck"
+                                )
+                                _start_top_prefetch("sustained_critical_recheck")
+                                sustained_critical_iters = 0
+                        else:
                             sustained_critical_iters = 0
                     else:
                         sustained_critical_iters = 0
 
                     if policy == "separated":
-                        if pressure == "critical" or is_disk_io_stressed:
+                        # When passive control is disabled we deliberately fall through to
+                        # the restore / queue-drain branches below, even if pressure is
+                        # critical: skipping the expensive top-consumer fetch + auto-limit
+                        # is the whole point.  Restore only acts on medium/low pressure,
+                        # so a genuinely-critical system simply leaves already-limited
+                        # apps alone until pressure subsides — same end state, just no
+                        # new auto-limits.
+                        if passive_enabled and (pressure == "critical" or is_disk_io_stressed):
                             # Reset the low-pressure timer
                             restore_pending = False
 
@@ -568,7 +597,10 @@ class DynamicBalancer:
                                 else:
                                     reset_state()
                     elif policy == "combined":
-                        if pressure == "critical":
+                        # See the matching note in the "separated" branch: when passive
+                        # control is off we skip the expensive top fetch + auto-limit and
+                        # let the restore / queue-drain branches handle the iteration.
+                        if passive_enabled and pressure == "critical":
                             # Reset the low-pressure timer
                             pressure_start_time = None
                             # First time entering critical state: obtain the top-app list

@@ -40,11 +40,17 @@ class AppIntercept(metaclass=SingletonMeta):
         self.app_pending_queue = JoinableQueue(1000000)
         self.monitored_app_launched = {}  # currently launched monitored apps
         self.pending_exit_events = {}  # pending exit events keyed by PID
-        # Fast-lookup structures for get_main_process (rebuilt by _rebuild_match_cache)
+        # Per-app live-PID set: app_name → set of PIDs currently believed to be
+        # running.  An app emits "running" only on the first PID joining and
+        # "stopped" only when the last PID leaves, so a multi-process launch
+        # (e.g. a shell wrapper that exec-chains into a daemon) no longer
+        # causes the UI to flicker through running/stopped/running as each
+        # intermediate execve fires its own BPF event.
+        self.app_live_pids: dict[str, Set[int]] = {}
+        # Fast-lookup structures for get_main_process (rebuilt by _rebuild_match_cache).
         self._comm_to_app: dict = {}          # comm_lower -> app_name  (O(1) bpf_name exact match)
         self._filename_exe_to_app: dict = {}  # exe_lower  -> app_name  (filename path match)
-        self._fuzzy_fragments: list = []      # [(fragment_lower, app_name)]  (fuzzy fallback)
-        self._quick_filter: frozenset = frozenset()  # union of all above for pre-filtering
+        self._quick_filter: frozenset = frozenset()  # union of above for pre-filtering
 
         # Event-driven critical-mode flag.  Set by _on_critical_state_changed()
         # when the system pressure monitor transitions into "critical" state;
@@ -90,7 +96,8 @@ class AppIntercept(metaclass=SingletonMeta):
 
         Called whenever monitored_apps or the app config changes so that the
         hot-path (print_event → get_main_process) never rebuilds these dicts
-        itself.
+        itself.  Matching is driven entirely by ``bpf_name`` entries; the
+        ``name`` field is treated as a display label only.
         """
         # Prefer the unified controlled_apps list; fall back to the legacy monitor_apps key.
         cnf_apps = (getattr(self.controlManager.config, 'controlled_apps', None)
@@ -102,26 +109,18 @@ class AppIntercept(metaclass=SingletonMeta):
 
         comm_to_app: dict[str, str] = {}
         filename_exe_to_app: dict[str, str] = {}
-        fuzzy_fragments: list[tuple[str, str]] = []
 
         for app in self.monitored_apps:
             for exe in app_executables.get(app, []):
                 exe_lower = exe.lower()
                 comm_to_app[exe_lower] = app
                 filename_exe_to_app[exe_lower] = app
-            app_lower = app.lower()
-            fuzzy_fragments.append((app_lower.replace(" ", "-"), app))
-            if " " in app_lower:
-                fuzzy_fragments.append((app_lower, app))
 
         self._comm_to_app = comm_to_app
         self._filename_exe_to_app = filename_exe_to_app
-        self._fuzzy_fragments = fuzzy_fragments
         # Any string whose presence in comm or filename justifies a full match check
         self._quick_filter = frozenset(
-            set(comm_to_app.keys()) |
-            set(filename_exe_to_app.keys()) |
-            {f for f, _ in fuzzy_fragments}
+            set(comm_to_app.keys()) | set(filename_exe_to_app.keys())
         )
 
     def trace_print(self) -> None:
@@ -130,9 +129,8 @@ class AppIntercept(metaclass=SingletonMeta):
     def get_main_process(self, comm: str, filename: str) -> tuple[bool, str]:
         """Check whether this execve event is the main process of a monitored app.
 
-        Uses pre-built lookup tables (_comm_to_app, _filename_exe_to_app,
-        _fuzzy_fragments) so no config access or dict construction occurs on the
-        hot path.
+        Uses pre-built lookup tables (_comm_to_app, _filename_exe_to_app) so
+        no config access or dict construction occurs on the hot path.
         """
         comm_lower = comm.lower()
         filename_lower = filename.lower()
@@ -156,11 +154,6 @@ class AppIntercept(metaclass=SingletonMeta):
             if f"/{exe}" in filename_lower or filename_lower.endswith(f"/{exe}"):
                 return True, app
 
-        # Fuzzy app-name match (app name appears as a substring of the path)
-        for fragment, app in self._fuzzy_fragments:
-            if fragment in filename_lower:
-                return True, app
-
         return False, ""
 
     def is_process_alive(self, pid):
@@ -178,13 +171,32 @@ class AppIntercept(metaclass=SingletonMeta):
             logger.debug(f"[Delay Check] PID={pid} still alive, not exiting normally.")
             return
 
-        logger.debug(f"Monitored process terminated: PID={pid}, app={app_name}")
-        app_utils.callback_manager.send_callback_notification({
-            'app_id': app_id,
-            'app_name': app_name,
-            'status': "stopped",
-            'purpose': "app"
-        }, True)
+        # Per-app PID accounting: only emit "stopped" once the app has no
+        # live PIDs left.  Intermediate exec-chain PIDs (shell wrapper that
+        # exec'd into a daemon) come through this path and would otherwise
+        # flicker "stopped" while the real worker is still running.
+        live_pids = self.app_live_pids.get(app_name)
+        if live_pids is not None:
+            live_pids.discard(pid)
+            still_running = bool(live_pids)
+            if not still_running:
+                self.app_live_pids.pop(app_name, None)
+        else:
+            still_running = False
+
+        if still_running:
+            logger.debug(
+                f"Monitored process exited but app '{app_name}' still has "
+                f"{len(live_pids)} live PID(s); skipping 'stopped' notification."
+            )
+        else:
+            logger.debug(f"Monitored process terminated: PID={pid}, app={app_name}")
+            app_utils.callback_manager.send_callback_notification({
+                'app_id': app_id,
+                'app_name': app_name,
+                'status': "stopped",
+                'purpose': "app"
+            }, True)
         del self.monitored_app_launched[pid]
 
         # Clean up pending_exit_events
@@ -221,14 +233,25 @@ class AppIntercept(metaclass=SingletonMeta):
                     app_id, app_priority = app_data['app_id'], app_data.get('priority', 'low') if app_data else ("", "low")
                     logger.debug(f"launch: app_id={app_id}, app_name={app_name}, comm={comm}, filename={filename}")
                     self.monitored_app_launched[pid] = (app_id, app_name, comm, filename)
+
+                    # Track this PID under its app and decide whether we
+                    # should emit a "running" notification.  Only the first
+                    # live PID for an app emits one; subsequent execve
+                    # events from sibling/child processes (shell wrapper
+                    # → daemon → helper) just join the set silently.
+                    live_pids = self.app_live_pids.setdefault(app_name, set())
+                    is_first_live_pid = len(live_pids) == 0
+                    live_pids.add(pid)
+
                     if app_priority.lower() == "critical":
                         app_utils.adjust_oom_priority(app_id, app_name, app_priority, app_data['cmdline'])
-                        app_utils.callback_manager.send_callback_notification({
-                            'app_id': app_id,
-                            'app_name': app_name,
-                            'status': "running",
-                            'purpose': "app"
-                        }, True)
+                        if is_first_live_pid:
+                            app_utils.callback_manager.send_callback_notification({
+                                'app_id': app_id,
+                                'app_name': app_name,
+                                'status': "running",
+                                'purpose': "app"
+                            }, True)
                     else:
                         # Only intercept (SIGSTOP) when the system is already in
                         # critical pressure state.  If the system is idle the app
@@ -244,12 +267,13 @@ class AppIntercept(metaclass=SingletonMeta):
                         else:
                             # System is not under critical pressure: let the app run.
                             logger.debug("System not critical, allowing '%s' (PID: %s) to run freely", app_name, pid)
-                            app_utils.callback_manager.send_callback_notification({
-                                'app_id': app_id,
-                                'app_name': app_name,
-                                'status': "running",
-                                'purpose': "app"
-                            }, True)
+                            if is_first_live_pid:
+                                app_utils.callback_manager.send_callback_notification({
+                                    'app_id': app_id,
+                                    'app_name': app_name,
+                                    'status': "running",
+                                    'purpose': "app"
+                                }, True)
                     self.mark_process_handled(pid)
 
         elif type == 1:  # exit event
@@ -372,6 +396,59 @@ class AppIntercept(metaclass=SingletonMeta):
         """Return the current list of monitored applications."""
         return list(self.monitored_apps)
 
+    def register_running_pids(self, app_id: str, app_name: str,
+                              cmdline: str = "") -> int:
+        """Adopt currently-running PIDs of an app into the BPF tracking state.
+
+        The BPF tracker emits "stopped" only after every PID it has seen
+        launch has exited (see :py:meth:`handle_exit_event`).  When an app
+        is already running at the moment the user adds it to control —
+        either via the dropdown form or the wizard — BPF never observed
+        the launch, so its exits would be ignored and the app's status in
+        the UI would stay "running" forever.
+
+        This method discovers the PIDs via ``process_names`` (preferred)
+        or the commandline-derived executable name and seeds them into
+        ``app_live_pids`` / ``monitored_app_launched`` so that subsequent
+        BPF exit events fire normally.
+
+        Returns the number of PIDs adopted (0 if none found).
+        """
+        # Prefer the configured process_names list so multi-process apps
+        # (e.g. a wrapper script + its daemon) get every PID adopted.
+        pids: set[int] = set()
+        process_names = app_utils._get_app_process_names(app_id=app_id, app_name=app_name)
+        if process_names:
+            for pname in process_names:
+                try:
+                    pids.update(app_utils.get_app_processes(pname))
+                except Exception:
+                    continue
+        elif cmdline:
+            try:
+                exe = app_utils._get_executable_name(app_name, cmdline)
+                if exe:
+                    pids.update(app_utils.get_app_processes(exe))
+            except Exception:
+                pass
+
+        if not pids:
+            return 0
+
+        live_pids = self.app_live_pids.setdefault(app_name, set())
+        for pid in pids:
+            if pid in self.monitored_app_launched:
+                continue
+            self.monitored_app_launched[pid] = (app_id, app_name, "", "")
+            self.mark_process_handled(pid)
+            live_pids.add(pid)
+
+        logger.info(
+            f"register_running_pids: adopted {len(pids)} PID(s) for app "
+            f"'{app_name}' (id={app_id}); live={sorted(live_pids)}"
+        )
+        return len(pids)
+
     def scan_already_running_apps(self) -> list:
         """Scan currently running processes for monitored apps that pre-date the balancer.
 
@@ -431,12 +508,22 @@ class AppIntercept(metaclass=SingletonMeta):
                         self.monitored_app_launched[pid] = (app_id, app_name, comm, exe)
                         self.mark_process_handled(pid)
 
-                        app_utils.callback_manager.send_callback_notification({
-                            'app_id': app_id,
-                            'app_name': app_name,
-                            'status': "running",
-                            'purpose': "app"
-                        }, True)
+                        # Seed app_live_pids so the eventual exit BPF event
+                        # for this PID reaches handle_exit_event with a known
+                        # state and emits "stopped" correctly.  Otherwise
+                        # apps that were already running at balancer startup
+                        # would never report stopped when terminated.
+                        live_pids = self.app_live_pids.setdefault(app_name, set())
+                        is_first_live_pid = len(live_pids) == 0
+                        live_pids.add(pid)
+
+                        if is_first_live_pid:
+                            app_utils.callback_manager.send_callback_notification({
+                                'app_id': app_id,
+                                'app_name': app_name,
+                                'status': "running",
+                                'purpose': "app"
+                            }, True)
                         detected.append({"app_id": app_id, "app_name": app_name, "pid": pid})
                         detected_app_ids.add(app_id)
 

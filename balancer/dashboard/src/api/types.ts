@@ -132,6 +132,47 @@ export interface SetPriorityPayload {
   priority: string
 }
 
+// "Add Application" wizard ------------------------------------------------
+// Mirrors balancer/monitor/app_discovery.py::Candidate / ExtractResult and
+// the /app/discover_search, /app/discover_extract, /app/wizard_commit
+// endpoints in BalanceService.py.
+export interface DiscoverCandidate {
+  pid: number
+  comm: string         // /proc/<pid>/comm — same 15-byte truncation BPF reports
+  exe: string          // readlink /proc/<pid>/exe (full path, may be empty)
+  cmdline: string      // nul-joined cmdline rendered with spaces
+  cgroup_unit: string  // systemd unit/scope (or "")
+  ppid: number
+  score: number        // ranking hint; higher = more likely user-launched
+}
+
+export interface DiscoverSearchData {
+  count: number
+  candidates: DiscoverCandidate[]
+}
+
+export interface DiscoverExtractData {
+  bpf_name: string[]
+  process_names: string[]
+  commandline: string[]
+  id_suggestion: string
+}
+
+export interface WizardCommitPayload {
+  name: string
+  id: string
+  priority: string
+  remark: string
+  commandline: string
+  bpf_name: string[]
+  process_names: string[]
+}
+
+export interface WizardCommitData {
+  name: string
+  id: string
+}
+
 export interface ResourceLimitPayload {
   app_id: string
   app_name: string

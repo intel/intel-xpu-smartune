@@ -84,6 +84,9 @@ class DynamicService:
     def rebuild_controlled_map(self):
         self.balancer.bpf_monitor.rebuild_controlled_map()
 
+    def register_running_pids(self, app_id, app_name, cmdline=""):
+        return self.balancer.bpf_monitor.register_running_pids(app_id, app_name, cmdline)
+
     def check_running_apps(self):
         return self.balancer.bpf_monitor.scan_already_running_apps()
 
@@ -407,6 +410,12 @@ def set_to_control():
         if controlled and app_id:
             status = check_app_running_status(app_id, app_name, cmdline)
             logger.info(f"set_to_control: initial status check for '{app_name}' → {status}")
+            # If the app is already running, adopt its PIDs into the BPF
+            # tracker.  Without this the eventual exit BPF events would be
+            # ignored (no entry in monitored_app_launched) and the UI would
+            # remain stuck on "running" after the user closes the app.
+            if status == "running":
+                _service.register_running_pids(app_id, app_name, cmdline)
             callback_manager.send_callback_notification({
                 'app_id': app_id,
                 'app_name': app_name,
@@ -423,6 +432,356 @@ def set_to_control():
         )
     except Exception as e:
         logger.error(f"Control set failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/discover_search', methods=['POST'])
+def discover_search():
+    """Wizard step 2: scan /proc for processes matching user-provided keywords.
+
+    Body: { "keywords": ["helicon", "vlm"] }
+    Returns the candidate list with pid / comm / exe / cmdline / cgroup_unit
+    so the UI can let the user multi-select the processes that belong to
+    the application being added.
+    """
+    try:
+        from monitor import app_discovery
+        from config.config import b_config
+
+        data = request.get_json(silent=True) or {}
+        keywords = data.get('keywords') or []
+        if isinstance(keywords, str):
+            keywords = [keywords]
+        keywords = [k for k in keywords if isinstance(k, str)]
+        if not keywords:
+            return construct_response(
+                data={"candidates": []},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="At least one keyword is required"
+            )
+
+        extra_blacklist = list(getattr(b_config, "blacklist", None) or [])
+        candidates = app_discovery.search_processes(
+            keywords,
+            extra_blacklist=extra_blacklist,
+        )
+        return construct_response(
+            data={
+                "count": len(candidates),
+                "candidates": [app_discovery.candidate_to_dict(c) for c in candidates],
+            },
+            retmsg=f"Found {len(candidates)} candidate(s) for keywords {keywords}"
+        )
+    except Exception as e:
+        logger.error(f"discover_search failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/discover_extract', methods=['POST'])
+def discover_extract():
+    """Wizard step 3: read /proc/<pid> for the user-selected PIDs and return
+    the aggregated bpf_name / process_names / commandline / id_suggestion
+    fields the wizard would otherwise force the user to type.
+
+    Body: { "pids": [...], "name": "<display name>" }
+    The ``name`` is optional but, when supplied, is used to derive a
+    slug-based default for ``id_suggestion`` if none of the selected PIDs
+    share a systemd unit.
+    """
+    try:
+        from monitor import app_discovery
+
+        data = request.get_json(silent=True) or {}
+        raw_pids = data.get('pids') or []
+        pids = []
+        for p in raw_pids:
+            try:
+                pids.append(int(p))
+            except (TypeError, ValueError):
+                continue
+        if not pids:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="At least one pid is required"
+            )
+
+        name = (data.get('name') or '').strip()
+        result = app_discovery.extract_fields(pids, name=name)
+        return construct_response(
+            data=app_discovery.extract_to_dict(result),
+            retmsg=f"Extracted fields from {len(pids)} pid(s)"
+        )
+    except Exception as e:
+        logger.error(f"discover_extract failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/new_controlled_app', methods=['POST'])
+def new_controlled_app():
+    """Register a brand-new managed application (final wizard step).
+
+    Body: {
+        "name":         "<display name>",
+        "id":           "<unique id; suggested by the wizard>",
+        "priority":     "low" | "medium" | "high" | "critical"  (optional)
+        "commandline":  "<argv[0] of the main process>",
+        "bpf_name":     ["<comm>", ...],
+        "process_names": ["<exe basename>", ...]
+    }
+
+    On success the entry is appended to config.yaml's controlled_apps,
+    inserted into the AIAppPriority DB table, and the BPF match cache is
+    rebuilt so the new app is monitored without restarting the balancer.
+
+    The complementary endpoint, /app/purge_controlled_app, removes the
+    config + DB record entirely — used when the user wants to re-add an
+    app whose process_names overlap with an existing entry.
+    """
+    try:
+        from config.config import b_config
+
+        data = request.get_json(silent=True) or {}
+        name = (data.get('name') or '').strip()
+        app_id = (data.get('id') or '').strip()
+        if not name or not app_id:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="Both 'name' and 'id' are required"
+            )
+
+        priority = data.get('priority') or 'low'
+        commandline = data.get('commandline') or ''
+        remark = (data.get('remark') or '').strip()
+        bpf_name = list(data.get('bpf_name') or [])
+        process_names = list(data.get('process_names') or [])
+
+        # Reject duplicates so the wizard never silently shadows an
+        # already-controlled app.  Three flavours of conflict, each with a
+        # specific message so the user can fix it without guessing:
+        #   1. same id          — DB primary-key collision.
+        #   2. same name        — would render as two indistinguishable rows.
+        #   3. overlapping       — different name+id but the BPF / pgrep
+        #      bpf_name or         match cache would route the same comm or
+        #      process_names       exe to whichever entry rebuilds last,
+        #                          so the second entry is effectively dead.
+        existing = [item for item in (getattr(b_config, "controlled_apps", None) or [])
+                    if isinstance(item, dict)]
+        name_lower = name.lower()
+        new_bpf = {b.lower() for b in bpf_name if b}
+        new_procs = {p.lower() for p in process_names if p}
+
+        for item in existing:
+            existing_id = item.get("id", "")
+            existing_name = item.get("name", "")
+            if existing_id == app_id:
+                return construct_response(
+                    data={"conflict": "id", "with": existing_name, "with_id": existing_id},
+                    retcode=RetCode.CONFLICT,
+                    retmsg=(
+                        f"An app with id '{app_id}' already exists. If it is the "
+                        f"app you want to control, just enable it from the "
+                        f"Application dropdown — no need to use the wizard."
+                    ),
+                )
+            if (existing_name or "").lower() == name_lower:
+                return construct_response(
+                    data={"conflict": "name", "with": existing_name, "with_id": existing_id},
+                    retcode=RetCode.CONFLICT,
+                    retmsg=(
+                        f"An app named '{name}' already exists. If it is the same "
+                        f"app, enable it from the Application dropdown instead. "
+                        f"To re-add it from scratch, purge the existing entry first."
+                    ),
+                )
+            existing_bpf = {b.lower() for b in (item.get("bpf_name") or []) if b}
+            existing_procs = {p.lower() for p in (item.get("process_names") or []) if p}
+            bpf_overlap = new_bpf & existing_bpf
+            proc_overlap = new_procs & existing_procs
+            if bpf_overlap or proc_overlap:
+                shared = sorted(bpf_overlap | proc_overlap)
+                return construct_response(
+                    data={
+                        "conflict": "processes",
+                        "with": existing_name,
+                        "with_id": existing_id,
+                        "shared": shared,
+                    },
+                    retcode=RetCode.CONFLICT,
+                    retmsg=(
+                        f"App '{existing_name}' is already monitoring "
+                        f"{', '.join(shared)}. If that is the same application, "
+                        f"enable it from the Application dropdown above. To "
+                        f"re-add it from scratch, purge the existing entry first."
+                    ),
+                )
+
+        # 1. Persist to config.yaml.
+        ok = b_config.append_to_list_section('controlled_apps', {
+            'name': name,
+            'id': app_id,
+            'commandline': commandline,
+            'bpf_name': bpf_name,
+            'process_names': process_names,
+        })
+        if not ok:
+            return construct_response(
+                data={},
+                retcode=RetCode.EXCEPTION_ERROR,
+                retmsg="Failed to write config.yaml"
+            )
+
+        # 2. Persist to DB.  The DB ``priority`` column is a string label
+        #    ("low" / "medium" / "high" / "critical") — same shape that
+        #    /app/set_to_control writes — because the dashboard front-end
+        #    calls ``.toLowerCase()`` on it during render.  Passing an int
+        #    crashes Balance.tsx and blanks the tab.
+        priority_label = (priority or "low").lower() if isinstance(priority, str) else "low"
+        try:
+            AIAppPriority.insert_record(
+                id=app_id,
+                app_id=app_id,
+                name=name,
+                priority=priority_label,
+                controlled=True,
+                cgroup='',
+                remark=remark,
+                cmdline=commandline,
+                status="NA",
+                last_update_time=datetime.now(),
+            )
+        except Exception as db_exc:
+            logger.warning(f"new_controlled_app: DB insert failed (continuing): {db_exc}")
+
+        # 3. Refresh the BPF match cache so this app is watched immediately.
+        _service.add_control(name)
+        _service.rebuild_controlled_map()
+
+        # 4. Probe the running state immediately so the UI reflects "running"
+        #    without waiting for the next BPF exec event.  Mirrors the
+        #    /app/set_to_control behavior so apps added via the wizard get
+        #    the same initial-status update as ones added manually.
+        try:
+            status = check_app_running_status(app_id, name, commandline)
+            logger.info(f"new_controlled_app: initial status check for '{name}' → {status}")
+            # Same as /app/set_to_control: if already running, adopt the PIDs
+            # so the BPF tracker can later report "stopped" when the app ends.
+            if status == "running":
+                _service.register_running_pids(app_id, name, commandline)
+            callback_manager.send_callback_notification({
+                'app_id': app_id,
+                'app_name': name,
+                'status': status,
+                'purpose': "app",
+            }, store=True)
+        except Exception as status_exc:
+            logger.warning(f"new_controlled_app: initial status check failed: {status_exc}")
+
+        return construct_response(
+            data={"name": name, "id": app_id},
+            retmsg=f"Application '{name}' added"
+        )
+    except Exception as e:
+        logger.error(f"new_controlled_app failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/purge_controlled_app', methods=['POST'])
+def purge_controlled_app():
+    """Hard-delete an app from BOTH config.yaml and the DB.
+
+    Distinct from /app/remove_from_control, which only flips
+    ``controlled=False`` so the app can be re-enabled from the dropdown
+    without reconfiguration.  This endpoint is the explicit "wipe it
+    completely" path: removes the config entry, deletes the DB row, restores
+    the OOM score, and refreshes the BPF cache.  Used by the wizard when
+    the user wants to re-add an app whose process_names overlap with an
+    existing entry.
+
+    Body: { "id": "<existing app id>" }
+    """
+    try:
+        from config.config import b_config
+
+        data = request.get_json(silent=True) or {}
+        app_id = (data.get('id') or '').strip()
+        if not app_id:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="'id' is required"
+            )
+
+        existing = [item for item in (getattr(b_config, "controlled_apps", None) or [])
+                    if isinstance(item, dict)]
+        target = next((item for item in existing if item.get("id") == app_id), None)
+        if target is None:
+            return construct_response(
+                data={},
+                retcode=RetCode.NOT_EXISTING,
+                retmsg=f"No controlled_apps entry with id '{app_id}'"
+            )
+
+        target_name = target.get("name") or ""
+
+        # 1. Remove from config.yaml (preserves comments via the generic helper).
+        removed_count = b_config.remove_from_list_section(
+            'controlled_apps', {'id': app_id}
+        )
+        if removed_count == 0:
+            return construct_response(
+                data={},
+                retcode=RetCode.EXCEPTION_ERROR,
+                retmsg="Failed to remove entry from config.yaml"
+            )
+
+        # 2. Restore OOM score (if any) before deleting the DB row, so the
+        #    bookkeeping in adjust_oom_priority sees the priority/cmdline.
+        try:
+            db_app = AIAppPriority.query().filter(AIAppPriority.id == app_id).first()
+            if db_app is not None:
+                adjust_oom_priority(
+                    app_id, target_name, db_app.priority, db_app.cmdline or "",
+                    restore=True,
+                )
+        except Exception as oom_exc:
+            logger.warning(f"purge_controlled_app: OOM restore failed (continuing): {oom_exc}")
+
+        # 3. Hard-delete the DB row.
+        try:
+            AIAppPriority.delete_record(id=app_id)
+        except Exception as db_exc:
+            logger.warning(f"purge_controlled_app: DB delete failed (continuing): {db_exc}")
+
+        # 4. Drop it from the BPF monitor and rebuild its cache so the app
+        #    is no longer watched.
+        if target_name:
+            _service.remove_control(target_name)
+        _service.rebuild_controlled_map()
+
+        return construct_response(
+            data={"id": app_id, "name": target_name},
+            retmsg=f"Application '{target_name or app_id}' purged; you can now re-add it"
+        )
+    except Exception as e:
+        logger.error(f"purge_controlled_app failed: {str(e)}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,

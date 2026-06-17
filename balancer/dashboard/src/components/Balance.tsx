@@ -28,12 +28,14 @@ import {
   DatabaseOutlined,
   ReloadOutlined,
   QuestionCircleOutlined,
+  SearchOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
 import { api } from '../api/client'
 import type { AppInfo, ResourceLimitProfileData, PassiveControlData } from '../api/types'
 import { useAppEvents } from '../hooks/useAppEvents'
+import { AddAppWizard } from './AddAppWizard'
 
 const { Text } = Typography
 const { Option } = Select
@@ -265,6 +267,7 @@ export default function Balance({ active }: Props) {
   const [addPriority, setAddPriority] = useState<string>('medium')
   const [remark, setRemark] = useState('')
   const [adding, setAdding] = useState(false)
+  const [wizardOpen, setWizardOpen] = useState(false)
 
   // Per-row priority edit state
   const [rowPriorities, setRowPriorities] = useState<Record<string, string>>({})
@@ -757,7 +760,10 @@ export default function Balance({ active }: Props) {
                 onClick={() => {
                   Modal.confirm({
                     title: `Remove ${record.app_name}?`,
-                    content: 'This will remove the app from resource control.',
+                    content:
+                      'This will stop monitoring the app. The configuration is kept, '
+                      + 'so you can re-add it later from the Application dropdown above '
+                      + 'without going through the wizard again.',
                     okText: 'Remove',
                     okType: 'danger',
                     onOk: () => handleRemove(record),
@@ -1002,7 +1008,12 @@ export default function Balance({ active }: Props) {
 
       <PassiveControlPanel active={active} />
 
-      {/* Add App Section */}
+      {/* Add App Section — two paths:
+            (1) Discover new: open the wizard, scan /proc, auto-fill bpf_name
+                / process_names / commandline by inspecting running processes.
+            (2) Pick configured: choose from controlled_apps already declared
+                in config.yaml and just enable monitoring + set priority.
+          The wizard is the entry for apps not yet in the dropdown.  */}
       <Card
         title={
           <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
@@ -1019,79 +1030,148 @@ export default function Balance({ active }: Props) {
         headStyle={{ borderBottom: `1px solid ${COLORS.border}`, padding: '8px 16px', minHeight: 40 }}
         bodyStyle={{ padding: '16px' }}
       >
-        <Row gutter={[12, 12]} align="middle">
-          <Col xs={24} sm={10} md={8}>
-            <div style={{ marginBottom: 4 }}>
-              <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>Application</Text>
+        {/* Two parallel options shown side-by-side so the user can see both
+            paths at once.  Each option has a short heading describing what it
+            does, then a bordered box with the actual controls.  Stacks
+            vertically on small screens via the responsive Col breakpoints. */}
+        <Row gutter={[12, 12]}>
+          {/* (1) Discover new — opens the wizard which scans /proc and
+                auto-fills bpf_name / process_names by inspecting running
+                processes.  Use this when the app isn't already in the
+                Pick-from-list dropdown. */}
+          <Col xs={24} md={8}>
+            <div style={{ marginBottom: 6 }}>
+              <Text style={{ color: COLORS.textMuted, fontSize: 11, fontWeight: 600 }}>
+                Option 1 — Discover by running process
+              </Text>
             </div>
-            <Select
-              value={selectedAppId || undefined}
-              onChange={setSelectedAppId}
-              placeholder="Select application..."
-              style={{ width: '100%' }}
-              showSearch
-              filterOption={(input, option) =>
-                String(option?.children ?? '').toLowerCase().includes(input.toLowerCase())
-              }
-              dropdownStyle={{ background: COLORS.panelBg }}
-              notFoundContent={
-                <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>No apps found</Text>
-              }
+            <div
+              style={{
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: 6,
+                padding: '16px',
+                height: 'calc(100% - 22px)',
+                display: 'flex',
+                flexDirection: 'column',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+              }}
             >
-              {uncontrolledApps.map((app) => (
-                <Option key={app.app_id} value={app.app_id}>
-                  {app.app_name}
-                </Option>
-              ))}
-            </Select>
+              <Text type="secondary" style={{ fontSize: 11, marginBottom: 12, textAlign: 'center' }}>
+                Scan running processes for an app that’s not in the list yet
+                — the wizard auto-fills the technical fields for you.
+              </Text>
+              <Button
+                type="primary"
+                icon={<SearchOutlined />}
+                onClick={() => setWizardOpen(true)}
+                style={{ width: '50%' }}
+              >
+                Find new application
+              </Button>
+            </div>
           </Col>
 
-          <Col xs={24} sm={6} md={4}>
-            <div style={{ marginBottom: 4 }}>
-              <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>Priority</Text>
+          {/* (2) Pick configured — choose from controlled_apps already
+                declared in config.yaml and just enable monitoring + set
+                priority. */}
+          <Col xs={24} md={16}>
+            <div style={{ marginBottom: 6 }}>
+              <Text style={{ color: COLORS.textMuted, fontSize: 11, fontWeight: 600 }}>
+                Option 2 — Pick a configured application
+              </Text>
             </div>
-            <Select
-              value={addPriority}
-              onChange={setAddPriority}
-              style={{ width: '100%' }}
-              dropdownStyle={{ background: COLORS.panelBg }}
+            <div
+              style={{
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: 6,
+                padding: '16px',
+              }}
             >
-              {PRIORITY_OPTIONS.map((opt) => (
-                <Option key={opt.value} value={opt.value}>
-                  <span style={{ color: opt.color }}>{opt.label}</span>
-                </Option>
-              ))}
-            </Select>
-          </Col>
+              <Row gutter={[12, 12]} align="middle">
+                <Col xs={24} sm={6}>
+                  <div style={{ marginBottom: 4 }}>
+                    <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>Application</Text>
+                  </div>
+                  <Select
+                    value={selectedAppId || undefined}
+                    onChange={setSelectedAppId}
+                    placeholder="Select application..."
+                    style={{ width: '100%' }}
+                    showSearch
+                    filterOption={(input, option) =>
+                      String(option?.children ?? '').toLowerCase().includes(input.toLowerCase())
+                    }
+                    dropdownStyle={{ background: COLORS.panelBg }}
+                    notFoundContent={
+                      <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>No apps found</Text>
+                    }
+                  >
+                    {uncontrolledApps.map((app) => (
+                      <Option key={app.app_id} value={app.app_id}>
+                        {app.app_name}
+                      </Option>
+                    ))}
+                  </Select>
+                </Col>
 
-          <Col xs={24} sm={10} md={8}>
-            <div style={{ marginBottom: 4 }}>
-              <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>Remark</Text>
-            </div>
-            <Input
-              value={remark}
-              onChange={(e) => setRemark(e.target.value)}
-              placeholder="Optional note..."
-              style={{ background: COLORS.panelBg, borderColor: COLORS.border }}
-            />
-          </Col>
+                <Col xs={12} sm={4}>
+                  <div style={{ marginBottom: 4 }}>
+                    <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>Priority</Text>
+                  </div>
+                  <Select
+                    value={addPriority}
+                    onChange={setAddPriority}
+                    style={{ width: '100%' }}
+                    dropdownStyle={{ background: COLORS.panelBg }}
+                  >
+                    {PRIORITY_OPTIONS.map((opt) => (
+                      <Option key={opt.value} value={opt.value}>
+                        <span style={{ color: opt.color }}>{opt.label}</span>
+                      </Option>
+                    ))}
+                  </Select>
+                </Col>
 
-          <Col xs={24} sm={24} md={4}>
-            <div style={{ marginBottom: 4, visibility: 'hidden' }}>
-              <Text style={{ fontSize: 11 }}>action</Text>
+                <Col xs={24} sm={9}>
+                  <div style={{ marginBottom: 4 }}>
+                    <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>Remark</Text>
+                  </div>
+                  <Input
+                    value={remark}
+                    onChange={(e) => setRemark(e.target.value)}
+                    placeholder="Optional note..."
+                    style={{ background: COLORS.panelBg, borderColor: COLORS.border }}
+                  />
+                </Col>
+
+                <Col xs={12} sm={5}>
+                  <div style={{ marginBottom: 4, visibility: 'hidden' }}>
+                    <Text style={{ fontSize: 11 }}>action</Text>
+                  </div>
+                  <Button
+                    type="primary"
+                    icon={<PlusOutlined />}
+                    loading={adding}
+                    onClick={handleAdd}
+                    block
+                  >
+                    Add to Control
+                  </Button>
+                </Col>
+              </Row>
             </div>
-            <Button
-              type="primary"
-              icon={<PlusOutlined />}
-              loading={adding}
-              onClick={handleAdd}
-              block
-            >
-              Add to Control
-            </Button>
           </Col>
         </Row>
       </Card>
+
+      <AddAppWizard
+        open={wizardOpen}
+        onClose={() => setWizardOpen(false)}
+        onSuccess={() => {
+          fetchData()
+        }}
+      />
 
       {/* Controlled Apps */}
       <Card

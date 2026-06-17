@@ -18,6 +18,10 @@ import type {
   ResourceLimitProfileData,
   WeightsTopData,
   PassiveControlData,
+  DiscoverSearchData,
+  DiscoverExtractData,
+  WizardCommitPayload,
+  WizardCommitData,
 } from './types'
 
 // Server uses RetCode.CONFLICT (409) for optimistic-concurrency mismatches
@@ -144,6 +148,48 @@ export const api = {
       updated_weights: WeightsTopData
       updated_at: number
     }>('/monitor/config/weights_top', { ...weights, expected_updated_at: expectedUpdatedAt }),
+
+  // "Add Application" wizard endpoints — see balancer/monitor/app_discovery.py
+  // and the /app/discover_* + /app/wizard_commit routes in BalanceService.py.
+  discoverSearch: (keywords: string[]) =>
+    post<DiscoverSearchData>('/app/discover_search', { keywords }),
+  discoverExtract: (pids: number[], name = '') =>
+    post<DiscoverExtractData>('/app/discover_extract', { pids, name }),
+  // newControlledApp uses a tagged-union return so the wizard can distinguish
+  // success / 409-conflict / other-error without try/catch around message
+  // parsing.  On conflict the backend includes "with_id" — used by the
+  // purge-and-retry path — which would be lost if we threw on retcode != 0.
+  newControlledApp: async (payload: WizardCommitPayload):
+    Promise<
+      | { status: 'ok'; data: WizardCommitData }
+      | { status: 'conflict'; conflict: 'id' | 'name' | 'processes';
+          withName: string; withId: string; shared?: string[]; message: string }
+      | { status: 'error'; message: string }
+    > => {
+    const res = await client.post<ApiResponse<WizardCommitData & {
+      conflict?: 'id' | 'name' | 'processes'
+      with?: string
+      with_id?: string
+      shared?: string[]
+    }>>('/app/new_controlled_app', payload)
+    if (res.data.retcode === 0) {
+      return { status: 'ok', data: res.data.data as WizardCommitData }
+    }
+    if (res.data.retcode === RETCODE_CONFLICT) {
+      const d = res.data.data ?? ({} as Record<string, unknown>)
+      return {
+        status: 'conflict',
+        conflict: (d.conflict as 'id' | 'name' | 'processes') ?? 'id',
+        withName: d.with ?? '',
+        withId: d.with_id ?? '',
+        shared: d.shared,
+        message: res.data.retmsg,
+      }
+    }
+    return { status: 'error', message: res.data.retmsg }
+  },
+  purgeControlledApp: (id: string) =>
+    post<{ id: string; name: string }>('/app/purge_controlled_app', { id }),
 
   getPassiveControl: () => get<PassiveControlData>('/monitor/config/passive_control'),
   updatePassiveControl: (enabled: boolean, expectedUpdatedAt?: number) =>

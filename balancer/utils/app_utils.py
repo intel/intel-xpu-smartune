@@ -423,7 +423,16 @@ def adjust_oom_priority(
 
     target_value = 0
     try:
-        exe_name = _get_executable_name(app_name, app_cmdline)
+        # Prefer the first configured process_name (an exe basename pulled
+        # straight from /proc/<pid>/exe, so always shell-safe) over
+        # _get_executable_name() which derives a regex-y string from the
+        # display name when no cmdline is set.  Falls back to the legacy
+        # path for old configs where process_names is empty.
+        configured_process_names = _get_app_process_names(app_id=app_id, app_name=app_name)
+        if configured_process_names:
+            exe_name = configured_process_names[0]
+        else:
+            exe_name = _get_executable_name(app_name, app_cmdline)
         logger.debug(f"Target executable: {exe_name}")
 
         pgrep_result = subprocess.run(

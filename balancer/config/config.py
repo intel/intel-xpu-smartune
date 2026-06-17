@@ -217,6 +217,239 @@ class Config:
         return modified
 
 
+    # ------------------------------------------------------------------
+    # Generic YAML list helpers
+    #
+    # The wizard / future UI editors need to add, remove and edit items in
+    # top-level YAML lists (controlled_apps, network_system_ports,
+    # testing_network_app, ...).  These helpers operate on *any* top-level
+    # list section while preserving comments and the existing indentation
+    # style, so each new "UI-editable section" does not need a bespoke
+    # YAML patcher.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_yaml_value(value: Any) -> str:
+        """Render a Python value as an inline YAML scalar / flow-collection."""
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return f"{value}"
+        if isinstance(value, list):
+            return "[" + ", ".join(Config._format_yaml_value(v) for v in value) + "]"
+        if isinstance(value, dict):
+            inner = ", ".join(
+                f"{Config._format_yaml_value(k)}: {Config._format_yaml_value(v)}"
+                for k, v in value.items()
+            )
+            return "{" + inner + "}"
+        # String — escape and wrap in double quotes.
+        s = str(value).replace("\\", "\\\\").replace("\"", "\\\"")
+        return f"\"{s}\""
+
+    @staticmethod
+    def _find_top_level_key(lines: list[str], section: str) -> int:
+        """Return the line index of ``section:`` at indent 0, or -1."""
+        prefix = f"{section}:"
+        for idx, line in enumerate(lines):
+            if line.startswith(prefix) and (
+                len(line) == len(prefix)
+                or line[len(prefix)] in (" ", "\t", "\n", "\r", "#")
+            ):
+                return idx
+        return -1
+
+    @staticmethod
+    def _find_block_end(lines: list[str], start_idx: int) -> int:
+        """Return the index of the first line *after* the YAML block whose
+        header lives at ``start_idx``.  The block ends at the next non-blank,
+        non-comment line whose indentation is 0 (a sibling top-level key)
+        or at EOF."""
+        for idx in range(start_idx + 1, len(lines)):
+            line = lines[idx]
+            if not line.strip():
+                continue
+            if line.lstrip().startswith("#"):
+                continue
+            if line[0] not in (" ", "\t"):
+                return idx
+        return len(lines)
+
+    @staticmethod
+    def _detect_list_item_indent(lines: list[str], header_idx: int, end_idx: int) -> tuple[int, int]:
+        """Look at the existing items in this list block to figure out the
+        indent of ``- `` (dash_indent) and of mapping sub-keys (subkey_indent).
+        Falls back to (2, 4) if the block is empty."""
+        for idx in range(header_idx + 1, end_idx):
+            line = lines[idx]
+            stripped = line.lstrip(" \t")
+            if stripped.startswith("- "):
+                dash_indent = len(line) - len(stripped)
+                # Try to find a sub-key on a subsequent line at higher indent.
+                for jdx in range(idx + 1, end_idx):
+                    sub = lines[jdx]
+                    s_stripped = sub.lstrip(" \t")
+                    if not s_stripped or s_stripped.startswith("#"):
+                        continue
+                    sub_indent = len(sub) - len(s_stripped)
+                    if sub_indent > dash_indent:
+                        return dash_indent, sub_indent
+                    break
+                return dash_indent, dash_indent + 2
+        return 2, 4
+
+    def _render_list_item(self, value: Any, dash_indent: int, subkey_indent: int) -> list[str]:
+        """Render ``value`` as one or more YAML lines suitable for inserting
+        into a sequence block.  Mapping values are expanded over multiple
+        lines (one key per line); scalars become a single ``- value`` line."""
+        dash_pad = " " * dash_indent
+        sub_pad = " " * subkey_indent
+
+        if isinstance(value, dict):
+            keys = list(value.keys())
+            if not keys:
+                return [f"{dash_pad}- {{}}\n"]
+            out = [f"{dash_pad}- {keys[0]}: {self._format_yaml_value(value[keys[0]])}\n"]
+            for k in keys[1:]:
+                out.append(f"{sub_pad}{k}: {self._format_yaml_value(value[k])}\n")
+            return out
+
+        return [f"{dash_pad}- {self._format_yaml_value(value)}\n"]
+
+    def append_to_list_section(
+        self,
+        section: str,
+        entry: Any,
+        path: Optional[str] = None,
+    ) -> bool:
+        """Append ``entry`` to the top-level list named ``section`` in YAML.
+
+        ``entry`` may be a dict (rendered as a multi-line mapping item) or a
+        scalar / list / nested dict (rendered inline).  Comments and the
+        existing indentation style are preserved.  The in-memory attribute
+        ``self.<section>`` is updated to match.
+        """
+        from utils.logger import logger
+
+        target = path or self._config_path
+        with self._persist_lock:
+            with open(target, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            header_idx = self._find_top_level_key(lines, section)
+            if header_idx == -1:
+                logger.warning(f"append_to_list_section: section '{section}:' not found")
+                return False
+
+            end_idx = self._find_block_end(lines, header_idx)
+            dash_indent, subkey_indent = self._detect_list_item_indent(lines, header_idx, end_idx)
+
+            new_lines = self._render_list_item(entry, dash_indent, subkey_indent)
+
+            # Insert just before end_idx, walking back over trailing blank
+            # lines so the new item lives inside the block.
+            insert_idx = end_idx
+            while insert_idx > header_idx + 1 and not lines[insert_idx - 1].strip():
+                insert_idx -= 1
+
+            lines[insert_idx:insert_idx] = new_lines
+
+            with open(target, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+
+            existing = getattr(self, section, None)
+            if not isinstance(existing, list):
+                existing = []
+            existing.append(entry)
+            setattr(self, section, existing)
+
+        logger.info(f"append_to_list_section: appended to '{section}'")
+        return True
+
+    def remove_from_list_section(
+        self,
+        section: str,
+        match: dict[str, Any],
+        path: Optional[str] = None,
+    ) -> int:
+        """Remove every item from list ``section`` whose keys match all of
+        ``match``.  Returns the number of items removed.  Only supports
+        list-of-mapping sections; scalar lists should use a different helper.
+        """
+        from utils.logger import logger
+
+        if not match:
+            return 0
+
+        target = path or self._config_path
+        with self._persist_lock:
+            with open(target, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            header_idx = self._find_top_level_key(lines, section)
+            if header_idx == -1:
+                return 0
+            end_idx = self._find_block_end(lines, header_idx)
+            dash_indent, _ = self._detect_list_item_indent(lines, header_idx, end_idx)
+            dash_prefix = " " * dash_indent + "- "
+
+            # Gather (start, end) ranges for each list item.
+            item_ranges: list[tuple[int, int]] = []
+            cur_start = -1
+            for idx in range(header_idx + 1, end_idx):
+                line = lines[idx]
+                if line.startswith(dash_prefix):
+                    if cur_start != -1:
+                        item_ranges.append((cur_start, idx))
+                    cur_start = idx
+            if cur_start != -1:
+                item_ranges.append((cur_start, end_idx))
+
+            removed_ranges: list[tuple[int, int]] = []
+            for (s, e) in item_ranges:
+                # Crude key:value scan within the item block.
+                fields: dict[str, str] = {}
+                for ln in lines[s:e]:
+                    stripped = ln.strip()
+                    if stripped.startswith("- "):
+                        stripped = stripped[2:]
+                    if ":" not in stripped or stripped.startswith("#"):
+                        continue
+                    k, _, v = stripped.partition(":")
+                    fields[k.strip()] = v.strip().strip("\"'")
+                if all(str(fields.get(k, "")) == str(v) for k, v in match.items()):
+                    removed_ranges.append((s, e))
+
+            if not removed_ranges:
+                return 0
+
+            # Delete from the bottom up so earlier indices stay valid.
+            for s, e in reversed(removed_ranges):
+                del lines[s:e]
+
+            with open(target, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+
+            existing = getattr(self, section, None)
+            if isinstance(existing, list):
+                setattr(
+                    self,
+                    section,
+                    [
+                        item
+                        for item in existing
+                        if not (
+                            isinstance(item, dict)
+                            and all(str(item.get(k, "")) == str(v) for k, v in match.items())
+                        )
+                    ],
+                )
+
+        logger.info(f"remove_from_list_section: removed {len(removed_ranges)} item(s) from '{section}'")
+        return len(removed_ranges)
+
     def update_config_section(self, section: str, updates: dict[str, Any]) -> bool:
         """Generic method to update a config section (e.g., weights_top, thresholds, etc.).
 

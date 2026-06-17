@@ -202,59 +202,94 @@ def _parse_cpu_model() -> Optional[str]:
     return None
 
 
-def _parse_dmesg_fw_versions(kind: str) -> List[str]:
-    output = run_cmd(["dmesg"], timeout=5)
-    if not output:
-        return []
+def _parse_debugfs_uc_info(kind: str) -> Optional[List[Dict[str, Any]]]:
+    """Parse GuC/HuC info from debugfs.
 
+    Per driver, only one card is read. For GT selection:
+    - single GT → read from it
+    - multiple GTs → guc from gt0, huc from gt1
+    - legacy i915 (no numbered gt) → fallback to gt/uc/
+    """
     key = kind.strip().lower()
     if key not in {"guc", "huc"}:
-        return []
+        return None
 
-    entries: List[str] = []
-    seen = set()
-    pattern = re.compile(
-        rf"\b{key}\s+firmware\s+(?:from\s+)?(?P<path>\S+)\s+version\s+(?P<ver>[0-9]+(?:\.[0-9]+)*)",
-        re.IGNORECASE,
-    )
+    debugfs_base = "/sys/kernel/debug/dri"
+    info_file = f"{key}_info"
 
-    for line in output.splitlines():
-        if key not in line.lower():
+    # One card per driver is enough
+    driver_to_dri: Dict[str, str] = {}
+    for card in get_gpu_cards():
+        driver = get_gpu_driver_name(card)
+        if driver and driver not in driver_to_dri:
+            driver_to_dri[driver] = os.path.basename(card).replace("card", "")
+
+    results: List[Dict[str, Any]] = []
+    for driver, dri_num in driver_to_dri.items():
+        dri_path = os.path.join(debugfs_base, dri_num)
+
+        # Pick GT directory
+        try:
+            gt_dirs = sorted(e for e in os.listdir(dri_path) if re.match(r"gt\d+$", e))
+        except OSError:
+            gt_dirs = []
+
+        if len(gt_dirs) > 1 and key == "huc":
+            gt_sub = gt_dirs[1]
+        elif gt_dirs:
+            gt_sub = gt_dirs[0]
+        else:
+            gt_sub = "gt"  # legacy i915
+
+        content = safe_read(os.path.join(dri_path, gt_sub, "uc", info_file))
+        if not content:
             continue
-        match = pattern.search(line)
-        if not match:
+
+        fw_path = version = status = None
+        for line in content.splitlines():
+            s = line.strip()
+            m = re.match(rf"{key}\s+firmware:\s*(\S+)", s, re.IGNORECASE)
+            if m and m.group(1) != "(null)":
+                fw_path = m.group(1)
+            elif s.startswith("status:"):
+                status = s.split(":", 1)[1].strip()
+            elif "found" in s and "version" in s:
+                m = re.search(r"(\d+(?:\.\d+)+)", s)
+                if m:
+                    version = m.group(1)
+
+        if fw_path and version:
+            results.append({
+                "driver": driver,
+                "firmware": fw_path,
+                "version": version,
+                "status": status,
+            })
+
+    return results or None
+
+
+def _get_uc_fw_info(kind: str) -> List[Dict[str, Any]]:
+    """Get GuC/HuC firmware info from debugfs."""
+    return _parse_debugfs_uc_info(kind) or []
+
+
+def _get_dpkg_version(pkg_names) -> Dict[str, Any]:
+    if isinstance(pkg_names, str):
+        pkg_names = [pkg_names]
+    for pkg_name in pkg_names:
+        cmd = ["dpkg", "-l", pkg_name]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+        except Exception:
             continue
-        fw_path = match.group("path").strip()
-        version = match.group("ver").strip()
-        value = f"{fw_path} version {version}"
-        if value in seen:
+        if res.returncode != 0 or not res.stdout.strip():
             continue
-        seen.add(value)
-        entries.append(value)
-
-    return entries
-
-
-def _get_dpkg_version(pkg_name: str) -> Dict[str, Any]:
-    cmd = ["dpkg", "-l", pkg_name]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
-    except Exception:
-        return {"installed": False, "version": "NA", "raw": "NA"}
-
-    if res.returncode != 0:
-        return {"installed": False, "version": "NA", "raw": "NA"}
-
-    output = res.stdout.strip()
-    if not output:
-        return {"installed": False, "version": "NA", "raw": "NA"}
-
-    for line in output.splitlines():
-        if line.startswith("ii") and pkg_name in line:
-            parts = line.split()
-            version = parts[2] if len(parts) > 2 else "NA"
-            return {"installed": True, "version": version, "raw": line.strip()}
-
+        for line in res.stdout.strip().splitlines():
+            if line.startswith("ii") and pkg_name in line:
+                parts = line.split()
+                version = parts[2] if len(parts) > 2 else "NA"
+                return {"installed": True, "version": version, "raw": line.strip()}
     return {"installed": False, "version": "NA", "raw": "NA"}
 
 
@@ -580,11 +615,11 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
             "driver": {
                 "kernel_version": safe_read("/proc/sys/kernel/osrelease"),
                 "kernel_cmdline": safe_read("/proc/cmdline"),
-                "guc_fw": _parse_dmesg_fw_versions("guc"),
-                "huc_fw": _parse_dmesg_fw_versions("huc"),
+                "guc_fw": _get_uc_fw_info("guc"),
+                "huc_fw": _get_uc_fw_info("huc"),
                 "mesa": _get_dpkg_version("mesa-common-dev"),
                 "opencl": _get_dpkg_version("intel-opencl-icd"),
-                "level_zero": _get_dpkg_version("intel-level-zero-gpu"),
+                "level_zero": _get_dpkg_version(["libze-intel-gpu1", "intel-level-zero-gpu"]),
                 "media": _get_dpkg_version("intel-media-va-driver-non-free"),
                 "npu_fw": get_npu_fw_version(),
             },

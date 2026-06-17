@@ -202,8 +202,8 @@ export interface StaticInfoData {
   driver: {
     kernel_version: string | null
     kernel_cmdline: string | null
-    guc_fw?: string[]
-    huc_fw?: string[]
+    guc_fw?: { driver: string; firmware: string; version: string; status: string | null }[]
+    huc_fw?: { driver: string; firmware: string; version: string; status: string | null }[]
     mesa: PackageInfo
     opencl: PackageInfo
     level_zero: PackageInfo

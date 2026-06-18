@@ -99,10 +99,7 @@ class AppIntercept(metaclass=SingletonMeta):
         itself.  Matching is driven entirely by ``bpf_name`` entries; the
         ``name`` field is treated as a display label only.
         """
-        # Prefer the unified controlled_apps list; fall back to the legacy monitor_apps key.
-        cnf_apps = (getattr(self.controlManager.config, 'controlled_apps', None)
-                    or getattr(self.controlManager.config, 'monitor_apps', None)
-                    or [])
+        cnf_apps = getattr(self.controlManager.config, 'controlled_apps', None) or []
         app_executables = {
             item['name']: item.get('bpf_name', []) for item in cnf_apps
         }

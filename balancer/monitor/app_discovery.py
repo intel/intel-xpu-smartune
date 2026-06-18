@@ -17,19 +17,8 @@ import os
 from dataclasses import dataclass, asdict
 from typing import Iterable, Optional
 
+from config.config import b_config
 
-# Hard-coded process noise that should never show up in the wizard.  Items
-# match against the lower-cased comm or exe basename as substrings.
-_BUILTIN_BLACKLIST = (
-    "kworker", "ksoftirqd", "migration", "rcu_", "watchdog",
-    "systemd-", "systemd ",
-    "dbus-", "gdbus", "gvfs", "gvfsd", "polkit", "snapd", "udisks",
-    "accounts-daemon", "rtkit-", "colord", "packagekit",
-    "ibus-", "fcitx", "at-spi-",
-    "pipewire", "pulseaudio", "wireplumber",
-    "NetworkManager", "ModemManager", "wpa_supplicant", "avahi",
-    "cron", "rsyslog", "logind",
-)
 
 # Shells / tiny tools — would never be the "app" the user wants to monitor.
 _SHELL_TOOLS = frozenset({
@@ -147,7 +136,7 @@ def _is_blacklisted(comm: str, exe_basename: str) -> bool:
         return True
     # Service / daemon noise checks both fields because some daemons spawn
     # short-lived helpers whose comm is benign but whose exe is the daemon.
-    for bad in _BUILTIN_BLACKLIST:
+    for bad in (b_config.blacklist or ()):
         b = bad.lower().strip()
         if not b:
             continue
@@ -186,19 +175,15 @@ def _score(info: dict) -> int:
 def search_processes(
     keywords: Iterable[str],
     *,
-    extra_blacklist: Iterable[str] = (),
     max_results: int = 100,
 ) -> list[Candidate]:
     """Return /proc entries matching any of ``keywords`` (case-insensitive substring).
 
-    ``extra_blacklist`` lets the caller pass ``config.blacklist`` so user
-    configured noise is filtered alongside the built-in list.
+    Filtering uses the unified ``b_config.blacklist`` list (see config.yaml).
     """
     keywords_lower = [k.strip().lower() for k in keywords if k and k.strip()]
     if not keywords_lower:
         return []
-
-    user_blacklist = tuple(b.lower() for b in extra_blacklist if b)
 
     results: list[Candidate] = []
     try:
@@ -223,9 +208,6 @@ def search_processes(
         exe_basename = os.path.basename(info["exe"]) if info["exe"] else ""
 
         if _is_blacklisted(comm, exe_basename):
-            continue
-        if user_blacklist and any(b in comm.lower() or b in exe_basename.lower()
-                                  for b in user_blacklist):
             continue
 
         if not _matches_any_keyword(info, keywords_lower):

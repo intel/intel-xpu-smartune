@@ -16,7 +16,6 @@ from utils.logger import logger
 from db.DatabaseModel import AIAppPriority
 from typing import List, Dict, Any
 from config.config import b_config
-from gi.repository import Gio
 
 _original_oom_scores: dict[str, str] = {}
 
@@ -851,41 +850,31 @@ def check_app_running_status(app_id: str, app_name: str, cmdline: str = "") -> s
 
 
 def fetch_all_apps():
+    """Return the configured controllable apps from ``b_config.controlled_apps``.
+
+    Returns an empty list when the config has no entries — the dashboard
+    surfaces a hint telling the user to add apps via the wizard.
+    """
     app_list = []
-    # Prefer the unified controlled_apps list; fall back to the legacy all_apps
-    # key for backward compatibility; finally enumerate system desktop apps via Gio.
-    apps_config = getattr(b_config, 'controlled_apps', None) or getattr(b_config, 'all_apps', None)
-    if apps_config:
-        for app in apps_config:
-            name = app.get("name", "")
-            app_id = app.get("id")
-            if not app_id:
-                logger.warning(
-                    f"fetch_all_apps: controlled_apps entry '{name}' is missing 'id'; "
-                    "skipping to avoid duplicate/ambiguous records."
-                )
-                continue
-            app_data = {
-                "name": name,              # legacy key used by other callers
-                "app_name": name,          # normalized key expected by the React dashboard
-                "app_id": app_id,
-                "cmdline": app.get("commandline", ""),
-                "process_names": app.get("process_names", []) or [],
-                "display_name": name,
-            }
-            app_list.append(app_data)
-    else:
-        apps = Gio.AppInfo.get_all()
-        for app in apps:
-            app_data = {
-                "name": app.get_name(),    # legacy key used by other callers
-                "app_name": app.get_name(),  # normalized key expected by the React dashboard
-                "app_id": app.get_id(),  # org.gnome.Calculator.desktop
-                "cmdline": app.get_commandline() or "",  # gnome-calculator
-                "process_names": [],
-                "display_name": app.get_display_name()
-            }
-            app_list.append(app_data)
+    apps_config = getattr(b_config, 'controlled_apps', None) or []
+    for app in apps_config:
+        name = app.get("name", "")
+        app_id = app.get("id")
+        if not app_id:
+            logger.warning(
+                f"fetch_all_apps: controlled_apps entry '{name}' is missing 'id'; "
+                "skipping to avoid duplicate/ambiguous records."
+            )
+            continue
+        app_data = {
+            "name": name,              # legacy key used by other callers
+            "app_name": name,          # normalized key expected by the React dashboard
+            "app_id": app_id,
+            "cmdline": app.get("commandline", ""),
+            "process_names": app.get("process_names", []) or [],
+            "display_name": name,
+        }
+        app_list.append(app_data)
     return app_list
 
 

@@ -45,10 +45,15 @@ weights_top:
   gpu: 5  #added to the default score as a secondary factor after GPU data is collected
 passive_resource_control:
   enabled: false  #关闭后系统压力升高时不再自动监测/限流top应用；网络控制与手动限流不受影响
-blacklist:
-  - systemd
-  - kworker
-  - dbus
+# Process noise filtered out from both top-resource sampling and the "Add App" wizard.
+# Substring match against lower-cased comm / exe basename. Add app/process names
+# here to hide them from monitoring & the wizard.
+blacklist: [
+  kworker, ksoftirqd, migration, rcu_, watchdog, systemd, dbus-, gdbus,
+  gvfs, gvfsd, polkit, snapd, udisks, accounts-daemon, rtkit-, colord,
+  packagekit, ibus-, fcitx, at-spi-, pipewire, pulseaudio, wireplumber,
+  networkmanager, modemmanager, wpa_supplicant, avahi, cron, rsyslog, logind,
+]
 cooldown_time: 15 # 避免频繁通知的冷却时间
 regular_update_sys_pressure_time: 5
 monitor_idle_check_interval: 10  # balancer 空闲时的压力检查周期（秒）

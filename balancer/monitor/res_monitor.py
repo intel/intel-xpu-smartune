@@ -459,10 +459,6 @@ class ResourceMonitor:
                 # Store the per-cgroup breakdown for proportional limit distribution
                 cgroup_data[primary]['per_cgroup_mem_rss'] = per_cg_mem_rss
                 cgroup_data[primary]['per_cgroup_cpu'] = per_cg_cpu
-                logger.debug(
-                    f"[multi_process] Merged {len(cg_list)} cgroups for app_id='{app_id}' "
-                    f"into primary='{primary}'"
-                )
 
         # Step 4: Compute scores based on the selected mode
         processes = []
@@ -542,8 +538,9 @@ class ResourceMonitor:
                     pid = info['pid']
 
                     # Skip already-processed PIDs or blacklisted processes
+                    name_lower = (info.get('name') or '').lower()
                     if (pid in seen_pids or
-                            any(b in info.get('name', '') for b in self.config.blacklist) or
+                            any(b in name_lower for b in (self.config.blacklist or ())) or
                             time.time() - info['create_time'] < 2):
                         continue
 
@@ -693,7 +690,6 @@ class ResourceMonitor:
                 if container_name.startswith('/'):
                     container_name = container_name[1:]
                 if container_name:
-                    logger.debug(f"Resolved Docker container {short_id} -> {container_name}")
                     return f"Docker: {container_name}"
         except Exception as e:
             # Only log warning if docker command failed (not just timeout)
@@ -721,7 +717,6 @@ class ResourceMonitor:
                 app_id = self._proc_name_to_app.get(pname.lower())
                 if app_id:
                     app_cfg = self._multiprocess_apps.get(app_id, {})
-                    logger.debug(f"try_match_app matched multi-process app '{app_cfg.get('name')}' by process_name '{pname}'")
                     return {
                         'type': 'configured',
                         'id': app_id,
@@ -750,7 +745,6 @@ class ResourceMonitor:
                 try:
                     app_cmd = app.get("cmdline", "")
                     if exe and app_cmd and exe in app_cmd:
-                        logger.debug(f"try_match_app matched desktop app by cmdline: {app_id}")
                         return {
                             'type': 'desktop',
                             'id': app_id,
@@ -760,7 +754,6 @@ class ResourceMonitor:
                     app_name_lower = app.get("name", "").lower()
                     for proc_name in match_names:
                         if app_name_lower and proc_name and app_name_lower in proc_name.lower():
-                            logger.debug(f"try_match_app matched desktop app by name: {app_id}")
                             return {
                                 'type': 'desktop',
                                 'id': app_id,
@@ -778,7 +771,6 @@ class ResourceMonitor:
             # Check if this is a Docker container
             docker_name = self._get_docker_container_name(scope_name)
             if docker_name:
-                logger.debug(f"Detected Docker container: {scope_name} -> {docker_name}")
                 return {
                     'type': 'docker',
                     'id': scope_name,
@@ -795,14 +787,28 @@ class ResourceMonitor:
                 terminal_name = self._extract_readable_app_name(parent_slice) if parent_slice else 'Terminal'
                 dominant_name = process_info.get('dominant_name', '')
                 display_name = f"{terminal_name} - {dominant_name}" if dominant_name else terminal_name
-                logger.debug(f"vte-spawn scope: parent={parent_slice!r} dominant={dominant_name!r} -> {display_name!r}")
                 return {
                     'type': 'cgroup',
                     'id': scope_name,
                     'name': display_name,
                 }
 
-            logger.debug(f"Extracted scope name from cgroup: {scope_name}")
+            # Generic systemd containers (session-N.scope, user@N.service, init.scope,
+            # user-N.slice, user.slice) are not apps — they group every process in a
+            # login session.  Showing them as "Session 1467" hides the real workload,
+            # so prefer the dominant process name (e.g. "claude") when available.
+            if re.match(
+                r'^(session-\d+\.scope|user@\d+\.service|init\.scope|user-\d+\.slice|user\.slice)$',
+                scope_name,
+            ):
+                dominant_name = process_info.get('dominant_name', '')
+                if dominant_name:
+                    return {
+                        'type': 'process',
+                        'id': dominant_name,
+                        'name': dominant_name,
+                    }
+
             return {
                 'type': 'cgroup',
                 'id': scope_name,
@@ -820,7 +826,6 @@ class ResourceMonitor:
         if pids:
             unit = self._find_systemd_unit(pids[0])
             if unit:
-                logger.debug(f"try_match_app Matched systemd unit: {unit}")
                 return {
                     'type': 'systemd',
                     'id': unit,
@@ -1040,32 +1045,18 @@ class ResourceMonitor:
                     _accumulate_engine_delta(engine_delta, t0['engines'], t1['engines'])
                 mem_bytes += t1['mem_bytes']
             gpu_util = 0.0
-            winning_engine = None
-            for engine, data in engine_delta.items():
+            for data in engine_delta.values():
                 util = 0.0
                 if data["total_cycles"] > 0:
                     util = (data["cycles"] / data["total_cycles"]) * 100
-                    # logger.debug(
-                        # f"  [GPU][{cgroup}] Xe engine={engine} delta_cy={data['cycles']} "
-                        # f"total_cy={data['total_cycles']} util={util:.1f}%"
-                    # )
                 elif elapsed_ns > 0 and data["time_ns"] > 0:
                     util = (data["time_ns"] / elapsed_ns) * 100
-                    # logger.debug(
-                        # f"  [GPU][{cgroup}] i915 engine={engine} delta_ns={data['time_ns']} util={util:.1f}%"
-                    # )
                 if util > gpu_util:
                     gpu_util = util
-                    winning_engine = engine
             gpu_stats_by_cgroup[cgroup] = {
                 'gpu_util': round(min(gpu_util, 100.0), 1),
                 'gpu_mem_mb': round(mem_bytes / (1024 * 1024), 1),
             }
-            logger.debug(
-                f"  [GPU][{cgroup}] winning_engine={winning_engine} "
-                f"gpu_util={gpu_stats_by_cgroup[cgroup]['gpu_util']}% "
-                f"mem_mb={gpu_stats_by_cgroup[cgroup]['gpu_mem_mb']}"
-            )
 
         for process in processes:
             process_name = process.get('dominant_name') or next(iter(process['names']), 'unknown')
@@ -1106,16 +1097,6 @@ class ResourceMonitor:
             key=lambda r: r['score'] + gpu_weight * r['gpu_util'],
             reverse=True
         )
-
-        logger.info("[AppResources] Top %d apps:", len(results))
-        for rank, r in enumerate(results, 1):
-            logger.info(
-                "  #%d app_name=%r process=%r cpu=%.1f%% mem_mb=%.1f "
-                "gpu_util=%.1f%% gpu_mem_mb=%.1f score=%.3f",
-                rank, r['app_name'], r['process_name'],
-                r['cpu_usage'] * 100, r['memory_mb'],
-                r['gpu_util'], r['gpu_mem_mb'], r['score'],
-            )
 
         return results
 

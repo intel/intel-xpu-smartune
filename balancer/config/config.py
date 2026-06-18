@@ -37,8 +37,6 @@ class Config:
     testing_network_app: list = None
     network_burst_map: dict = None
     network_system_ports: list = None
-    monitor_apps: dict = None
-    all_apps: dict = None
     controlled_apps: list = None
     _config_path: str = field(default="config/config.yaml", repr=False, compare=False)
     _persist_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False, init=False)

@@ -1096,7 +1096,11 @@ export default function Balance({ active }: Props) {
                   <Select
                     value={selectedAppId || undefined}
                     onChange={setSelectedAppId}
-                    placeholder="Select application..."
+                    placeholder={
+                      uncontrolledApps.length === 0
+                        ? 'No new apps to add — use the wizard'
+                        : 'Select application...'
+                    }
                     style={{ width: '100%' }}
                     showSearch
                     filterOption={(input, option) =>
@@ -1104,7 +1108,9 @@ export default function Balance({ active }: Props) {
                     }
                     dropdownStyle={{ background: COLORS.panelBg }}
                     notFoundContent={
-                      <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>No apps found</Text>
+                      <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
+                        No new apps to add — register one via &ldquo;Find new application&rdquo;.
+                      </Text>
                     }
                   >
                     {uncontrolledApps.map((app) => (

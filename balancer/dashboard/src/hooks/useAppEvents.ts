@@ -5,6 +5,7 @@ export interface AppStatusEvent {
   app_name: string
   status: string
   purpose: 'app' | 'notify' | string
+  message?: string
 }
 
 type EventCallback = (event: AppStatusEvent) => void

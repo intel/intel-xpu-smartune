@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import logging
 import os
 import hashlib
 import queue as _queue
@@ -1051,17 +1052,26 @@ def app_resource_limit():
 
         result = _service.resource_limit(app_id, app_name, priority, limit_overrides=limit_overrides)
 
+        # set_resource_limit signals "intentionally skipped" with {"skipped": reason}.
+        # That's a successful evaluation, not a failure — return 200 + the reason as
+        # retmsg so the UI can show one notification and close the limit dialog,
+        # instead of falling through to the OPERATING_ERROR branch (which would also
+        # trigger a duplicate SSE 'limit_skipped' toast).
+        if isinstance(result, dict) and "skipped" in result:
+            return construct_response(
+                data={"skipped": True},
+                retmsg=result["skipped"],
+            )
         if result:
             return construct_response(
                 data={},
                 retmsg="Successfully found and set resource limit"
             )
-        else:
-            return construct_response(
-                data={},
-                retcode=RetCode.OPERATING_ERROR,
-                retmsg="No matching app found or failed to set resource limit"
-            )
+        return construct_response(
+            data={},
+            retcode=RetCode.OPERATING_ERROR,
+            retmsg="No matching app found or failed to set resource limit"
+        )
     except Exception as e:
         logger.error(f"Set resource limit failed: {str(e)}")
         return construct_response(
@@ -1172,7 +1182,48 @@ def app_events():
     return response
 
 
+class _ClientDisconnectFilter(logging.Filter):
+    """Silence werkzeug's noisy traceback when a client tears down a streaming
+    response (typically /app/events SSE) mid-flight.
+
+    Werkzeug logs BrokenPipeError / ssl.SSLError(UNEXPECTED_EOF_WHILE_READING)
+    at ERROR level with full traceback, but these are benign – the peer
+    closed the connection before we finished writing the next chunk.
+
+    Note: werkzeug formats the traceback into the *message string*
+    (server.log("error", "Error on request:\\n%s", traceback_str)) rather
+    than via record.exc_info, so we have to grep the rendered message.
+    """
+
+    _BENIGN = (
+        "BrokenPipeError",
+        "UNEXPECTED_EOF_WHILE_READING",
+        "ConnectionResetError",
+        "ConnectionAbortedError",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            text = record.getMessage()
+        except Exception:
+            text = str(record.msg)
+        if record.exc_info:
+            text += "\n" + logging.Formatter().formatException(record.exc_info)
+        return not any(marker in text for marker in self._BENIGN)
+
+
 def main():
+    # Apply the disconnect filter both to werkzeug's logger AND to its handlers
+    # (and the root logger's handlers). werkzeug's traceback travels through
+    # multiple paths — sometimes via the named "werkzeug" logger, sometimes via
+    # the root logger's StreamHandler — and a logger-level filter only catches
+    # the former. Filtering at the handler level catches the rest.
+    f = _ClientDisconnectFilter()
+    for name in ("werkzeug", ""):
+        lg = logging.getLogger(name)
+        lg.addFilter(f)
+        for h in lg.handlers:
+            h.addFilter(f)
     logger.info("Starting Balance Service...")
     if not os.path.exists(CERT_FILE) or not os.path.exists(KEY_FILE):
         logger.error(f"Certificate files not found: {CERT_FILE}, {KEY_FILE}, "

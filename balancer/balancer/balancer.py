@@ -1618,8 +1618,11 @@ class DynamicBalancer:
                 f"Mem {usage.get('mem_current', 0) + usage.get('mem_swap_current', 0):.1f}→{mem_current:.1f} MB"
             )
 
-        # Apply the 10% CPU threshold filter once, after peak-latch is resolved.
-        cpu_usage_percent = raw_cpu_percent if raw_cpu_percent >= 10 else 0
+        # Apply CPU threshold filter once, after peak-latch is resolved.
+        # cpu_percent here is "share of all cores" (Δ / elapsed / num_cpus); a single
+        # core fully pegged on a 16-core box reads ~6.3%. A 10% gate would discard
+        # 1-core workloads entirely, so use 2% (~1/3 of one core on a 16-core box).
+        cpu_usage_percent = raw_cpu_percent if raw_cpu_percent >= 2 else 0
 
         # Keep automatic IO-pressure gating for legacy/auto paths, but if user passes
         # disk_io overrides from UI, honor user decision directly.
@@ -1628,15 +1631,33 @@ class DynamicBalancer:
             isinstance(limit_overrides, dict) and isinstance(limit_overrides.get("disk_io"), dict)
         )
 
-        # Set limits based on usage and configured rates
-        cpu_quota = int(cpu_usage_percent * limit_rates["cpu_rate"]) if (limit_rates.get("cpu_rate") and
-                                                                         cpu_usage_percent > 0) else None
-        mem_high = int(mem_current * limit_rates["mem_rate"]) if (limit_rates.get("mem_rate") and mem_current > 0) else None
+        # Set limits based on usage and configured rates.
+        # Use max(1, int(...)) so a small but non-zero usage*rate (e.g.
+        # 6.3 * 0.05 = 0.315) doesn't floor to 0 and look like "no limit
+        # requested" — controller.adjust_resources rejects cpu_quota=0 anyway.
+        cpu_quota = (max(1, int(cpu_usage_percent * limit_rates["cpu_rate"]))
+                     if (limit_rates.get("cpu_rate") and cpu_usage_percent > 0) else None)
+        mem_high = (max(1, int(mem_current * limit_rates["mem_rate"]))
+                    if (limit_rates.get("mem_rate") and mem_current > 0) else None)
         io_limits = limit_rates.get("disk_io_rate", {})
         should_apply_io_limit = bool(io_limits) and (force_user_io_limit or is_io_limit)
 
-        # If there is nothing to limit (process undetectable or usage too low), notify the
-        # user so they can choose a different app to throttle, then bail out early.
+        # Quantization trace: shows whether int(usage * rate) collapsed a real
+        # usage reading to 0 (i.e. usage*rate < 1). Helps diagnose cases where
+        # cpu_usage_percent>0 but adjust_resources later rejects cpu_quota=0.
+        logger.debug(
+            f"[set_resource_limit] {app_name}: cpu_usage_percent={cpu_usage_percent} "
+            f"* cpu_rate={limit_rates.get('cpu_rate')} -> cpu_quota={cpu_quota}; "
+            f"mem_current={mem_current}MB * mem_rate={limit_rates.get('mem_rate')} -> mem_high={mem_high}; "
+            f"is_io_limit={is_io_limit} force_user_io_limit={force_user_io_limit} "
+            f"should_apply_io_limit={should_apply_io_limit}"
+        )
+
+        # If there is nothing to limit (process undetectable or usage too low), tell
+        # the caller so it can surface a friendly message — this is NOT a failure.
+        # Returning a {"skipped": reason} dict lets the HTTP layer respond 200 with
+        # the reason as retmsg (single notification, dialog auto-closes), instead of
+        # the generic "No matching app found or failed to set resource limit" error.
         no_cpu_limit = cpu_quota is None
         no_mem_limit = mem_high is None
         no_io_limit = not should_apply_io_limit
@@ -1647,8 +1668,7 @@ class DynamicBalancer:
                 else f"{app_name} has negligible resource usage (CPU<10%, memory≈0, IO<100 MB/s and <1000 IOPS); no limit needed. Please select another application."
             )
             logger.warning(reason)
-            app_utils.safe_notify("Resource limit skipped", reason, icon="dialog-warning")
-            return False
+            return {"skipped": reason}
 
         logger.debug(f"Calculated limits - CPU: {cpu_quota if cpu_quota else 'No Limit'}, "
                      f"Memory: {mem_high if mem_high else 'No Limit'}, is_io_limit: {is_io_limit}, "

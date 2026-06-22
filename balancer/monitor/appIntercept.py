@@ -331,7 +331,6 @@ class AppIntercept(metaclass=SingletonMeta):
                 }, True)
             else:
                 logger.info(f"System resources busy, skipping relaunch of {app_name}")
-                app_utils.safe_notify("System resources busy", f"Paused startup of app: {app_name}", icon='dialog-warning')
                 app_utils.callback_manager.send_callback_notification({
                     'app_id': app_id,
                     'app_name': app_name,

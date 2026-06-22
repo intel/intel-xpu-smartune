@@ -251,16 +251,18 @@ class Controller:
                 properties.append(f"MemoryHigh={mem_high}M")
             else:
                 properties.append("MemoryHigh=")
-            if io_weight is not None:
-                properties.append(f"IOWeight={io_weight}")
-            else:
-                properties.append("IOWeight=")
+            # IOWeight is intentionally NOT touched here. This project drives
+            # all IO limits through io.max directly (see IOController), and
+            # writing IOWeight (or clearing it) makes systemd asynchronously
+            # detach `io` from the parent slice's cgroup.subtree_control,
+            # which races with concurrent io.max writes and produces EACCES
+            # (the multi-SSD restore failure we hit in 2026-06).
         else:
-            # Restore: clear all limits
+            # Restore: clear CPU/memory limits we may have set above. IOWeight
+            # is omitted for the same reason as in the set branch.
             properties.extend([
                 "CPUQuota=",
                 "MemoryHigh=",
-                "IOWeight="
             ])
 
         # Execute command with up to _MAX_RETRIES retries to handle transient dbus timeout issues

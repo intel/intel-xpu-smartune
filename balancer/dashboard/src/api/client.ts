@@ -132,8 +132,15 @@ export const api = {
     post<void>('/app/set_oom_score', payload),
   cancelRelaunch: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<void>('/app/cancel_relaunch', payload),
-  resourceLimit: (payload: ResourceLimitPayload) =>
-    post<void>('/app/resource_limit', payload),
+  // Server returns {skipped: true} (with retmsg = human-readable reason) when
+  // the app has negligible usage and no limit was actually applied. That's a
+  // successful evaluation, not an error, so post() resolves and the caller can
+  // distinguish "applied" vs "skipped" via the response shape.
+  resourceLimit: async (payload: ResourceLimitPayload) => {
+    const res = await client.post<ApiResponse<{ skipped?: boolean }>>('/app/resource_limit', payload)
+    if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
+    return { skipped: res.data.data?.skipped === true, message: res.data.retmsg }
+  },
   getResourceLimitProfile: (payload: Pick<ResourceLimitPayload, 'app_id' | 'app_name' | 'priority'>) =>
     post<ResourceLimitProfileData>('/app/resource_limit_profile', payload),
   resourceRestore: (payload: Pick<AppIdPayload, 'app_id'>) =>

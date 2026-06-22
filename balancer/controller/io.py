@@ -32,14 +32,15 @@ class IOController:
             logger.error(f"Failed to get active user slices: {e}")
         return "0"
 
-    def _run_cmd(self, cmd, check: bool = True) -> bool:
+    def _run_cmd(self, cmd, check: bool = True, log_on_fail: bool = True) -> bool:
         """Execute a shell command and return True on success."""
         try:
             subprocess.run(cmd, shell=False, check=check, capture_output=True)
             return True
         except subprocess.CalledProcessError as e:
-            cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
-            logger.error(f"Command failed: {cmd_str}\nError: {e.stderr.decode().strip()}")
+            if log_on_fail:
+                cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
+                logger.error(f"Command failed: {cmd_str}\nError: {e.stderr.decode().strip()}")
             return False
 
     def _check_file_exists(self, path: str) -> bool:
@@ -137,16 +138,17 @@ class IOController:
 
         :param cgroup_path: e.g. /sys/fs/cgroup/.../vte-spawn-xxx.scope/io.max
         :return: True if cgroup_path is usable after enabling
-        """
-        # Path already exists; nothing to do
-        if os.path.exists(cgroup_path):
-            return True
 
+        Always walks every ancestor cgroup.subtree_control even if io.max
+        already appears to exist: systemd's `set-property ... IOWeight=` (clear)
+        can detach io from a parent's subtree_control while the child's io.max
+        is still transiently visible — writing it then returns EACCES. Verifying
+        subtree_control unconditionally re-adds +io in that window.
+        """
         try:
             # Leaf node does not need a subtree_control entry
             target_dir = os.path.dirname(os.path.dirname(cgroup_path))
 
-            # Build path components starting from the cgroup mount point
             components = []
             path = target_dir
             while path != self.cgroup_mount:
@@ -265,51 +267,33 @@ class IOController:
                 limit_str = " ".join(limit_parts)
 
             if limit_str:  # skip if nothing to apply
-                # io.max may have vanished if the IO controller was disabled in a parent cgroup
-                # (e.g. after systemd reload/session rebuild).  During restore this is benign:
-                # disabling the controller already clears all limits, so there is nothing to do.
                 if not os.path.exists(io_max_path):
                     if is_restore:
-                        logger.warning(
-                            f"io.max not found for cgroup {cgroup_id} (disk {disk_name}), "
-                            f"IO controller appears disabled — limits already cleared, skipping restore"
-                        )
+                        # Controller already detached — limits are gone.
                         continue
-                    else:
-                        logger.error(
-                            f"io.max not found for cgroup {cgroup_id} (disk {disk_name}), cannot apply limits"
-                        )
-                        success = False
-                        continue
+                    logger.error(
+                        f"io.max not found for cgroup {cgroup_id} (disk {disk_name}), cannot apply limits"
+                    )
+                    success = False
+                    continue
 
-                # Build command using the utility function
                 cmd = build_sudo_shell_redirect(f"{disk_id} {limit_str}", io_max_path)
                 logger.info(f"Setting IO limits for cgroup: {cgroup_id} in disk {disk_name}({disk_id}): {limit_str}")
 
-                if is_restore:
-                    # For restore, run the command directly so we can distinguish a benign
-                    # "io.max disappeared between the existence check and the write" (TOCTOU)
-                    # from a genuine permission failure, without emitting a misleading ERROR.
-                    try:
-                        result = subprocess.run(cmd, shell=False, check=False, capture_output=True)
-                        if result.returncode != 0:
-                            if not os.path.exists(io_max_path):
-                                logger.warning(
-                                    f"io.max disappeared for cgroup {cgroup_id} (disk {disk_name}) "
-                                    f"mid-restore — IO controller was disabled, limits already cleared (benign)"
-                                )
-                            else:
-                                cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
-                                logger.error(
-                                    f"Command failed: {cmd_str}\nError: {result.stderr.decode().strip()}"
-                                )
-                                success = False
-                    except Exception as e:
-                        logger.error(f"Restore command raised an exception: {str(e)}")
-                        success = False
-                else:
-                    if not self._run_cmd(cmd):
-                        success = False
+                # Any `systemctl set-property` elsewhere (e.g. CPU/mem restore) can
+                # asynchronously detach `io` from a parent's cgroup.subtree_control —
+                # systemd doesn't know we set io.max directly, so it thinks the unit
+                # has no IO constraints once CPUQuota=/MemoryHigh= are cleared. The
+                # write then returns EACCES even though our pre-flight check passed.
+                # Re-run _ensure_io_enabled (re-adds +io) and retry once.
+                if not self._run_cmd(cmd, log_on_fail=False):
+                    if self._ensure_io_enabled(io_max_path) and self._run_cmd(cmd):
+                        continue
+                    logger.error(
+                        f"Failed to write io.max for cgroup {cgroup_id} (disk {disk_name}) "
+                        f"after retry"
+                    )
+                    success = False
 
         return success
 

@@ -8,8 +8,6 @@ import subprocess
 import time
 import psutil
 import threading
-from getpass import getuser
-from pwd import getpwnam
 from datetime import datetime
 
 from utils.logger import logger
@@ -647,11 +645,12 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
                     logger.debug(f"[resource_usage] io.stat read error: {e}")
             return rbytes, wbytes, rios, wios
 
-        # Sample CPU and IO over a short window so we get accurate rates
+        # 1 s window: a compromise between sample stability and limit-path
+        # latency; see the same sleep in _get_multi_process_app_resource_usage.
         t1 = time.monotonic()
         cpu_usec1 = read_cpu_usage_usec()
         io_rbytes1, io_wbytes1, io_rios1, io_wios1 = read_io_stats(label="sample1")
-        time.sleep(0.5)
+        time.sleep(1)
         t2 = time.monotonic()
         cpu_usec2 = read_cpu_usage_usec()
         io_rbytes2, io_wbytes2, io_rios2, io_wios2 = read_io_stats(label="sample2")
@@ -703,38 +702,6 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
     except Exception as e:
         logger.error(f"Error getting resource usage for {app_name} (ID: {app_id}): {e}")
         return {}
-
-
-def safe_notify(title, message, icon="dialog-information"):
-    try:
-        # Method 1: try native notify-send first
-        user = os.getenv("SUDO_USER") or getuser()
-
-        user_uid = getpwnam(user).pw_uid
-
-        # Build the correct DBus address
-        dbus_address = f'unix:path=/run/user/{user_uid}/bus'
-
-        # Execute as the target user via sudo -u
-        subprocess.run([
-            'sudo', '-u', user,
-            f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',
-            'DISPLAY=:0',
-            'notify-send',
-            f'--icon={icon}',
-            title,
-            message
-        ], check=True)
-
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        try:
-            # Method 2: fall back to zenity
-            subprocess.run(
-                ["zenity", "--info", "--text", f"{title}\n{message}", "--title", "System notification"],
-                check=True
-            )
-        except:
-            print(f"\a⚠️ {title}: {message}")
 
 
 def get_dbus_address():
@@ -974,7 +941,10 @@ def _get_multi_process_app_resource_usage(app_id: str, app_name: str, process_na
     mem_bytes = sum(mem_per_cgroup.values())
     swap_bytes = sum(swap_per_cgroup.values())
 
-    time.sleep(0.5)
+    # 1 s window: a compromise between sample stability and limit-path
+    # latency; the 0.5 s window made multi-process apps look idle when only
+    # one helper was active at sample time.
+    time.sleep(1)
 
     # --- Second snapshot ---
     t2 = time.monotonic()
@@ -991,6 +961,15 @@ def _get_multi_process_app_resource_usage(app_id: str, app_name: str, process_na
     total_w = sum(max(0, io2[cg][1] - io1[cg][1]) for cg in cgroup_paths)
     total_rios = sum(max(0, io2[cg][2] - io1[cg][2]) for cg in cgroup_paths)
     total_wios = sum(max(0, io2[cg][3] - io1[cg][3]) for cg in cgroup_paths)
+
+    # Per-cgroup CPU debug: if total_cpu_delta is 0 we want to see whether
+    # cpu.stat usage_usec moved at all, and on which cgroup the PIDs landed.
+    logger.debug(
+        f"[multi_process_resource] '{app_name}' cpu samples: "
+        f"pids={all_pids} elapsed={elapsed:.3f}s "
+        + ", ".join(f"{os.path.basename(cg)}: {cpu1[cg]}->{cpu2[cg]} (Δ={cpu_delta_per_cgroup[cg]})"
+                    for cg in cgroup_paths)
+    )
 
     cpu_percent = round(total_cpu_delta / (elapsed_usec * num_cpus) * 100, 1) if elapsed_usec > 0 else 0.0
     io_read_mb_s = round(total_r / elapsed / (1024 ** 2), 2) if elapsed > 0 else 0.0

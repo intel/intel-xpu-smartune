@@ -371,13 +371,16 @@ export default function Balance({ active }: Props) {
         )
 
         // Show a toast that mirrors the Python register_notification() logic:
-        //   - limited/a_limited → resource-limit warning
-        //   - any other status change → generic status-updated info
-        if (event.status === APP_STATUS.LIMITED || event.status === APP_STATUS.A_LIMITED) {
+        //   - 'limited' (auto, balancer-initiated) → "system busy, will auto-restore" warning
+        //   - 'a_limited' (manual, user-initiated) → no toast here; submitResourceLimit
+        //     already shows "Resource limit applied to ...". A second message would be
+        //     duplicate and the auto-restore wording is wrong for manual limits.
+        //   - other transitions → generic status-updated info
+        if (event.status === APP_STATUS.LIMITED) {
           messageApi.warning(
             `System busy: ${event.app_name} resource usage has been temporarily limited. It will be restored when resources become available.`
           )
-        } else {
+        } else if (event.status !== APP_STATUS.A_LIMITED) {
           const statusLabel: Record<string, string> = {
             running: 'Running',
             stopped: 'Stopped',
@@ -543,10 +546,11 @@ export default function Balance({ active }: Props) {
       const priority = rowPriorities[limitDialog.app.app_id] ?? limitDialog.app.priority ?? 'medium'
       const isMultiTarget = limitForm.cgroupIds.length > 1
 
+      let res: { skipped: boolean; message: string }
       if (isMultiTarget && !useInlineProcessHint) {
         const selectedTarget = activeLimitTarget || limitForm.cgroupIds[0]
         const form = perTargetForms[selectedTarget] ?? limitForm
-        await api.resourceLimit({
+        res = await api.resourceLimit({
           app_id: limitDialog.app.app_id,
           app_name: limitDialog.app.app_name,
           priority,
@@ -566,7 +570,7 @@ export default function Balance({ active }: Props) {
           },
         })
       } else {
-        await api.resourceLimit({
+        res = await api.resourceLimit({
           app_id: limitDialog.app.app_id,
           app_name: limitDialog.app.app_name,
           priority,
@@ -585,7 +589,13 @@ export default function Balance({ active }: Props) {
           },
         })
       }
-      messageApi.success(`Resource limit applied to ${limitDialog.app.app_name}`)
+      if (res.skipped) {
+        // Server intentionally skipped the limit (negligible usage / undetectable
+        // process). Surface the server-provided reason and close the dialog.
+        messageApi.warning(res.message)
+      } else {
+        messageApi.success(`Resource limit applied to ${limitDialog.app.app_name}`)
+      }
       setActiveLimitTarget('')
       setPerTargetForms({})
       setLimitDialog({ app: null, open: false, loadingProfile: false, submitting: false })

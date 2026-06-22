@@ -165,7 +165,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # Start the Vite dev server
 # ---------------------------------------------------------------------------
-echo "[INFO] Starting development server → http://localhost:3000"
+echo "[INFO] Starting development server → http://localhost:39527"
 echo "[INFO] API proxy           → https://127.0.0.1:9001 (self-signed cert bypassed)"
 echo ""
 echo "Press Ctrl+C to stop."

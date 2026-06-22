@@ -191,4 +191,4 @@ separated from the system resource management logic. The main mechanisms are as 
         # if missing or outdated. See dashboard/README.md for full setup instructions.
         cd dashboard
         bash start_dashboard.sh
-        # Opens http://localhost:3000
+        # Opens http://localhost:39527

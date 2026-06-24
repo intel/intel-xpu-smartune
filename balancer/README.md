@@ -181,10 +181,33 @@ separated from the system resource management logic. The main mechanisms are as 
  
 # Start:
     1. server:
-        config/config.yaml
-            enable_network_control: true -> default is enabled, disable with false
-            vendor: "generic" -> bash start_balancer.sh
-            # If you are in "admin" permission, config/config.yaml # vendor: "admin"
+        Option A) Run manually:
+            config/config.yaml
+                enable_network_control: true -> default is enabled, disable with false
+                vendor: "generic" -> bash start_balancer.sh
+                # If you are in "admin" permission, config/config.yaml # vendor: "admin"
+
+        Option B) Run as a systemd system service (smartune.service):
+            # The unit file `smartune.service` and entry script `start_smartune_service.sh`
+            # are provided in this directory. Install and enable them as below.
+            1. Make sure the entry script is executable:
+                 chmod +x /home/nas/intel-xpu-smartune/balancer/start_smartune_service.sh
+            2. Install the unit file into systemd:
+                 sudo cp /home/nas/intel-xpu-smartune/balancer/smartune.service /etc/systemd/system/
+                 sudo systemctl daemon-reload
+            3. Enable on boot and start the service:
+                 sudo systemctl enable smartune.service
+                 sudo systemctl start smartune.service
+            4. Check status / logs:
+                 sudo systemctl status smartune.service
+                 tail -f /home/nas/intel-xpu-smartune/balancer/logs/smartune.log
+            5. Stop / disable / uninstall (if needed):
+                 sudo systemctl stop smartune.service
+                 sudo systemctl disable smartune.service
+                 sudo rm /etc/systemd/system/smartune.service
+                 sudo systemctl daemon-reload
+            # Note: if you change WorkingDirectory/ExecStart paths, edit smartune.service
+            # accordingly before copying, then re-run `daemon-reload` and `restart`.
 
     3. client (React dashboard – Grafana-style 6-tab UI):
         # Node.js 20.19+ is required. The script auto-installs/upgrades it on Ubuntu/Debian

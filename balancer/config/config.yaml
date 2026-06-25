@@ -34,11 +34,11 @@ controlled_apps:
   #                   their resources are aggregated across all cgroups they may
   #                   reside in (useful for multi-process / multi-cgroup apps)
   # F.ex:
-  - name: "heliconsearch"
-    id: "heliconsearch.id"
-    commandline: "/usr/local/heliconsearch/HeliconSearch_agent"
-    bpf_name: ["HeliconSearch_a", "VLMService"]
-    process_names: ["HeliconSearch_agent", "VLMService"]
+  # - name: "heliconSearch"
+  #   id: "heliconsearch.id"
+  #   commandline: "/usr/local/heliconsearch/HeliconSearch_agent"
+  #   bpf_name: ["HeliconSearch_a", "VLMService"]
+  #   process_names: ["HeliconSearch_agent", "VLMService"]
 weights_top:
   cpu: 2
   memory: 7

@@ -111,7 +111,11 @@ export const api = {
 
   checkRunningApps: () => post<AppListData>('/app/check_running_apps'),
   getApps: () => post<AppListData>('/app/get_apps'),
-  getControlledApps: () => post<AppListData>('/app/get_controlled_app'),
+  getControlledApps: () =>
+    post<AppListData>('/app/get_controlled_app').catch((e: Error) => {
+      if (e.message === 'No controlled apps found') return [] as AppListData
+      throw e
+    }),
   // The server returns retcode=404 (NOT_EXISTING, "No pending apps found") when the
   // pending queue is empty, which makes post() throw.  Treat that specific case as an
   // empty list so the UI clears the pending queue card when the last app goes running.

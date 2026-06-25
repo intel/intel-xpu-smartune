@@ -21,10 +21,11 @@ import {
 import {
   PlusOutlined,
   DeleteOutlined,
+  DeleteFilled,
   ThunderboltOutlined,
-  StopOutlined,
+  CloseOutlined,
   HeartOutlined,
-  ArrowUpOutlined,
+  SaveOutlined,
   DatabaseOutlined,
   ReloadOutlined,
   QuestionCircleOutlined,
@@ -349,13 +350,22 @@ export default function Balance({ active }: Props) {
     if (active) {
       if (!startupScanDone.current) {
         startupScanDone.current = true
-        // Fire-and-forget: errors here are non-critical; the backend logs them.
-        // Log to console in development so frontend engineers can diagnose failures.
-        api.checkRunningApps().catch((e: unknown) => {
-          console.error('[Balance] startup scan failed:', e)
-        })
+        // Two-stage load: render whatever the DB has now (typically "NA"
+        // immediately after a service start because reset_app_status() ran),
+        // then refetch once the startup scan finishes so the row picks up
+        // the real "running"/"stopped" status the scan just persisted.
+        // Without the second fetch the user has to switch tabs and back to
+        // see correct statuses, because the SSE channel may not be up yet
+        // when scan_already_running_apps() emits its callbacks.
+        fetchData()
+        api.checkRunningApps()
+          .catch((e: unknown) => {
+            console.error('[Balance] startup scan failed:', e)
+          })
+          .finally(() => fetchData())
+      } else {
+        fetchData()
       }
-      fetchData()
     }
   }, [active, fetchData])
 
@@ -462,10 +472,16 @@ export default function Balance({ active }: Props) {
     }
   }
 
-  const handleRemove = (app: AppInfo) =>
-    withLoading(`remove-${app.app_id}`, async () => {
+  const handleUncontrol = (app: AppInfo) =>
+    withLoading(`uncontrol-${app.app_id}`, async () => {
       await api.removeFromControl({ app_id: app.app_id, app_name: app.app_name })
-      messageApi.success(`Removed ${app.app_name}`)
+      messageApi.success(`Uncontrolled ${app.app_name}`)
+    })()
+
+  const handleDelete = (app: AppInfo) =>
+    withLoading(`delete-${app.app_id}`, async () => {
+      await api.purgeControlledApp(app.app_id)
+      messageApi.success(`Deleted ${app.app_name}`)
     })()
 
   const handleUpdatePriority = (app: AppInfo) =>
@@ -630,7 +646,7 @@ export default function Balance({ active }: Props) {
       title: 'App Name',
       dataIndex: 'app_name',
       key: 'app_name',
-      width: 150,
+      width: 180,
       render: (name: string, record) => {
         const displayName = name || record.app_id
         const tooltipContent = record.remark ? `${displayName} — ${record.remark}` : displayName
@@ -646,42 +662,71 @@ export default function Balance({ active }: Props) {
     {
       title: 'Priority',
       key: 'priority',
-      width: 160,
+      width: 150,
       render: (_: unknown, record: AppInfo) => (
-        <Select
-          value={rowPriorities[record.app_id] ?? record.priority ?? 'medium'}
-          onChange={(v) => setRowPriorities((prev) => ({ ...prev, [record.app_id]: v }))}
-          size="small"
-          style={{ width: 120 }}
-          dropdownStyle={{ background: COLORS.panelBg }}
-        >
-          {PRIORITY_OPTIONS.map((opt) => (
-            <Option key={opt.value} value={opt.value}>
-              <span style={{ color: opt.color }}>{opt.label}</span>
-            </Option>
-          ))}
-        </Select>
+        <Space size={12} wrap={false}>
+          <Select
+            value={rowPriorities[record.app_id] ?? record.priority ?? 'medium'}
+            onChange={(v) => setRowPriorities((prev) => ({ ...prev, [record.app_id]: v }))}
+            size="small"
+            style={{ width: 120 }}
+            dropdownStyle={{ background: COLORS.panelBg }}
+          >
+            {PRIORITY_OPTIONS.map((opt) => (
+              <Option key={opt.value} value={opt.value}>
+                <span style={{ color: opt.color }}>{opt.label}</span>
+              </Option>
+            ))}
+          </Select>
+          <Tooltip title="Save Priority">
+            <Button
+              size="small"
+              icon={<SaveOutlined />}
+              loading={actionLoading[`priority-${record.app_id}`]}
+              onClick={() => handleUpdatePriority(record)}
+              style={{ borderColor: COLORS.accent, color: COLORS.accent }}
+            />
+          </Tooltip>
+        </Space>
       ),
     },
     {
       title: 'Status',
       key: 'status',
-      width: 100,
-      align: 'center',
+      width: 150,
       render: (_: unknown, record: AppInfo) => {
         const s = record.status ?? APP_STATUS.NA
-        if (s === APP_STATUS.RUNNING) return <Tag color="success">Running</Tag>
-        if (s === APP_STATUS.STOPPED) return <Tag color="default">Stopped</Tag>
-        if (s === APP_STATUS.LIMITED || s === APP_STATUS.A_LIMITED) return <Tag color="warning">Limited</Tag>
-        if (s === APP_STATUS.PENDING) return <Tag color="processing">Pending</Tag>
-        return <Tag color="default">NA</Tag>
+        const tag =
+          s === APP_STATUS.RUNNING ? <Tag color="success" style={{ marginInlineEnd: 0 }}>Running</Tag>
+          : s === APP_STATUS.STOPPED ? <Tag color="default" style={{ marginInlineEnd: 0 }}>Stopped</Tag>
+          : (s === APP_STATUS.LIMITED || s === APP_STATUS.A_LIMITED)
+              ? <Tag color="warning" style={{ marginInlineEnd: 0 }}>Limited</Tag>
+          : s === APP_STATUS.PENDING ? <Tag color="processing" style={{ marginInlineEnd: 0 }}>Pending</Tag>
+          : <Tag color="default" style={{ marginInlineEnd: 0 }}>NA</Tag>
+
+        return (
+          <Space size={6} wrap={false}>
+            <div style={{ width: 120, display: 'flex' }}>{tag}</div>
+            {s === APP_STATUS.PENDING && (
+              <Tooltip title="Cancel Relaunch">
+                <Button
+                  size="small"
+                  icon={<CloseOutlined />}
+                  loading={actionLoading[`cancel-${record.app_id}`]}
+                  onClick={() => handleCancelRelaunch(record)}
+                  style={{ borderColor: COLORS.accent, color: COLORS.accent }}
+                />
+              </Tooltip>
+            )}
+          </Space>
+        )
       },
     },
     {
       title: 'Remark',
       dataIndex: 'remark',
       key: 'remark',
-      width: 140,
+      width: 220,
       render: (v: string) => (
         <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>{v || '—'}</Text>
       ),
@@ -692,37 +737,12 @@ export default function Balance({ active }: Props) {
       width: 160,
       align: 'center',
       render: (_: unknown, record: AppInfo) => {
-        const isPending = record.status === APP_STATUS.PENDING
         const isRunning = record.status === APP_STATUS.RUNNING
         const isCritical = (rowPriorities[record.app_id] ?? record.priority ?? '').toLowerCase() === 'critical'
         const isLimited = record.status === APP_STATUS.LIMITED || record.status === APP_STATUS.A_LIMITED
 
         return (
           <Space size={4} wrap={false}>
-            <Tooltip title="Cancel Relaunch (only for pending)">
-              <Button
-                size="small"
-                icon={<StopOutlined />}
-                disabled={!isPending}
-                loading={actionLoading[`cancel-${record.app_id}`]}
-                onClick={() => handleCancelRelaunch(record)}
-              >
-                Cancel
-              </Button>
-            </Tooltip>
-
-            <Tooltip title="Update Priority">
-              <Button
-                size="small"
-                type="primary"
-                icon={<ArrowUpOutlined />}
-                loading={actionLoading[`priority-${record.app_id}`]}
-                onClick={() => handleUpdatePriority(record)}
-              >
-                Priority
-              </Button>
-            </Tooltip>
-
             {isLimited ? (
               <Tooltip title="Restore Resources">
                 <Button
@@ -730,6 +750,7 @@ export default function Balance({ active }: Props) {
                   icon={<ReloadOutlined />}
                   loading={actionLoading[`restore-${record.app_id}`]}
                   onClick={() => handleResourceRestore(record)}
+                  style={{ borderColor: COLORS.accent, color: COLORS.accent }}
                 >
                   Restore
                 </Button>
@@ -742,6 +763,7 @@ export default function Balance({ active }: Props) {
                   disabled={!isRunning}
                   loading={limitDialog.loadingProfile && limitDialog.app?.app_id === record.app_id}
                   onClick={() => handleResourceLimit(record)}
+                  style={isRunning ? { borderColor: COLORS.accent, color: COLORS.accent } : {}}
                 >
                   Limit
                 </Button>
@@ -755,32 +777,54 @@ export default function Balance({ active }: Props) {
                 disabled={!isCritical || !isRunning}
                 loading={actionLoading[`keepalive-${record.app_id}`]}
                 onClick={() => handleKeepAlive(record)}
-                style={isCritical && isRunning ? { borderColor: COLORS.red, color: COLORS.red } : {}}
+                style={isCritical && isRunning ? { borderColor: COLORS.accent, color: COLORS.accent } : {}}
               >
                 Keep Alive
               </Button>
             </Tooltip>
 
-            <Tooltip title="Remove from Control">
+            <Tooltip title="Uncontrol (config kept; re-add from dropdown)">
               <Button
                 size="small"
-                danger
                 icon={<DeleteOutlined />}
-                loading={actionLoading[`remove-${record.app_id}`]}
+                loading={actionLoading[`uncontrol-${record.app_id}`]}
                 onClick={() => {
                   Modal.confirm({
-                    title: `Remove ${record.app_name}?`,
+                    title: `Uncontrol ${record.app_name}?`,
                     content:
                       'This will stop monitoring the app. The configuration is kept, '
                       + 'so you can re-add it later from the Application dropdown above '
                       + 'without going through the wizard again.',
-                    okText: 'Remove',
+                    okText: 'Uncontrol',
+                    onOk: () => handleUncontrol(record),
+                  })
+                }}
+                style={{ borderColor: COLORS.accent, color: COLORS.accent }}
+              >
+                Uncontrol
+              </Button>
+            </Tooltip>
+
+            <Tooltip title="Delete completely (purges config + DB; needs the wizard to re-add)">
+              <Button
+                size="small"
+                danger
+                icon={<DeleteFilled />}
+                loading={actionLoading[`delete-${record.app_id}`]}
+                onClick={() => {
+                  Modal.confirm({
+                    title: `Delete ${record.app_name} completely?`,
+                    content:
+                      'This permanently removes the entry from config.yaml and the database. '
+                      + 'To control this app again you will need to re-add it through the '
+                      + 'wizard. Use Uncontrol instead if you want to keep the configuration.',
+                    okText: 'Delete',
                     okType: 'danger',
-                    onOk: () => handleRemove(record),
+                    onOk: () => handleDelete(record),
                   })
                 }}
               >
-                Remove
+                Delete
               </Button>
             </Tooltip>
           </Space>

@@ -483,7 +483,7 @@ class DynamicBalancer:
                             else:
                                 reset_state()
 
-                        elif not self.app_priority_queue.empty():
+                        elif not self.app_priority_queue.empty() and pressure != "critical" and not is_disk_io_stressed:
                             # Process apps in the task queue
                             app_data, priority = self.app_priority_queue.get()
                             logger.info(
@@ -729,7 +729,7 @@ class DynamicBalancer:
 
                             else:
                                 reset_state()
-                        elif not self.app_priority_queue.empty():
+                        elif not self.app_priority_queue.empty() and pressure != "critical":
                             # Process apps in the task queue
                             app_data, priority = self.app_priority_queue.get()
                             logger.info(

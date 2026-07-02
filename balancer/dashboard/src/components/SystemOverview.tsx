@@ -2737,7 +2737,8 @@ export default function SystemOverview({ active }: Props) {
     const staticMemory = staticInfo?.memory
     if (staticMemory) {
       const parts: string[] = []
-      if (isNumber(staticMemory.total_gb)) parts.push(`${staticMemory.total_gb.toFixed(1)} GB`)
+      const totalGb = staticMemory.total_gb
+      if (totalGb != null && isNumber(totalGb)) parts.push(`${totalGb.toFixed(1)} GB`)
       // Memory type (e.g. LPDDR5) from devices or ddr_speeds
       const memTypes = [...new Set(
         (staticMemory.devices?.devices ?? []).map((d) => d.type).filter(Boolean) as string[]
@@ -2843,7 +2844,8 @@ export default function SystemOverview({ active }: Props) {
   const memoryUsagePct = normalizePercent(dynamicInfo?.memory?.usage_percent ?? null)
 
   // System pressure: use the weighted composite score from SystemPressureMonitor when available
-  const pressureScore = isNumber(dynamicInfo?.pressure?.score) ? (dynamicInfo?.pressure?.score as number) * 100 : null
+  const pressureScoreRaw = dynamicInfo?.pressure?.score
+  const pressureScore = isNumber(pressureScoreRaw) ? pressureScoreRaw * 100 : null
   const pressureLevel = dynamicInfo?.pressure?.level ?? null
   const fallbackSystemPressure = isNumber(cpuUsagePct) && isNumber(memoryUsagePct)
     ? (cpuUsagePct + memoryUsagePct) / 2
@@ -2852,7 +2854,8 @@ export default function SystemOverview({ active }: Props) {
 
   // Disk IO: use is_disk_io_stressed data
   const diskIsStressed = dynamicInfo?.disk?.is_stressed ?? false
-  const diskIoWait = isNumber(dynamicInfo?.disk?.iowait) ? (dynamicInfo?.disk?.iowait as number) : null
+  const diskIoWaitRaw = dynamicInfo?.disk?.iowait
+  const diskIoWait = isNumber(diskIoWaitRaw) ? diskIoWaitRaw : null
   // Disk IO pressure: read pre-computed values from backend
   const diskBusyNames = dynamicInfo?.disk?.busy_disks ?? []
   const diskTotalCount = dynamicInfo?.disk?.total_disks ?? 0
@@ -2870,7 +2873,7 @@ export default function SystemOverview({ active }: Props) {
   const npuParsed = useMemo(() => parseNpuRaw(dynamicInfo?.npu?.npu_smi?.raw), [dynamicInfo?.npu?.npu_smi?.raw])
   const npuUtilValue = useMemo(() => {
     if (!dynamicInfo?.npu?.npu_smi?.available) return null
-    return typeof npuParsed?.utilization_percent === 'number' ? normalizePercent(npuParsed.utilization_percent as number) : null
+    return typeof npuParsed?.utilization_percent === 'number' ? normalizePercent(npuParsed?.utilization_percent as number) : null
   }, [dynamicInfo, npuParsed])
   const npuValue = npuUtilValue
   const cpuTrendValue = cpuUsagePct

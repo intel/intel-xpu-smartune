@@ -2509,14 +2509,14 @@ export default function SystemOverview({ active }: Props) {
       // Fallback: if no valid NICs, use aggregated total with static peak bandwidth
       if (validNics.length === 0) {
         const totalNet = data.network?.total
-        const fallbackRx = isNumber(totalNet?.rx_bytes_per_sec) ? totalNet.rx_bytes_per_sec : null
-        const fallbackTx = isNumber(totalNet?.tx_bytes_per_sec) ? totalNet.tx_bytes_per_sec : null
+        const fallbackRx = isNumber(totalNet?.rx_bytes_per_sec) ? totalNet?.rx_bytes_per_sec : null
+        const fallbackTx = isNumber(totalNet?.tx_bytes_per_sec) ? totalNet?.tx_bytes_per_sec : null
         const rxMbps = toMbps(fallbackRx)
         const txMbps = toMbps(fallbackTx)
         updates['bw:network:rx_mbps'] = rxMbps
         updates['bw:network:tx_mbps'] = txMbps
-        const staticPeakMbps = isNumber(staticInfo?.io?.network_peak_mbps) && staticInfo.io.network_peak_mbps > 0
-          ? staticInfo.io.network_peak_mbps : null
+        const staticPeak = staticInfo?.io?.network_peak_mbps
+        const staticPeakMbps = isNumber(staticPeak) && staticPeak > 0 ? staticPeak : null
         const rxUtil = isNumber(rxMbps) && isNumber(staticPeakMbps) && staticPeakMbps > 0 ? Math.min(rxMbps / staticPeakMbps * 100, 100) : null
         const txUtil = isNumber(txMbps) && isNumber(staticPeakMbps) && staticPeakMbps > 0 ? Math.min(txMbps / staticPeakMbps * 100, 100) : null
         updates['util:network:rx'] = rxUtil
@@ -2754,7 +2754,7 @@ export default function SystemOverview({ active }: Props) {
       return parts.join(' | ')
     }
     const dynamicTotalGb = dynamicInfo?.memory?.total_gb
-    return isNumber(dynamicTotalGb)
+    return (dynamicTotalGb != null && isNumber(dynamicTotalGb))
       ? `${dynamicTotalGb.toFixed(1)} GB total`
       : 'No data'
   }, [staticInfo?.memory, dynamicInfo?.memory?.total_gb])
@@ -2765,8 +2765,8 @@ export default function SystemOverview({ active }: Props) {
     return validNics.map((nic) => {
       const nicName = nic.name
       const nicData = dynamicInfo?.network?.interfaces?.[nicName]
-      const rxRate = isNumber(nicData?.rx_bytes_per_sec) ? nicData.rx_bytes_per_sec : null
-      const txRate = isNumber(nicData?.tx_bytes_per_sec) ? nicData.tx_bytes_per_sec : null
+      const rxRate = isNumber(nicData?.rx_bytes_per_sec) ? nicData?.rx_bytes_per_sec : null
+      const txRate = isNumber(nicData?.tx_bytes_per_sec) ? nicData?.tx_bytes_per_sec : null
       const bandwidth = nic.speed_mbps > 0 ? nic.speed_mbps : null
       // Use static NIC link speed for utilization
       const rxMbps = toMbps(rxRate)
@@ -2780,19 +2780,20 @@ export default function SystemOverview({ active }: Props) {
   }, [validNics, dynamicInfo])
 
   // Fallback for when no valid NICs exist (keep legacy single-card behavior)
-  const primaryInterfaceName = typeof staticInfo?.io?.primary_interface === 'string'
-    ? staticInfo.io.primary_interface
+  const primaryInterface = staticInfo?.io?.primary_interface
+  const primaryInterfaceName = typeof primaryInterface === 'string'
+    ? primaryInterface
     : null
   const fallbackNetworkRates = primaryInterfaceName && dynamicInfo?.network?.interfaces?.[primaryInterfaceName]
     ? dynamicInfo.network.interfaces[primaryInterfaceName]
     : dynamicInfo?.network?.total
-  const fallbackRxRate = isNumber(fallbackNetworkRates?.rx_bytes_per_sec) ? fallbackNetworkRates.rx_bytes_per_sec : null
-  const fallbackTxRate = isNumber(fallbackNetworkRates?.tx_bytes_per_sec) ? fallbackNetworkRates.tx_bytes_per_sec : null
+  const fallbackRxRate = isNumber(fallbackNetworkRates?.rx_bytes_per_sec) ? fallbackNetworkRates?.rx_bytes_per_sec : null
+  const fallbackTxRate = isNumber(fallbackNetworkRates?.tx_bytes_per_sec) ? fallbackNetworkRates?.tx_bytes_per_sec : null
   // Use static peak bandwidth for fallback utilization
   const fbRxMbps = toMbps(fallbackRxRate)
   const fbTxMbps = toMbps(fallbackTxRate)
-  const fbStaticPeakMbps = isNumber(staticInfo?.io?.network_peak_mbps) && staticInfo.io.network_peak_mbps > 0
-    ? staticInfo.io.network_peak_mbps : null
+  const fbStaticPeak = staticInfo?.io?.network_peak_mbps
+  const fbStaticPeakMbps = isNumber(fbStaticPeak) && fbStaticPeak > 0 ? fbStaticPeak : null
   const fallbackRxUtil = isNumber(fbRxMbps) && isNumber(fbStaticPeakMbps) && fbStaticPeakMbps > 0 ? Math.min(fbRxMbps / fbStaticPeakMbps * 100, 100) : null
   const fallbackTxUtil = isNumber(fbTxMbps) && isNumber(fbStaticPeakMbps) && fbStaticPeakMbps > 0 ? Math.min(fbTxMbps / fbStaticPeakMbps * 100, 100) : null
   const fallbackUtilValues = [fallbackRxUtil, fallbackTxUtil].filter(isNumber)
@@ -2936,7 +2937,10 @@ export default function SystemOverview({ active }: Props) {
   )
 
   const diskStaticTotalText = useMemo(
-    () => (isNumber(staticInfo?.disk?.total_size_gb) ? `${staticInfo.disk.total_size_gb.toFixed(2)} GB` : 'N/A'),
+    () => {
+      const diskTotalGb = staticInfo?.disk?.total_size_gb
+      return isNumber(diskTotalGb) ? `${diskTotalGb.toFixed(2)} GB` : 'N/A'
+    },
     [staticInfo?.disk?.total_size_gb]
   )
 
@@ -3140,7 +3144,13 @@ export default function SystemOverview({ active }: Props) {
                 })(),
                 source: 'dynamic',
               },
-              { label: 'Swap', value: dynamicInfo?.memory?.swap_total_gb != null ? `${formatMetric(dynamicInfo.memory.swap_used_gb, 'GB', 1)} / ${dynamicInfo.memory.swap_total_gb.toFixed(1)} GB (${formatPercent(dynamicInfo.memory.swap_usage_percent)})` : 'N/A', source: 'dynamic' },
+              { label: 'Swap', value: (() => {
+                const mem = dynamicInfo?.memory
+                const swapTotal = mem?.swap_total_gb
+                return swapTotal != null
+                  ? `${formatMetric(mem?.swap_used_gb, 'GB', 1)} / ${swapTotal.toFixed(1)} GB (${formatPercent(mem?.swap_usage_percent)})`
+                  : 'N/A'
+              })(), source: 'dynamic' },
             ]}
             sparkMode={sparkMode}
             trendWindow={trendWindow}

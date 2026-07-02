@@ -665,8 +665,8 @@ function buildGpuTrendSeries(items: HistorySnapshotItem[]): GpuTrendSeries[] {
       // iGPU uses system memory; dGPU uses dedicated VRAM (keyed by card index in vram map)
       const vramEntry = dynamic.gpu?.vram?.[`card${index}`]
       const memUsage = integrated
-        ? normalizePercent(dynamic?.memory?.usage_percent)
-        : normalizePercent(vramEntry?.usage_percent ?? dynamic?.memory?.usage_percent)
+        ? normalizePercent(dynamic.memory?.usage_percent)
+        : normalizePercent(vramEntry?.usage_percent ?? dynamic.memory?.usage_percent)
 
       const point: GpuTrendPoint = {
         timestamp: label,

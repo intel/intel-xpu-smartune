@@ -2733,8 +2733,9 @@ export default function SystemOverview({ active }: Props) {
       ? `${dynamicInfo?.cpu?.per_core_usage?.length ?? 0} cores`
       : 'No data'
 
+  const staticMemory = staticInfo?.memory
+  const dynamicTotalGb = dynamicInfo?.memory?.total_gb
   const memorySnapshotMeta = useMemo(() => {
-    const staticMemory = staticInfo?.memory
     if (staticMemory) {
       const parts: string[] = []
       const totalGb = staticMemory.total_gb
@@ -2754,11 +2755,10 @@ export default function SystemOverview({ active }: Props) {
       else if (!memTypes.length) parts.push('DDR N/A')
       return parts.join(' | ')
     }
-    const dynamicTotalGb = dynamicInfo?.memory?.total_gb
     return (dynamicTotalGb != null && isNumber(dynamicTotalGb))
       ? `${dynamicTotalGb.toFixed(1)} GB total`
       : 'No data'
-  }, [staticInfo?.memory, dynamicInfo?.memory?.total_gb])
+  }, [staticMemory, dynamicTotalGb])
 
   // Build per-NIC render data
   const networkNicCards = useMemo(() => {
@@ -2870,7 +2870,8 @@ export default function SystemOverview({ active }: Props) {
   const networkPressurePct = dynamicInfo?.pressure?.network_busy_pct ?? null
   const networkBusyLevelLabel = dynamicInfo?.pressure?.network_busy_level ?? 'NO DATA'
 
-  const npuParsed = useMemo(() => parseNpuRaw(dynamicInfo?.npu?.npu_smi?.raw), [dynamicInfo?.npu?.npu_smi?.raw])
+  const npuSmiRaw = dynamicInfo?.npu?.npu_smi?.raw
+  const npuParsed = useMemo(() => parseNpuRaw(npuSmiRaw), [npuSmiRaw])
   const npuUtilValue = useMemo(() => {
     if (!dynamicInfo?.npu?.npu_smi?.available) return null
     return typeof npuParsed?.utilization_percent === 'number' ? normalizePercent(npuParsed?.utilization_percent as number) : null

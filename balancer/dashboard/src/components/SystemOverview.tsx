@@ -2728,32 +2728,34 @@ export default function SystemOverview({ active }: Props) {
   }, [staticInfo?.cpu?.freq_mhz])
 
   const cpuSnapshotMeta = staticInfo?.cpu?.model_name
-    ? `${staticInfo.cpu.core_count?.logical ?? 0} cores | ${cpuFreqRangeMeta} | ${staticInfo.cpu.model_name}`
-    : (dynamicInfo?.cpu?.per_core_usage?.length != null && dynamicInfo.cpu.per_core_usage.length > 0)
-      ? `${dynamicInfo.cpu.per_core_usage.length} cores`
+    ? `${staticInfo?.cpu?.core_count?.logical ?? 0} cores | ${cpuFreqRangeMeta} | ${staticInfo?.cpu?.model_name}`
+    : ((dynamicInfo?.cpu?.per_core_usage?.length ?? 0) > 0)
+      ? `${dynamicInfo?.cpu?.per_core_usage?.length ?? 0} cores`
       : 'No data'
 
   const memorySnapshotMeta = useMemo(() => {
-    if (staticInfo?.memory) {
+    const staticMemory = staticInfo?.memory
+    if (staticMemory) {
       const parts: string[] = []
-      if (isNumber(staticInfo.memory.total_gb)) parts.push(`${staticInfo.memory.total_gb.toFixed(1)} GB`)
+      if (isNumber(staticMemory.total_gb)) parts.push(`${staticMemory.total_gb.toFixed(1)} GB`)
       // Memory type (e.g. LPDDR5) from devices or ddr_speeds
       const memTypes = [...new Set(
-        (staticInfo.memory.devices?.devices ?? []).map((d) => d.type).filter(Boolean) as string[]
+        (staticMemory.devices?.devices ?? []).map((d) => d.type).filter(Boolean) as string[]
       )]
       if (memTypes.length) parts.push(memTypes.join('/'))
       // Prefer actual configured speed over rated speed
-      const firstDev = staticInfo.memory.devices?.devices?.[0]
+      const firstDev = staticMemory.devices?.devices?.[0]
       const configuredSpeed = firstDev?.configured_speed
       const speedStr = (configuredSpeed && configuredSpeed !== 'Unknown')
         ? configuredSpeed
-        : (staticInfo.memory.ddr_speeds?.length ? staticInfo.memory.ddr_speeds.join('/') : null)
+        : (staticMemory.ddr_speeds?.length ? staticMemory.ddr_speeds.join('/') : null)
       if (speedStr) parts.push(speedStr)
       else if (!memTypes.length) parts.push('DDR N/A')
       return parts.join(' | ')
     }
-    return (dynamicInfo?.memory?.total_gb != null && isNumber(dynamicInfo.memory.total_gb))
-      ? `${dynamicInfo.memory.total_gb.toFixed(1)} GB total`
+    const dynamicTotalGb = dynamicInfo?.memory?.total_gb
+    return isNumber(dynamicTotalGb)
+      ? `${dynamicTotalGb.toFixed(1)} GB total`
       : 'No data'
   }, [staticInfo?.memory, dynamicInfo?.memory?.total_gb])
 
@@ -2840,7 +2842,7 @@ export default function SystemOverview({ active }: Props) {
   const memoryUsagePct = normalizePercent(dynamicInfo?.memory?.usage_percent ?? null)
 
   // System pressure: use the weighted composite score from SystemPressureMonitor when available
-  const pressureScore = isNumber(dynamicInfo?.pressure?.score) ? (dynamicInfo.pressure.score as number) * 100 : null
+  const pressureScore = isNumber(dynamicInfo?.pressure?.score) ? (dynamicInfo?.pressure?.score as number) * 100 : null
   const pressureLevel = dynamicInfo?.pressure?.level ?? null
   const fallbackSystemPressure = isNumber(cpuUsagePct) && isNumber(memoryUsagePct)
     ? (cpuUsagePct + memoryUsagePct) / 2
@@ -2849,7 +2851,7 @@ export default function SystemOverview({ active }: Props) {
 
   // Disk IO: use is_disk_io_stressed data
   const diskIsStressed = dynamicInfo?.disk?.is_stressed ?? false
-  const diskIoWait = isNumber(dynamicInfo?.disk?.iowait) ? (dynamicInfo.disk.iowait as number) : null
+  const diskIoWait = isNumber(dynamicInfo?.disk?.iowait) ? (dynamicInfo?.disk?.iowait as number) : null
   // Disk IO pressure: read pre-computed values from backend
   const diskBusyNames = dynamicInfo?.disk?.busy_disks ?? []
   const diskTotalCount = dynamicInfo?.disk?.total_disks ?? 0

@@ -20,32 +20,206 @@ from controller.network import NetworkController
 from controller.io import IOController
 
 
-g_limited_apps = OrderedDict()  # tracks rate-limited apps
-g_limited_apps_manual = OrderedDict()  # tracks manually rate-limited apps
-g_app_id_mapping = {}  # {app_id: list[effective_app_id] | str} – list for multi-cgroup apps (set by set_resource_limit), str fallback for legacy paths
-g_extra_cgroup_ids: dict = {}  # {primary_effective_app_id: [extra_id, ...]} for multi-cgroup apps
-g_manual_limit_baseline: dict = {}  # {effective_app_id: peak usage snapshot} – persists across restore→limit cycles
-                                    # to prevent an artificially low second sample (caused by an active limit)
-                                    # from computing an even tighter cap on subsequent limit invocations
-is_limited_app_dominant = False  # whether the current top process is a previously-limited app
 IO_LIMIT_MBPS_THRESHOLD = 100
 IO_LIMIT_IOPS_THRESHOLD = 1000
 
-@dataclass
-class WorkloadGroup:
-    name: str
-    priority: int
-    cpu_weight: int
-    memory_min: int = 0
-    io_weight: int = 100
+
+class LimitRegistry:
+    """Runtime registry of every app currently under a resource limit.
+
+    Fields:
+      * auto_limited_apps     — apps limited automatically by the
+            pressure-driven loop.
+      * manual_limited_apps   — apps limited via the REST/UI manual API.
+            Kept separate from auto_limited_apps so the pressure loop
+            never restores or replaces a manual limit.
+      * app_id_to_cgroup_ids  — {public_app_id: list[effective_app_id] | str}.
+            Translates the public app id back to its primary cgroup id
+            (and any extras) when set_restore_resource fires.
+      * extra_cgroup_ids      — {primary_effective_app_id: [extra_id, ...]}
+            so restore loops can fan out to multi-cgroup apps.
+      * manual_limit_baseline — {effective_app_id: peak usage snapshot}
+            that persists across restore→limit cycles to keep the
+            manually-applied cap from tightening when a second sample
+            (taken under an active limit) reports a lower value than the
+            original peak.
+      * is_limited_app_dominant — True when the current top process is
+            one we already limited; the pressure loop reads this so it
+            doesn't count its own throttled traffic as fresh pressure.
+
+    Both auto_limited_apps and manual_limited_apps use the tuple shape
+    "(app_name, limit_rates, limit_parts, state)" where "state" is
+    "None" for fully limited and "partially_restored" after a
+    partial restore.
+    """
+
+    def __init__(self):
+        self.auto_limited_apps: "OrderedDict[str, tuple]" = OrderedDict()
+        self.manual_limited_apps: "OrderedDict[str, tuple]" = OrderedDict()
+        self.app_id_to_cgroup_ids: Dict[str, Any] = {}
+        self.extra_cgroup_ids: Dict[str, list] = {}
+        self.manual_limit_baseline: Dict[str, dict] = {}
+        self.is_limited_app_dominant: bool = False
 
 
 @dataclass
-class WorkloadTask:
-    workload: WorkloadGroup
-    params: Dict
-    pid: Optional[int] = None
-    task_id: str = ""
+class _MonitorLoopState:
+    """Per-loop runtime state for ``DynamicBalancer._run_monitor_resource_loop``.
+
+    Shared across the policy-specific tick methods so they can read and
+    mutate the same loop variables.
+    """
+    default_idle_check_interval: float
+    idle_check_interval: float
+    last_check_time: float = 0.0
+    last_network_sample_time: float = 0.0
+    network_sample_interval: float = 5.0          # network sampling interval (seconds)
+    top_consume_apps: list = None
+    reach_threshold: bool = False                 # some apps may have negligible resource usage; skip limiting them
+    restore_pending: bool = False                 # True when there are apps waiting to be restored
+    pressure_start_time: Optional[float] = None   # timestamp when pressure entered medium/low
+    current_pressure: Optional[str] = None        # current pressure level; used to detect stability
+    disk_io_not_stressed_start_time: Optional[float] = None  # timestamp when disk IO pressure was relieved
+    sustained_critical_iters: int = 0
+    prev_pressure: Optional[str] = None
+    current_time: float = 0.0
+
+    # Stability thresholds, kept on the state object so the tick methods
+    # can reach them directly.
+    STABLE_PERIOD: int = 1800                     # 30-minute stability period (seconds)
+    STABLE_DISK_IO_PERIOD: int = 300              # 5-minute disk IO stability period (seconds)
+
+    def __post_init__(self):
+        if self.top_consume_apps is None:
+            self.top_consume_apps = []
+
+    def reset(self) -> None:
+        """Clear transient state when the loop bails out of a tick."""
+        self.top_consume_apps = []
+        self.idle_check_interval = self.default_idle_check_interval
+        self.pressure_start_time = None
+
+
+class TopConsumerPrefetcher:
+    """Background-warmed cache of the top resource-consuming apps.
+
+    ``resource_monitor.get_top_resource_consumers()`` is a multi-second
+    CPU+IO+GPU sampling pipeline; running it inline at the moment pressure
+    hits ``critical`` would delay throttling by that same duration. This
+    class warms the answer asynchronously so the eventual critical-path
+    lookup returns immediately.
+
+    Pure cache, no autonomous behavior:
+      * Never schedules its own work — every fetch is triggered by an
+        explicit ``start(reason)`` call from the caller.
+      * Never inspects ``passive_resource_control`` — the caller is
+        responsible for skipping ``start()`` when auto-limit is off, so
+        that the multi-second sampling never runs without a consumer.
+
+    Allowed triggers from the pressure loop (each gated by the caller):
+      1. Rising-edge into ``high``       — ``reason="entering_high"``
+      2. Sustained-critical recheck      — ``reason="sustained_critical_recheck"``
+      3. Critical-state listener entry   — ``reason="critical_listener"``
+
+    Debounce (NOT a validity TTL): ``CACHE_TTL`` only suppresses repeat
+    ``start()`` calls fired within seconds of one another (e.g. rising-edge
+    followed by listener). ``resolve_for_critical()`` will happily return
+    cached data of any age — refresh is event-driven, not time-driven.
+
+    Cold-start fallback: ``resolve_for_critical()`` first returns cached
+    data; if empty, waits up to ``CRITICAL_WAIT`` for an in-flight
+    prefetch; only then falls back to a synchronous fetch (paying the
+    full sampling cost), so the first critical event after boot never
+    proceeds without top-consumer info.
+
+    Thread-safety: ``_lock`` guards the cache dict; ``_inflight`` is a
+    one-shot gate that prevents fetch storms when multiple triggers race.
+    """
+
+    CACHE_TTL = 5.0                       # rising-edge / listener debounce window (s)
+    CRITICAL_WAIT = 0.35                  # max wait for an in-flight prefetch on cold-start (s)
+    SUSTAINED_CRITICAL_REFRESH_ITERS = 5  # iters of sustained critical before background recheck
+
+    def __init__(self, fetch_top_consumers):
+        """
+        :param fetch_top_consumers: callable returning
+            ``(apps, reach_threshold)``; usually
+            ``resource_monitor.get_top_resource_consumers``.
+        """
+        self._fetch = fetch_top_consumers
+        self._cache = {"apps": [], "reach_threshold": False, "fetched_at": 0.0}
+        self._lock = threading.Lock()
+        self._inflight = threading.Event()
+
+    def start(self, reason: str) -> None:
+        """Kick off a background prefetch. No-op when one is already in
+        flight or when the cache was refreshed within ``CACHE_TTL``
+        seconds (back-to-back trigger debounce).
+
+        Caller is responsible for ensuring auto-limit is enabled before
+        invoking this — the cache has no other consumer.
+        """
+        if self._inflight.is_set():
+            logger.debug(f"Top-consumer prefetch skipped ({reason}): fetch already in flight")
+            return
+        with self._lock:
+            age = time.time() - self._cache["fetched_at"]
+            if self._cache["apps"] and age < self.CACHE_TTL:
+                logger.debug(f"Top-consumer prefetch skipped ({reason}): cache fresh, age={age:.2f}s")
+                return
+        self._inflight.set()
+        t0 = time.time()
+        logger.debug(f"Top-consumer prefetch started ({reason})")
+
+        def _worker():
+            try:
+                apps, threshold = self._fetch()
+                with self._lock:
+                    self._cache["apps"] = list(apps or [])
+                    self._cache["reach_threshold"] = bool(threshold)
+                    self._cache["fetched_at"] = time.time()
+                logger.debug(
+                    f"Top-consumer prefetch completed ({reason}): apps={len(apps)}, "
+                    f"reach_threshold={threshold}, took={time.time() - t0:.2f}s"
+                )
+            except Exception as e:
+                logger.warning(f"Top-consumer prefetch failed ({reason}): {e}")
+            finally:
+                self._inflight.clear()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def resolve_for_critical(self):
+        """Return ``(apps, reach_threshold)`` for the critical-path lookup.
+
+        Order of operations:
+          1. Return cached data immediately when present (any age).
+          2. Otherwise wait up to ``CRITICAL_WAIT`` for an in-flight
+             prefetch and return its result.
+          3. As a last resort, run a synchronous fetch — pays the full
+             multi-second sampling cost; only reached on cold-start
+             before any trigger has fired.
+        """
+        with self._lock:
+            apps = list(self._cache["apps"])
+            threshold = bool(self._cache["reach_threshold"])
+            age = time.time() - self._cache["fetched_at"]
+        if apps:
+            logger.debug(f"Critical resolve: using cached top (age={age:.2f}s, apps={len(apps)})")
+            return apps, threshold
+
+        if self._inflight.is_set():
+            logger.debug(f"Critical resolve: waiting up to {self.CRITICAL_WAIT}s for in-flight prefetch")
+            self._inflight.wait(self.CRITICAL_WAIT)
+            with self._lock:
+                apps = list(self._cache["apps"])
+                threshold = bool(self._cache["reach_threshold"])
+            if apps:
+                logger.debug(f"Critical resolve: got cache after wait (apps={len(apps)})")
+                return apps, threshold
+
+        logger.debug("Critical resolve: cache empty, falling back to synchronous fetch")
+        return self._fetch()
 
 
 class MaxPriorityQueue:
@@ -133,29 +307,27 @@ class DynamicBalancer:
     def __init__(self):
         self.bpf_monitor = AppIntercept("monitor/bpf_event.c")
         self.config = b_config
-        self.controlManager = self.bpf_monitor.controlManager
-        self.resource_monitor = self.controlManager.res
+        self.control_manager = self.bpf_monitor.control_manager
+        self.resource_monitor = self.control_manager.res
         self.io_ctl = IOController()
 
-        self.workload_groups = {}
-        self.running_tasks = {}
         self.known_pids = set()
 
         self.is_running = False
         self.app_detect_queue = JoinableQueue(1000000)
         self.app_priority_queue = MaxPriorityQueue()
+        # Runtime state for every app currently under a resource limit.
+        # See LimitRegistry for the full field list and tuple shape.
+        self.limits = LimitRegistry()
 
-        self._init_default_workloads()
+        # Background-warmed top-consumer cache. Pure cache; callers must
+        # gate ``start()`` on passive_resource_control being enabled —
+        # the fetch is a multi-second CPU+IO+GPU sampling pipeline.
+        self.top_prefetcher = TopConsumerPrefetcher(
+            self.resource_monitor.get_top_resource_consumers
+        )
 
         self.network_controller = NetworkController()
-
-    def _init_default_workloads(self):
-        default_groups = [
-            WorkloadGroup("critical", 100, 300, 2<<30, 500),
-            WorkloadGroup("high", 80, 200, 1<<30, 300),
-            WorkloadGroup("normal", 50, 100, 0, 200),
-            WorkloadGroup("best-effort", 20, 50, 0, 100)
-        ]
 
     def start(self):
         """
@@ -176,8 +348,65 @@ class DynamicBalancer:
         logger.info("Service started; worker threads are running")
 
     def _run_monitor_resource_loop(self):
+        """Main pressure-driven decision loop.
+
+        Each iteration:
+          1. Samples peak pressure (and disk-IO stress, in separated policy).
+          2. Warms the top-consumer cache on rising edges / sustained
+             critical, gated by ``passive_resource_control``.
+          3. Dispatches to the policy-specific tick method.
+          4. Runs the network tick.
+
+        Decision logic lives in ``_tick_separated_policy`` /
+        ``_tick_combined_policy``; this method only orchestrates.
+        """
         logger.info("Monitor resource service started")
-        global g_limited_apps, g_extra_cgroup_ids, is_limited_app_dominant
+        state = self._make_monitor_loop_state()
+        policy = self.config.limit_policy['policy']
+
+        self.control_manager.register_critical_state_listener(self._on_critical_state_changed)
+
+        while self.is_running:
+            try:
+                state.current_time = time.time()
+
+                _prc = self.config.passive_resource_control or {}
+                passive_enabled = bool(_prc.get('enabled', True))
+
+                if not self.app_priority_queue.empty() or (state.current_time - state.last_check_time) >= state.idle_check_interval:
+                    # Use consume_peak_pressure_level() instead of get_current_pressure_level()
+                    # so that transient "critical" spikes that occurred while the
+                    # idle_check_interval gate was closed are never silently dropped.
+                    if policy == "separated":
+                        pressure, _, is_disk_io_stressed = self.control_manager.consume_peak_pressure_level()
+                    else:  # policy == "combined"
+                        pressure, *_ = self.control_manager.consume_peak_pressure_level()
+                        is_disk_io_stressed = False
+
+                    state.last_check_time = state.current_time
+                    # Top-consumer prefetch / recheck only exist to warm the cache for the
+                    # auto-limit path.  When passive control is off we are not going to
+                    # apply any auto-limit, so skip the multi-second sampling pipeline.
+                    self._maybe_trigger_prefetch(state, pressure, passive_enabled)
+
+                    if policy == "separated":
+                        self._tick_separated_policy(state, pressure, is_disk_io_stressed, passive_enabled)
+                    elif policy == "combined":
+                        self._tick_combined_policy(state, pressure, passive_enabled)
+                    state.prev_pressure = pressure
+                self._run_network_tick(state)
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"Error in monitor loop: {str(e)}", exc_info=True)
+                state.reset()
+                time.sleep(1)
+
+        logger.info("Monitor resource service stopped")
+
+    def _make_monitor_loop_state(self) -> "_MonitorLoopState":
+        """Build the per-loop state object, clamping idle_check_interval
+        to the [min, max] window and emitting a warning when the config
+        value gets clamped."""
         _MIN_IDLE_CHECK = 2.0   # seconds – below this polling is too aggressive
         _MAX_IDLE_CHECK = 30.0  # seconds – above this response latency becomes unacceptable
         _raw_idle = float(getattr(self.config, "monitor_idle_check_interval", 10))
@@ -194,625 +423,577 @@ class DynamicBalancer:
                 "(allowed range [%.0fs, %.0fs], min=regular_update_sys_pressure_time=%.1fs)",
                 _raw_idle, default_idle_check_interval, _MIN_IDLE_CHECK, _MAX_IDLE_CHECK, _pressure_update,
             )
-        idle_check_interval = default_idle_check_interval
-        last_check_time = 0
-        last_network_sample_time = 0
-        network_sample_interval = 5  # network sampling interval (seconds)
-        top_consume_apps = []  # list of top-consuming apps
-        reach_threshold = False  # some apps may have negligible resource usage; skip limiting them
-        restore_pending = False  # True when there are apps waiting to be restored
-        pressure_start_time = None  # timestamp when pressure entered medium/low
-        current_pressure = None  # current pressure level; used to detect stability
-        STABLE_PERIOD = 1800  # 30-minute stability period (seconds)
-        disk_io_not_stressed_start_time = None  # timestamp when disk IO pressure was relieved
-        STABLE_DISK_IO_PERIOD = 300  # 5-minute disk IO stability period (seconds)
-        policy = self.config.limit_policy['policy']
-        # Top-consumer prefetch: only fired on rising edges (low/medium → high) and on
-        # critical-state listener entry. Sustained high/critical does NOT re-fetch.
-        top_consumer_cache = {"apps": [], "reach_threshold": False, "fetched_at": 0.0}
-        prefetch_lock = threading.Lock()
-        prefetch_inflight = threading.Event()
-        # Debounce window for back-to-back prefetch triggers (e.g. rising-edge fires
-        # then listener fires milliseconds later). NOT a validity TTL for the cached
-        # data — critical resolve uses the cache as long as it has data; explicit
-        # refresh comes from rising-edge / listener / sustained-critical recheck.
-        PREFETCH_CACHE_TTL = 5.0
-        CRITICAL_PREFETCH_WAIT = 0.35
-        # Sustained-critical recheck: after N consecutive critical iters, refresh top
-        # in background to detect a new dominant app (the originally-limited top1 may
-        # have settled but pressure persists because another app took over).
-        SUSTAINED_CRITICAL_REFRESH_ITERS = 5
-        sustained_critical_iters = 0
-        prev_pressure = None
+        return _MonitorLoopState(
+            default_idle_check_interval=default_idle_check_interval,
+            idle_check_interval=default_idle_check_interval,
+        )
 
-        def reset_state():
-            nonlocal top_consume_apps, idle_check_interval, pressure_start_time
-            top_consume_apps = []
-            idle_check_interval = default_idle_check_interval
-            pressure_start_time = None  # reset timer
+    def _on_critical_state_changed(self, is_critical: bool) -> None:
+        """Critical-state listener — backstops the rising-edge prefetch
+        when pressure jumps directly into critical from below the ``high``
+        band. Gates on ``passive_resource_control`` so the multi-second
+        top-consumer sampling is only paid when auto-limit will use it."""
+        if not is_critical:
+            return
+        prc = self.config.passive_resource_control or {}
+        if not bool(prc.get('enabled', True)):
+            logger.debug("Critical-state listener fired but passive control disabled: skipping prefetch")
+            return
+        logger.debug("Critical-state listener fired: triggering top-consumer prefetch")
+        self.top_prefetcher.start("critical_listener")
 
-        def _start_top_prefetch(reason):
-            # In-flight check first; cheap and avoids redundant fetch storms
-            if prefetch_inflight.is_set():
-                logger.debug(f"Top-consumer prefetch skipped ({reason}): fetch already in flight")
-                return
-            with prefetch_lock:
-                age = time.time() - top_consumer_cache["fetched_at"]
-                if top_consumer_cache["apps"] and age < PREFETCH_CACHE_TTL:
-                    logger.debug(f"Top-consumer prefetch skipped ({reason}): cache fresh, age={age:.2f}s")
-                    return
-            prefetch_inflight.set()
-            t0 = time.time()
-            logger.debug(f"Top-consumer prefetch started ({reason})")
+    def _maybe_trigger_prefetch(self, state: "_MonitorLoopState", pressure: str, passive_enabled: bool) -> None:
+        """Edge-trigger and sustained-critical recheck for the
+        top-consumer prefetch. No-op when passive_resource_control is
+        disabled (the multi-second sampling has no consumer in that case).
+        """
+        if not passive_enabled:
+            state.sustained_critical_iters = 0
+            return
 
-            def _worker():
-                try:
-                    apps, threshold = self.resource_monitor.get_top_resource_consumers()
-                    with prefetch_lock:
-                        top_consumer_cache["apps"] = list(apps or [])
-                        top_consumer_cache["reach_threshold"] = bool(threshold)
-                        top_consumer_cache["fetched_at"] = time.time()
-                    logger.debug(
-                        f"Top-consumer prefetch completed ({reason}): apps={len(apps)}, "
-                        f"reach_threshold={threshold}, took={time.time() - t0:.2f}s"
-                    )
-                except Exception as e:
-                    logger.warning(f"Top-consumer prefetch failed ({reason}): {e}")
-                finally:
-                    prefetch_inflight.clear()
+        # Edge trigger: prefetch whenever pressure enters the high band from
+        # any other state (low/medium below, critical above). This is the
+        # core mechanism — by the time we reach critical the cache is warm.
+        # Sustained high stays cached. The critical-state listener is a
+        # backstop for non-high→critical direct jumps.
+        if pressure == "high" and state.prev_pressure != "high":
+            logger.debug(
+                f"Pressure edge {state.prev_pressure}→high: triggering top-consumer prefetch"
+            )
+            self.top_prefetcher.start("entering_high")
 
-            threading.Thread(target=_worker, daemon=True).start()
-
-        def _resolve_top_for_critical():
-            # Cache is consumed without TTL — refresh is event-driven (rising edge,
-            # critical listener, sustained-critical recheck). Empty cache only at
-            # cold-start before any trigger fired, in which case wait for in-flight
-            # or fall back to synchronous fetch.
-            with prefetch_lock:
-                apps = list(top_consumer_cache["apps"])
-                threshold = bool(top_consumer_cache["reach_threshold"])
-                age = time.time() - top_consumer_cache["fetched_at"]
-            if apps:
-                logger.debug(f"Critical resolve: using cached top (age={age:.2f}s, apps={len(apps)})")
-                return apps, threshold
-
-            if prefetch_inflight.is_set():
-                logger.debug(f"Critical resolve: waiting up to {CRITICAL_PREFETCH_WAIT}s for in-flight prefetch")
-                prefetch_inflight.wait(CRITICAL_PREFETCH_WAIT)
-                with prefetch_lock:
-                    apps = list(top_consumer_cache["apps"])
-                    threshold = bool(top_consumer_cache["reach_threshold"])
-                if apps:
-                    logger.debug(f"Critical resolve: got cache after wait (apps={len(apps)})")
-                    return apps, threshold
-
-            logger.debug("Critical resolve: cache empty, falling back to synchronous fetch")
-            return self.resource_monitor.get_top_resource_consumers()
-
-        def _on_critical_state_changed(is_critical):
-            if is_critical:
-                # Skip the prefetch when passive control is off — _get_top_resource_consumers
-                # is a multi-second CPU+IO+GPU sampling pipeline whose only purpose is to
-                # feed the auto-limit decision, which is itself disabled.
-                prc = self.config.passive_resource_control or {}
-                if not bool(prc.get('enabled', True)):
-                    logger.debug("Critical-state listener fired but passive control disabled: skipping prefetch")
-                    return
-                logger.debug("Critical-state listener fired: triggering top-consumer prefetch")
-                _start_top_prefetch("critical_listener")
-
-        self.controlManager.register_critical_state_listener(_on_critical_state_changed)
-
-        def handle_network_operations():
-            nonlocal last_network_sample_time, current_time
-            if self.network_controller.enable_network_control:
-                self.network_controller.update_app_network_control()
-                self.network_controller.network.get_tc_class_stats(self.network_controller.IFB_DEV,
-                                                                   self.network_controller.handle_id + 1,
-                                                                   classids=self.network_controller.ingress_classids,
-                                                                   direction="ingress")
-                self.network_controller.network.get_tc_class_stats(self.network_controller.dev,
-                                                                   self.network_controller.handle_id,
-                                                                   classids=self.network_controller.egress_classids,
-                                                                   direction="egress")
-            self.network_controller.network.sample_network_pressure()
-            if current_time - last_network_sample_time >= network_sample_interval:
-                last_network_sample_time = current_time
-                network_data = self.network_controller.network.get_current_pressure()
-                tx_pressure, rx_pressure, *_ = self.controlManager.update_network_pressure_level(network_data)
-                tx_total_bw = self.network_controller.total_bw * network_data['tx']
-                rx_total_bw = self.network_controller.total_bw * network_data['rx']
+        # Sustained-critical recheck: if critical persists for N iters, the
+        # original top1 has had ample time to settle under its limit. Refresh
+        # top in background to catch a new dominant app that may have taken
+        # over. Counter resets whenever pressure drops out of critical.
+        if pressure == "critical":
+            state.sustained_critical_iters += 1
+            if state.sustained_critical_iters >= TopConsumerPrefetcher.SUSTAINED_CRITICAL_REFRESH_ITERS:
                 logger.debug(
-                    f"NetworkMonitor {self.network_controller.dev} TX level: {tx_pressure} (pressure: {network_data['tx']:.2f}),"
-                    f" RX level: {rx_pressure} (pressure: {network_data['rx']:.2f})")
-                if self.network_controller.enable_network_control:
-                    ingress_rates = self.network_controller.network.get_tc_class_stats_rate_ingress()
-                    egress_rates = self.network_controller.network.get_tc_class_stats_rate_egress()
-                    rates = self.network_controller.get_rates(self.network_controller.handle_id, egress_rates,
-                                                              ingress_rates)
-                    logger.debug(
-                        f"NetworkMonitor {self.network_controller.dev} TX_total_BW={tx_total_bw:,.2f}kbit/s (App Class BW: System - {rates['egress_system']:,.2f},"
-                        f" Critical - {rates['egress_critical']:,.2f} , High - {rates['egress_high']:,.2f}, Low - {rates['egress_low']:,.2f}),"
-                        f" RX_total_BW={rx_total_bw:,.2f}kbit/s (App Class BW: System - {rates['ingress_system']:,.2f},"
-                        f" Critical - {rates['ingress_critical']:,.2f} , High - {rates['ingress_high']:,.2f}, Low - {rates['ingress_low']:,.2f})")
-                    self.network_controller.handle_network_pressure(tx_pressure, rx_pressure, ingress_rates,
-                                                                    egress_rates, network_data)
-        while self.is_running:
-            try:
-                current_time = time.time()
+                    f"Sustained critical for {state.sustained_critical_iters} iters: "
+                    f"triggering background top-consumer recheck"
+                )
+                self.top_prefetcher.start("sustained_critical_recheck")
+                state.sustained_critical_iters = 0
+        else:
+            state.sustained_critical_iters = 0
 
-                _prc = self.config.passive_resource_control or {}
-                passive_enabled = bool(_prc.get('enabled', True))
+    def _drain_pending_app_queue(self, state: "_MonitorLoopState") -> None:
+        """Pop one pending app off ``app_priority_queue`` and resume it:
+        emit SIGCONT, flip DB status to "running", broadcast the SSE
+        callback, then reset loop state.
+        """
+        app_data, priority = self.app_priority_queue.get()
+        logger.info(
+            f"Starting app: {app_data['app_name']} (PID: {app_data['pid']}, Priority: {priority})")
+        os.kill(app_data['pid'], signal.SIGCONT)
+        app_utils.update_app_status(app_data['app_id'], "running")
+        app_utils.callback_manager.send_callback_notification({
+            'app_id': app_data['app_id'],
+            'app_name': app_data['app_name'],
+            'status': "running",
+            'purpose': "app"
+        }, True)
+        state.reset()
 
-                if not self.app_priority_queue.empty() or (current_time - last_check_time) >= idle_check_interval:
-                    # Use consume_peak_pressure_level() instead of get_current_pressure_level()
-                    # so that transient "critical" spikes that occurred while the
-                    # idle_check_interval gate was closed are never silently dropped.
-                    if policy == "separated":
-                        pressure, _, is_disk_io_stressed = self.controlManager.consume_peak_pressure_level()
-                    else:  # policy == "combined"
-                        pressure, *_ = self.controlManager.consume_peak_pressure_level()
-                        is_disk_io_stressed = False
+    def _update_dominant_flag_from_top(self, state: "_MonitorLoopState") -> None:
+        """Walk the prefetched top-consumer list and decide whether any
+        already-limited (and not yet partially-restored) app is the
+        current dominant resource consumer. Sets
+        ``self.limits.is_limited_app_dominant`` and pushes the flag down
+        into the control manager so PSI baselines compensate correctly.
+        """
+        for app_info in state.top_consume_apps:
+            current_app_id = (app_info.get('app') or {}).get('id')
+            if current_app_id in self.limits.auto_limited_apps:
+                _, _, _, app_state = self.limits.auto_limited_apps[current_app_id]
+                self.limits.is_limited_app_dominant = (app_state != "partially_restored")
+                break
+            else:
+                self.limits.is_limited_app_dominant = False
 
-                    last_check_time = current_time
-                    # Top-consumer prefetch / recheck only exist to warm the cache for the
-                    # auto-limit path.  When passive control is off we are not going to
-                    # apply any auto-limit, so skip the multi-second sampling pipeline.
-                    if passive_enabled:
-                        # Edge trigger: prefetch whenever pressure enters the high band from
-                        # any other state (low/medium below, critical above). This is the
-                        # core mechanism — by the time we reach critical the cache is warm.
-                        # Sustained high stays cached. The critical-state listener is a
-                        # backstop for non-high→critical direct jumps.
-                        if pressure == "high" and prev_pressure != "high":
-                            logger.debug(
-                                f"Pressure edge {prev_pressure}→high: triggering top-consumer prefetch"
+        logger.debug(f"Balance- was the process limited before? {self.limits.is_limited_app_dominant}")
+        self.control_manager.set_limited_app_dominant(self.limits.is_limited_app_dominant)
+
+    def _tick_separated_policy(
+        self,
+        state: "_MonitorLoopState",
+        pressure: str,
+        is_disk_io_stressed: bool,
+        passive_enabled: bool,
+    ) -> None:
+        """One iteration of the separated-policy state machine.
+
+        Three mutually-exclusive cases:
+          * critical pressure or disk-IO stress — apply or refresh limits
+          * pending app launches with no critical pressure — drain queue
+          * medium/low pressure with limited apps — staged restore
+        """
+        if passive_enabled and (pressure == "critical" or is_disk_io_stressed):
+            state.restore_pending = False
+
+            if not is_disk_io_stressed:
+                state.pressure_start_time = None
+                if not state.top_consume_apps:
+                    state.top_consume_apps, state.reach_threshold = self.top_prefetcher.resolve_for_critical()
+            else:
+                state.disk_io_not_stressed_start_time = None
+                state.top_consume_apps = self.resource_monitor.get_top_disk_io_consumers()
+                state.reach_threshold = True  # IO pressure always counts as threshold-crossing
+            if state.top_consume_apps:
+                self._update_dominant_flag_from_top(state)
+
+                if not is_disk_io_stressed:
+                    should_adjust, is_controlled, app_id, limit_rates = self._handle_critical_pressure(
+                        state.top_consume_apps, state.reach_threshold)
+                else:
+                    should_adjust, is_controlled, app_id, limit_rates = self._handle_disk_io_stressed(
+                        state.top_consume_apps)
+
+                if not self.limits.is_limited_app_dominant and state.reach_threshold and should_adjust and app_id:
+                    self._apply_resource_limits(
+                        state.top_consume_apps[0],
+                        app_id,
+                        limit_rates,
+                        is_controlled,
+                        is_disk_io_stressed=is_disk_io_stressed
+                    )
+
+                state.top_consume_apps.pop(0)
+            else:
+                state.reset()
+
+        elif not self.app_priority_queue.empty() and pressure != "critical" and not is_disk_io_stressed:
+            self._drain_pending_app_queue(state)
+        else:
+            self._tick_separated_restore(state, pressure, is_disk_io_stressed)
+
+    def _tick_separated_restore(
+        self,
+        state: "_MonitorLoopState",
+        pressure: str,
+        is_disk_io_stressed: bool,
+    ) -> None:
+        """Staged restore arm of the separated-policy tick.
+
+        Tracks two independent stability timers (pressure and disk-IO) and
+        runs partial / full restore on the head of ``auto_limited_apps``
+        once the relevant timer crosses ``STABLE_PERIOD`` /
+        ``STABLE_DISK_IO_PERIOD``.
+        """
+        if not (self.limits.auto_limited_apps and not state.restore_pending):
+            return
+
+        should_check_pressure = (pressure in ("medium", "low") and
+                                 any(app_data[2].get('cpu_mem_limited', False) for app_data in
+                                     self.limits.auto_limited_apps.values()))
+        should_check_io = (not is_disk_io_stressed and
+                           any(app_data[2].get('io_limited', False) for app_data in
+                               self.limits.auto_limited_apps.values()))
+        if not (should_check_pressure or should_check_io):
+            state.reset()
+            return
+
+        logger.info(f"pressure_start_time: {state.pressure_start_time}, "
+                    f"current_pressure: {state.current_pressure}, pressure: {pressure}")
+        if should_check_pressure:
+            if (state.pressure_start_time is None) or (state.current_pressure != pressure):
+                state.pressure_start_time = state.current_time
+                state.current_pressure = pressure
+                logger.info(
+                    f"Pressure level changed to {pressure}. "
+                    f"Will restore resources after {state.STABLE_PERIOD} sec if it remains stable.")
+
+        if should_check_io:
+            if state.disk_io_not_stressed_start_time is None:
+                state.disk_io_not_stressed_start_time = state.current_time
+                logger.info(
+                    f"Disk IO stress resolved. Will consider for restoration after {state.STABLE_DISK_IO_PERIOD} sec if it remains stable.")
+
+        pressure_stable = (should_check_pressure and
+                           (state.current_time - state.pressure_start_time >= state.STABLE_PERIOD))
+        io_stable = (should_check_io and
+                     (state.current_time - state.disk_io_not_stressed_start_time >= state.STABLE_DISK_IO_PERIOD))
+        io_double_stable = (should_check_io and
+                     (state.current_time - state.disk_io_not_stressed_start_time >= state.STABLE_DISK_IO_PERIOD * 2))
+
+        logger.info(f"pressure_stable: {pressure_stable}, io_stable: {io_stable}, io_double_stable: {io_double_stable}")
+
+        if pressure_stable and pressure == "medium":
+            state.restore_pending = True
+            app_id, (app_name, limit_rates, limit_parts, app_state) = next(
+                iter(self.limits.auto_limited_apps.items()))
+            if app_state != "partially_restored":
+                logger.info(
+                    f"Pressure remained at 'medium' for {state.STABLE_PERIOD} sec. "
+                    f"Partially restoring app {app_id}.")
+                if self.restore_resources(app_id, app_name, limit_rates, limit_parts, "partial"):
+                    self.limits.auto_limited_apps[app_id] = (
+                    app_name, limit_rates, limit_parts, "partially_restored")
+                else:
+                    logger.warning(f"Partial restore failed for {app_name}")
+                self.limits.auto_limited_apps.move_to_end(app_id)
+        elif io_stable and not io_double_stable:
+            state.restore_pending = True
+            app_id, (app_name, limit_rates, limit_parts, app_state) = next(
+                iter(self.limits.auto_limited_apps.items()))
+            if app_state != "partially_restored":
+                logger.info(f"Disk IO stress resolved. Partially restoring app {app_id}.")
+                if self.restore_resources(app_id, app_name, limit_rates, limit_parts, "partial"):
+                    self.limits.auto_limited_apps[app_id] = (
+                    app_name, limit_rates, limit_parts, "partially_restored")
+                else:
+                    logger.warning(f"Partial restore failed for {app_name}")
+                self.limits.auto_limited_apps.move_to_end(app_id)
+        elif (pressure_stable and pressure == "low") or io_double_stable:
+            state.restore_pending = True
+            app_id, (app_name, limit_rates, limit_parts, app_state) = next(
+                iter(self.limits.auto_limited_apps.items()))
+
+            success = self.restore_resources(app_id, app_name, limit_rates, limit_parts,
+                                             "full")
+            if success:
+                updated_limits = self.limits.auto_limited_apps[app_id][2]
+                is_fully_restored = not (
+                            updated_limits.get('cpu_mem_limited') or updated_limits.get('io_limited'))
+                if is_fully_restored:
+                    app_utils.update_app_status(app_id, "running")
+                    app_utils.callback_manager.send_callback_notification({
+                        'app_id': app_id,
+                        'app_name': app_name,
+                        'status': "running",
+                        'purpose': "app"
+                    }, False)
+                    self.limits.auto_limited_apps.pop(app_id, None)
+                    logger.info(f"Fully restored app {app_id}, removed from limited apps")
+
+                    if io_double_stable:
+                        state.disk_io_not_stressed_start_time = None
+                        logger.debug("Reset IO stress timer after full restoration")
+                else:
+                    self.limits.auto_limited_apps.move_to_end(app_id)
+                    logger.info(f"Partial restore for app {app_id}, moved to end of queue")
+            else:
+                logger.error(f"Failed to restore resources for app {app_id}")
+                self.limits.auto_limited_apps.move_to_end(app_id)
+        state.restore_pending = False
+
+    def _tick_combined_policy(
+        self,
+        state: "_MonitorLoopState",
+        pressure: str,
+        passive_enabled: bool,
+    ) -> None:
+        """One iteration of the combined-policy state machine.
+
+        Combined policy treats CPU/memory and disk-IO as a single pressure
+        signal, so there's no parallel disk-IO branch and no double-stable
+        timer. Three mutually-exclusive cases:
+          * critical pressure         — apply or refresh limits (CPU/Mem + IO together)
+          * pending app launches      — drain queue when pressure isn't critical
+          * medium/low pressure       — staged restore on a single timer
+        """
+        if passive_enabled and pressure == "critical":
+            state.pressure_start_time = None
+            state.restore_pending = False
+            if not state.top_consume_apps:
+                state.top_consume_apps, state.reach_threshold = self.top_prefetcher.resolve_for_critical()
+
+            if state.top_consume_apps:
+                self._update_dominant_flag_from_top(state)
+                should_adjust, is_controlled, app_id, limit_rates = self._handle_critical_pressure(
+                    state.top_consume_apps, state.reach_threshold)
+
+                if not self.limits.is_limited_app_dominant and state.reach_threshold and should_adjust and app_id:
+                    self._apply_combined_critical_limits(
+                        state.top_consume_apps[0], app_id, limit_rates, is_controlled
+                    )
+
+                state.top_consume_apps.pop(0)
+            else:
+                state.reset()
+        elif not self.app_priority_queue.empty() and pressure != "critical":
+            self._drain_pending_app_queue(state)
+        else:
+            self._tick_combined_restore(state, pressure)
+
+    def _apply_combined_critical_limits(
+        self,
+        target: dict,
+        app_id: str,
+        limit_rates: dict,
+        is_controlled: bool,
+    ) -> None:
+        """Apply combined-policy CPU/Memory + disk-IO limits to the
+        dominant top consumer.
+        """
+        app_name = target.get('process', {}).get('name') or ''
+        total_mem = self.resource_monitor.get_total_memory()
+        logger.info(f"Adjusting resources for app: {app_id}")
+        extra_cgroup_ids = target.get('extra_cgroups', [])
+        per_cg_mem_rss = target.get('per_cgroup_mem_rss', {})
+        per_cg_cpu = target.get('per_cgroup_cpu', {})
+
+        resource_limited = False
+        io_limited = False
+
+        cpu_rate = int(100 * limit_rates["cpu_rate"]) if limit_rates.get("cpu_rate") else None
+        mem_rate = int(total_mem * limit_rates["mem_rate"]) if limit_rates.get(
+            "mem_rate") else None
+
+        if (cpu_rate is not None or mem_rate is not None) and self.is_running:
+            if extra_cgroup_ids:
+                all_ids = [app_id] + extra_cgroup_ids
+                mem_dist = _split_proportionally(mem_rate, all_ids, per_cg_mem_rss)
+                cpu_dist = _split_proportionally(cpu_rate, all_ids, per_cg_cpu)
+                auto_limit = self.control_manager.adjust_resources(
+                    app_id, "critical",
+                    cpu_quota=cpu_dist.get(app_id, cpu_rate),
+                    mem_high=mem_dist.get(app_id, mem_rate),
+                )
+                if auto_limit:
+                    resource_limited = True
+                    logger.info(f"Successfully limited CPU/Memory for {app_name} ({app_id})")
+                else:
+                    logger.warning(f"Failed to limit CPU/Memory for {app_name} ({app_id})")
+                for extra_id in extra_cgroup_ids:
+                    ok = self.control_manager.adjust_resources(
+                        extra_id, "critical",
+                        cpu_quota=cpu_dist.get(extra_id, cpu_rate),
+                        mem_high=mem_dist.get(extra_id, mem_rate),
+                    )
+                    logger.info(
+                        f"{'Successfully limited' if ok else 'Failed to limit'} "
+                        f"CPU/Memory for extra cgroup {extra_id}"
+                    )
+            else:
+                auto_limit = self.control_manager.adjust_resources(
+                    app_id,
+                    "critical",
+                    cpu_quota=cpu_rate,
+                    mem_high=mem_rate,
+                )
+                if auto_limit:
+                    resource_limited = True
+                    logger.info(f"Successfully limited CPU/Memory for {app_name}")
+                else:
+                    logger.warning(f"Failed to limit CPU/Memory for {app_name}")
+
+        io_limits = limit_rates.get("disk_io_rate", {})
+        if io_limits and self.is_running:
+            limits = {
+                "default": {
+                    "rbps": io_limits['read'] * 1024 ** 2,
+                    "wbps": io_limits['write'] * 1024 ** 2,
+                    "wiops": io_limits['write_iops'],
+                    "riops": io_limits['read_iops']
+                }
+            }
+            io_limited = self.io_ctl.set_disk_io_throttle(
+                app_id,
+                limits=limits
+            )
+            if not io_limited:
+                logger.error(f"Failed to set write IO limit for {app_name}")
+            for extra_id in extra_cgroup_ids:
+                self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
+
+        if resource_limited or io_limited:
+            self.limits.auto_limited_apps[app_id] = (app_name, limit_rates, {
+                'cpu_mem_limited': resource_limited,
+                'io_limited': io_limited
+            }, None)
+            if extra_cgroup_ids:
+                self.limits.extra_cgroup_ids[app_id] = extra_cgroup_ids
+
+            if is_controlled:
+                app_utils.update_app_status(app_id, "limited")
+
+            app_utils.callback_manager.send_callback_notification({
+                'app_id': app_id,
+                'app_name': app_name,
+                'status': "limited",
+                'purpose': "app"
+            }, False)
+        else:
+            logger.warning(f"No resource limits successfully applied for {app_name}")
+
+    def _tick_combined_restore(self, state: "_MonitorLoopState", pressure: str) -> None:
+        """Staged restore arm of the combined-policy tick.
+
+        Single ``STABLE_PERIOD`` timer drives both partial (at medium) and
+        full (at low) restore on the head of ``auto_limited_apps``.
+        """
+        if not (self.limits.auto_limited_apps and not state.restore_pending):
+            return
+        if pressure not in ("medium", "low"):
+            state.reset()
+            return
+
+        if (state.pressure_start_time is None) or (state.current_pressure != pressure):
+            state.pressure_start_time = state.current_time
+            state.current_pressure = pressure
+            logger.info(
+                f"Pressure level changed to {pressure}. "
+                f"Will restore resources after {state.STABLE_PERIOD} sec if it remains stable."
+            )
+            return
+
+        if state.current_time - state.pressure_start_time < state.STABLE_PERIOD:
+            return
+
+        state.restore_pending = True
+
+        if pressure == "medium":
+            app_id, (app_name, limit_rates, limit_parts, app_state) = next(iter(self.limits.auto_limited_apps.items()))
+            if app_state != "partially_restored":
+                total_mem = self.resource_monitor.get_total_memory()
+                logger.info(
+                    f"Pressure remained at 'medium' for {state.STABLE_PERIOD} sec. "
+                    f"Partially restoring app {app_id} (twice the rate of limited resources)."
+                )
+                extra_ids = self.limits.extra_cgroup_ids.get(app_id, [])
+                restore_success = True
+
+                if limit_parts.get('cpu_mem_limited', False):
+                    cpu_restore = int(100 * limit_rates[
+                        "cpu_rate"] * 2) if "cpu_rate" in limit_rates else None
+                    mem_restore = int(total_mem * limit_rates[
+                        "mem_rate"] * 2) if "mem_rate" in limit_rates else None
+
+                    if (cpu_restore is not None or mem_restore is not None) and self.is_running:
+                        cpu_mem_restored = self.control_manager.adjust_resources(
+                            app_id,
+                            "medium",
+                            cpu_quota=cpu_restore,
+                            mem_high=mem_restore,
+                            is_restore=False,
+                        )
+                        if not cpu_mem_restored:
+                            logger.error(
+                                f"Failed to partially restore CPU/Memory for {app_name}")
+                            restore_success = False
+                        for extra_id in extra_ids:
+                            self.control_manager.adjust_resources(
+                                extra_id, "medium",
+                                cpu_quota=cpu_restore,
+                                mem_high=mem_restore,
+                                is_restore=False,
                             )
-                            _start_top_prefetch("entering_high")
 
-                        # Sustained-critical recheck: if critical persists for N iters, the
-                        # original top1 has had ample time to settle under its limit. Refresh
-                        # top in background to catch a new dominant app that may have taken
-                        # over. Counter resets whenever pressure drops out of critical.
-                        if pressure == "critical":
-                            sustained_critical_iters += 1
-                            if sustained_critical_iters >= SUSTAINED_CRITICAL_REFRESH_ITERS:
-                                logger.debug(
-                                    f"Sustained critical for {sustained_critical_iters} iters: "
-                                    f"triggering background top-consumer recheck"
-                                )
-                                _start_top_prefetch("sustained_critical_recheck")
-                                sustained_critical_iters = 0
-                        else:
-                            sustained_critical_iters = 0
-                    else:
-                        sustained_critical_iters = 0
+                if (limit_parts.get('io_limited', False) and "disk_io_rate" in limit_rates) and self.is_running:
+                    io_restored = True
+                    io_limits = limit_rates["disk_io_rate"]
 
-                    if policy == "separated":
-                        if passive_enabled and (pressure == "critical" or is_disk_io_stressed):
-                            restore_pending = False
+                    limits = {
+                        "default": {
+                            "rbps": io_limits['read'] * 2 * 1024 ** 2,
+                            "wbps": io_limits['write'] * 2 * 1024 ** 2,
+                            "wiops": io_limits['write_iops'] * 2,
+                            "riops": io_limits['read_iops'] * 2
+                        }
+                    }
+                    io_limited = self.io_ctl.set_disk_io_throttle(
+                        app_id,
+                        limits=limits
+                    )
 
-                            if not is_disk_io_stressed:
-                                pressure_start_time = None
-                                if not top_consume_apps:
-                                    top_consume_apps, reach_threshold = _resolve_top_for_critical()
-                            else:
-                                disk_io_not_stressed_start_time = None
-                                top_consume_apps = self.resource_monitor.get_top_disk_io_consumers()
-                                reach_threshold = True  # IO pressure always counts as threshold-crossing
-                            if top_consume_apps:
-                                for app_info in top_consume_apps:
-                                    current_app_id = (app_info.get('app') or {}).get('id')
+                    if not io_limited:
+                        logger.error(
+                            f"Failed to partially restore disk IO for {app_name}")
+                        io_restored = False
+                    for extra_id in extra_ids:
+                        self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
-                                    if current_app_id in g_limited_apps:
-                                        _, _, _, state = g_limited_apps[current_app_id]
-                                        is_limited_app_dominant = (state != "partially_restored")
-                                        break
-                                    else:
-                                        is_limited_app_dominant = False
+                    if not io_restored:
+                        restore_success = False
 
-                                logger.debug(f"Balance- was the process limited before? {is_limited_app_dominant}")
-                                self.controlManager.set_limited_app_dominant(is_limited_app_dominant)
+                if restore_success:
+                    self.limits.auto_limited_apps[app_id] = (
+                    app_name, limit_rates, limit_parts, "partially_restored")
+                else:
+                    logger.warning(f"Partial restore failed for {app_name}")
 
-                                if not is_disk_io_stressed:
-                                    should_adjust, is_controlled, app_id, limit_rates = self._handle_critical_pressure(
-                                        top_consume_apps, reach_threshold)
-                                else:
-                                    should_adjust, is_controlled, app_id, limit_rates = self._handle_disk_io_stressed(
-                                        top_consume_apps)
+                self.limits.auto_limited_apps.move_to_end(app_id)
+        else:  # pressure == "low"
+            app_id, (app_name, _, limit_parts, _) = self.limits.auto_limited_apps.popitem()
+            logger.info(
+                f"Pressure remained at 'low' for {state.STABLE_PERIOD} sec. "
+                f"Fully restoring app {app_id} (100% resources)."
+            )
 
-                                if not is_limited_app_dominant and reach_threshold and should_adjust and app_id:
-                                    self._apply_resource_limits(
-                                        top_consume_apps[0],
-                                        app_id,
-                                        limit_rates,
-                                        is_controlled,
-                                        is_disk_io_stressed=is_disk_io_stressed
-                                    )
+            restore_success = True
+            extra_ids = self.limits.extra_cgroup_ids.pop(app_id, [])
 
-                                top_consume_apps.pop(0)
+            if limit_parts.get('cpu_mem_limited', False) and self.is_running:
+                if not self.control_manager.adjust_resources(app_id, "low"):
+                    logger.error(f"Failed to fully restore CPU/Memory for {app_name}")
+                    restore_success = False
+                for extra_id in extra_ids:
+                    self.control_manager.adjust_resources(extra_id, "low")
 
-                            else:
-                                reset_state()
+            if limit_parts.get('io_limited', False) and self.is_running:
+                io_restored = True
 
-                        elif not self.app_priority_queue.empty() and pressure != "critical" and not is_disk_io_stressed:
-                            app_data, priority = self.app_priority_queue.get()
-                            logger.info(
-                                f"Starting app: {app_data['app_name']} (PID: {app_data['pid']}, Priority: {priority})")
-                            os.kill(app_data['pid'], signal.SIGCONT)
-                            app_utils.update_app_status(app_data['app_id'], "running")
-                            app_utils.callback_manager.send_callback_notification({
-                                'app_id': app_data['app_id'],
-                                'app_name': app_data['app_name'],
-                                'status': "running",
-                                'purpose': "app"
-                            }, True)
-                            reset_state()
-                        else:
-                            if g_limited_apps and not restore_pending:
-                                should_check_pressure = (pressure in ("medium", "low") and
-                                                         any(app_data[2].get('cpu_mem_limited', False) for app_data in
-                                                             g_limited_apps.values()))
-                                should_check_io = (not is_disk_io_stressed and
-                                                   any(app_data[2].get('io_limited', False) for app_data in
-                                                       g_limited_apps.values()))
-                                if should_check_pressure or should_check_io:
-                                    logger.info(f"pressure_start_time: {pressure_start_time}, "
-                                                f"current_pressure: {current_pressure}, pressure: {pressure}")
-                                    if should_check_pressure:
-                                        if (pressure_start_time is None) or (current_pressure != pressure):
-                                            pressure_start_time = current_time
-                                            current_pressure = pressure
-                                            logger.info(
-                                                f"Pressure level changed to {pressure}. "
-                                                f"Will restore resources after {STABLE_PERIOD} sec if it remains stable.")
+                if not self.io_ctl.restore_disk_io_throttle(app_id):
+                    logger.error(f"Failed to remove IO limits for {app_name}")
+                    io_restored = False
+                for extra_id in extra_ids:
+                    self.io_ctl.restore_disk_io_throttle(extra_id)
 
-                                    if should_check_io:
-                                        if disk_io_not_stressed_start_time is None:
-                                            disk_io_not_stressed_start_time = current_time
-                                            logger.info(
-                                                f"Disk IO stress resolved. Will consider for restoration after {STABLE_DISK_IO_PERIOD} sec if it remains stable.")
+                if not io_restored:
+                    restore_success = False
 
-                                    pressure_stable = (should_check_pressure and
-                                                       (current_time - pressure_start_time >= STABLE_PERIOD))
-                                    io_stable = (should_check_io and
-                                                 (current_time - disk_io_not_stressed_start_time >= STABLE_DISK_IO_PERIOD))
-                                    io_double_stable = (should_check_io and
-                                                 (current_time - disk_io_not_stressed_start_time >= STABLE_DISK_IO_PERIOD * 2))
+            if restore_success:
+                app_utils.update_app_status(app_id, "running")
+                app_utils.callback_manager.send_callback_notification({
+                    'app_id': app_id,
+                    'app_name': app_name,
+                    'status': "running",
+                    'purpose': "app"
+                }, False)
+            else:
+                logger.error(f"Failed to fully restore resources for {app_name}")
 
-                                    logger.info(f"pressure_stable: {pressure_stable}, io_stable: {io_stable}, io_double_stable: {io_double_stable}")
+        state.restore_pending = False
+        state.reset()  # reset timer and current pressure state
 
-                                    if pressure_stable and pressure == "medium":
-                                        restore_pending = True
-                                        app_id, (app_name, limit_rates, limit_parts, state) = next(
-                                            iter(g_limited_apps.items()))
-                                        if state != "partially_restored":
-                                            logger.info(
-                                                f"Pressure remained at 'medium' for {STABLE_PERIOD} sec. "
-                                                f"Partially restoring app {app_id}.")
-                                            if self.restore_resources(app_id, app_name, limit_rates, limit_parts, "partial"):
-                                                g_limited_apps[app_id] = (
-                                                app_name, limit_rates, limit_parts, "partially_restored")
-                                            else:
-                                                logger.warning(f"Partial restore failed for {app_name}")
-                                            g_limited_apps.move_to_end(app_id)
-                                    elif io_stable and not io_double_stable:
-                                        restore_pending = True
-                                        app_id, (app_name, limit_rates, limit_parts, state) = next(
-                                            iter(g_limited_apps.items()))
-                                        if state != "partially_restored":
-                                            logger.info(f"Disk IO stress resolved. Partially restoring app {app_id}.")
-                                            if self.restore_resources(app_id, app_name, limit_rates, limit_parts, "partial"):
-                                                g_limited_apps[app_id] = (
-                                                app_name, limit_rates, limit_parts, "partially_restored")
-                                            else:
-                                                logger.warning(f"Partial restore failed for {app_name}")
-                                            g_limited_apps.move_to_end(app_id)
-                                    elif (pressure_stable and pressure == "low") or io_double_stable:
-                                        restore_pending = True
-                                        app_id, (app_name, limit_rates, limit_parts, state) = next(
-                                            iter(g_limited_apps.items()))
-
-                                        success = self.restore_resources(app_id, app_name, limit_rates, limit_parts,
-                                                                         "full")
-                                        if success:
-                                            updated_limits = g_limited_apps[app_id][2]
-                                            is_fully_restored = not (
-                                                        updated_limits.get('cpu_mem_limited') or updated_limits.get('io_limited'))
-                                            if is_fully_restored:
-                                                app_utils.update_app_status(app_id, "running")
-                                                app_utils.callback_manager.send_callback_notification({
-                                                    'app_id': app_id,
-                                                    'app_name': app_name,
-                                                    'status': "running",
-                                                    'purpose': "app"
-                                                }, False)
-                                                g_limited_apps.pop(app_id, None)
-                                                logger.info(f"Fully restored app {app_id}, removed from limited apps")
-
-                                                if io_double_stable:
-                                                    disk_io_not_stressed_start_time = None
-                                                    logger.debug("Reset IO stress timer after full restoration")
-                                            else:
-                                                g_limited_apps.move_to_end(app_id)
-                                                logger.info(f"Partial restore for app {app_id}, moved to end of queue")
-                                        else:
-                                            logger.error(f"Failed to restore resources for app {app_id}")
-                                            g_limited_apps.move_to_end(app_id)
-                                    restore_pending = False
-                                else:
-                                    reset_state()
-                    elif policy == "combined":
-                        if passive_enabled and pressure == "critical":
-                            pressure_start_time = None
-                            restore_pending = False
-                            if not top_consume_apps:
-                                top_consume_apps, reach_threshold = _resolve_top_for_critical()
-
-                            if top_consume_apps:
-                                for app_info in top_consume_apps:
-                                    current_app_id = (app_info.get('app') or {}).get('id')
-
-                                    if current_app_id in g_limited_apps:
-                                        _, _, _, state = g_limited_apps[current_app_id]
-                                        is_limited_app_dominant = (state != "partially_restored")
-                                        break
-                                    else:
-                                        is_limited_app_dominant = False
-
-                                logger.debug(f"Balance- was the process limited before? {is_limited_app_dominant}")
-                                self.controlManager.set_limited_app_dominant(is_limited_app_dominant)
-                                should_adjust, is_controlled, app_id, limit_rates = self._handle_critical_pressure(
-                                    top_consume_apps, reach_threshold)
-
-                                if not is_limited_app_dominant and reach_threshold and should_adjust and app_id:
-                                    target = top_consume_apps[0]
-                                    app_name = target.get('process', {}).get('name') or ''
-                                    total_mem = self.resource_monitor.get_total_memory()
-                                    logger.info(f"Adjusting resources for app: {app_id}")
-                                    extra_cgroup_ids = target.get('extra_cgroups', [])
-                                    per_cg_mem_rss = target.get('per_cgroup_mem_rss', {})
-                                    per_cg_cpu = target.get('per_cgroup_cpu', {})
-
-                                    resource_limited = False
-                                    io_limited = False
-
-                                    cpu_rate = int(100 * limit_rates["cpu_rate"]) if limit_rates.get("cpu_rate") else None
-                                    mem_rate = int(total_mem * limit_rates["mem_rate"]) if limit_rates.get(
-                                        "mem_rate") else None
-
-                                    if (cpu_rate is not None or mem_rate is not None) and self.is_running:
-                                        if extra_cgroup_ids:
-                                            all_ids = [app_id] + extra_cgroup_ids
-                                            mem_dist = _split_proportionally(mem_rate, all_ids, per_cg_mem_rss)
-                                            cpu_dist = _split_proportionally(cpu_rate, all_ids, per_cg_cpu)
-                                            auto_limit = self.controlManager.adjust_resources(
-                                                app_id, "critical",
-                                                cpu_quota=cpu_dist.get(app_id, cpu_rate),
-                                                mem_high=mem_dist.get(app_id, mem_rate),
-                                            )
-                                            if auto_limit:
-                                                resource_limited = True
-                                                logger.info(f"Successfully limited CPU/Memory for {app_name} ({app_id})")
-                                            else:
-                                                logger.warning(f"Failed to limit CPU/Memory for {app_name} ({app_id})")
-                                            for extra_id in extra_cgroup_ids:
-                                                ok = self.controlManager.adjust_resources(
-                                                    extra_id, "critical",
-                                                    cpu_quota=cpu_dist.get(extra_id, cpu_rate),
-                                                    mem_high=mem_dist.get(extra_id, mem_rate),
-                                                )
-                                                logger.info(
-                                                    f"{'Successfully limited' if ok else 'Failed to limit'} "
-                                                    f"CPU/Memory for extra cgroup {extra_id}"
-                                                )
-                                        else:
-                                            auto_limit = self.controlManager.adjust_resources(
-                                                app_id,
-                                                "critical",
-                                                cpu_quota=cpu_rate,
-                                                mem_high=mem_rate,
-                                            )
-                                            if auto_limit:
-                                                resource_limited = True
-                                                logger.info(f"Successfully limited CPU/Memory for {app_name}")
-                                            else:
-                                                logger.warning(f"Failed to limit CPU/Memory for {app_name}")
-
-                                    io_limits = limit_rates.get("disk_io_rate", {})
-                                    if io_limits and self.is_running:
-                                        limits = {
-                                            "default": {
-                                                "rbps": io_limits['read'] * 1024 ** 2,
-                                                "wbps": io_limits['write'] * 1024 ** 2,
-                                                "wiops": io_limits['write_iops'],
-                                                "riops": io_limits['read_iops']
-                                            }
-                                        }
-                                        io_limited = self.io_ctl.set_disk_io_throttle(
-                                            app_id,
-                                            limits=limits
-                                        )
-                                        if not io_limited:
-                                            logger.error(f"Failed to set write IO limit for {app_name}")
-                                        for extra_id in extra_cgroup_ids:
-                                            self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
-
-                                    if resource_limited or io_limited:
-                                        g_limited_apps[app_id] = (app_name, limit_rates, {
-                                            'cpu_mem_limited': resource_limited,
-                                            'io_limited': io_limited
-                                        }, None)
-                                        if extra_cgroup_ids:
-                                            g_extra_cgroup_ids[app_id] = extra_cgroup_ids
-
-                                        if is_controlled:
-                                            app_utils.update_app_status(app_id, "limited")
-
-                                        app_utils.callback_manager.send_callback_notification({
-                                            'app_id': app_id,
-                                            'app_name': app_name,
-                                            'status': "limited",
-                                            'purpose': "app"
-                                        }, False)
-                                    else:
-                                        logger.warning(f"No resource limits successfully applied for {app_name}")
-
-                                top_consume_apps.pop(0)
-
-                            else:
-                                reset_state()
-                        elif not self.app_priority_queue.empty() and pressure != "critical":
-                            app_data, priority = self.app_priority_queue.get()
-                            logger.info(
-                                f"Starting app: {app_data['app_name']} (PID: {app_data['pid']}, Priority: {priority})")
-                            os.kill(app_data['pid'], signal.SIGCONT)
-                            app_utils.update_app_status(app_data['app_id'], "running")
-                            app_utils.callback_manager.send_callback_notification({
-                                'app_id': app_data['app_id'],
-                                'app_name': app_data['app_name'],
-                                'status': "running",
-                                'purpose': "app"
-                            }, True)
-                            reset_state()
-                        else:
-                            if g_limited_apps and not restore_pending:
-                                if pressure in ("medium", "low"):
-                                    if (pressure_start_time is None) or (current_pressure != pressure):
-                                        pressure_start_time = current_time
-                                        current_pressure = pressure
-                                        logger.info(
-                                            f"Pressure level changed to {pressure}. "
-                                            f"Will restore resources after {STABLE_PERIOD} sec if it remains stable."
-                                        )
-
-                                    elif current_time - pressure_start_time >= STABLE_PERIOD:
-                                        restore_pending = True
-
-                                        if pressure == "medium":
-                                            app_id, (app_name, limit_rates, limit_parts, state) = next(iter(g_limited_apps.items()))
-                                            if state != "partially_restored":
-                                                total_mem = self.resource_monitor.get_total_memory()
-                                                logger.info(
-                                                    f"Pressure remained at 'medium' for {STABLE_PERIOD} sec. "
-                                                    f"Partially restoring app {app_id} (twice the rate of limited resources)."
-                                                )
-                                                extra_ids = g_extra_cgroup_ids.get(app_id, [])
-                                                restore_success = True
-
-                                                if limit_parts.get('cpu_mem_limited', False):
-                                                    cpu_restore = int(100 * limit_rates[
-                                                        "cpu_rate"] * 2) if "cpu_rate" in limit_rates else None
-                                                    mem_restore = int(total_mem * limit_rates[
-                                                        "mem_rate"] * 2) if "mem_rate" in limit_rates else None
-
-                                                    if (cpu_restore is not None or mem_restore is not None) and self.is_running:
-                                                        cpu_mem_restored = self.controlManager.adjust_resources(
-                                                            app_id,
-                                                            "medium",
-                                                            cpu_quota=cpu_restore,
-                                                            mem_high=mem_restore,
-                                                            is_restore=False,
-                                                        )
-                                                        if not cpu_mem_restored:
-                                                            logger.error(
-                                                                f"Failed to partially restore CPU/Memory for {app_name}")
-                                                            restore_success = False
-                                                        for extra_id in extra_ids:
-                                                            self.controlManager.adjust_resources(
-                                                                extra_id, "medium",
-                                                                cpu_quota=cpu_restore,
-                                                                mem_high=mem_restore,
-                                                                is_restore=False,
-                                                            )
-
-                                                if (limit_parts.get('io_limited', False) and "disk_io_rate" in limit_rates) and self.is_running:
-                                                    io_restored = True
-                                                    io_limits = limit_rates["disk_io_rate"]
-
-                                                    limits = {
-                                                        "default": {
-                                                            "rbps": io_limits['read'] * 2 * 1024 ** 2,
-                                                            "wbps": io_limits['write'] * 2 * 1024 ** 2,
-                                                            "wiops": io_limits['write_iops'] * 2,
-                                                            "riops": io_limits['read_iops'] * 2
-                                                        }
-                                                    }
-                                                    io_limited = self.io_ctl.set_disk_io_throttle(
-                                                        app_id,
-                                                        limits=limits
-                                                    )
-
-                                                    if not io_limited:
-                                                        logger.error(
-                                                            f"Failed to partially restore disk IO for {app_name}")
-                                                        io_restored = False
-                                                    for extra_id in extra_ids:
-                                                        self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
-
-                                                    if not io_restored:
-                                                        restore_success = False
-
-                                                if restore_success:
-                                                    g_limited_apps[app_id] = (
-                                                    app_name, limit_rates, limit_parts, "partially_restored")
-                                                else:
-                                                    logger.warning(f"Partial restore failed for {app_name}")
-
-                                                g_limited_apps.move_to_end(app_id)
-                                        else:  # pressure == "low"
-                                            app_id, (app_name, _, limit_parts, _) = g_limited_apps.popitem()
-                                            logger.info(
-                                                f"Pressure remained at 'low' for {STABLE_PERIOD} sec. "
-                                                f"Fully restoring app {app_id} (100% resources)."
-                                            )
-
-                                            restore_success = True
-                                            extra_ids = g_extra_cgroup_ids.pop(app_id, [])
-
-                                            if limit_parts.get('cpu_mem_limited', False) and self.is_running:
-                                                if not self.controlManager.adjust_resources(app_id, "low"):
-                                                    logger.error(f"Failed to fully restore CPU/Memory for {app_name}")
-                                                    restore_success = False
-                                                for extra_id in extra_ids:
-                                                    self.controlManager.adjust_resources(extra_id, "low")
-
-                                            if limit_parts.get('io_limited', False) and self.is_running:
-                                                io_restored = True
-
-                                                if not self.io_ctl.restore_disk_io_throttle(app_id):
-                                                    logger.error(f"Failed to remove IO limits for {app_name}")
-                                                    io_restored = False
-                                                for extra_id in extra_ids:
-                                                    self.io_ctl.restore_disk_io_throttle(extra_id)
-
-                                                if not io_restored:
-                                                    restore_success = False
-
-                                            if restore_success:
-                                                app_utils.update_app_status(app_id, "running")
-                                                app_utils.callback_manager.send_callback_notification({
-                                                    'app_id': app_id,
-                                                    'app_name': app_name,
-                                                    'status': "running",
-                                                    'purpose': "app"
-                                                }, False)
-                                            else:
-                                                logger.error(f"Failed to fully restore resources for {app_name}")
-
-                                        restore_pending = False
-                                        reset_state()  # reset timer and current pressure state
-                                else:
-                                    reset_state()
-                    prev_pressure = pressure
-                handle_network_operations()
-                time.sleep(1)
-            except Exception as e:
-                logger.error(f"Error in monitor loop: {str(e)}", exc_info=True)
-                reset_state()
-                time.sleep(1)
-
-        logger.info("Monitor resource service stopped")
+    def _run_network_tick(self, state: "_MonitorLoopState") -> None:
+        """Network sampling + handling. Runs every iteration (regardless
+        of ``idle_check_interval``) so traffic pressure stays current.
+        """
+        if self.network_controller.enable_network_control:
+            self.network_controller.update_app_network_control()
+            self.network_controller.network.get_tc_class_stats(self.network_controller.IFB_DEV,
+                                                               self.network_controller.handle_id + 1,
+                                                               classids=self.network_controller.ingress_classids,
+                                                               direction="ingress")
+            self.network_controller.network.get_tc_class_stats(self.network_controller.dev,
+                                                               self.network_controller.handle_id,
+                                                               classids=self.network_controller.egress_classids,
+                                                               direction="egress")
+        self.network_controller.network.sample_network_pressure()
+        if state.current_time - state.last_network_sample_time >= state.network_sample_interval:
+            state.last_network_sample_time = state.current_time
+            network_data = self.network_controller.network.get_current_pressure()
+            tx_pressure, rx_pressure, *_ = self.control_manager.update_network_pressure_level(network_data)
+            tx_total_bw = self.network_controller.total_bw * network_data['tx']
+            rx_total_bw = self.network_controller.total_bw * network_data['rx']
+            logger.debug(
+                f"NetworkMonitor {self.network_controller.dev} TX level: {tx_pressure} (pressure: {network_data['tx']:.2f}),"
+                f" RX level: {rx_pressure} (pressure: {network_data['rx']:.2f})")
+            if self.network_controller.enable_network_control:
+                ingress_rates = self.network_controller.network.get_tc_class_stats_rate_ingress()
+                egress_rates = self.network_controller.network.get_tc_class_stats_rate_egress()
+                rates = self.network_controller.get_rates(self.network_controller.handle_id, egress_rates,
+                                                          ingress_rates)
+                logger.debug(
+                    f"NetworkMonitor {self.network_controller.dev} TX_total_BW={tx_total_bw:,.2f}kbit/s (App Class BW: System - {rates['egress_system']:,.2f},"
+                    f" Critical - {rates['egress_critical']:,.2f} , High - {rates['egress_high']:,.2f}, Low - {rates['egress_low']:,.2f}),"
+                    f" RX_total_BW={rx_total_bw:,.2f}kbit/s (App Class BW: System - {rates['ingress_system']:,.2f},"
+                    f" Critical - {rates['ingress_critical']:,.2f} , High - {rates['ingress_high']:,.2f}, Low - {rates['ingress_low']:,.2f})")
+                self.network_controller.handle_network_pressure(tx_pressure, rx_pressure, ingress_rates,
+                                                                egress_rates, network_data)
 
     def _run_handle_loop(self):
         logger.info("Resource handle service is wait for processing")
@@ -864,7 +1045,6 @@ class DynamicBalancer:
 
     def _apply_resource_limits(self, target_app, app_id, limit_rates, is_controlled, is_disk_io_stressed=False):
         """Apply resource limits (common logic)."""
-        global g_extra_cgroup_ids
         app_name = target_app.get('process', {}).get('name') or ''
         total_mem = self.resource_monitor.get_total_memory()
         logger.info(f"Adjusting resources for app: {app_id}")
@@ -885,7 +1065,7 @@ class DynamicBalancer:
                     all_ids = [app_id] + extra_cgroup_ids
                     mem_dist = _split_proportionally(mem_rate, all_ids, per_cg_mem_rss)
                     cpu_dist = _split_proportionally(cpu_rate, all_ids, per_cg_cpu)
-                    primary_ok = self.controlManager.adjust_resources(
+                    primary_ok = self.control_manager.adjust_resources(
                         app_id, "critical",
                         cpu_quota=cpu_dist.get(app_id, cpu_rate),
                         mem_high=mem_dist.get(app_id, mem_rate),
@@ -894,7 +1074,7 @@ class DynamicBalancer:
                         resource_limited = True
                         logger.info(f"Successfully limited CPU/Memory for {app_name} ({app_id})")
                     for extra_id in extra_cgroup_ids:
-                        ok = self.controlManager.adjust_resources(
+                        ok = self.control_manager.adjust_resources(
                             extra_id, "critical",
                             cpu_quota=cpu_dist.get(extra_id, cpu_rate),
                             mem_high=mem_dist.get(extra_id, mem_rate),
@@ -904,7 +1084,7 @@ class DynamicBalancer:
                             f"CPU/Memory for extra cgroup {extra_id}"
                         )
                 else:
-                    auto_limit = self.controlManager.adjust_resources(
+                    auto_limit = self.control_manager.adjust_resources(
                         app_id,
                         "critical",
                         cpu_quota=cpu_rate,
@@ -932,14 +1112,14 @@ class DynamicBalancer:
                     self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
         if resource_limited or io_limited:
-            g_limited_apps[app_id] = (
+            self.limits.auto_limited_apps[app_id] = (
                 app_name,
                 limit_rates,
                 {'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
                 None  # None indicates fully limited
             )
             if extra_cgroup_ids:
-                g_extra_cgroup_ids[app_id] = extra_cgroup_ids
+                self.limits.extra_cgroup_ids[app_id] = extra_cgroup_ids
 
             if is_controlled:
                 app_utils.update_app_status(app_id, "limited")
@@ -961,9 +1141,8 @@ class DynamicBalancer:
         :param restore_type: restore scope ("partial" or "full")
         :return: (success, restored_parts)
         """
-        global g_limited_apps, g_extra_cgroup_ids
         restore_success = True
-        extra_ids = g_extra_cgroup_ids.get(app_id, [])
+        extra_ids = self.limits.extra_cgroup_ids.get(app_id, [])
 
         if self.is_running:
             if limit_parts.get('cpu_mem_limited', False):
@@ -971,27 +1150,27 @@ class DynamicBalancer:
                     cpu_restore = int(100 * limit_rates["cpu_rate"] * 2) if "cpu_rate" in limit_rates else None
                     mem_restore = int(self.resource_monitor.get_total_memory() * limit_rates[
                         "mem_rate"] * 2) if "mem_rate" in limit_rates else None
-                    if not self.controlManager.adjust_resources(
+                    if not self.control_manager.adjust_resources(
                         app_id, "medium", cpu_quota=cpu_restore, mem_high=mem_restore, is_restore=False
                     ):
                         logger.error(f"Failed to partially restore CPU/Memory for {app_name}")
                         restore_success = False
                     for extra_id in extra_ids:
-                        self.controlManager.adjust_resources(
+                        self.control_manager.adjust_resources(
                             extra_id, "medium", cpu_quota=cpu_restore, mem_high=mem_restore, is_restore=False
                         )
                 else:  # full restore
-                    cpu_mem_restored = self.controlManager.adjust_resources(app_id, "low")
+                    cpu_mem_restored = self.control_manager.adjust_resources(app_id, "low")
                     if not cpu_mem_restored:
                         logger.error(f"Failed to fully restore CPU/Memory for {app_name}")
                         restore_success = False
                     else:
-                        g_limited_apps[app_id] = (app_name, limit_rates, {
+                        self.limits.auto_limited_apps[app_id] = (app_name, limit_rates, {
                             'cpu_mem_limited': False,
                             'io_limited': limit_parts['io_limited']
                         }, None)
                     for extra_id in extra_ids:
-                        self.controlManager.adjust_resources(extra_id, "low")
+                        self.control_manager.adjust_resources(extra_id, "low")
             if limit_parts.get('io_limited', False):
                 if restore_type == "partial" and "disk_io_rate" in limit_rates:
                     io_limits = limit_rates["disk_io_rate"]
@@ -1013,14 +1192,14 @@ class DynamicBalancer:
                         logger.error(f"Failed to fully restore disk IO for {app_name}")
                         restore_success = False
                     else:
-                        g_limited_apps[app_id] = (app_name, limit_rates, {
+                        self.limits.auto_limited_apps[app_id] = (app_name, limit_rates, {
                             'cpu_mem_limited': limit_parts['cpu_mem_limited'],
                             'io_limited': False
                         }, None)
                     for extra_id in extra_ids:
                         self.io_ctl.restore_disk_io_throttle(extra_id)
             if restore_type == "full":
-                g_extra_cgroup_ids.pop(app_id, None)
+                self.limits.extra_cgroup_ids.pop(app_id, None)
 
         return restore_success
 
@@ -1119,32 +1298,31 @@ class DynamicBalancer:
 
     def restore_all_limited_apps_resources(self):
         """Restore all limited apps resources"""
-        global g_limited_apps, g_limited_apps_manual, g_extra_cgroup_ids, g_manual_limit_baseline
-        if not g_limited_apps and not g_limited_apps_manual:
+        if not self.limits.auto_limited_apps and not self.limits.manual_limited_apps:
             logger.info("No limited apps to restore")
             return
 
         logger.info(
-            f"Restoring resources for {len(g_limited_apps)} limited apps and "
-            f"{len(g_limited_apps_manual)} manual limited apps")
+            f"Restoring resources for {len(self.limits.auto_limited_apps)} limited apps and "
+            f"{len(self.limits.manual_limited_apps)} manual limited apps")
 
         all_limited_apps = {}
-        all_limited_apps.update(g_limited_apps)
-        all_limited_apps.update(g_limited_apps_manual)
+        all_limited_apps.update(self.limits.auto_limited_apps)
+        all_limited_apps.update(self.limits.manual_limited_apps)
 
         for app_id, (app_name, _, limit_parts, _) in list(all_limited_apps.items()):
             try:
-                app_source = "manual" if app_id in g_limited_apps_manual else "auto"
+                app_source = "manual" if app_id in self.limits.manual_limited_apps else "auto"
                 logger.info(f"Restoring resources for {app_source} limited app: {app_id}, name: {app_name}")
                 restore_success = True
-                extra_ids = g_extra_cgroup_ids.pop(app_id, [])
+                extra_ids = self.limits.extra_cgroup_ids.pop(app_id, [])
 
                 if limit_parts.get('cpu_mem_limited', False):
-                    if not self.controlManager.adjust_resources(app_id, "low"):
+                    if not self.control_manager.adjust_resources(app_id, "low"):
                         logger.error(f"Failed to restore CPU/Memory for {app_source} limited app {app_id}")
                         restore_success = False
                     for extra_id in extra_ids:
-                        self.controlManager.adjust_resources(extra_id, "low")
+                        self.control_manager.adjust_resources(extra_id, "low")
 
                 if limit_parts.get('io_limited', False):
                     if not self.io_ctl.restore_disk_io_throttle(app_id):
@@ -1158,9 +1336,9 @@ class DynamicBalancer:
             except Exception as e:
                 logger.error(f"Failed to restore resources for app {app_id}: {str(e)}")
             finally:
-                g_limited_apps.pop(app_id, None)
-                g_limited_apps_manual.pop(app_id, None)
-                g_manual_limit_baseline.pop(app_id, None)
+                self.limits.auto_limited_apps.pop(app_id, None)
+                self.limits.manual_limited_apps.pop(app_id, None)
+                self.limits.manual_limit_baseline.pop(app_id, None)
 
         logger.info("All limited apps resources restoration completed")
 
@@ -1421,8 +1599,6 @@ class DynamicBalancer:
             limit_overrides: Optional[Dict[str, Any]] = None
     ) -> bool:
         """Set resource limits for an application (balanced policy)."""
-        global g_limited_apps_manual, g_app_id_mapping, g_extra_cgroup_ids, g_manual_limit_baseline
-
         priority = priority or "undefined"
         if isinstance(limit_overrides, dict):
             try:
@@ -1457,7 +1633,7 @@ class DynamicBalancer:
         io_read_iops = usage.get("io_read_iops", 0)
         io_write_iops = usage.get("io_write_iops", 0)
 
-        baseline = g_manual_limit_baseline.get(effective_app_id, {})
+        baseline = self.limits.manual_limit_baseline.get(effective_app_id, {})
         if baseline:
             raw_cpu_percent = max(raw_cpu_percent, baseline.get("cpu_percent", 0))
             mem_current = max(mem_current, baseline.get("mem_total", 0))
@@ -1533,19 +1709,19 @@ class DynamicBalancer:
                 all_ids = [effective_app_id] + extra_effective_ids
                 mem_dist = _split_proportionally(mem_high, all_ids, per_cg_mem)
                 cpu_dist = _split_proportionally(cpu_quota, all_ids, per_cg_cpu_delta)
-                primary_ok = self.controlManager.adjust_resources(
+                primary_ok = self.control_manager.adjust_resources(
                     effective_app_id, "critical",
                     cpu_quota=cpu_dist.get(effective_app_id, cpu_quota),
                     mem_high=mem_dist.get(effective_app_id, mem_high),
                 )
                 if primary_ok:
                     resource_limited = True
-                    self.controlManager.set_limited_app_dominant(True)
+                    self.control_manager.set_limited_app_dominant(True)
                     logger.info(f"Successfully set CPU/Memory limits for {app_name} ({effective_app_id})")
                 else:
                     logger.error(f"Failed to set CPU/Memory limits for {app_name} ({effective_app_id})")
                 for extra_id in extra_effective_ids:
-                    ok = self.controlManager.adjust_resources(
+                    ok = self.control_manager.adjust_resources(
                         extra_id, "critical",
                         cpu_quota=cpu_dist.get(extra_id, cpu_quota),
                         mem_high=mem_dist.get(extra_id, mem_high),
@@ -1555,13 +1731,13 @@ class DynamicBalancer:
                         f"CPU/Memory limits for extra cgroup {extra_id}"
                     )
             else:
-                if self.controlManager.adjust_resources(
+                if self.control_manager.adjust_resources(
                         effective_app_id, "critical",
                         cpu_quota=cpu_quota,
                         mem_high=mem_high
                 ):
                     resource_limited = True
-                    self.controlManager.set_limited_app_dominant(True)
+                    self.control_manager.set_limited_app_dominant(True)
                     logger.info(f"Successfully set CPU/Memory limits for {app_name} ({effective_app_id})")
                 else:
                     logger.error(f"Failed to set CPU/Memory limits for {app_name} ({effective_app_id})")
@@ -1583,18 +1759,18 @@ class DynamicBalancer:
             for extra_id in extra_effective_ids:
                 self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
-        if effective_app_id in g_limited_apps:
-            g_limited_apps.pop(effective_app_id, None)
+        if effective_app_id in self.limits.auto_limited_apps:
+            self.limits.auto_limited_apps.pop(effective_app_id, None)
             logger.info(f"Removed {app_name} from auto-limited apps (now manually limited)")
 
         if resource_limited or io_limited:
-            g_limited_apps_manual[effective_app_id] = (app_name, limit_rates, {
+            self.limits.manual_limited_apps[effective_app_id] = (app_name, limit_rates, {
                 'cpu_mem_limited': resource_limited,
                 'io_limited': io_limited
             }, None)
-            g_app_id_mapping[app_id] = effective_app_ids
+            self.limits.app_id_to_cgroup_ids[app_id] = effective_app_ids
             if extra_effective_ids:
-                g_extra_cgroup_ids[effective_app_id] = extra_effective_ids
+                self.limits.extra_cgroup_ids[effective_app_id] = extra_effective_ids
             app_utils.update_app_status(app_id, "a_limited")
             app_utils.callback_manager.send_callback_notification({
                 'app_id': app_id,
@@ -1602,7 +1778,7 @@ class DynamicBalancer:
                 'status': "a_limited",
                 'purpose': "app"
             }, False)
-            g_manual_limit_baseline[effective_app_id] = {
+            self.limits.manual_limit_baseline[effective_app_id] = {
                 "cpu_percent": raw_cpu_percent,
                 "mem_total": mem_current,
                 "io_read_mb": io_read_mb,
@@ -1620,25 +1796,23 @@ class DynamicBalancer:
 
     def set_restore_resource(self, app_id: str) -> bool:
         """Restore resource limits for the given app_id."""
-        global g_limited_apps_manual, g_app_id_mapping, g_extra_cgroup_ids
-
-        raw = g_app_id_mapping.pop(app_id, app_id)
+        raw = self.limits.app_id_to_cgroup_ids.pop(app_id, app_id)
         effective_app_ids = raw if isinstance(raw, list) else [raw]
         effective_app_id = effective_app_ids[0]
         extra_effective_ids = effective_app_ids[1:]
-        extra_effective_ids = extra_effective_ids or g_extra_cgroup_ids.pop(effective_app_id, [])
+        extra_effective_ids = extra_effective_ids or self.limits.extra_cgroup_ids.pop(effective_app_id, [])
 
-        app_name, _, limit_parts, _ = g_limited_apps_manual.pop(effective_app_id, (None, None, {}, None))
+        app_name, _, limit_parts, _ = self.limits.manual_limited_apps.pop(effective_app_id, (None, None, {}, None))
         restore_success = True
         try:
             logger.info(f"Restoring resources for app: {app_id}, name: {app_name}")
 
             if limit_parts.get('cpu_mem_limited', False):
-                if not self.controlManager.adjust_resources(effective_app_id, "low"):
+                if not self.control_manager.adjust_resources(effective_app_id, "low"):
                     logger.error(f"Failed to restore CPU/Memory for {app_id} ({effective_app_id})")
                     restore_success = False
                 for extra_id in extra_effective_ids:
-                    self.controlManager.adjust_resources(extra_id, "low")
+                    self.control_manager.adjust_resources(extra_id, "low")
 
             if limit_parts.get('io_limited', False):
                 if not self.io_ctl.restore_disk_io_throttle(effective_app_id):
@@ -1663,46 +1837,7 @@ class DynamicBalancer:
             return False
         finally:
             time.sleep(self.config.regular_update_sys_pressure_time)
-            self.controlManager.set_limited_app_dominant(False)
-
-    def _execute_task(self, task: WorkloadTask, pressure_level: str) -> bool:
-        """Execute a queued workload task."""
-        try:
-            if task.pid:
-                self.running_tasks[task.pid] = task
-                logger.info("Task %s registered (PID: %d)", task.workload.name, task.pid)
-
-                self.controlManager.adjust_resources("", pressure_level)
-                return True
-            return False
-        except Exception as e:
-            logger.error("Task registration failed: %s", str(e))
-            return False
-
-
-    def register_workload_group(self, group: WorkloadGroup):
-        """Register a workload type."""
-        with self._lock:
-            self.workload_groups[group.name] = group
-            logger.info(f"Registered workload group: {group.name}")
-
-
-    def add_workload(self, group_name: str, params: Dict = None) -> bool:
-        """Add a concrete task to the processing queue."""
-        if group_name not in self.workload_groups:
-            logger.error(f"Unknown workload group: {group_name}")
-            return False
-
-        task = {
-            "type": "new_app",
-            "group": group_name,
-            "params": params or {},
-            "task_id": f"wl_{time.time_ns()}"
-        }
-        self.push_task(task)
-        logger.debug(f"add workload to task: {task}")
-        return True
-
+            self.control_manager.set_limited_app_dominant(False)
 
     def shutdown(self):
         """

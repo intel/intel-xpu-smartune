@@ -9,7 +9,7 @@ from typing import Any, List, Set, Union
 
 import psutil
 from bcc import BPF
-from controller.controlManager import ControlManager
+from controller.control_manager import ControlManager
 from utils import app_utils
 from utils.logger import logger
 
@@ -31,7 +31,7 @@ class SingletonMeta(type):
 class AppIntercept(metaclass=SingletonMeta):
     def __init__(self, c_src_file: str = "bpf_event.c"):
         self.bpf = BPF(src_file=c_src_file, cflags=["-Wno-duplicate-decl-specifier"])
-        self.controlManager = ControlManager()
+        self.control_manager = ControlManager()
         self.monitored_apps: Set[str] = set()
         self.handled_processes: Set[int] = set()  # set of already-handled process IDs
         self.controlled_app_map = []
@@ -57,11 +57,11 @@ class AppIntercept(metaclass=SingletonMeta):
         # cleared when it leaves.  Used in print_event to avoid issuing SIGSTOP
         # unless the system is actually under critical pressure.
         self._system_critical = Event()
-        self.controlManager.register_critical_state_listener(self._on_critical_state_changed)
+        self.control_manager.register_critical_state_listener(self._on_critical_state_changed)
         # Seed the flag from the current (possibly already cached) pressure level
         # so that apps detected before the first monitor callback are handled
         # correctly at startup.  The tuple is (level, score, is_disk_io_stressed).
-        initial_level, *_ = self.controlManager.get_current_pressure_level()
+        initial_level, *_ = self.control_manager.get_current_pressure_level()
         if initial_level == "critical":
             self._system_critical.set()
 
@@ -99,7 +99,7 @@ class AppIntercept(metaclass=SingletonMeta):
         itself.  Matching is driven entirely by ``bpf_name`` entries; the
         ``name`` field is treated as a display label only.
         """
-        cnf_apps = getattr(self.controlManager.config, 'controlled_apps', None) or []
+        cnf_apps = getattr(self.control_manager.config, 'controlled_apps', None) or []
         app_executables = {
             item['name']: item.get('bpf_name', []) for item in cnf_apps
         }

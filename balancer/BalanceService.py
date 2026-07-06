@@ -41,7 +41,7 @@ class DynamicService:
         self.balancer = DynamicBalancer()
         # Share the controller's SystemPressureMonitor with the monitor API so that
         # both use the same instance (including is_limited_app_dominant state).
-        register_system_pressure_monitor(self.balancer.controlManager.system_pressure_monitor)
+        register_system_pressure_monitor(self.balancer.control_manager.system_pressure_monitor)
         self.rebuild_controlled_map()
         self.secret_hash = self._generate_secret_hash()  # Generate and store the hash
         logger.info("Service secret hash generated.")

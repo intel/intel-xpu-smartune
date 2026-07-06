@@ -26,7 +26,7 @@ from .res_monitor import ResourceMonitor
 from .cgroup import CgroupMonitor
 from .pressure import PressureAnalyzer
 from .network import NetworkMonitor, WindowDiffHistory
-from .appIntercept import AppIntercept
+from .app_intercept import AppIntercept
 
 __all__ = [
     "PSIMonitor",

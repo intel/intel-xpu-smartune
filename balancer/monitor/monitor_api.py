@@ -521,7 +521,7 @@ class SystemPressureMonitor:
         interval — no dynamic coupling between those three clocks is required.
 
         Note: get_current_pressure_level() is intentionally kept separate and is
-        still used by display/point-in-time paths (UI, appIntercept) that must NOT
+        still used by display/point-in-time paths (UI, app_intercept) that must NOT
         consume or reset the peak.
         """
         with self._update_lock:

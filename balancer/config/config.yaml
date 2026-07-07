@@ -44,7 +44,7 @@ weights_top:
   memory: 7
   gpu: 5  #added to the default score as a secondary factor after GPU data is collected
 passive_resource_control:
-  enabled: false  #When disabled, the balancer no longer auto-monitors/throttles top apps on high system pressure; network control and manual throttling are unaffected
+  enabled: true  #When disabled, the balancer no longer auto-monitors/throttles top apps on high system pressure; network control and manual throttling are unaffected
 # Process noise filtered out from both top-resource sampling and the "Add App" wizard.
 # Substring match against lower-cased comm / exe basename. Add app/process names
 # here to hide them from monitoring & the wizard.
@@ -57,6 +57,7 @@ blacklist: [
 cooldown_time: 15 # Cooldown period (seconds) to avoid frequent notifications
 regular_update_sys_pressure_time: 5
 monitor_idle_check_interval: 10  # Pressure check interval (seconds) when the balancer is idle
+limit_reap_interval: 2  # How often (seconds) to check whether a limited app closed and restore its stale limit
 app_priority:
   critical: 100
   high: 80

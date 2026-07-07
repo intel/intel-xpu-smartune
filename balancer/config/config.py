@@ -29,6 +29,10 @@ class Config:
     disk_io_throughput_threshold_kb: float = 102400  # KB/s, i.e. 100 MB/s
     regular_update_sys_pressure_time: float = 5
     monitor_idle_check_interval: float = 10
+    # How often (seconds) the reaper checks whether a limited app has closed
+    # so its (now-stale) cgroup limit can be restored. Kept independent of
+    # monitor_idle_check_interval so detection latency stays short.
+    limit_reap_interval: float = 2
     network_thresholds: dict = None
     network_interface: dict = None
     network_bandwidth_kbit: int = 1000000 #kbit/s

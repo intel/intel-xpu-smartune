@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-import os, signal, time
-from dataclasses import dataclass
+import os, signal, subprocess, time
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Union
 
 from collections import OrderedDict
@@ -24,42 +24,102 @@ IO_LIMIT_MBPS_THRESHOLD = 100
 IO_LIMIT_IOPS_THRESHOLD = 1000
 
 
+@dataclass
+class LimitedApp:
+    """All runtime state for one app currently under a resource limit.
+
+    A single ``LimitRegistry.apps`` entry keyed by the primary effective
+    app id (the lexicographically-first cgroup basename).  ``source``
+    distinguishes pressure-driven ("auto") from REST/UI ("manual") limits
+    so the pressure loop never restores or replaces a manual limit.
+
+    Fields:
+      * public_app_id — the public app id (DB primary key) used for
+            status updates and SSE callbacks.  For auto limits it may
+            equal the cgroup key.
+      * limit_rates   — the rate config used when the limit was applied.
+      * limit_parts   — {'cpu_mem_limited': bool, 'io_limited': bool}.
+      * state         — ``None`` for fully limited, ``"partially_restored"``
+            after a partial restore (auto only).
+      * cgroups       — [primary, *extras]; multi-cgroup apps fan restores
+            out across every entry.
+      * pids          — snapshot of the app's PIDs at limit time, used by
+            the reaper to detect that the app has closed (see
+            DynamicBalancer._is_app_closed).
+    """
+    public_app_id: str
+    app_name: str
+    source: str                              # "auto" | "manual"
+    limit_rates: dict
+    limit_parts: dict
+    state: Optional[str] = None
+    cgroups: list = field(default_factory=list)
+    pids: set = field(default_factory=set)
+
+
 class LimitRegistry:
     """Runtime registry of every app currently under a resource limit.
 
     Fields:
-      * auto_limited_apps     — apps limited automatically by the
-            pressure-driven loop.
-      * manual_limited_apps   — apps limited via the REST/UI manual API.
-            Kept separate from auto_limited_apps so the pressure loop
-            never restores or replaces a manual limit.
-      * app_id_to_cgroup_ids  — {public_app_id: list[effective_app_id] | str}.
-            Translates the public app id back to its primary cgroup id
-            (and any extras) when set_restore_resource fires.
-      * extra_cgroup_ids      — {primary_effective_app_id: [extra_id, ...]}
-            so restore loops can fan out to multi-cgroup apps.
+      * apps — OrderedDict[primary_effective_app_id, LimitedApp].  The
+            single source of truth for both auto- and manual-limited apps
+            (see ``LimitedApp.source``).  Insertion order is preserved so
+            the auto restore path can pop the oldest limit first.
       * manual_limit_baseline — {effective_app_id: peak usage snapshot}
             that persists across restore→limit cycles to keep the
             manually-applied cap from tightening when a second sample
             (taken under an active limit) reports a lower value than the
-            original peak.
+            original peak.  Kept separate from ``apps`` on purpose: its
+            lifetime outlives an individual LimitedApp entry (a manual
+            restore removes the entry but intentionally keeps the peak).
       * is_limited_app_dominant — True when the current top process is
             one we already limited; the pressure loop reads this so it
             doesn't count its own throttled traffic as fresh pressure.
-
-    Both auto_limited_apps and manual_limited_apps use the tuple shape
-    "(app_name, limit_rates, limit_parts, state)" where "state" is
-    "None" for fully limited and "partially_restored" after a
-    partial restore.
+      * lock — guards every mutation of ``apps`` so the reaper thread and
+            the REST manual limit/restore calls never race.
     """
 
     def __init__(self):
-        self.auto_limited_apps: "OrderedDict[str, tuple]" = OrderedDict()
-        self.manual_limited_apps: "OrderedDict[str, tuple]" = OrderedDict()
-        self.app_id_to_cgroup_ids: Dict[str, Any] = {}
-        self.extra_cgroup_ids: Dict[str, list] = {}
+        self.apps: "OrderedDict[str, LimitedApp]" = OrderedDict()
         self.manual_limit_baseline: Dict[str, dict] = {}
         self.is_limited_app_dominant: bool = False
+        self.lock = threading.RLock()
+
+    # --- Query helpers (preserve the ordering semantics the callers rely on) ---
+    def first_auto(self) -> "Optional[tuple[str, LimitedApp]]":
+        """Return the oldest auto-limited (key, LimitedApp), or None.
+
+        Mirrors the previous ``next(iter(auto_limited_apps.items()))``
+        FIFO-head behaviour, now filtered by source over the unified dict.
+        """
+        for key, app in self.apps.items():
+            if app.source == "auto":
+                return key, app
+        return None
+
+    def pop_last_auto(self) -> "Optional[tuple[str, LimitedApp]]":
+        """Pop and return the most-recently-inserted auto-limited entry.
+
+        Mirrors the previous ``auto_limited_apps.popitem()`` (LIFO tail)
+        used by the combined-policy full-restore path.
+        """
+        for key in reversed(self.apps):
+            if self.apps[key].source == "auto":
+                return key, self.apps.pop(key)
+        return None
+
+    def by_public_id(self, public_app_id: str, source: Optional[str] = None) -> "Optional[tuple[str, LimitedApp]]":
+        """Find the (key, LimitedApp) whose public_app_id matches, or None.
+
+        When *source* is given, only entries of that source ("auto"/"manual")
+        are considered.  The manual restore path passes ``source="manual"`` so
+        a user-initiated restore can never pull an auto-limited app out of the
+        pressure-driven staged-recovery flow.
+        """
+        for key, app in self.apps.items():
+            if app.public_app_id == public_app_id and (source is None or app.source == source):
+                return key, app
+        return None
 
 
 @dataclass
@@ -72,6 +132,7 @@ class _MonitorLoopState:
     default_idle_check_interval: float
     idle_check_interval: float
     last_check_time: float = 0.0
+    last_reap_time: float = 0.0
     last_network_sample_time: float = 0.0
     network_sample_interval: float = 5.0          # network sampling interval (seconds)
     top_consume_apps: list = None
@@ -317,8 +378,8 @@ class DynamicBalancer:
         self.app_detect_queue = JoinableQueue(1000000)
         self.app_priority_queue = MaxPriorityQueue()
         # Runtime state for every app currently under a resource limit.
-        # See LimitRegistry for the full field list and tuple shape.
-        self.limits = LimitRegistry()
+        # See LimitRegistry / LimitedApp for the full field list.
+        self.all_limits = LimitRegistry()
 
         # Background-warmed top-consumer cache. Pure cache; callers must
         # gate ``start()`` on passive_resource_control being enabled —
@@ -395,6 +456,16 @@ class DynamicBalancer:
                         self._tick_combined_policy(state, pressure, passive_enabled)
                     state.prev_pressure = pressure
                 self._run_network_tick(state)
+
+                # Reaper: restore limits for apps that have since closed. Runs
+                # on its own short cadence (limit_reap_interval), independent of
+                # the idle_check_interval gate above, so a closed app's stale
+                # limit is lifted within a couple of seconds.
+                reap_interval = float(getattr(self.config, "limit_reap_interval", 2))
+                if state.current_time - state.last_reap_time >= reap_interval:
+                    state.last_reap_time = state.current_time
+                    self._reap_closed_apps()
+
                 time.sleep(1)
             except Exception as e:
                 logger.error(f"Error in monitor loop: {str(e)}", exc_info=True)
@@ -500,20 +571,38 @@ class DynamicBalancer:
         """Walk the prefetched top-consumer list and decide whether any
         already-limited (and not yet partially-restored) app is the
         current dominant resource consumer. Sets
-        ``self.limits.is_limited_app_dominant`` and pushes the flag down
+        ``self.all_limits.is_limited_app_dominant`` and pushes the flag down
         into the control manager so PSI baselines compensate correctly.
         """
         for app_info in state.top_consume_apps:
+            # Match by cgroup membership, not just the top-consumer id: a
+            # controlled multi-cgroup app is keyed in the registry by its
+            # resolved primary cgroup basename, which need not equal this
+            # sample's ``app.id`` or its surfaced cgroup.
             current_app_id = (app_info.get('app') or {}).get('id')
-            if current_app_id in self.limits.auto_limited_apps:
-                _, _, _, app_state = self.limits.auto_limited_apps[current_app_id]
-                self.limits.is_limited_app_dominant = (app_state != "partially_restored")
+            top_cgroups = set()
+            if app_info.get('cgroup'):
+                top_cgroups.add(os.path.basename(app_info['cgroup']))
+            for extra in app_info.get('extra_cgroups', []) or []:
+                top_cgroups.add(os.path.basename(extra))
+
+            entry = self.all_limits.apps.get(current_app_id)
+            if entry is None:
+                for cand_key, cand in self.all_limits.apps.items():
+                    if cand.source == "auto" and (
+                        cand_key in top_cgroups or top_cgroups & set(cand.cgroups)
+                    ):
+                        entry = cand
+                        break
+
+            if entry is not None and entry.source == "auto":
+                self.all_limits.is_limited_app_dominant = (entry.state != "partially_restored")
                 break
             else:
-                self.limits.is_limited_app_dominant = False
+                self.all_limits.is_limited_app_dominant = False
 
-        logger.debug(f"Balance- was the process limited before? {self.limits.is_limited_app_dominant}")
-        self.control_manager.set_limited_app_dominant(self.limits.is_limited_app_dominant)
+        logger.debug(f"Balance- was the process limited before? {self.all_limits.is_limited_app_dominant}")
+        self.control_manager.set_limited_app_dominant(self.all_limits.is_limited_app_dominant)
 
     def _tick_separated_policy(
         self,
@@ -550,7 +639,7 @@ class DynamicBalancer:
                     should_adjust, is_controlled, app_id, limit_rates = self._handle_disk_io_stressed(
                         state.top_consume_apps)
 
-                if not self.limits.is_limited_app_dominant and state.reach_threshold and should_adjust and app_id:
+                if not self.all_limits.is_limited_app_dominant and state.reach_threshold and should_adjust and app_id:
                     self._apply_resource_limits(
                         state.top_consume_apps[0],
                         app_id,
@@ -581,15 +670,15 @@ class DynamicBalancer:
         once the relevant timer crosses ``STABLE_PERIOD`` /
         ``STABLE_DISK_IO_PERIOD``.
         """
-        if not (self.limits.auto_limited_apps and not state.restore_pending):
+        if not (self.all_limits.first_auto() is not None and not state.restore_pending):
             return
 
         should_check_pressure = (pressure in ("medium", "low") and
-                                 any(app_data[2].get('cpu_mem_limited', False) for app_data in
-                                     self.limits.auto_limited_apps.values()))
+                                 any(app.limit_parts.get('cpu_mem_limited', False) for app in
+                                     self.all_limits.apps.values() if app.source == "auto"))
         should_check_io = (not is_disk_io_stressed and
-                           any(app_data[2].get('io_limited', False) for app_data in
-                               self.limits.auto_limited_apps.values()))
+                           any(app.limit_parts.get('io_limited', False) for app in
+                               self.all_limits.apps.values() if app.source == "auto"))
         if not (should_check_pressure or should_check_io):
             state.reset()
             return
@@ -621,39 +710,37 @@ class DynamicBalancer:
 
         if pressure_stable and pressure == "medium":
             state.restore_pending = True
-            app_id, (app_name, limit_rates, limit_parts, app_state) = next(
-                iter(self.limits.auto_limited_apps.items()))
-            if app_state != "partially_restored":
+            app_id, entry = self.all_limits.first_auto()
+            app_name, limit_rates, limit_parts = entry.app_name, entry.limit_rates, entry.limit_parts
+            if entry.state != "partially_restored":
                 logger.info(
                     f"Pressure remained at 'medium' for {state.STABLE_PERIOD} sec. "
                     f"Partially restoring app {app_id}.")
                 if self.restore_resources(app_id, app_name, limit_rates, limit_parts, "partial"):
-                    self.limits.auto_limited_apps[app_id] = (
-                    app_name, limit_rates, limit_parts, "partially_restored")
+                    entry.state = "partially_restored"
                 else:
                     logger.warning(f"Partial restore failed for {app_name}")
-                self.limits.auto_limited_apps.move_to_end(app_id)
+                self.all_limits.apps.move_to_end(app_id)
         elif io_stable and not io_double_stable:
             state.restore_pending = True
-            app_id, (app_name, limit_rates, limit_parts, app_state) = next(
-                iter(self.limits.auto_limited_apps.items()))
-            if app_state != "partially_restored":
+            app_id, entry = self.all_limits.first_auto()
+            app_name, limit_rates, limit_parts = entry.app_name, entry.limit_rates, entry.limit_parts
+            if entry.state != "partially_restored":
                 logger.info(f"Disk IO stress resolved. Partially restoring app {app_id}.")
                 if self.restore_resources(app_id, app_name, limit_rates, limit_parts, "partial"):
-                    self.limits.auto_limited_apps[app_id] = (
-                    app_name, limit_rates, limit_parts, "partially_restored")
+                    entry.state = "partially_restored"
                 else:
                     logger.warning(f"Partial restore failed for {app_name}")
-                self.limits.auto_limited_apps.move_to_end(app_id)
+                self.all_limits.apps.move_to_end(app_id)
         elif (pressure_stable and pressure == "low") or io_double_stable:
             state.restore_pending = True
-            app_id, (app_name, limit_rates, limit_parts, app_state) = next(
-                iter(self.limits.auto_limited_apps.items()))
+            app_id, entry = self.all_limits.first_auto()
+            app_name, limit_rates, limit_parts = entry.app_name, entry.limit_rates, entry.limit_parts
 
             success = self.restore_resources(app_id, app_name, limit_rates, limit_parts,
                                              "full")
             if success:
-                updated_limits = self.limits.auto_limited_apps[app_id][2]
+                updated_limits = entry.limit_parts
                 is_fully_restored = not (
                             updated_limits.get('cpu_mem_limited') or updated_limits.get('io_limited'))
                 if is_fully_restored:
@@ -664,18 +751,18 @@ class DynamicBalancer:
                         'status': "running",
                         'purpose': "app"
                     }, False)
-                    self.limits.auto_limited_apps.pop(app_id, None)
+                    self.all_limits.apps.pop(app_id, None)
                     logger.info(f"Fully restored app {app_id}, removed from limited apps")
 
                     if io_double_stable:
                         state.disk_io_not_stressed_start_time = None
                         logger.debug("Reset IO stress timer after full restoration")
                 else:
-                    self.limits.auto_limited_apps.move_to_end(app_id)
+                    self.all_limits.apps.move_to_end(app_id)
                     logger.info(f"Partial restore for app {app_id}, moved to end of queue")
             else:
                 logger.error(f"Failed to restore resources for app {app_id}")
-                self.limits.auto_limited_apps.move_to_end(app_id)
+                self.all_limits.apps.move_to_end(app_id)
         state.restore_pending = False
 
     def _tick_combined_policy(
@@ -704,7 +791,7 @@ class DynamicBalancer:
                 should_adjust, is_controlled, app_id, limit_rates = self._handle_critical_pressure(
                     state.top_consume_apps, state.reach_threshold)
 
-                if not self.limits.is_limited_app_dominant and state.reach_threshold and should_adjust and app_id:
+                if not self.all_limits.is_limited_app_dominant and state.reach_threshold and should_adjust and app_id:
                     self._apply_combined_critical_limits(
                         state.top_consume_apps[0], app_id, limit_rates, is_controlled
                     )
@@ -799,12 +886,16 @@ class DynamicBalancer:
                 self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
         if resource_limited or io_limited:
-            self.limits.auto_limited_apps[app_id] = (app_name, limit_rates, {
-                'cpu_mem_limited': resource_limited,
-                'io_limited': io_limited
-            }, None)
-            if extra_cgroup_ids:
-                self.limits.extra_cgroup_ids[app_id] = extra_cgroup_ids
+            self.all_limits.apps[app_id] = LimitedApp(
+                public_app_id=app_id,
+                app_name=app_name,
+                source="auto",
+                limit_rates=limit_rates,
+                limit_parts={'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
+                state=None,
+                cgroups=[app_id] + list(extra_cgroup_ids),
+                pids=set(target.get('pids') or []),
+            )
 
             if is_controlled:
                 app_utils.update_app_status(app_id, "limited")
@@ -824,7 +915,7 @@ class DynamicBalancer:
         Single ``STABLE_PERIOD`` timer drives both partial (at medium) and
         full (at low) restore on the head of ``auto_limited_apps``.
         """
-        if not (self.limits.auto_limited_apps and not state.restore_pending):
+        if not (self.all_limits.first_auto() is not None and not state.restore_pending):
             return
         if pressure not in ("medium", "low"):
             state.reset()
@@ -845,14 +936,15 @@ class DynamicBalancer:
         state.restore_pending = True
 
         if pressure == "medium":
-            app_id, (app_name, limit_rates, limit_parts, app_state) = next(iter(self.limits.auto_limited_apps.items()))
-            if app_state != "partially_restored":
+            app_id, entry = self.all_limits.first_auto()
+            app_name, limit_rates, limit_parts = entry.app_name, entry.limit_rates, entry.limit_parts
+            if entry.state != "partially_restored":
                 total_mem = self.resource_monitor.get_total_memory()
                 logger.info(
                     f"Pressure remained at 'medium' for {state.STABLE_PERIOD} sec. "
                     f"Partially restoring app {app_id} (twice the rate of limited resources)."
                 )
-                extra_ids = self.limits.extra_cgroup_ids.get(app_id, [])
+                extra_ids = entry.cgroups[1:]
                 restore_success = True
 
                 if limit_parts.get('cpu_mem_limited', False):
@@ -909,21 +1001,21 @@ class DynamicBalancer:
                         restore_success = False
 
                 if restore_success:
-                    self.limits.auto_limited_apps[app_id] = (
-                    app_name, limit_rates, limit_parts, "partially_restored")
+                    entry.state = "partially_restored"
                 else:
                     logger.warning(f"Partial restore failed for {app_name}")
 
-                self.limits.auto_limited_apps.move_to_end(app_id)
+                self.all_limits.apps.move_to_end(app_id)
         else:  # pressure == "low"
-            app_id, (app_name, _, limit_parts, _) = self.limits.auto_limited_apps.popitem()
+            app_id, entry = self.all_limits.pop_last_auto()
+            app_name, limit_parts = entry.app_name, entry.limit_parts
             logger.info(
                 f"Pressure remained at 'low' for {state.STABLE_PERIOD} sec. "
                 f"Fully restoring app {app_id} (100% resources)."
             )
 
             restore_success = True
-            extra_ids = self.limits.extra_cgroup_ids.pop(app_id, [])
+            extra_ids = entry.cgroups[1:]
 
             if limit_parts.get('cpu_mem_limited', False) and self.is_running:
                 if not self.control_manager.adjust_resources(app_id, "low"):
@@ -1112,14 +1204,16 @@ class DynamicBalancer:
                     self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
         if resource_limited or io_limited:
-            self.limits.auto_limited_apps[app_id] = (
-                app_name,
-                limit_rates,
-                {'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
-                None  # None indicates fully limited
+            self.all_limits.apps[app_id] = LimitedApp(
+                public_app_id=app_id,
+                app_name=app_name,
+                source="auto",
+                limit_rates=limit_rates,
+                limit_parts={'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
+                state=None,  # None indicates fully limited
+                cgroups=[app_id] + list(extra_cgroup_ids),
+                pids=set(target_app.get('pids') or []),
             )
-            if extra_cgroup_ids:
-                self.limits.extra_cgroup_ids[app_id] = extra_cgroup_ids
 
             if is_controlled:
                 app_utils.update_app_status(app_id, "limited")
@@ -1142,7 +1236,8 @@ class DynamicBalancer:
         :return: (success, restored_parts)
         """
         restore_success = True
-        extra_ids = self.limits.extra_cgroup_ids.get(app_id, [])
+        entry = self.all_limits.apps.get(app_id)
+        extra_ids = entry.cgroups[1:] if entry else []
 
         if self.is_running:
             if limit_parts.get('cpu_mem_limited', False):
@@ -1164,11 +1259,11 @@ class DynamicBalancer:
                     if not cpu_mem_restored:
                         logger.error(f"Failed to fully restore CPU/Memory for {app_name}")
                         restore_success = False
-                    else:
-                        self.limits.auto_limited_apps[app_id] = (app_name, limit_rates, {
+                    elif entry is not None:
+                        entry.limit_parts = {
                             'cpu_mem_limited': False,
-                            'io_limited': limit_parts['io_limited']
-                        }, None)
+                            'io_limited': limit_parts['io_limited'],
+                        }
                     for extra_id in extra_ids:
                         self.control_manager.adjust_resources(extra_id, "low")
             if limit_parts.get('io_limited', False):
@@ -1191,15 +1286,13 @@ class DynamicBalancer:
                     if not self.io_ctl.restore_disk_io_throttle(app_id):
                         logger.error(f"Failed to fully restore disk IO for {app_name}")
                         restore_success = False
-                    else:
-                        self.limits.auto_limited_apps[app_id] = (app_name, limit_rates, {
+                    elif entry is not None:
+                        entry.limit_parts = {
                             'cpu_mem_limited': limit_parts['cpu_mem_limited'],
-                            'io_limited': False
-                        }, None)
+                            'io_limited': False,
+                        }
                     for extra_id in extra_ids:
                         self.io_ctl.restore_disk_io_throttle(extra_id)
-            if restore_type == "full":
-                self.limits.extra_cgroup_ids.pop(app_id, None)
 
         return restore_success
 
@@ -1246,6 +1339,55 @@ class DynamicBalancer:
 
         return False, False, None, None
 
+    def _resolve_controlled_target(self, app_info: dict, controlled_data: dict) -> Optional[str]:
+        """Resolve a controlled app's real cgroups and rewrite ``app_info`` so
+        the auto-limit apply path fans out across all of them.
+
+        The top-consumer sample keys an app by a single cgroup (or, for
+        ``process_names`` apps, by a public app id that is not a systemd unit
+        name), which makes multi-cgroup controlled apps either under-limited or
+        not limited at all.  This resolves the controlled app's full cgroup set
+        via :func:`app_utils.get_app_resource_usage` (the same source the manual
+        path uses) and mutates ``app_info`` in place:
+
+          * ``extra_cgroups``       -> the non-primary cgroup basenames
+          * ``pids``                -> the app's live PIDs (for close-detection)
+          * ``per_cgroup_mem_rss`` / ``per_cgroup_cpu`` -> basename-keyed weights
+            used to split the limit proportionally.
+
+        Returns the primary (lexicographically-first) cgroup basename to use as
+        the limit key, or ``None`` if the cgroups could not be resolved (in
+        which case the caller keeps the original top-consumer id).
+        """
+        public_id = controlled_data.get('app_id')
+        name = controlled_data.get('app_name') or ''
+        usage = app_utils.get_app_resource_usage(public_id, name) or {}
+        cgroup_paths = usage.get('cgroup_paths') or (
+            [usage['cgroup_path']] if usage.get('cgroup_path') else []
+        )
+        effective_ids = [os.path.basename(p) for p in cgroup_paths if p]
+        if not effective_ids:
+            logger.warning(
+                f"Could not resolve cgroups for controlled app '{name}' "
+                f"({public_id}); limiting the top-consumer cgroup only")
+            return None
+
+        primary = min(effective_ids)
+        extras = [e for e in effective_ids if e != primary]
+
+        app_info['extra_cgroups'] = extras
+        if usage.get('pids'):
+            app_info['pids'] = usage['pids']
+        if usage.get('per_cgroup_mem'):
+            app_info['per_cgroup_mem_rss'] = usage['per_cgroup_mem']
+        if usage.get('per_cgroup_cpu_delta'):
+            app_info['per_cgroup_cpu'] = usage['per_cgroup_cpu_delta']
+
+        logger.info(
+            f"Controlled app '{name}' resolved to cgroups {effective_ids}; "
+            f"primary={primary}, extras={extras}")
+        return primary
+
     def _handle_critical_pressure(self, top_consumers, reach_threshold):
         """Handle resource pressure (processes one app per invocation)."""
         if not top_consumers or not top_consumers[0]:
@@ -1279,6 +1421,16 @@ class DynamicBalancer:
 
         if not is_controlled or priority != 'critical':
             self._critical_counter = 0
+            # A controlled app may span several cgroups while the top-consumer
+            # sample only surfaces one of them (and, for process_names apps,
+            # reports a public app id that is not a valid systemd unit). Once
+            # we know it is controlled, resolve the app's full cgroup set and
+            # rewrite the target so the limit fans out to every cgroup — the
+            # same treatment the manual limit path already applies.
+            if is_controlled and controlled_data:
+                resolved_id = self._resolve_controlled_target(app_info, controlled_data)
+                if resolved_id:
+                    app_id = resolved_id
             return True, is_controlled, app_id, self.get_limited_rates(priority or "undefined")
 
         self._critical_counter += 1
@@ -1296,51 +1448,210 @@ class DynamicBalancer:
 
         return False, False, None, None
 
+    def _restore_entry(self, entry: "LimitedApp", notify: bool) -> bool:
+        """Fully restore one already-removed limited app's cgroups.
+
+        Shared restore path for the shutdown sweep
+        (:meth:`restore_all_limited_apps_resources`, ``notify=False``) and
+        the reaper (:meth:`_reap_closed_apps`, ``notify=True``).  The caller
+        must have already popped ``entry`` from ``self.all_limits.apps`` (and its
+        ``manual_limit_baseline``) under the lock — this method only touches
+        cgroups, never the registry, so it is safe to run outside the lock.
+
+        When ``notify`` is True and the restore succeeds, emits the
+        app-status "running" callback plus a "notify" callback so the UI can
+        tell the user the app closed and its limit was lifted.
+        """
+        cgroups = entry.cgroups or [entry.public_app_id]
+        key = cgroups[0]
+        app_name, source = entry.app_name, entry.source
+        restore_success = True
+        logger.info(f"Restoring resources for {source} limited app: {key}, name: {app_name}")
+        try:
+            gone = 0
+            for idx, cg in enumerate(cgroups):
+                is_primary = (idx == 0)
+                # A closed app's cgroup is often already removed; there is
+                # nothing to restore, so skip it quietly instead of retrying
+                # systemctl and logging errors.
+                if not self._cgroup_exists(cg):
+                    gone += 1
+                    logger.debug(f"Cgroup {cg} already gone; nothing to restore")
+                    continue
+                if entry.limit_parts.get('cpu_mem_limited', False):
+                    if not self.control_manager.adjust_resources(cg, "low") and is_primary:
+                        logger.error(f"Failed to restore CPU/Memory for {source} limited app {cg}")
+                        restore_success = False
+                if entry.limit_parts.get('io_limited', False):
+                    if not self.io_ctl.restore_disk_io_throttle(cg) and is_primary:
+                        logger.error(f"Failed to remove IO limits for {source} limited app {cg}")
+                        restore_success = False
+
+            if gone == len(cgroups):
+                logger.info(f"All cgroups for {source} limited app {key} already gone; limit already cleared")
+            elif restore_success:
+                logger.info(f"{source.capitalize()} limited app resources restoration completed")
+        except Exception as e:
+            logger.error(f"Failed to restore resources for app {key}: {str(e)}")
+            restore_success = False
+
+        if notify and restore_success:
+            app_utils.update_app_status(entry.public_app_id, "running")
+            app_utils.callback_manager.send_callback_notification({
+                'app_id': entry.public_app_id,
+                'app_name': app_name,
+                'status': "running",
+                'purpose': "app"
+            }, False)
+            # Tell the UI the app closed and we lifted its (now-stale) limit.
+            app_utils.callback_manager.send_callback_notification({
+                'app_id': entry.public_app_id,
+                'app_name': app_name,
+                'status': "app_closed_limit_restored",
+                'purpose': "notify"
+            }, False)
+
+        return restore_success
+
     def restore_all_limited_apps_resources(self):
-        """Restore all limited apps resources"""
-        if not self.limits.auto_limited_apps and not self.limits.manual_limited_apps:
-            logger.info("No limited apps to restore")
-            return
+        """Restore all limited apps resources (called on shutdown)."""
+        with self.all_limits.lock:
+            if not self.all_limits.apps:
+                logger.info("No limited apps to restore")
+                return
 
-        logger.info(
-            f"Restoring resources for {len(self.limits.auto_limited_apps)} limited apps and "
-            f"{len(self.limits.manual_limited_apps)} manual limited apps")
+            auto_n = sum(1 for a in self.all_limits.apps.values() if a.source == "auto")
+            manual_n = sum(1 for a in self.all_limits.apps.values() if a.source == "manual")
+            logger.info(
+                f"Restoring resources for {auto_n} limited apps and "
+                f"{manual_n} manual limited apps")
 
-        all_limited_apps = {}
-        all_limited_apps.update(self.limits.auto_limited_apps)
-        all_limited_apps.update(self.limits.manual_limited_apps)
-
-        for app_id, (app_name, _, limit_parts, _) in list(all_limited_apps.items()):
-            try:
-                app_source = "manual" if app_id in self.limits.manual_limited_apps else "auto"
-                logger.info(f"Restoring resources for {app_source} limited app: {app_id}, name: {app_name}")
-                restore_success = True
-                extra_ids = self.limits.extra_cgroup_ids.pop(app_id, [])
-
-                if limit_parts.get('cpu_mem_limited', False):
-                    if not self.control_manager.adjust_resources(app_id, "low"):
-                        logger.error(f"Failed to restore CPU/Memory for {app_source} limited app {app_id}")
-                        restore_success = False
-                    for extra_id in extra_ids:
-                        self.control_manager.adjust_resources(extra_id, "low")
-
-                if limit_parts.get('io_limited', False):
-                    if not self.io_ctl.restore_disk_io_throttle(app_id):
-                        logger.error(f"Failed to remove IO limits for {app_source} limited app {app_id}")
-                        restore_success = False
-                    for extra_id in extra_ids:
-                        self.io_ctl.restore_disk_io_throttle(extra_id)
-
-                if restore_success:
-                    logger.info(f"{app_source.capitalize()} limited app resources restoration completed")
-            except Exception as e:
-                logger.error(f"Failed to restore resources for app {app_id}: {str(e)}")
-            finally:
-                self.limits.auto_limited_apps.pop(app_id, None)
-                self.limits.manual_limited_apps.pop(app_id, None)
-                self.limits.manual_limit_baseline.pop(app_id, None)
+            for key in list(self.all_limits.apps):
+                entry = self.all_limits.apps.pop(key, None)
+                self.all_limits.manual_limit_baseline.pop(key, None)
+                if entry is not None:
+                    self._restore_entry(entry, notify=False)
 
         logger.info("All limited apps resources restoration completed")
+
+    def _cgroup_exists(self, cgroup_id: str) -> bool:
+        """Return True if a cgroup directory named *cgroup_id* still exists.
+
+        Used before restoring a closed app: if the scope/service is already
+        gone its limit died with it, so restoring is a no-op we skip to avoid
+        noisy systemctl retries. On any lookup error assume it exists so the
+        restore still proceeds (old behaviour).
+        """
+        mount = getattr(self.config, "cgroup_mount", "/sys/fs/cgroup")
+        try:
+            result = subprocess.run(
+                ["find", mount, "-name", cgroup_id, "-type", "d"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5,
+            )
+            return bool(result.stdout.strip())
+        except Exception:
+            return True
+
+    # Signals whose default action terminates the process.
+    _FATAL_PENDING_SIGNALS = frozenset({2, 9, 15})  # SIGINT, SIGKILL, SIGTERM
+
+    def _pid_gone_or_dying(self, pid: int) -> bool:
+        """True if *pid* is dead, a zombie, or stuck in 'D' with a pending fatal
+        signal. The last case is a task that was asked to die but cannot receive
+        the signal because our own throttle is pinning it in uninterruptible
+        sleep; counting it as gone lets the reaper restore and unblock it. A
+        healthy busy app never carries a pending kill signal.
+        """
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                content = f.read()
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+        except Exception:
+            return False  # can't tell — treat as alive, don't restore
+
+        fields = {}
+        for line in content.splitlines():
+            if line.startswith(("State:", "SigPnd:", "ShdPnd:")):
+                key, _, value = line.partition(":")
+                fields[key] = value.strip()
+
+        state = (fields.get("State", "") or " ")[0]
+        if state == 'Z':
+            return True
+        if state == 'D':
+            pending = 0
+            for key in ("ShdPnd", "SigPnd"):
+                try:
+                    pending |= int(fields.get(key, "0").split()[0], 16)
+                except (ValueError, IndexError):
+                    pass
+            fatal_mask = 0
+            for sig in self._FATAL_PENDING_SIGNALS:
+                fatal_mask |= 1 << (sig - 1)
+            if pending & fatal_mask:
+                logger.info(f"PID {pid} stuck in 'D' with a pending fatal signal; treating as gone")
+                return True
+        return False
+
+    def _is_app_closed(self, entry: "LimitedApp") -> bool:
+        """Decide whether a limited app has closed, so its limit can be lifted.
+
+        Detection is PID-based, not cgroup-emptiness-based, since an app may
+        share its cgroup with other processes that keep it non-empty.
+
+          * All snapshot PIDs gone or dying-but-pinned -> the app closed.
+          * Multi-cgroup app where any limited cgroup no longer has a live
+            snapshot PID -> the app is broken; lift the limit.
+
+        Callers must have already filtered out entries with no PID snapshot.
+        """
+        alive = [pid for pid in entry.pids if not self._pid_gone_or_dying(pid)]
+        if not alive:
+            return True
+
+        if len(entry.cgroups) > 1:
+            live_cgroups = set()
+            for pid in alive:
+                cg = app_utils.get_cgroup_path_by_pid(pid)
+                if cg:
+                    live_cgroups.add(os.path.basename(cg))
+            if set(entry.cgroups) - live_cgroups:
+                return True
+
+        return False
+
+    def _reap_closed_apps(self) -> None:
+        """One reaper pass: restore limits for any app that has closed.
+
+        Runs in the monitor thread (so it never races the auto limit/restore
+        logic) on a short, fixed cadence independent of
+        ``monitor_idle_check_interval``.  Closed entries are popped under the
+        lock — so a concurrent manual restore cannot double-act — and the
+        actual cgroup restore + notifications happen outside the lock to keep
+        the hold time short.
+        """
+        closed: list = []
+        with self.all_limits.lock:
+            for key in list(self.all_limits.apps):
+                entry = self.all_limits.apps.get(key)
+                if entry is None:
+                    continue
+                if not entry.pids:
+                    logger.warning(
+                        f"Reaper: no PID snapshot for limited app {key} "
+                        f"({entry.app_name}); skipping close-check")
+                    continue
+                if self._is_app_closed(entry):
+                    self.all_limits.apps.pop(key, None)
+                    self.all_limits.manual_limit_baseline.pop(key, None)
+                    closed.append(entry)
+
+        for entry in closed:
+            logger.info(
+                f"Reaper: app '{entry.app_name}' ({entry.public_app_id}) closed; "
+                f"restoring its {entry.source} limit")
+            self._restore_entry(entry, notify=True)
 
     def cancel_relaunch_by_app_id(self, app_id: str) -> bool:
         """Remove queue items for the given app_id and terminate the associated process."""
@@ -1633,7 +1944,7 @@ class DynamicBalancer:
         io_read_iops = usage.get("io_read_iops", 0)
         io_write_iops = usage.get("io_write_iops", 0)
 
-        baseline = self.limits.manual_limit_baseline.get(effective_app_id, {})
+        baseline = self.all_limits.manual_limit_baseline.get(effective_app_id, {})
         if baseline:
             raw_cpu_percent = max(raw_cpu_percent, baseline.get("cpu_percent", 0))
             mem_current = max(mem_current, baseline.get("mem_total", 0))
@@ -1759,50 +2070,75 @@ class DynamicBalancer:
             for extra_id in extra_effective_ids:
                 self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
-        if effective_app_id in self.limits.auto_limited_apps:
-            self.limits.auto_limited_apps.pop(effective_app_id, None)
-            logger.info(f"Removed {app_name} from auto-limited apps (now manually limited)")
+        with self.all_limits.lock:
+            existing = self.all_limits.apps.get(effective_app_id)
+            if existing is not None and existing.source == "auto":
+                self.all_limits.apps.pop(effective_app_id, None)
+                logger.info(f"Removed {app_name} from auto-limited apps (now manually limited)")
 
-        if resource_limited or io_limited:
-            self.limits.manual_limited_apps[effective_app_id] = (app_name, limit_rates, {
-                'cpu_mem_limited': resource_limited,
-                'io_limited': io_limited
-            }, None)
-            self.limits.app_id_to_cgroup_ids[app_id] = effective_app_ids
-            if extra_effective_ids:
-                self.limits.extra_cgroup_ids[effective_app_id] = extra_effective_ids
-            app_utils.update_app_status(app_id, "a_limited")
-            app_utils.callback_manager.send_callback_notification({
-                'app_id': app_id,
-                'app_name': app_name,
-                'status': "a_limited",
-                'purpose': "app"
-            }, False)
-            self.limits.manual_limit_baseline[effective_app_id] = {
-                "cpu_percent": raw_cpu_percent,
-                "mem_total": mem_current,
-                "io_read_mb": io_read_mb,
-                "io_write_mb": io_write_mb,
-                "io_read_iops": io_read_iops,
-                "io_write_iops": io_write_iops,
-                "per_cgroup_mem": per_cg_mem,
-                "per_cgroup_cpu_delta": per_cg_cpu_delta,
-            }
-            logger.info(f"Recorded resource limits for {app_name}")
-            return True
+            if resource_limited or io_limited:
+                self.all_limits.apps[effective_app_id] = LimitedApp(
+                    public_app_id=app_id,
+                    app_name=app_name,
+                    source="manual",
+                    limit_rates=limit_rates,
+                    limit_parts={'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
+                    state=None,
+                    cgroups=[effective_app_id] + list(extra_effective_ids),
+                    pids=set(usage.get('pids') or []),
+                )
+                app_utils.update_app_status(app_id, "a_limited")
+                app_utils.callback_manager.send_callback_notification({
+                    'app_id': app_id,
+                    'app_name': app_name,
+                    'status': "a_limited",
+                    'purpose': "app"
+                }, False)
+                self.all_limits.manual_limit_baseline[effective_app_id] = {
+                    "cpu_percent": raw_cpu_percent,
+                    "mem_total": mem_current,
+                    "io_read_mb": io_read_mb,
+                    "io_write_mb": io_write_mb,
+                    "io_read_iops": io_read_iops,
+                    "io_write_iops": io_write_iops,
+                    "per_cgroup_mem": per_cg_mem,
+                    "per_cgroup_cpu_delta": per_cg_cpu_delta,
+                }
+                logger.info(f"Recorded resource limits for {app_name}")
+                return True
 
         logger.warning(f"No resource limits successfully applied for {app_name}")
         return False
 
     def set_restore_resource(self, app_id: str) -> bool:
-        """Restore resource limits for the given app_id."""
-        raw = self.limits.app_id_to_cgroup_ids.pop(app_id, app_id)
-        effective_app_ids = raw if isinstance(raw, list) else [raw]
+        """Restore resource limits for the given app_id (manual/UI path).
+
+        Behaviour unchanged from the pre-registry-refactor version; the
+        only additions are (1) locating the entry via the unified registry
+        and (2) popping it under ``self.all_limits.lock`` so the reaper thread
+        cannot restore the same app concurrently.  ``manual_limit_baseline``
+        is intentionally left in place (peak latch survives a manual
+        restore, as before).
+        """
+        with self.all_limits.lock:
+            # Manual restore only ever targets manual limits — auto limits are
+            # owned by the pressure loop's staged recovery (and the reaper on
+            # close), never by an explicit user restore.
+            found = self.all_limits.by_public_id(app_id, source="manual")
+            if found is not None:
+                effective_app_id, entry = found
+                effective_app_ids = list(entry.cgroups) or [effective_app_id]
+                app_name = entry.app_name
+                limit_parts = entry.limit_parts
+                self.all_limits.apps.pop(effective_app_id, None)
+            else:
+                # Fallback: treat app_id itself as the effective cgroup id,
+                # matching the previous default when no mapping existed.
+                effective_app_ids = [app_id]
+                app_name, limit_parts = None, {}
+
         effective_app_id = effective_app_ids[0]
         extra_effective_ids = effective_app_ids[1:]
-        extra_effective_ids = extra_effective_ids or self.limits.extra_cgroup_ids.pop(effective_app_id, [])
-
-        app_name, _, limit_parts, _ = self.limits.manual_limited_apps.pop(effective_app_id, (None, None, {}, None))
         restore_success = True
         try:
             logger.info(f"Restoring resources for app: {app_id}, name: {app_name}")

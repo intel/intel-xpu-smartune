@@ -866,6 +866,10 @@ class ResourceMonitor:
                     'io_read_rate': process['io_read_rate']
                 },
                 'app': app_info,
+                # Full PID list for the cgroup (bash already filtered upstream).
+                # The balancer snapshots these so the reaper can detect when the
+                # limited app has closed and restore its (now-stale) limit.
+                'pids': list(process['pids']),
                 # Unit names (basename) of any additional cgroups merged into this
                 # entry (multi-process apps only).  Empty list for single-cgroup apps.
                 'extra_cgroups': [
@@ -900,6 +904,8 @@ class ResourceMonitor:
                     'io_write_rate': process['io_write_rate']
                 },
                 'app': app_info,
+                # Full PID list (see get_top_resource_consumers) for close-detection.
+                'pids': list(process['pids']),
                 'extra_cgroups': [
                     os.path.basename(c) for c in process.get('extra_cgroups', [])
                 ],

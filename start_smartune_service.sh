@@ -3,15 +3,17 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Systemd entry point: called by balancer.service, already running as root.
+# Systemd entry point: called by smartune.service, already running as root.
 # No sudo usage or trap installation needed; lifecycle is managed by systemd.
 
 set -e
-cd "$(dirname "$(readlink -f "$0")")"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
-export CERT_FILE="./b_server.crt"
-export KEY_FILE="./b_server.key"
+KEY_DIR="$SCRIPT_DIR/key"
+CERT_FILE="$KEY_DIR/b_server.crt"
+KEY_FILE="$KEY_DIR/b_server.key"
 
+mkdir -p "$KEY_DIR" "$SCRIPT_DIR/logs"
 if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
     echo "Certificate and key already exist. Skipping generation."
 else
@@ -26,4 +28,4 @@ else
 fi
 
 PYTHON_BIN="$(command -v python3)"
-exec "$PYTHON_BIN" BalanceService.py
+exec "$PYTHON_BIN" "$SCRIPT_DIR/smartune.py"

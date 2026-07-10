@@ -1,5 +1,5 @@
-import React, { useState, useCallback } from 'react'
-import { Tabs, Layout, Typography, Space, Badge } from 'antd'
+import React, { useState, useCallback, useEffect } from 'react'
+import { Tabs, Layout, Typography, Space, Badge, Tooltip } from 'antd'
 import {
   DashboardOutlined,
   AppstoreOutlined,
@@ -15,11 +15,25 @@ import Balance from './components/Balance'
 import HistoryDashboard from './components/HistoryDashboard'
 import About from './components/About'
 import { COLORS } from './styles/theme'
+import { api } from './api/client'
+
+const MONITOR_ONLY_MSG =
+  'The current server is running in monitor-only mode; balancer control is not available.'
 
 const { Header, Content } = Layout
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('1')
+  // 1 = balancer + monitor, 0 = monitor only. Default to enabled so older
+  // servers without the /smartune/capabilities endpoint keep full behaviour.
+  const [balancerEnabled, setBalancerEnabled] = useState(true)
+
+  useEffect(() => {
+    api
+      .getCapabilities()
+      .then((c) => setBalancerEnabled(c.capabilities === 1))
+      .catch(() => setBalancerEnabled(true))
+  }, [])
 
   const tabs = [
     {
@@ -64,13 +78,21 @@ export default function App() {
     },
     {
       key: '5',
-      label: (
+      disabled: !balancerEnabled,
+      label: balancerEnabled ? (
         <Space>
           <ControlOutlined />
           Balancer
         </Space>
+      ) : (
+        <Tooltip title={MONITOR_ONLY_MSG}>
+          <Space>
+            <ControlOutlined />
+            Balancer
+          </Space>
+        </Tooltip>
       ),
-      children: <Balance active={activeTab === '5'} />,
+      children: <Balance active={activeTab === '5' && balancerEnabled} balancerEnabled={balancerEnabled} />,
     },
     {
       key: '6',

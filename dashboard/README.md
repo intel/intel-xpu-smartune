@@ -143,7 +143,7 @@ npm run preview      # serve the production build locally
 |---|---|
 | `[ERROR] Node.js is not installed` | Follow [Step 1](#1-install-nodejs) above |
 | `npm install` fails with `EACCES` | Run `sudo chown -R $USER ~/.npm` then retry |
-| Dashboard shows "Connection Error" on all panels | Make sure `BalanceService.py` is running on port 9001 |
+| Dashboard shows "Connection Error" on all panels | Make sure `smartune.py` (balancer) is running on port 9001 |
 | Port 39527 already in use | Edit `vite.config.ts` → `server.port` and change to another port |
 | `node: /lib/x86_64-linux-gnu/libc.so.6: version GLIBC_2.28 not found` | Your glibc is too old for the latest Node.js binary; use `nvm install 20` to get a compatible build |
 | `Vite requires Node.js version 20.19+ or 22.12+` | Your Node.js is too old; upgrade with `nvm install 20 && nvm use 20` or `sudo snap install node --classic --channel=20` |

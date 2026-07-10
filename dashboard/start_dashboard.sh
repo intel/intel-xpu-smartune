@@ -6,6 +6,27 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [-h]
+
+Proxies /api to the SmarTune backend on port 9001. Both server modes ('-a' and
+'-m') listen on 9001, and the UI auto-adapts to a monitor-only server via
+/smartune/capabilities. Override the backend with VITE_PROXY_TARGET, e.g.:
+  VITE_PROXY_TARGET=https://192.168.1.10:9001 $(basename "$0")
+
+  -h   Show this help and exit.
+EOF
+}
+
+while getopts "h" opt; do
+  case "$opt" in
+    h) usage; exit 0 ;;
+    *) usage >&2; exit 1 ;;
+  esac
+done
+export VITE_PROXY_TARGET="${VITE_PROXY_TARGET:-https://127.0.0.1:9001}"
+
 echo "================================================"
 echo "  Intel XPU SmarTune Dashboard"
 echo "================================================"
@@ -168,7 +189,7 @@ echo ""
 # Start the Vite dev server
 # ---------------------------------------------------------------------------
 echo "[INFO] Starting development server → http://localhost:39527"
-echo "[INFO] API proxy           → https://127.0.0.1:9001 (self-signed cert bypassed)"
+echo "[INFO] API proxy           → $VITE_PROXY_TARGET (self-signed cert bypassed)"
 echo ""
 echo "Press Ctrl+C to stop."
 echo ""

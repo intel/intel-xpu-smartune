@@ -11,7 +11,10 @@ export default defineConfig({
     port: 39527,
     proxy: {
       '/api': {
-        target: 'https://127.0.0.1:9001',
+        // Backend to proxy to. Both server modes (-a/-m) listen on 9001; the UI
+        // adapts to a monitor-only server via /smartune/capabilities. Override
+        // with VITE_PROXY_TARGET for a remote backend.
+        target: process.env.VITE_PROXY_TARGET || 'https://127.0.0.1:9001',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
         secure: false,

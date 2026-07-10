@@ -6,13 +6,13 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/nas/intel-xpu-smartune/balancer
-ExecStart=/home/nas/intel-xpu-smartune/balancer/start_smartune_service.sh
+WorkingDirectory=__SMARTUNE_ROOT__
+ExecStart=__SMARTUNE_ROOT__/start_smartune_service.sh
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGINT
 TimeoutStopSec=20
-StandardOutput=append:/home/nas/intel-xpu-smartune/balancer/logs/smartune.log
+StandardOutput=append:__SMARTUNE_ROOT__/logs/smartune.log
 StandardError=inherit
 
 [Install]

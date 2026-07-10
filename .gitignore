@@ -8,13 +8,14 @@
 __pycache__/
 
 # SSL certificates
-balancer/b_server.crt
-balancer/b_server.key
+key/
 
 # Database files
-balancer/my_database.db-shm
-balancer/my_database.db-wal
 my_database.db
+my_database.db-shm
+my_database.db-wal
 
 # Logs
 logs/
+
+config/runtime_state.json

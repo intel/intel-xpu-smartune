@@ -17,16 +17,20 @@ from balancer.balancer import DynamicBalancer
 from db.DatabaseModel import AIAppPriority, DBStatus, init_database
 from monitor.monitor_api import monitor_bp, register_system_pressure_monitor, _start_snapshot_cleanup_task
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
+from smartune_api import smartune_bp, set_balancer_available
 from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, get_priority_value
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
 
 app = Flask(__name__)
 app.register_blueprint(monitor_bp)
+app.register_blueprint(smartune_bp)
+set_balancer_available(True)
 _start_snapshot_cleanup_task()
 
-CERT_FILE = './b_server.crt'
-KEY_FILE = './b_server.key'
+_KEY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "key")
+CERT_FILE = os.path.join(_KEY_DIR, 'b_server.crt')
+KEY_FILE = os.path.join(_KEY_DIR, 'b_server.key')
 
 _service_lock = Lock()
 _service = None  # Singleton service instance
@@ -1161,7 +1165,7 @@ def main():
     logger.info("Starting Balance Service...")
     if not os.path.exists(CERT_FILE) or not os.path.exists(KEY_FILE):
         logger.error(f"Certificate files not found: {CERT_FILE}, {KEY_FILE}, "
-                     f"please check 'start_balancer.sh' to generate them.")
+                     f"please run 'start_smartune.sh' to generate them.")
         return
 
     init_database()

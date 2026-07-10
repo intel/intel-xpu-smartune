@@ -26,6 +26,115 @@ Each component of the Edge Infrastructure external is licensed under [Apache 2.0
         - bcc
         - cpupower
 
+## Installation:
+    server:
+        #ubuntu:
+            Start a terminal w/o any virtual(like conda) env, then run:
+            sudo apt install python3-pip (optional)
+            sudo pip install psutil>=5.5.1 --break-system-packages
+            sudo pip install peewee==3.17.8 --break-system-packages
+            sudo pip install flask --break-system-packages
+            # sudo pip install flask --break-system-packages --ignore-installed blinker(err with "Cannot uninstall blinker...")
+
+        #Tos:
+            1. Install above packages w/o "sudo".
+            2. Re-compile kernel by enable CONFIG_IKHEADERS=m (FATAL: Module kheaders not found in directory /lib/modules/6.12.41+)
+            Or, if you have "kheaders.ko",
+                mkdir -p /lib/modules/$(uname -r)/kernel/kernel/
+                cp kheaders.ko /lib/modules/$(uname -r)/kernel/kernel/
+                depmod -a
+                modprobe kheaders
+
+        If need, please refer to "Other" -> 2. Build bcc and 3. Build cpupower to install bcc and cpupower manually.
+
+    Other:
+        1. Build libcgroup wheel from source:
+            If need:
+                # Go into "base" env, then check python version and upgrade to python3.12.7 with:
+                # conda install -n base python=3.12.7
+                # pip install --upgrade pip # if need, currently is 25.2
+            pip install Cython
+            sudo apt install libpam-dev flex bison libsystemd-dev cmake build-essential autoconf automake libtool m4
+                sudo apt install linux-tools-common cpufrequtils -y
+            git clone https://github.com/libcgroup/libcgroup.git
+            cd libcgroup
+            git checkout v3.2.0 -b v3.2.0
+            ./bootstrap.sh(sudo apt-get --reinstall install gcc g++ // issue: /usr/include/c++/14/mutex:768:23: internal compiler error: Segmentation fault)
+            make
+            cd libcgroup/src/python
+            export VERSION_RELEASE="3.2.0"
+            python setup.py bdist_wheel
+            pip install dist/libcgroup-3.2.0-cp312-cp312-linux_x86_64.whl
+
+        2. Build bcc (Refer to: https://github.com/iovisor/bcc/blob/master/INSTALL.md#ubuntu---binary):
+
+            sudo apt install -y zip bison build-essential cmake flex git libedit-dev \
+              libllvm14 llvm-14-dev libclang-14-dev python3 zlib1g-dev libelf-dev libfl-dev python3-setuptools \
+              liblzma-dev libdebuginfod-dev arping netperf iperf
+
+            git clone https://github.com/iovisor/bcc.git
+            mkdir bcc/build; cd bcc/build
+            cmake ..
+            make
+            sudo make install
+            cmake -DPYTHON_CMD=python3 .. # build python3 binding
+            pushd src/python/
+            make
+            sudo make install
+            popd
+
+        3. Build cpupower:
+            git clone https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+            cd linux
+            git checkout v6.12.41 (align to your kernel version)
+            cd tools/power/cpupower
+            apt install libpci-dev gettext
+            make
+            sudo make install
+
+## Start:
+    All commands are run from the repository root. TLS certs are auto-generated
+    under `key/`, logs are written under `logs/`, and `my_database.db` is created
+    at the repository root.
+
+    1. server:
+        Option A) Run manually:
+            # Adjust config/config.yaml first if needed:
+            #   enable_network_control: true  -> default enabled, disable with false
+            #   vendor: "generic"             -> use "admin" if running with admin permission
+            ./start_smartune.sh            # -a (default): balancer + monitor (single process, port 9001)
+            ./start_smartune.sh -m         # monitor only (standalone telemetry, port 9001)
+            # Both modes listen on port 9001; the dashboard auto-adapts to a
+            # monitor-only server via /smartune/capabilities.
+
+        Option B) Run as a systemd system service (smartune.service):
+            # smartune.service uses the placeholder __SMARTUNE_ROOT__; fill it with the
+            # repository root at install time so the paths follow wherever the code lives.
+            1. Make sure the logs dir exists and the entry script is executable:
+                 mkdir -p logs
+                 chmod +x start_smartune_service.sh
+            2. Install the unit file into systemd (path filled automatically from $(pwd)):
+                 sed "s#__SMARTUNE_ROOT__#$(pwd)#g" smartune.service | sudo tee /etc/systemd/system/smartune.service
+                 sudo systemctl daemon-reload
+            3. Enable on boot and start the service:
+                 sudo systemctl enable smartune.service
+                 sudo systemctl start smartune.service
+            4. Check status / logs:
+                 sudo systemctl status smartune.service
+                 tail -f logs/smartune.log
+            5. Stop / disable / uninstall (if needed):
+                 sudo systemctl stop smartune.service
+                 sudo systemctl disable smartune.service
+                 sudo rm /etc/systemd/system/smartune.service
+                 sudo systemctl daemon-reload
+
+    2. client (React dashboard – Grafana-style 6-tab UI):
+        # Node.js 20.19+ is required. The script auto-installs/upgrades it on Ubuntu/Debian
+        # if missing or outdated. See dashboard/README.md for full setup instructions.
+        cd dashboard
+        bash start_dashboard.sh
+        # Opens http://localhost:39527
+
 ## Key Features:
 
 ### 1. Resource Control
@@ -96,41 +205,52 @@ Supports manual operations on controlled apps, including priority adjustment, ca
 For a complete reference of all backend REST API endpoints, see the [Backend API Guide](docs/API_ENDPOINTS.md).
 
 ## Directory Structure:
+
+The monitor and the shared layers (config/utils/db) live at the repository root
+so the monitor can run independently of the balancer. `balancer/` holds only the
+balancer-specific source and cannot run on its own without the monitor.
 ```
 intel-xpu-smartune/
-├── docs/                        # API documentation (API_ENDPOINTS.md)
-└── balancer/
-    ├── BalanceService.py        # Flask REST API server; resource-balancing entry point
-    ├── start_balancer.sh        # Convenience script to start the balancer service
-    ├── balancer/                # Core balancing logic: DynamicBalancer, MaxPriorityQueue,
-    │                            #   app-intercept loop, network controller integration
-    ├── config/                  # config.yaml (thresholds, weights, app list) and config loader
-    ├── controller/              # Resource controllers:
-    │   ├── cpu.py               #   CPU quota (cgroups v2 cpu.max)
-    │   ├── memory.py            #   Memory limits (memory.high / memory.max)
-    │   ├── io.py                #   Disk I/O throttling (io.max rbps/wbps/riops/wiops)
-    │   ├── network.py           #   Network traffic shaping (tc/HTB + iptables + cgroup)
-    │   ├── governor.py          #   CPU frequency governor switching
-    │   └── psi.py               #   PSI trigger-based resource reader
-    ├── db/                      # Peewee ORM database model for controlled app records
-    ├── monitor/                 # System monitoring components:
-    │   ├── psi.py               #   Linux PSI reader
-    │   ├── pressure.py          #   Pressure scoring and level classification
-    │   ├── res_monitor.py       #   CPU/memory/disk/network resource usage and top-process finder
-    │   ├── network.py           #   Network traffic sampling and pressure calculation
-    │   ├── cgroup.py            #   cgroup path resolution and monitoring
-    │   ├── appIntercept.py      #   eBPF-based app launch/exit detection (BCC)
-    │   ├── app_discovery.py     #   "Add App" wizard: process search and field extraction
-    │   ├── bpf_event.c          #   eBPF C program for execve/exit tracepoints
-    │   ├── gpu_monitor.py       #   Intel GPU monitoring (i915/Xe PMU, RAPL, fdinfo)
-    │   ├── npu_monitor.py       #   Intel NPU monitoring via PMT telemetry and fdinfo
-    │   ├── system_info.py       #   Static/dynamic hardware & software info collection
-    │   ├── metrics/             #   Per-subsystem metric collectors (cpu, gpu_info, gpu_perf, npu, history, utils)
-    │   └── monitor_api.py       #   Flask Blueprint exposing /monitor/* REST endpoints
-    ├── test/                    # Feature test scripts (BPF, PSI, disk I/O, notifications)
-    ├── utils/                   # Shared utilities: logger, app_utils, http_utils
-    └── dashboard/               # React/TypeScript dashboard (6-tab UI: Performance,
-                                 #   App Resources, Process Resources, Balancer, History, About)
+├── smartune.py                 # Single entry point: dispatches -a (balancer + monitor) / -m (monitor only)
+├── start_smartune.sh           # Start script: -a (default, all) / -m (monitor only)
+├── start_smartune_service.sh   # systemd entry script (cert-gen + launch, no sudo/trap)
+├── smartune.service            # systemd unit template (__SMARTUNE_ROOT__ filled at install)
+├── my_database.db              # Peewee SQLite DB (generated at runtime)
+├── key/                        # Generated TLS certificate/key (b_server.crt / .key)
+├── logs/                       # Runtime logs
+├── docs/                       # API documentation (API_ENDPOINTS.md)
+├── config/                     # config.yaml (thresholds, weights, app list) and config loader
+├── utils/                      # Shared utilities: logger, app_utils, http_utils
+├── db/                         # Peewee ORM database model for controlled app records
+├── monitor/                    # System monitoring components (runs standalone):
+│   ├── monitor_service.py      #   Standalone monitor entry point (own Flask app, port 9001)
+│   ├── monitor_api.py          #   Flask Blueprint exposing /monitor/* REST endpoints
+│   ├── psi.py                  #   Linux PSI reader
+│   ├── pressure.py             #   Pressure scoring and level classification
+│   ├── res_monitor.py          #   CPU/memory/disk/network resource usage and top-process finder
+│   ├── network.py              #   Network traffic sampling and pressure calculation
+│   ├── cgroup.py               #   cgroup path resolution and monitoring
+│   ├── app_discovery.py        #   "Add App" wizard: process search and field extraction
+│   ├── gpu_monitor.py          #   Intel GPU monitoring (i915/Xe PMU, RAPL, fdinfo)
+│   ├── npu_monitor.py          #   Intel NPU monitoring via PMT telemetry and fdinfo
+│   ├── system_info.py          #   Static/dynamic hardware & software info collection
+│   └── metrics/                #   Per-subsystem metric collectors (cpu, gpu_info, gpu_perf, npu, history, utils)
+├── dashboard/                  # React/TypeScript dashboard (6-tab UI: Performance,
+│                               #   App Resources, Process Resources, Balancer, History, About)
+└── balancer/                   # Balancer-specific source (not standalone-runnable):
+    ├── balance_service.py        #   Flask REST API server; resource-balancing entry point
+    ├── balancer/                #   Core balancing logic: DynamicBalancer, MaxPriorityQueue,
+    │                            #     monitor-resource loop, network controller integration
+    ├── controller/              #   Resource controllers:
+    │   ├── cpu.py               #     CPU quota (cgroups v2 cpu.max)
+    │   ├── memory.py            #     Memory limits (memory.high / memory.max)
+    │   ├── io.py                #     Disk I/O throttling (io.max rbps/wbps/riops/wiops)
+    │   ├── network.py           #     Network traffic shaping (tc/HTB + iptables + cgroup)
+    │   ├── governor.py          #     CPU frequency governor switching
+    │   ├── psi.py               #     PSI trigger-based resource reader
+    │   ├── app_intercept.py     #     eBPF-based app launch/exit detection (BCC)
+    │   └── bpf_event.c          #     eBPF C program for execve/exit tracepoints
+    └── test/                    #   Feature test scripts (BPF, PSI, disk I/O, notifications)
 ```
 
 

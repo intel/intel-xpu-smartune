@@ -59,7 +59,7 @@ class Logger:
     def critical(self, message):
         self.logger.critical(message)
 
-LOG_DIR = "./logs"
+LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 LOG_PREFIX = "multi_tasks"
 _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file_path = os.path.join(LOG_DIR, f"{LOG_PREFIX}_{_timestamp}.log")

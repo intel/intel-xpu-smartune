@@ -66,6 +66,8 @@ async function postWithConflict<TOk>(url: string, body: object): Promise<SaveRes
 }
 
 export const api = {
+  // Server capability level: 1 = balancer + monitor, 0 = monitor only.
+  getCapabilities: () => get<{ capabilities: number }>('/smartune/capabilities'),
   getAppResourceStats: (n = 10) => get<AppResourceStatsData>(`/monitor/app_resource_stats?n=${n}`),
   getAppDiskIoStats: (n = 10) => get<AppDiskIoStatsData>(`/monitor/app_disk_io_stats?n=${n}`),
   getProcesses: () => get<ProcessListData>('/monitor/processes'),

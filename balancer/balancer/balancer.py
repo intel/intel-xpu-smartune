@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Union
 
 from collections import OrderedDict
-from monitor import AppIntercept
+from controller.app_intercept import AppIntercept
 
 from utils.logger import logger
 from utils import app_utils
@@ -366,7 +366,7 @@ def _split_proportionally(total_budget, all_ids: list, per_cg_usage: dict) -> di
 
 class DynamicBalancer:
     def __init__(self):
-        self.bpf_monitor = AppIntercept("monitor/bpf_event.c")
+        self.bpf_monitor = AppIntercept("controller/bpf_event.c")
         self.config = b_config
         self.control_manager = self.bpf_monitor.control_manager
         self.resource_monitor = self.control_manager.res

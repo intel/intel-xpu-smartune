@@ -17,7 +17,6 @@ Usage::
         PressureAnalyzer,
         NetworkMonitor,
         WindowDiffHistory,
-        AppIntercept,
     )
 """
 
@@ -26,7 +25,6 @@ from .res_monitor import ResourceMonitor
 from .cgroup import CgroupMonitor
 from .pressure import PressureAnalyzer
 from .network import NetworkMonitor, WindowDiffHistory
-from .app_intercept import AppIntercept
 
 __all__ = [
     "PSIMonitor",
@@ -35,5 +33,4 @@ __all__ = [
     "PressureAnalyzer",
     "NetworkMonitor",
     "WindowDiffHistory",
-    "AppIntercept",
 ]

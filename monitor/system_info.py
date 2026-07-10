@@ -7,7 +7,7 @@ Exposes:
     collect_static_info   -- cached hardware / driver inventory
     collect_dynamic_info  -- real-time metrics snapshot
     preload_static_info   -- convenience wrapper for startup
-    shutdown_gpu_usage    -- re-exported for BalanceService
+    shutdown_gpu_usage    -- re-exported for balance_service
 """
 
 import json

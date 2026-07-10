@@ -1,12 +1,18 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import yaml
+
+# config.yaml lives alongside this module. Resolve it relative to __file__ so the
+# config package works regardless of the process working directory (e.g. when the
+# package is imported from the repository root rather than from balancer/).
+_DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 
 @dataclass
 class Config:
@@ -42,7 +48,7 @@ class Config:
     network_burst_map: dict = None
     network_system_ports: list = None
     controlled_apps: list = None
-    _config_path: str = field(default="config/config.yaml", repr=False, compare=False)
+    _config_path: str = field(default=_DEFAULT_CONFIG_PATH, repr=False, compare=False)
     _persist_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False, init=False)
 
     @classmethod
@@ -517,4 +523,4 @@ class Config:
         return modified
 
 
-b_config = Config.from_file("config/config.yaml")
+b_config = Config.from_file(_DEFAULT_CONFIG_PATH)

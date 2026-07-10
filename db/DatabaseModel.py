@@ -34,7 +34,8 @@ class DBStatus(Enum):
 db_lock = Lock()
 
 # Database connection object
-db = SqliteDatabase('my_database.db')
+_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'my_database.db')
+db = SqliteDatabase(_DB_PATH)
 db.execute_sql('PRAGMA journal_mode=WAL;')
 
 class DataBaseModel(Model):

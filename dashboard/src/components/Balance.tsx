@@ -52,6 +52,9 @@ const APP_STATUS = {
 
 interface Props {
   active: boolean
+  // false = monitor-only server: the balancer is not available, so this tab
+  // renders a notice and performs no balancer calls.
+  balancerEnabled?: boolean
 }
 
 interface LimitDialogState {
@@ -255,7 +258,7 @@ function PassiveControlPanel({ active }: PassiveControlPanelProps) {
   )
 }
 
-export default function Balance({ active }: Props) {
+export default function Balance({ active, balancerEnabled = true }: Props) {
   const [allApps, setAllApps] = useState<AppInfo[]>([])
   const [controlledApps, setControlledApps] = useState<AppInfo[]>([])
   const [pendingApps, setPendingApps] = useState<AppInfo[]>([])
@@ -1045,6 +1048,19 @@ export default function Balance({ active }: Props) {
       </Text>
     </>
   )
+
+  if (!balancerEnabled) {
+    return (
+      <div style={{ padding: '16px 0' }}>
+        <Alert
+          type="info"
+          showIcon
+          message="Monitor-only mode"
+          description="The current server is running in monitor-only mode; balancer control is not available."
+        />
+      </div>
+    )
+  }
 
   return (
     <div style={{ padding: '16px 0' }}>

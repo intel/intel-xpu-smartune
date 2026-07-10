@@ -23,7 +23,7 @@ BCC_MACROS=(
 )
 
 FILES=(
-    "$PROJECT_ROOT/balancer/monitor/bpf_event.c"
+    "$PROJECT_ROOT/balancer/controller/bpf_event.c"
     "$PROJECT_ROOT/balancer/test/bpf_event_direct.c"
     "$PROJECT_ROOT/balancer/test/bpf_event.c"
 )

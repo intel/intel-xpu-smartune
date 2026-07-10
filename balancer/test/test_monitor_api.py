@@ -12,7 +12,7 @@ _TEST_HOST = "127.0.0.1"
 _TEST_PORT = 9001
 _BASE_URL = f"https://{_TEST_HOST}:{_TEST_PORT}/monitor"
 
-B_CERT_FILE = "./../b_server.crt"
+B_CERT_FILE = "../../key/b_server.crt"
 
 def main():
     def _create_session():

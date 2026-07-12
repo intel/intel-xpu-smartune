@@ -48,6 +48,10 @@ class Config:
     network_burst_map: dict = None
     network_system_ports: list = None
     controlled_apps: list = None
+    # dynamic_info hardware sections the background collector continuously
+    # monitors (feeds the live cache + history). None = monitor all sections;
+    # [] = pure on-demand (no background collector). See DYNAMIC_INFO_SECTIONS.
+    monitored_sections: list = None
     _config_path: str = field(default=_DEFAULT_CONFIG_PATH, repr=False, compare=False)
     _persist_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False, init=False)
 

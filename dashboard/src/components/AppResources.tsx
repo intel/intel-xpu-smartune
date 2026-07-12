@@ -22,6 +22,7 @@ import { COLORS } from '../styles/theme'
 import { api } from '../api/client'
 import type { AppResourceEntry, AppDiskIoEntry, WeightsTopData } from '../api/types'
 import { usePolling } from '../hooks/usePolling'
+import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 
 const { Text, Title } = Typography
 
@@ -91,6 +92,7 @@ function formatTimestamp(ts: number | undefined | null): string {
 
 function SettingsModal({ visible, onClose }: SettingsModalProps) {
   const [form] = Form.useForm()
+  const { publishNotice } = useGlobalConfigNotices()
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [initialValues, setInitialValues] = useState<WeightsConfig | null>(null)
@@ -155,6 +157,12 @@ function SettingsModal({ visible, onClose }: SettingsModalProps) {
             setInitialValues(next)
             setUpdatedAt(newTs)
             form.setFieldsValue(next)
+            publishNotice({
+              title: 'Weights configuration updated',
+              description: `Another client changed score weights at ${tsLabel}. The form has been reloaded.`,
+              scope: 'weights_top',
+              updatedAt: newTs,
+            })
           },
         })
         return
@@ -166,6 +174,12 @@ function SettingsModal({ visible, onClose }: SettingsModalProps) {
         const w = response.updated_weights
         setInitialValues({ cpu: w.cpu, memory: w.memory, gpu: w.gpu })
         setUpdatedAt(response.updated_at)
+        publishNotice({
+          title: 'Weights configuration updated',
+          description: `Score weights are now CPU ${w.cpu}, Memory ${w.memory}, GPU ${w.gpu}.`,
+          scope: 'weights_top',
+          updatedAt: response.updated_at,
+        })
         onClose()
       } else {
         message.error('Failed to update weights configuration')

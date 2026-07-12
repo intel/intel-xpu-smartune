@@ -15,7 +15,13 @@ from flask import Flask, request, Response, stream_with_context
 
 from balancer.balancer import DynamicBalancer
 from db.DatabaseModel import AIAppPriority, DBStatus, init_database
-from monitor.monitor_api import monitor_bp, register_system_pressure_monitor, _start_snapshot_cleanup_task
+from monitor.monitor_api import (
+    monitor_bp,
+    register_system_pressure_monitor,
+    _start_snapshot_cleanup_task,
+    _start_dynamic_info_auto_refresh,
+    stop_dynamic_info_collector,
+)
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
 from smartune_api import smartune_bp, set_balancer_available
 from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, get_priority_value
@@ -61,6 +67,9 @@ class DynamicService:
 
     def start(self):
         self.balancer.start()
+        # Begin continuous background collection of the configured
+        # monitored_sections (no-op if the operator set it to []).
+        _start_dynamic_info_auto_refresh()
 
 
     def cancel_relaunch(self, app_id):
@@ -94,6 +103,7 @@ class DynamicService:
         return self.balancer.bpf_monitor.scan_already_running_apps()
 
     def shutdown(self):
+        stop_dynamic_info_collector()
         self.balancer.shutdown()
         shutdown_gpu_usage()
 
@@ -1187,6 +1197,11 @@ def main():
     # Set BALANCER_HOST=0.0.0.0 to bind to all interfaces if needed
     host = os.environ.get("BALANCER_HOST", "127.0.0.1")
     port = int(os.environ.get("BALANCER_PORT", "9001"))
+
+    # werkzeug installs its own request-log handler; stop it from also
+    # propagating to the root logger, which otherwise prints every access line
+    # twice (once as "127.0.0.1 - -" and once as "INFO:werkzeug:...").
+    logging.getLogger("werkzeug").propagate = False
 
     try:
         app.run(host=host, port=port, debug=False, use_reloader=False, ssl_context=ssl_context)

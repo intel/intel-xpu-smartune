@@ -45,6 +45,10 @@ weights_top:
   gpu: 5  #added to the default score as a secondary factor after GPU data is collected
 passive_resource_control:
   enabled: true  #When disabled, the balancer no longer auto-monitors/throttles top apps on high system pressure; network control and manual throttling are unaffected
+
+# set to [] for pure on-demand (no background collection).
+# Valid: cpu, memory, pressure, network, disk, gpu, npu.
+monitored_sections: [cpu, memory, pressure, network, disk, gpu, npu]
 # Process noise filtered out from both top-resource sampling and the "Add App" wizard.
 # Substring match against lower-cased comm / exe basename. Add app/process names
 # here to hide them from monitoring & the wizard.

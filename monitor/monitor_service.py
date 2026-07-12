@@ -26,7 +26,12 @@ from flask import Flask
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db.DatabaseModel import init_database
-from monitor.monitor_api import monitor_bp, _start_snapshot_cleanup_task
+from monitor.monitor_api import (
+    monitor_bp,
+    _start_snapshot_cleanup_task,
+    _start_dynamic_info_auto_refresh,
+    stop_dynamic_info_collector,
+)
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
 from smartune_api import smartune_bp
 from utils.logger import logger
@@ -74,6 +79,10 @@ def _shutdown_once():
     _shutdown_started = True
     logger.info("Shutting down Monitor Service...")
     try:
+        stop_dynamic_info_collector()
+    except Exception as exc:
+        logger.warning(f"stop_dynamic_info_collector failed: {exc}")
+    try:
         shutdown_gpu_usage()
     except Exception as exc:
         logger.warning(f"shutdown_gpu_usage failed: {exc}")
@@ -103,6 +112,14 @@ def main():
         preload_static_info()
     except Exception as exc:
         logger.warning(f"Preload static info failed, will retry on first static request: {exc}")
+
+    # Start the background dynamic-info collector so history is persisted even
+    # in monitor-only mode.  Without this, history is only written when the
+    # balancer runs (balance_service) or when a client hits the full/single
+    # /dynamic_info endpoint — the dashboard's selective ?sections= requests do
+    # not persist, so History would otherwise stay empty here.  No-op when
+    # monitored_sections is [].
+    _start_dynamic_info_auto_refresh()
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)

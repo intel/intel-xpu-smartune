@@ -637,7 +637,7 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
                 "swap_total_gb": round(psutil.swap_memory().total / (1024 ** 3), 2),
                 "devices": _parse_memory_devices(dmi_mem_output),
             },
-            "io": network_static,
+            "network": network_static,
             "disk": disk_static,
             "gpu": {
                 "names": get_gpu_names(),
@@ -670,96 +670,179 @@ def preload_static_info() -> Dict[str, Any]:
     return data
 
 
-def collect_dynamic_info(resource_monitor=None, system_pressure_monitor=None) -> Dict[str, Any]:
-    pressure_extra: Dict[str, Any] = {}
-    disk_stats: Dict[str, Any] = {}
+# Canonical set of static_info sections, in the order they appear in a full
+# snapshot.  Used by the monitor API to expose per-section views of the (always
+# cached) static configuration blob.
+STATIC_INFO_SECTIONS = ("bios", "os", "driver", "cpu", "memory", "network", "disk", "gpu", "npu")
 
-    if system_pressure_monitor is not None:
-        try:
-            level, score, is_disk_io_stressed = system_pressure_monitor.get_current_pressure_level()
-            pressure_extra['score'] = score
-            pressure_extra['level'] = level
-            pressure_extra['is_disk_io_stressed'] = is_disk_io_stressed
-        except Exception as e:
-            logger.warning(f"SystemPressureMonitor unavailable: {e}")
-        try:
-            disk_stress = system_pressure_monitor.get_disk_io_stress()
-            if disk_stress:
+# Canonical set of dynamic_info sections, in the order they appear in a full
+# snapshot.  Used by collect_dynamic_info() to validate/order section requests
+# and by the monitor API to expose per-hardware endpoints.
+DYNAMIC_INFO_SECTIONS = ("cpu", "memory", "pressure", "network", "disk", "gpu", "npu")
+
+
+class _DynamicInfoCollector:
+    """Collects dynamic_info sections independently while sharing intermediates.
+
+    Each hardware section maps to one method here.  Building blocks that feed
+    more than one section (currently the runtime network bandwidth, which the
+    ``network`` section returns verbatim and the ``pressure`` section reuses to
+    compute per-NIC busy ratios) are computed lazily and memoized, so requesting
+    a single section only pays for what that section actually needs, and
+    requesting several never collects a shared block twice.
+    """
+
+    def __init__(self, resource_monitor=None, system_pressure_monitor=None):
+        self._rm = resource_monitor
+        self._spm = system_pressure_monitor
+        self._network_bw = None
+        self._network_bw_done = False
+
+    def _network_bw_runtime(self) -> Dict[str, Any]:
+        """Memoized runtime network bandwidth (shared by network + pressure)."""
+        if not self._network_bw_done:
+            self._network_bw = _get_network_runtime_bw()
+            self._network_bw_done = True
+        return self._network_bw
+
+    def cpu(self) -> Dict[str, Any]:
+        cpu = get_cpu_dynamic()
+        num_logical = len(cpu.get("per_core_usage") or [])
+        cpu_temps = get_cpu_temperatures(num_logical=num_logical)
+        cpu["temperature_c"] = cpu_temps["package_c"]
+        cpu["per_core_temperature_c"] = cpu_temps["per_core_c"]
+        return cpu
+
+    def memory(self) -> Dict[str, Any]:
+        return get_memory_dynamic()
+
+    def network(self) -> Dict[str, Any]:
+        return self._network_bw_runtime()
+
+    def disk(self) -> Dict[str, Any]:
+        disk_stats: Dict[str, Any] = {}
+
+        if self._spm is not None:
+            try:
+                disk_stress = self._spm.get_disk_io_stress()
+                if disk_stress:
+                    disk_stats = {
+                        'disk_io': disk_stress.get('details', {}),
+                        'is_stressed': disk_stress.get('is_stressed', False),
+                        'stressed_disks': disk_stress.get('stressed_disks', []),
+                        'iowait': disk_stress.get('iowait', 0.0),
+                    }
+            except Exception as e:
+                logger.warning(f"Disk stress check unavailable via SPM: {e}")
+
+        if not disk_stats and self._rm is not None:
+            try:
+                disk_stress = self._rm.is_disk_io_stressed()
                 disk_stats = {
                     'disk_io': disk_stress.get('details', {}),
                     'is_stressed': disk_stress.get('is_stressed', False),
                     'stressed_disks': disk_stress.get('stressed_disks', []),
                     'iowait': disk_stress.get('iowait', 0.0),
                 }
-        except Exception as e:
-            logger.warning(f"Disk stress check unavailable via SPM: {e}")
+            except Exception as e:
+                logger.warning(f"Disk stress check unavailable: {e}")
 
-    try:
-        from monitor.psi import PSIMonitor
-        psi = PSIMonitor().get_current_pressure()
-        pressure_extra['cpu'] = psi.get('cpu', 0.0)
-        pressure_extra['memory'] = psi.get('memory', 0.0)
-        pressure_extra['io'] = psi.get('io', 0.0)
-    except Exception as e:
-        logger.debug(f"PSIMonitor unavailable for raw pressure: {e}")
+        # Disk IO pressure: aggregate busy ratio from per-disk is_busy flags
+        disk_pressure = _compute_disk_pressure(disk_stats)
+        disk_stats['busy_disks'] = disk_pressure['busy_disks']
+        disk_stats['total_disks'] = disk_pressure['total_disks']
+        disk_stats['busy_ratio'] = disk_pressure['busy_ratio']
+        disk_stats['busy_pct'] = disk_pressure['busy_pct']
+        disk_stats['busy_level'] = disk_pressure['busy_level']
+        return disk_stats
 
-    if not disk_stats and resource_monitor is not None:
-        try:
-            disk_stress = resource_monitor.is_disk_io_stressed()
-            disk_stats = {
-                'disk_io': disk_stress.get('details', {}),
-                'is_stressed': disk_stress.get('is_stressed', False),
-                'stressed_disks': disk_stress.get('stressed_disks', []),
-                'iowait': disk_stress.get('iowait', 0.0),
-            }
-        except Exception as e:
-            logger.warning(f"Disk stress check unavailable: {e}")
-
-    # Disk IO pressure: aggregate busy ratio from per-disk is_busy flags
-    disk_pressure = _compute_disk_pressure(disk_stats)
-    disk_stats['busy_disks'] = disk_pressure['busy_disks']
-    disk_stats['total_disks'] = disk_pressure['total_disks']
-    disk_stats['busy_ratio'] = disk_pressure['busy_ratio']
-    disk_stats['busy_pct'] = disk_pressure['busy_pct']
-    disk_stats['busy_level'] = disk_pressure['busy_level']
-
-    gpu_cards = get_gpu_cards()
-
-    network_bw = _get_network_runtime_bw()
-
-    # Network pressure: per-NIC busy ratio based on actual link speed
-    try:
-        net_static = _get_network_static_info()
-        net_pressure_result = _compute_network_pressure(network_bw, net_static)
-        pressure_extra['network_busy_nics'] = net_pressure_result['busy_nics']
-        pressure_extra['network_total_nics'] = net_pressure_result['total_nics']
-        pressure_extra['network_busy_ratio'] = net_pressure_result['busy_ratio']
-        pressure_extra['network_busy_pct'] = net_pressure_result['busy_pct']
-        pressure_extra['network_busy_level'] = net_pressure_result['busy_level']
-    except Exception as e:
-        logger.debug(f"Network pressure calculation unavailable: {e}")
-
-    data = {
-        "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "cpu": get_cpu_dynamic(),
-        "memory": get_memory_dynamic(),
-        "pressure": pressure_extra,
-        "network": network_bw,
-        "disk": disk_stats,
-        "gpu": {
+    def gpu(self) -> Dict[str, Any]:
+        gpu_cards = get_gpu_cards()
+        return {
             "vram": get_gpu_vram(gpu_cards),
             "gpu_usage": get_gpu_usage_output(),
-        },
-        "npu": {
+        }
+
+    def npu(self) -> Dict[str, Any]:
+        return {
             "npu_smi": get_intel_npu_smi_output(),
-        },
-    }
+        }
 
-    num_logical = len(data["cpu"].get("per_core_usage") or [])
-    cpu_temps = get_cpu_temperatures(num_logical=num_logical)
-    data["cpu"]["temperature_c"] = cpu_temps["package_c"]
-    data["cpu"]["per_core_temperature_c"] = cpu_temps["per_core_c"]
+    def pressure(self) -> Dict[str, Any]:
+        pressure_extra: Dict[str, Any] = {}
 
-    persist_dynamic_snapshot_if_due(data)
+        if self._spm is not None:
+            try:
+                level, score, is_disk_io_stressed = self._spm.get_current_pressure_level()
+                pressure_extra['score'] = score
+                pressure_extra['level'] = level
+                pressure_extra['is_disk_io_stressed'] = is_disk_io_stressed
+            except Exception as e:
+                logger.warning(f"SystemPressureMonitor unavailable: {e}")
+
+        try:
+            from monitor.psi import PSIMonitor
+            psi = PSIMonitor().get_current_pressure()
+            pressure_extra['cpu'] = psi.get('cpu', 0.0)
+            pressure_extra['memory'] = psi.get('memory', 0.0)
+            pressure_extra['io'] = psi.get('io', 0.0)
+        except Exception as e:
+            logger.debug(f"PSIMonitor unavailable for raw pressure: {e}")
+
+        # Network pressure: per-NIC busy ratio based on actual link speed.
+        # Reuses the memoized runtime bandwidth so a full snapshot does not
+        # sample the NICs twice for the network and pressure sections.
+        try:
+            network_bw = self._network_bw_runtime()
+            net_static = _get_network_static_info()
+            net_pressure_result = _compute_network_pressure(network_bw, net_static)
+            pressure_extra['network_busy_nics'] = net_pressure_result['busy_nics']
+            pressure_extra['network_total_nics'] = net_pressure_result['total_nics']
+            pressure_extra['network_busy_ratio'] = net_pressure_result['busy_ratio']
+            pressure_extra['network_busy_pct'] = net_pressure_result['busy_pct']
+            pressure_extra['network_busy_level'] = net_pressure_result['busy_level']
+        except Exception as e:
+            logger.debug(f"Network pressure calculation unavailable: {e}")
+
+        return pressure_extra
+
+
+def collect_dynamic_info(resource_monitor=None, system_pressure_monitor=None,
+                         sections=None, persist=None) -> Dict[str, Any]:
+    """Collect a dynamic system metrics snapshot.
+
+    Args:
+        resource_monitor: optional ResourceMonitor (disk stress fallback).
+        system_pressure_monitor: optional SystemPressureMonitor.
+        sections: optional iterable of section names (see
+            ``DYNAMIC_INFO_SECTIONS``) to restrict collection to specific
+            hardware groups.  ``None`` (default) collects the full snapshot and
+            is fully backward compatible.  Unknown names are ignored; the
+            returned sections always follow the canonical order.
+        persist: whether to write this snapshot to history.  ``None`` (default)
+            keeps the historical behaviour — only full snapshots are persisted,
+            so ad-hoc partial API pulls never pollute history.  The background
+            monitor passes ``persist=True`` to persist its configured
+            (possibly partial) monitored set.
+    """
+    full = sections is None
+    if full:
+        selected = DYNAMIC_INFO_SECTIONS
+    else:
+        requested = set(sections)
+        selected = tuple(name for name in DYNAMIC_INFO_SECTIONS if name in requested)
+
+    collector = _DynamicInfoCollector(
+        resource_monitor=resource_monitor,
+        system_pressure_monitor=system_pressure_monitor,
+    )
+
+    data: Dict[str, Any] = {"collected_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    for name in selected:
+        data[name] = getattr(collector, name)()
+
+    should_persist = full if persist is None else persist
+    if should_persist:
+        persist_dynamic_snapshot_if_due(data)
 
     return data

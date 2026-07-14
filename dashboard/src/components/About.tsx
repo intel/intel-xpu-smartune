@@ -389,12 +389,12 @@ export default function About({ active }: Props) {
             ],
           }]
       ),
-      ...(staticInfo.io.valid_nics?.length
-        ? staticInfo.io.valid_nics.map((nic) => ({
+      ...(staticInfo.network.valid_nics?.length
+        ? staticInfo.network.valid_nics.map((nic) => ({
             title: `NIC: ${nic.name}`,
             items: [
               { label: 'Speed', value: formatNetworkSpeed(nic.speed_mbps) },
-              { label: 'Primary', value: nic.name === staticInfo.io.primary_interface ? 'Yes' : 'No' },
+              { label: 'Primary', value: nic.name === staticInfo.network.primary_interface ? 'Yes' : 'No' },
               ...(nic.ipv4?.length ? [{ label: 'IPv4', value: nic.ipv4.join(', ') }] : []),
               ...(nic.ipv6?.length ? [{ label: 'IPv6', value: nic.ipv6.join(', ') }] : []),
             ],
@@ -402,9 +402,9 @@ export default function About({ active }: Props) {
         : [{
             title: 'Network',
             items: [
-              { label: 'NIC count', value: formatPlain(staticInfo.io.nic_count) },
-              { label: 'Primary NIC', value: formatPlain(staticInfo.io.primary_interface) },
-              { label: 'Peak speed', value: formatNetworkSpeed(staticInfo.io.network_peak_mbps) },
+              { label: 'NIC count', value: formatPlain(staticInfo.network.nic_count) },
+              { label: 'Primary NIC', value: formatPlain(staticInfo.network.primary_interface) },
+              { label: 'Peak speed', value: formatNetworkSpeed(staticInfo.network.network_peak_mbps) },
             ],
           }]
       ),

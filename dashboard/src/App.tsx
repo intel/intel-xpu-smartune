@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect } from 'react'
-import { Tabs, Layout, Typography, Space, Badge } from 'antd'
+import { Tabs, Layout, Typography, Space, Badge, Alert } from 'antd'
 import {
   DashboardOutlined,
   AppstoreOutlined,
@@ -16,8 +16,32 @@ import HistoryDashboard from './components/HistoryDashboard'
 import About from './components/About'
 import { COLORS } from './styles/theme'
 import { api } from './api/client'
+import { GlobalConfigNoticesProvider, useGlobalConfigNotices } from './hooks/useGlobalConfigNotices'
 
 const { Header, Content } = Layout
+
+function GlobalConfigNoticeBar() {
+  const { notices, dismissNotice } = useGlobalConfigNotices()
+
+  if (!notices.length) return null
+
+  return (
+    <div style={{ marginTop: 12 }}>
+      {notices.map((notice) => (
+        <Alert
+          key={notice.id}
+          message={notice.title}
+          description={notice.description}
+          type="info"
+          showIcon
+          closable
+          onClose={() => dismissNotice(notice.id)}
+          style={{ marginBottom: 8 }}
+        />
+      ))}
+    </div>
+  )
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('1')
@@ -30,6 +54,22 @@ export default function App() {
       .getCapabilities()
       .then((c) => setBalancerEnabled(c.capabilities === 1))
       .catch(() => setBalancerEnabled(true))
+  }, [])
+
+  // Publish the combined height of the sticky header + sticky tab bar as a CSS
+  // variable so per-page sticky toolbars can pin themselves *below* the tab bar
+  // instead of colliding with it (both would otherwise stick at top:64 and the
+  // toolbar, having a lower z-index, would hide behind the tabs).
+  useEffect(() => {
+    const measure = () => {
+      const header = document.querySelector('.ant-layout-header') as HTMLElement | null
+      const nav = document.querySelector('.ant-tabs-nav') as HTMLElement | null
+      const offset = (header?.offsetHeight ?? 64) + (nav?.offsetHeight ?? 0)
+      document.documentElement.style.setProperty('--app-sticky-top', `${offset}px`)
+    }
+    measure()
+    window.addEventListener('resize', measure)
+    return () => window.removeEventListener('resize', measure)
   }, [])
 
   const tabs = [
@@ -102,67 +142,70 @@ export default function App() {
   ]
 
   return (
-    <Layout style={{ minHeight: '100vh', background: COLORS.bg }}>
-      <Header
-        style={{
-          background: COLORS.headerBg,
-          borderBottom: `1px solid ${COLORS.border}`,
-          padding: '0 24px',
-          display: 'flex',
-          alignItems: 'center',
-          gap: 16,
-          position: 'sticky',
-          top: 0,
-          zIndex: 100,
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <div
-            style={{
-              width: 32,
-              height: 32,
-              background: `linear-gradient(135deg, ${COLORS.accent} 0%, #3a6fd8 100%)`,
-              borderRadius: 6,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-          >
-            <DashboardOutlined style={{ color: '#fff', fontSize: 16 }} />
-          </div>
-          <Typography.Title
-            level={4}
-            style={{ color: COLORS.text, margin: 0, fontWeight: 600 }}
-          >
-            Intel XPU SmarTune
-          </Typography.Title>
-        </div>
-        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
-          <Badge status="processing" color={COLORS.green} />
-          <Typography.Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
-            Dynamic
-          </Typography.Text>
-        </div>
-      </Header>
-
-      <Content style={{ padding: '0 16px 16px', background: COLORS.bg }}>
-        <Tabs
-          activeKey={activeTab}
-          onChange={setActiveTab}
-          items={tabs}
-          size="large"
-          style={{ color: COLORS.text }}
-          tabBarStyle={{
-            marginBottom: 0,
-            paddingTop: 8,
-            background: COLORS.bg,
+    <GlobalConfigNoticesProvider>
+      <Layout style={{ minHeight: '100vh', background: COLORS.bg }}>
+        <Header
+          style={{
+            background: COLORS.headerBg,
             borderBottom: `1px solid ${COLORS.border}`,
+            padding: '0 24px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 16,
             position: 'sticky',
-            top: 64,
-            zIndex: 99,
+            top: 0,
+            zIndex: 100,
           }}
-        />
-      </Content>
-    </Layout>
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div
+              style={{
+                width: 32,
+                height: 32,
+                background: `linear-gradient(135deg, ${COLORS.accent} 0%, #3a6fd8 100%)`,
+                borderRadius: 6,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <DashboardOutlined style={{ color: '#fff', fontSize: 16 }} />
+            </div>
+            <Typography.Title
+              level={4}
+              style={{ color: COLORS.text, margin: 0, fontWeight: 600 }}
+            >
+              Intel XPU SmarTune
+            </Typography.Title>
+          </div>
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Badge status="processing" color={COLORS.green} />
+            <Typography.Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
+              Dynamic
+            </Typography.Text>
+          </div>
+        </Header>
+
+        <Content style={{ padding: '0 16px 16px', background: COLORS.bg }}>
+          <GlobalConfigNoticeBar />
+          <Tabs
+            activeKey={activeTab}
+            onChange={setActiveTab}
+            items={tabs}
+            size="large"
+            style={{ color: COLORS.text }}
+            tabBarStyle={{
+              marginBottom: 0,
+              paddingTop: 8,
+              background: COLORS.bg,
+              borderBottom: `1px solid ${COLORS.border}`,
+              position: 'sticky',
+              top: 64,
+              zIndex: 99,
+            }}
+          />
+        </Content>
+      </Layout>
+    </GlobalConfigNoticesProvider>
   )
 }

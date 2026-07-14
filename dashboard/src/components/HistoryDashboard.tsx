@@ -3,27 +3,27 @@ import { Alert, Button, Card, Checkbox, DatePicker, Divider, Dropdown, Empty, Mo
 import { DownloadOutlined, FilterOutlined, ReloadOutlined, SettingOutlined, DownOutlined } from '@ant-design/icons'
 import ExcelJS from 'exceljs'
 import {
-  Brush,
-  CartesianGrid,
-  Line,
   LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
+  CartesianGrid,
+  Line,
+  Brush,
 } from 'recharts'
 import dayjs, { type Dayjs } from 'dayjs'
 import { api } from '../api/client'
 import type { DynamicInfoData, HistoryData, HistoryRetentionData, HistorySnapshotItem, GpuUsageDevice, StaticInfoData } from '../api/types'
 import { COLORS } from '../styles/theme'
+import { useMonitoredSections } from '../hooks/useMonitoredSections'
+import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 
 const { Text, Title } = Typography
 
 interface Props {
   active: boolean
 }
-
-type EngineKey = 'vcs' | 'vecs' | 'ccs' | 'rcs' | 'bcs'
 
 interface PressureTrendPoint {
   timestamp: string
@@ -154,6 +154,19 @@ const RANGE_SECONDS: Record<Exclude<RangePreset, 'custom'>, number> = {
   '24h': 24 * 60 * 60,
 }
 
+const STICKY_TOOLBAR_STYLE: React.CSSProperties = {
+  position: 'sticky',
+  // Pin below the sticky app header + tab bar (measured in App.tsx); the
+  // fallback covers the initial paint before the variable is set.
+  top: 'var(--app-sticky-top, 128px)',
+  zIndex: 25,
+  background: 'rgba(11, 15, 20, 0.9)',
+  backdropFilter: 'blur(8px)',
+  borderBottom: `1px solid ${COLORS.border}`,
+  padding: '8px 0',
+  marginBottom: 16,
+}
+
 const SNAPSHOT_INTERVAL_SECONDS = 5
 const HISTORY_LIMIT_CAP = 100000
 const MAX_CHART_POINTS = 800
@@ -237,6 +250,8 @@ function formatHistoryAxisTick(val: string | number): string {
 const DISK_COLORS = ['#e07b54', '#73bf69', COLORS.accent, COLORS.yellow, COLORS.red, '#b877db', '#56c8d8']
 const NETWORK_COLORS = ['#73bf69', COLORS.accent, '#e07b54', COLORS.yellow, '#b877db', '#56c8d8', COLORS.red]
 
+type EngineKey = 'vcs' | 'vecs' | 'ccs' | 'rcs' | 'bcs'
+
 // Fixed per-metric colors for disk and network charts
 const METRIC_COLORS = { util: '#56c8d8', read: '#73bf69', write: '#e07b54', rx: '#73bf69', tx: '#e07b54' }
 
@@ -252,7 +267,10 @@ const P_CORE_COLORS = ['#ff7f00', '#ffd700', '#a65628', '#d4a017', '#ffa500', '#
 const E_CORE_COLORS = ['#377eb8', '#4daf4a', '#17becf', '#1e90ff', '#00ced1', '#7cfc00', '#20b2aa', '#2e8b57', '#4682b4', '#32cd32', '#00ffff', '#008b8b', '#6495ed', '#7fffd4', '#00fa9a', '#87ceeb']
 const LPE_CORE_COLORS = ['#984ea3', '#f781bf', '#ba55d3', '#e879f9', '#9370db', '#ff69b4', '#c71585', '#dda0dd']
 
-const SECTION_OPTIONS = [
+const DEFAULT_MONITORED_DYNAMIC_SECTIONS = ['cpu', 'memory', 'pressure', 'network', 'disk', 'gpu', 'npu'] as const
+const DEFAULT_MONITORED_DYNAMIC_SECTION_SET = new Set<string>(DEFAULT_MONITORED_DYNAMIC_SECTIONS)
+
+const RAW_SECTION_OPTIONS = [
   { label: 'System Pressure', value: 'pressure' },
   { label: 'CPU & Memory', value: 'cpuMem' },
   { label: 'CPU Per-Core', value: 'cpuPerCore' },
@@ -261,7 +279,25 @@ const SECTION_OPTIONS = [
   { label: 'NPU', value: 'npu' },
   { label: 'GPU', value: 'gpu' },
 ]
-const ALL_SECTIONS = SECTION_OPTIONS.map((o) => o.value)
+// A chart is shown when ANY of its required sections is monitored (`.some`),
+// not all of them.  This matters for the combined "CPU & Memory" chart: with
+// only cpu (or only memory) monitored it still appears, showing whichever
+// series has data.  Single-requirement entries are unaffected.
+const SECTION_REQUIREMENTS: Record<string, string[]> = {
+  pressure: ['pressure'],
+  cpuMem: ['cpu', 'memory'],
+  cpuPerCore: ['cpu'],
+  disk: ['disk'],
+  network: ['network'],
+  npu: ['npu'],
+  gpu: ['gpu'],
+}
+const DEFAULT_SECTION_OPTIONS = RAW_SECTION_OPTIONS.filter((opt) =>
+  (SECTION_REQUIREMENTS[opt.value] || []).some((name) =>
+    DEFAULT_MONITORED_DYNAMIC_SECTION_SET.has(name)
+  )
+)
+const DEFAULT_ALL_SECTIONS = DEFAULT_SECTION_OPTIONS.map((o) => o.value)
 
 function normalizePercent(value: unknown): number | null {
   if (typeof value !== 'number' || Number.isNaN(value)) return null
@@ -1011,16 +1047,21 @@ function ConfigurableChart<T extends { timestamp: string }>({
   )
 }
 
-function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
-  const [hidden, setHidden] = useState<Set<string>>(new Set())
-  const toggle = useCallback((key: string) => {
-    setHidden((prev) => {
-      const next = new Set(prev)
-      if (next.has(key)) next.delete(key)
-      else next.add(key)
-      return next
-    })
-  }, [])
+const EMPTY_GPU_HIDDEN: Set<string> = new Set()
+
+function GpuHistoryCard({
+  series,
+  hidden = EMPTY_GPU_HIDDEN,
+  onToggle,
+}: {
+  series: GpuTrendSeries
+  // Hidden-legend state is owned by the parent (keyed by device id) so it
+  // survives data refreshes that would otherwise remount this card and wipe a
+  // local useState — matching how the other history charts persist their state.
+  hidden?: Set<string>
+  onToggle: (key: string) => void
+}) {
+  const toggle = onToggle
 
   // Shared brush state so both charts stay aligned
   const [brushRange, setBrushRange] = useState<{ startIndex: number; endIndex: number } | null>(null)
@@ -1293,7 +1334,7 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
     <>
       {pCoreSeries.length > 0 && (
         <ConfigurableChart
-          title={`P-Core (${pCoreIndices.length}) — Utilization & Frequency`}
+          title={`CPU P-Core (${pCoreIndices.length}) — Utilization & Frequency`}
           storageKey="history-cpu-pcore"
           data={points}
           allSeries={pCoreSeries}
@@ -1304,7 +1345,7 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
       )}
       {eCoreSeries.length > 0 && (
         <ConfigurableChart
-          title={`E-Core (${eCoreIndices.length}) — Utilization & Frequency`}
+          title={`CPU E-Core (${eCoreIndices.length}) — Utilization & Frequency`}
           storageKey="history-cpu-ecore"
           data={points}
           allSeries={eCoreSeries}
@@ -1315,7 +1356,7 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
       )}
       {lpeCoreSeries.length > 0 && (
         <ConfigurableChart
-          title={`LPE-Core (${lpeCoreIndices.length}) — Utilization & Frequency`}
+          title={`CPU LPE-Core (${lpeCoreIndices.length}) — Utilization & Frequency`}
           storageKey="history-cpu-lpecore"
           data={points}
           allSeries={lpeCoreSeries}
@@ -1341,11 +1382,28 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
 export default function HistoryDashboard({ active }: Props) {
   const [rangePreset, setRangePreset] = useState<RangePreset>('15m')
   const [customRange, setCustomRange] = useState<[Dayjs | null, Dayjs | null] | null>(null)
+  const { publishNotice } = useGlobalConfigNotices()
   const [history, setHistory] = useState<HistoryData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [lastFetchAt, setLastFetchAt] = useState<string | null>(null)
-  const [visibleSections, setVisibleSections] = useState<string[]>(ALL_SECTIONS)
+  const { sectionSet: monitoredSectionSet } =
+    useMonitoredSections(active, [...DEFAULT_MONITORED_DYNAMIC_SECTIONS])
+  const sectionOptions = useMemo(() => RAW_SECTION_OPTIONS.filter((opt) =>
+    (SECTION_REQUIREMENTS[opt.value] || []).some((name) => monitoredSectionSet.has(name))
+  ), [monitoredSectionSet])
+  const allSections = useMemo(() => sectionOptions.map((o) => o.value), [sectionOptions])
+  const [visibleSections, setVisibleSections] = useState<string[]>(DEFAULT_ALL_SECTIONS)
+
+  useEffect(() => {
+    setVisibleSections((prev) => {
+      if (prev.length === 0) return prev
+      const allowed = new Set(allSections)
+      const filtered = prev.filter((name) => allowed.has(name))
+      if (filtered.length === prev.length) return prev
+      return filtered.length > 0 ? filtered : [...allSections]
+    })
+  }, [allSections])
 
   // Static info for NIC link speeds & disk throughput caps
   const [staticInfo, setStaticInfo] = useState<StaticInfoData | null>(null)
@@ -1478,6 +1536,12 @@ export default function HistoryDashboard({ active }: Props) {
           onOk: () => {
             setRetention((prev) => prev ? { ...prev, ...current } : current)
             setPendingRetentionDays(current.retention_days)
+            publishNotice({
+              title: 'History retention updated',
+              description: `Another client set retention to ${current.retention_days} day(s) at ${tsLabel}.`,
+              scope: 'history_retention',
+              updatedAt: newTs,
+            })
           },
         })
         return
@@ -1493,6 +1557,12 @@ export default function HistoryDashboard({ active }: Props) {
         ? `Retention set to ${data.retention_days} day(s). ${data.deleted} old record(s) deleted.`
         : `Retention set to ${data.retention_days} day(s).`
       messageApi.success(msg)
+      publishNotice({
+        title: 'History retention updated',
+        description: msg,
+        scope: 'history_retention',
+        updatedAt: data.updated_at,
+      })
       // Refresh history so the UI reflects any newly-removed rows.
       fetchHistory()
     } catch (e: unknown) {
@@ -1500,7 +1570,7 @@ export default function HistoryDashboard({ active }: Props) {
     } finally {
       setSavingRetention(false)
     }
-  }, [pendingRetentionDays, retention?.updated_at, messageApi, fetchHistory])
+  }, [pendingRetentionDays, retention?.updated_at, messageApi, fetchHistory, publishNotice])
 
   const dynamicItems = useMemo<HistorySnapshotItem[]>(
     () => (history?.items ?? []).filter((item: HistorySnapshotItem) => item.snapshot_type === 'dynamic'),
@@ -1532,8 +1602,8 @@ export default function HistoryDashboard({ active }: Props) {
     const { points, nicNames: nn, nicSpeeds: sp } = buildNetworkTrendPoints(dynamicItems)
     // Merge with static info NIC speeds as fallback (history data may lack speed_mbps)
     const merged = { ...sp }
-    if (staticInfo?.io?.network_speeds_mbps && typeof staticInfo.io.network_speeds_mbps === 'object') {
-      for (const [name, speed] of Object.entries(staticInfo.io.network_speeds_mbps)) {
+    if (staticInfo?.network?.network_speeds_mbps && typeof staticInfo.network.network_speeds_mbps === 'object') {
+      for (const [name, speed] of Object.entries(staticInfo.network.network_speeds_mbps)) {
         if (typeof speed === 'number' && speed > 0 && !merged[name]) {
           merged[name] = speed
         }
@@ -1588,6 +1658,18 @@ export default function HistoryDashboard({ active }: Props) {
       if (next.has(key)) next.delete(key)
       else next.add(key)
       return next
+    })
+  }, [])
+
+  // GPU legend state is kept here (per device id) rather than inside
+  // GpuHistoryCard so it is not lost when a refresh remounts the card.
+  const [gpuHidden, setGpuHidden] = useState<Record<string, Set<string>>>({})
+  const toggleGpu = useCallback((deviceId: string, key: string) => {
+    setGpuHidden((prev) => {
+      const next = new Set(prev[deviceId] ?? [])
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return { ...prev, [deviceId]: next }
     })
   }, [])
 
@@ -1953,12 +2035,13 @@ export default function HistoryDashboard({ active }: Props) {
         />
       )}
 
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
-        <Title level={5} style={{ color: COLORS.text, margin: 0 }}>
-          History Trends
-        </Title>
+      <div style={STICKY_TOOLBAR_STYLE}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <Title level={5} style={{ color: COLORS.text, margin: 0 }}>
+            History Trends
+          </Title>
 
-        <Space size={12} wrap>
+          <Space size={12} wrap>
           <Segmented
             options={RANGE_PRESET_OPTIONS}
             value={rangePreset}
@@ -1998,15 +2081,15 @@ export default function HistoryDashboard({ active }: Props) {
             content={
               <div>
                 <Checkbox
-                  indeterminate={visibleSections.length > 0 && visibleSections.length < ALL_SECTIONS.length}
-                  checked={visibleSections.length === ALL_SECTIONS.length}
-                  onChange={(e) => setVisibleSections(e.target.checked ? [...ALL_SECTIONS] : [])}
+                  indeterminate={visibleSections.length > 0 && visibleSections.length < allSections.length}
+                  checked={allSections.length > 0 && visibleSections.length === allSections.length}
+                  onChange={(e) => setVisibleSections(e.target.checked ? [...allSections] : [])}
                 >
                   Select All
                 </Checkbox>
                 <Divider style={{ margin: '6px 0' }} />
                 <Checkbox.Group
-                  options={SECTION_OPTIONS}
+                  options={sectionOptions}
                   value={visibleSections}
                   onChange={(checked) => setVisibleSections(checked as string[])}
                   style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
@@ -2016,9 +2099,9 @@ export default function HistoryDashboard({ active }: Props) {
           >
             <Button
               icon={<FilterOutlined />}
-              style={visibleSections.length < ALL_SECTIONS.length ? { borderColor: COLORS.accent, color: COLORS.accent } : undefined}
+              style={visibleSections.length < allSections.length ? { borderColor: COLORS.accent, color: COLORS.accent } : undefined}
             >
-              Filter{visibleSections.length < ALL_SECTIONS.length ? ` (${visibleSections.length}/${ALL_SECTIONS.length})` : ''} <DownOutlined style={{ fontSize: 10 }} />
+              Filter{visibleSections.length < allSections.length ? ` (${visibleSections.length}/${allSections.length})` : ''} <DownOutlined style={{ fontSize: 10 }} />
             </Button>
           </Popover>
 
@@ -2077,25 +2160,26 @@ export default function HistoryDashboard({ active }: Props) {
             </AntTooltip>
           </Popover>
 
-          <Dropdown
-            trigger={['click']}
-            menu={{
-              items: [
-                { key: 'xlsx', label: 'Export as Excel (.xlsx)' },
-                { key: 'json', label: 'Export as JSON' },
-              ],
-              onClick: ({ key }) => {
-                if (key === 'xlsx') handleExportXLSX()
-                else if (key === 'json') handleExportJSON()
-              },
-            }}
-            disabled={dynamicItems.length === 0}
-          >
-            <Button icon={<DownloadOutlined />} disabled={dynamicItems.length === 0}>
-              Export <DownOutlined style={{ fontSize: 10 }} />
-            </Button>
-          </Dropdown>
-        </Space>
+            <Dropdown
+              trigger={['click']}
+              menu={{
+                items: [
+                  { key: 'xlsx', label: 'Export as Excel (.xlsx)' },
+                  { key: 'json', label: 'Export as JSON' },
+                ],
+                onClick: ({ key }) => {
+                  if (key === 'xlsx') handleExportXLSX()
+                  else if (key === 'json') handleExportJSON()
+                },
+              }}
+              disabled={dynamicItems.length === 0}
+            >
+              <Button icon={<DownloadOutlined />} disabled={dynamicItems.length === 0}>
+                Export <DownOutlined style={{ fontSize: 10 }} />
+              </Button>
+            </Dropdown>
+          </Space>
+        </div>
       </div>
 
       <Text style={{ color: COLORS.textMuted, fontSize: 12, display: 'block', marginBottom: 12 }}>
@@ -2443,20 +2527,10 @@ export default function HistoryDashboard({ active }: Props) {
         </>
       )}
 
-      {/* GPU History */}
-      {visibleSections.includes('gpu') && <div style={{ marginTop: 16 }}>
-        {loading ? (
-          <Card
-            style={{
-              background: COLORS.panelBg,
-              border: `1px solid ${COLORS.border}`,
-              borderRadius: 6,
-            }}
-            bodyStyle={{ padding: 16 }}
-          >
-            <div style={{ color: COLORS.textMuted, textAlign: 'center' }}>Loading GPU history...</div>
-          </Card>
-        ) : gpuTrendSeries.length === 0 ? (
+      {/* GPU History — shares the single global "Loading history..." indicator
+          above; no separate loading placeholder (matches the other sections). */}
+      {visibleSections.includes('gpu') && !loading && <div style={{ marginTop: 16 }}>
+        {gpuTrendSeries.length === 0 ? (
           <Card
             style={{
               background: COLORS.panelBg,
@@ -2469,7 +2543,12 @@ export default function HistoryDashboard({ active }: Props) {
           </Card>
         ) : (
           gpuTrendSeries.map((series: GpuTrendSeries) => (
-            <GpuHistoryCard key={series.id} series={series} />
+            <GpuHistoryCard
+              key={series.id}
+              series={series}
+              hidden={gpuHidden[series.id]}
+              onToggle={(key) => toggleGpu(series.id, key)}
+            />
           ))
         )}
       </div>}

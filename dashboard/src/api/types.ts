@@ -291,7 +291,7 @@ export interface StaticInfoData {
       }>
     }
   }
-  io: {
+  network: {
     nic_count: number
     network_speeds_mbps: Record<string, number>
     network_peak_mbps: number | null
@@ -378,6 +378,7 @@ export interface GpuUsageOutput {
 
 export interface DynamicInfoData {
   collected_at: string
+  monitored_sections_updated_at?: number
   cpu: {
     usage_total: number | null
     per_core_usage: number[]
@@ -474,6 +475,13 @@ export interface WeightsTopData {
 
 export interface PassiveControlData {
   enabled: boolean
+  updated_at?: number
+}
+
+export interface MonitoredSectionsData {
+  sections: string[]
+  configured_sections: string[] | null
+  all_sections: string[]
   updated_at?: number
 }
 

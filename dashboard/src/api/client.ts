@@ -21,6 +21,7 @@ import type {
   ResourceLimitProfileData,
   WeightsTopData,
   PassiveControlData,
+  MonitoredSectionsData,
   DiscoverSearchData,
   DiscoverExtractData,
   WizardCommitPayload,
@@ -73,7 +74,13 @@ export const api = {
   getProcesses: () => get<ProcessListData>('/monitor/processes'),
   getStaticInfo: () => get<StaticInfoData>('/monitor/static_info'),
   refreshStaticInfo: () => get<StaticInfoData>('/monitor/static_info?force_refresh=1'),
-  getDynamicInfo: () => get<DynamicInfoData>('/monitor/dynamic_info'),
+  getDynamicInfo: (sections?: string[]) => {
+    const sectionList = sections?.map((s) => s.trim()).filter(Boolean) || []
+    const query = sectionList.length
+      ? `?sections=${encodeURIComponent(sectionList.join(','))}`
+      : ''
+    return get<DynamicInfoData>(`/monitor/dynamic_info${query}`)
+  },
   getHistory: (options: HistoryQueryOptions = {}) => {
     const snapshotType = options.snapshotType ?? 'dynamic'
     const limit = Math.max(1, Math.min(options.limit ?? 100, 20000))
@@ -208,6 +215,7 @@ export const api = {
     post<{ id: string; name: string }>('/app/purge_controlled_app', { id }),
 
   getPassiveControl: () => get<PassiveControlData>('/monitor/config/passive_control'),
+  getMonitoredSections: () => get<MonitoredSectionsData>('/monitor/config/monitored_sections'),
   updatePassiveControl: (enabled: boolean, expectedUpdatedAt?: number) =>
     postWithConflict<{
       success: boolean

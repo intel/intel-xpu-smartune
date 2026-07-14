@@ -80,14 +80,17 @@ All endpoints return a standardized JSON structure:
 | Monitor | `/monitor/app_disk_io_stats` | GET | App disk I/O usage | Throughput + IOPS |
 | Monitor | `/monitor/processes` | GET | All processes | Like `top`, sorted by CPU |
 | Monitor | `/monitor/static_info` | GET | System hardware info | BIOS/OS/CPU/GPU/NPU |
-| Monitor | `/monitor/dynamic_info` | GET | Live system metrics (CPU, memory, IO, GPU, NPU) | Auto-refresh cached (2s interval) |
-| Monitor | `/monitor/history` | GET | Snapshot history (dynamic_info) | Time-range, type filter, limit support |
+| Monitor | `/monitor/static_info/<section>` | GET | Single static section | e.g. `/static_info/gpu`; `all` = full |
+| Monitor | `/monitor/dynamic_info` | GET | Live system metrics (CPU, memory, IO, GPU, NPU) | Full snapshot; optional `?sections=` filter |
+| Monitor | `/monitor/dynamic_info/<section>` | GET | Single dynamic section | e.g. `/dynamic_info/gpu`; on-demand; `all` = full |
+| Monitor | `/monitor/history` | GET | Snapshot history (static/dynamic) | Time-range, type filter, limit, `sections` projection |
 | Monitor | `/monitor/history/retention` | GET | Get retention config | Current period + bounds |
 | Monitor | `/monitor/history/retention` | POST | Set retention period | Optimistic concurrency |
 | Config | `/monitor/config/weights_top` | GET | Get ranking weights | CPU/memory/GPU weights |
 | Config | `/monitor/config/weights_top` | POST | Update ranking weights | Optimistic concurrency |
 | Config | `/monitor/config/passive_control` | GET | Get passive control state | Enable/disable flag |
 | Config | `/monitor/config/passive_control` | POST | Toggle passive control | Optimistic concurrency |
+| Config | `/monitor/config/monitored_sections` | GET | Get monitored dynamic sections | Effective + configured + all |
 
 ---
 
@@ -936,9 +939,45 @@ data: {"app_id": "com.example.app", "app_name": "example", "status": "running", 
 
 ---
 
+#### GET /monitor/static_info/&lt;section&gt;
+
+**Purpose:** Return a single section of the static config, e.g. `/monitor/static_info/gpu`. Convenience sub-resource so a caller can fetch just the hardware group it needs.
+
+**Path Parameter:**
+
+| Parameter | Required | Type | Description |
+|-----------|----------|------|-------------|
+| section | Yes | string | One of `bios`, `os`, `driver`, `cpu`, `memory`, `network`, `disk`, `gpu`, `npu`, or `all` (full snapshot, equivalent to `/monitor/static_info`) |
+
+**Query Parameters:** Same as `/monitor/static_info` (`force_refresh`).
+
+**Response:** Same envelope as `/monitor/static_info`, with `data` restricted to the requested section (e.g. `{ "gpu": { ... } }`).
+
+**Response (Invalid section — 101 ARGUMENT_ERROR):**
+```json
+{
+  "retcode": 101,
+  "retmsg": "Unknown section 'foo'. Valid sections: bios, os, driver, cpu, memory, network, disk, gpu, npu, all",
+  "data": {}
+}
+```
+
+---
+
 #### GET /monitor/dynamic_info
 
-**Purpose:** Return dynamic system metrics snapshot. Auto-cached with background refresh every 2 seconds.
+**Purpose:** Return a dynamic system metrics snapshot. By default returns the **full** snapshot (all sections), served from a background-refreshed cache (refresh every 2 seconds). An optional `sections` query parameter restricts the payload to specific hardware groups.
+
+**Query Parameters:**
+
+| Parameter | Required | Type | Default | Description |
+|-----------|----------|------|---------|-------------|
+| sections | No | string | — | Comma-separated section list, e.g. `sections=cpu,gpu`. Omitted/empty = full snapshot. Valid: `cpu`, `memory`, `pressure`, `network`, `disk`, `gpu`, `npu` |
+
+**Behavior:**
+- **No `sections`** → full snapshot. Starts the full-collection background thread and serves from its warm cache.
+- **With `sections`** → returns only those sections. Monitored sections are sliced from the warm cache; non-monitored sections are collected on demand (with a short per-section TTL cache) and do **not** start the full background collector — so e.g. requesting only `gpu` never touches CPU/NPU/disk.
+- Invalid section names return `101 ARGUMENT_ERROR`.
 
 **Response:**
 ```json
@@ -953,10 +992,29 @@ data: {"app_id": "com.example.app", "app_name": "example", "status": "running", 
     "network": { "per_nic": {"eth0": {"tx_mbps": 120.5, "rx_mbps": 85.3}} },
     "disk": { "is_stressed": false, "iowait": 2.1, "busy_level": "low", "disk_io": {"sda": {"read_mbps": 50.0, "write_mbps": 30.0, "is_busy": false}}, "..." },
     "gpu": { "vram": {"card0": {"used_mb": 1024, "total_mb": 8192, "free_mb": 7168}}, "gpu_usage": {"devices": [{"engines": ["rcs","bcs","vcs","vecs","ccs"], "engine_util": {"rcs": 45.2, "vcs": 80.5, "..."}, "freqs": [{"name": "gt0", "cur_mhz": 1200, "act_mhz": 1150, "max_mhz": 1500, "rc6_pct": 85.0}], "power_w": {"gpu": 15.2, "pkg": 28.0}}]} },
-    "npu": { "npu_smi": {} }
+    "npu": { "npu_smi": {} },
+    "monitored_sections_updated_at": 1718600000
   }
 }
 ```
+
+**Field Notes:**
+- `monitored_sections_updated_at` — Unix timestamp that advances only when the effective monitored-sections set changes. Clients can watch it to detect a config change and re-sync (see `/monitor/config/monitored_sections`).
+- A section-filtered response contains only the requested section keys plus `collected_at` and `monitored_sections_updated_at`.
+
+---
+
+#### GET /monitor/dynamic_info/&lt;section&gt;
+
+**Purpose:** Return a single hardware section of the dynamic snapshot — a convenience sub-resource for the common single-section case, e.g. `/monitor/dynamic_info/cpu`. Collects only that section on demand.
+
+**Path Parameter:**
+
+| Parameter | Required | Type | Description |
+|-----------|----------|------|-------------|
+| section | Yes | string | One of `cpu`, `memory`, `pressure`, `network`, `disk`, `gpu`, `npu`, or `all` (full snapshot, equivalent to `/monitor/dynamic_info`) |
+
+**Response:** Same envelope as `/monitor/dynamic_info`; `data` contains only the requested section (plus `collected_at`, `monitored_sections_updated_at`). Invalid names return `101 ARGUMENT_ERROR`.
 
 ---
 
@@ -971,6 +1029,7 @@ data: {"app_id": "com.example.app", "app_name": "example", "status": "running", 
 | Parameter | Required | Type | Default | Description |
 |-----------|----------|------|---------|-------------|
 | snapshot_type | No | string | "all" | Filter: `static`, `dynamic`, or `all` |
+| sections | No | string | — | Comma-separated field projection, e.g. `sections=cpu,gpu`. Restricts each row's `data` payload to those sections. Valid: `bios`, `os`, `driver`, `cpu`, `memory`, `pressure`, `network`, `disk`, `gpu`, `npu` |
 | limit | No | int | 100 | Max rows to return (1-20000) |
 | start_time | No | int | — | Unix timestamp (seconds), range start |
 | end_time | No | int | — | Unix timestamp (seconds), range end |
@@ -979,6 +1038,7 @@ data: {"app_id": "com.example.app", "app_name": "example", "status": "running", 
 **Notes:**
 - `range_seconds` is only used when both `start_time` and `end_time` are omitted
 - Server anchors the window to its own clock to avoid client clock-skew issues
+- `sections` only trims serialization/transfer; rows are still read from the DB in full. Omitting it (or `null`) returns every stored field. Invalid section names return `101 ARGUMENT_ERROR`
 
 **Response:**
 ```json
@@ -987,6 +1047,7 @@ data: {"app_id": "com.example.app", "app_name": "example", "status": "running", 
   "retmsg": "Successfully retrieved monitor history",
   "data": {
     "snapshot_type": "dynamic",
+    "sections": null,
     "limit": 100,
     "start_time": 1718600000,
     "end_time": 1718603600,
@@ -1235,14 +1296,49 @@ data: {"app_id": "com.example.app", "app_name": "example", "status": "running", 
 
 ---
 
+#### GET /monitor/config/monitored_sections
+
+**Purpose:** Report which dynamic-info sections the background collector continuously monitors. Driven by the `monitored_sections` config key:
+- **unset (`null`)** → monitor **all** sections (default)
+- **list** (e.g. `["cpu","gpu"]`) → monitor only those; others are on-demand only
+- **empty (`[]`)** → nothing monitored; no background collector runs (pure on-demand)
+
+This is read-only via the API — the set is changed by editing the server config (`config.yaml`).
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Successfully retrieved monitored_sections configuration",
+  "data": {
+    "sections": ["cpu", "gpu"],
+    "configured_sections": ["cpu", "gpu"],
+    "all_sections": ["cpu", "memory", "pressure", "network", "disk", "gpu", "npu"],
+    "updated_at": 1718600000
+  }
+}
+```
+
+**Field Details:**
+| Field | Type | Description |
+|-------|------|-------------|
+| sections | string[] | Effective monitored sections, in canonical order (resolves `null` → all) |
+| configured_sections | string[] \| null | Raw config value; `null` means "all sections" |
+| all_sections | string[] | Full list of supported dynamic sections |
+| updated_at | int | Unix timestamp; advances only when the effective set changes |
+
+---
+
 ## Notes
 
 ### Background Caching
 
 Several monitor endpoints use background threads for performance:
-- `/monitor/dynamic_info` — refreshes every 2 seconds
+- `/monitor/dynamic_info` — full-snapshot collector refreshes every 2 seconds. It only runs when `monitored_sections` is non-empty, and collects just the monitored sections. When `monitored_sections` is `[]`, no background collector runs and all section requests are served on demand.
 - `/monitor/app_resource_stats` — refreshes every 2 seconds (parks when idle >5.5s)
 - `/monitor/app_disk_io_stats` — refreshes every 2 seconds (same cache thread)
+
+Section-scoped requests (`/monitor/dynamic_info?sections=...`, `/monitor/dynamic_info/<section>`) use a short per-section TTL cache to coalesce rapid on-demand polls and never start the full collector.
 
 ### SSE Connection
 

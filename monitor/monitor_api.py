@@ -13,7 +13,12 @@ import psutil
 
 from db.DatabaseModel import MonitorSnapshot
 from monitor import ResourceMonitor, PSIMonitor, PressureAnalyzer
-from monitor.system_info import collect_static_info, collect_dynamic_info
+from monitor.system_info import (
+    collect_static_info,
+    collect_dynamic_info,
+    STATIC_INFO_SECTIONS,
+    DYNAMIC_INFO_SECTIONS,
+)
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
 
@@ -34,6 +39,25 @@ _DYNAMIC_INFO_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
 _DYNAMIC_INFO_CACHE_LOCK = threading.Lock()
 _dynamic_info_refresh_started = False
 _dynamic_info_refresh_start_lock = threading.Lock()
+# Stop signal + handle for the background collector so it can be shut down
+# cleanly at service stop (rather than only dying with the process).
+_dynamic_info_stop_event = threading.Event()
+_dynamic_info_collector_thread = None
+
+# Section-scoped on-demand cache for /dynamic_info?sections=... and
+# /dynamic_info/<section>.  Unlike the full snapshot above, these requests are
+# meant for integrators who only want one hardware block: they collect ONLY the
+# requested sections and never start the full-collection background thread, so
+# polling /dynamic_info/gpu never queries CPU/NPU/disk/etc.  A short per-section
+# TTL coalesces rapid polls so each request doesn't re-fork xpu-smi/npu-smi.
+_DYNAMIC_SECTION_TTL_SEC: float = 1.0
+_DYNAMIC_SECTION_CACHE: Dict[str, Dict[str, Any]] = {}  # section -> {"data":..., "ts":...}
+_DYNAMIC_SECTION_CACHE_LOCK = threading.Lock()
+# Sections whose collection needs the ResourceMonitor / SystemPressureMonitor
+# singletons; everything else (cpu/memory/network/gpu/npu) needs neither, so a
+# GPU-only request never constructs those monitors.
+_SECTIONS_NEED_RM = frozenset({"disk"})
+_SECTIONS_NEED_SPM = frozenset({"disk", "pressure"})
 
 # ---------------------------------------------------------------------------
 # Background auto-refresh cache for /app_resource_stats and /app_disk_io_stats
@@ -67,42 +91,92 @@ _app_stats_refresh_started = False
 _app_stats_refresh_start_lock = threading.Lock()
 
 
-def _start_dynamic_info_auto_refresh() -> None:
-    """Start the background thread that pre-caches dynamic_info.
+def _get_monitored_sections() -> list:
+    """Resolve the configured set of sections to continuously monitor.
 
-    Idempotent: calling more than once has no effect.  The thread collects
-    fresh metrics every ``_DYNAMIC_INFO_REFRESH_INTERVAL_SEC`` seconds and
-    stores the result in ``_DYNAMIC_INFO_CACHE`` so that API requests return
-    immediately without blocking on expensive metric collection.
+    ``monitored_sections`` unset (None) → monitor every section (the default,
+    backward compatible).  An explicit list is validated against
+    ``DYNAMIC_INFO_SECTIONS`` (unknown names dropped) and returned in canonical
+    order.  An explicit empty list means "pure on-demand" — no background
+    collector runs.
     """
-    global _dynamic_info_refresh_started
-    with _dynamic_info_refresh_start_lock:
-        if _dynamic_info_refresh_started:
-            return
-        _dynamic_info_refresh_started = True
+    from config.config import b_config
+    raw = b_config.monitored_sections
+    if raw is None:
+        return list(DYNAMIC_INFO_SECTIONS)
+    raw_set = set(raw)
+    return [name for name in DYNAMIC_INFO_SECTIONS if name in raw_set]
 
-    def refresh_loop() -> None:
-        while True:
-            loop_start = time.time()
-            try:
-                monitor = _get_resource_monitor()
-                spm = _get_system_pressure_monitor()
+
+def _dynamic_info_collector_loop() -> None:
+    """Continuously collect the configured ``monitored_sections`` into the
+    shared cache and persist them to history, until signalled to stop.
+
+    The configured set is re-read every cycle, so it only ever collects the
+    hardware the operator asked to monitor — a deployment configured for GPU
+    only never queries CPU/NPU/disk/etc. in the background.
+    """
+    while not _dynamic_info_stop_event.is_set():
+        loop_start = time.time()
+        try:
+            monitored = _get_monitored_sections()
+            if monitored:
+                # sections=None collects the full snapshot (and keeps the exact
+                # historical full-snapshot shape); a subset collects just those.
+                all_set = set(monitored) == set(DYNAMIC_INFO_SECTIONS)
+                sections_arg = None if all_set else monitored
+                need_rm = any(s in _SECTIONS_NEED_RM for s in monitored)
+                need_spm = any(s in _SECTIONS_NEED_SPM for s in monitored)
                 data = collect_dynamic_info(
-                    resource_monitor=monitor,
-                    system_pressure_monitor=spm,
+                    resource_monitor=_get_resource_monitor() if need_rm else None,
+                    system_pressure_monitor=_get_system_pressure_monitor() if need_spm else None,
+                    sections=sections_arg,
+                    persist=True,
                 )
                 with _DYNAMIC_INFO_CACHE_LOCK:
                     _DYNAMIC_INFO_CACHE["data"] = data
                     _DYNAMIC_INFO_CACHE["ts"] = time.time()
-            except Exception as exc:
-                logger.debug("dynamic_info auto-refresh error: %s", exc)
-            elapsed = time.time() - loop_start
-            # Always sleep at least 0.1 s to avoid a tight loop if collection
-            # finishes faster than expected (e.g. an exception path).
-            time.sleep(max(0.1, _DYNAMIC_INFO_REFRESH_INTERVAL_SEC - elapsed))
+        except Exception as exc:
+            logger.debug("dynamic_info collector error: %s", exc)
+        elapsed = time.time() - loop_start
+        # Wait on the stop event (not time.sleep) so shutdown is prompt; still
+        # sleep at least 0.1 s to avoid a tight loop on a fast/exception path.
+        _dynamic_info_stop_event.wait(max(0.1, _DYNAMIC_INFO_REFRESH_INTERVAL_SEC - elapsed))
 
-    t = threading.Thread(target=refresh_loop, daemon=True, name="dynamic-info-refresh")
-    t.start()
+
+def _start_dynamic_info_auto_refresh() -> None:
+    """Start the config-driven background collector (idempotent).
+
+    Collects the configured ``monitored_sections`` every
+    ``_DYNAMIC_INFO_REFRESH_INTERVAL_SEC`` seconds so API requests return
+    immediately from the warm cache.  A no-op when ``monitored_sections`` is
+    empty (pure on-demand mode).  Started at service startup; also called
+    lazily by the full endpoint as a dev/test self-start fallback.
+    """
+    global _dynamic_info_refresh_started, _dynamic_info_collector_thread
+    with _dynamic_info_refresh_start_lock:
+        if _dynamic_info_refresh_started or not _get_monitored_sections():
+            return
+        _dynamic_info_refresh_started = True
+        _dynamic_info_stop_event.clear()
+        _dynamic_info_collector_thread = threading.Thread(
+            target=_dynamic_info_collector_loop, daemon=True, name="dynamic-info-collector")
+        _dynamic_info_collector_thread.start()
+
+
+def stop_dynamic_info_collector() -> None:
+    """Signal the background collector to stop and wait briefly for it to exit.
+
+    Safe to call when the collector was never started (no-op).
+    """
+    global _dynamic_info_refresh_started
+    with _dynamic_info_refresh_start_lock:
+        if not _dynamic_info_refresh_started:
+            return
+        _dynamic_info_refresh_started = False
+    _dynamic_info_stop_event.set()
+    if _dynamic_info_collector_thread is not None:
+        _dynamic_info_collector_thread.join(timeout=2)
 
 
 def _start_app_stats_auto_refresh() -> None:
@@ -232,7 +306,50 @@ _CONFIG_TS_KEYS = {
     "weights_top":              "weights_top_updated_at",
     "retention":                "retention_updated_at",
     "passive_resource_control": "passive_resource_control_updated_at",
+    "monitored_sections":       "monitored_sections_updated_at",
 }
+
+
+_MONITORED_SECTIONS_SNAPSHOT_KEY = "monitored_sections_snapshot"
+
+
+def _get_monitored_sections_updated_at() -> int:
+    """Return a change-driven updated_at for monitored_sections.
+
+    The timestamp advances only when the *effective* monitored sections
+    actually change (a config edit that alters the resolved list, or a future
+    API update) — never on unrelated config.yaml writes such as adding an app
+    or tweaking weights, which is what a raw file mtime would (wrongly) react
+    to.  The last-seen section list and its timestamp are persisted in
+    monitor_settings.json, so the value is stable across repeated reads and
+    monotonic across service restarts.
+    """
+    key = _CONFIG_TS_KEYS["monitored_sections"]
+    current = _get_monitored_sections()
+    with _SETTINGS_LOCK:
+        settings = _read_settings_file()
+        stored_snapshot = settings.get(_MONITORED_SECTIONS_SNAPSHOT_KEY)
+        try:
+            stored_ts = int(settings.get(key, 0))
+        except (TypeError, ValueError):
+            stored_ts = 0
+        # Unchanged and already stamped once → return the persisted value.
+        if stored_snapshot == current and stored_ts > 0:
+            return stored_ts
+        # First observation, or the resolved sections changed → bump.  Keep it
+        # strictly greater than the stored value so the change is always
+        # detectable even within the same wall-clock second.
+        new_ts = max(stored_ts + 1, int(time.time()))
+        try:
+            _write_settings_file({key: new_ts, _MONITORED_SECTIONS_SNAPSHOT_KEY: current})
+        except Exception as exc:
+            # Persistence unavailable (e.g. read-only config dir).  Never fail
+            # the caller over a bookkeeping write — return the last persisted
+            # value so the timestamp stays stable instead of advancing on every
+            # call (which would make clients refetch endlessly).
+            logger.debug("monitored_sections updated_at persist failed: %s", exc)
+            return stored_ts
+        return new_ts
 
 
 def _read_settings_file() -> Dict[str, Any]:
@@ -671,13 +788,31 @@ def get_processes():
         )
 
 
+def _static_force_refresh() -> bool:
+    force_raw = (request.args.get('force_refresh') or '').strip().lower()
+    return force_raw in {'1', 'true', 'yes', 'y', 'on'}
+
+
 @monitor_bp.route('/static_info', methods=['GET'])
 def get_static_info():
-    """Return static system configuration info (hardware, OS, drivers)."""
+    """Return static system configuration info (hardware, OS, drivers).
+
+    Returns the full config by default.  An optional comma-separated
+    ``sections`` query parameter restricts the payload to specific groups, e.g.
+    ``/static_info?sections=gpu,cpu``.  Static info is always served from the
+    in-memory cache, so filtering is a pure response-view projection — it never
+    triggers a partial (re)collection.  Valid names are in
+    ``STATIC_INFO_SECTIONS``.
+    """
     try:
-        force_raw = (request.args.get('force_refresh') or '').strip().lower()
-        force_refresh = force_raw in {'1', 'true', 'yes', 'y', 'on'}
-        data = collect_static_info(force_refresh=force_refresh)
+        data = collect_static_info(force_refresh=_static_force_refresh())
+
+        sections, err = _parse_section_param(request.args.get('sections'), STATIC_INFO_SECTIONS)
+        if err:
+            return construct_response(data={}, retcode=RetCode.ARGUMENT_ERROR, retmsg=err)
+        if sections is not None:
+            data = _project_sections(data, sections)
+
         return construct_response(
             data=data,
             retmsg="Successfully retrieved static system info"
@@ -691,16 +826,105 @@ def get_static_info():
         )
 
 
-@monitor_bp.route('/dynamic_info', methods=['GET'])
-def get_dynamic_info():
-    """Return dynamic system metrics snapshot (background-cached)."""
-    _start_dynamic_info_auto_refresh()
+@monitor_bp.route('/static_info/<section>', methods=['GET'])
+def get_static_info_section(section):
+    """Return a single section of the static config, e.g. ``/static_info/gpu``.
+
+    ``/static_info/all`` returns the full config (equivalent to
+    ``/static_info``).
+    """
+    try:
+        data = collect_static_info(force_refresh=_static_force_refresh())
+
+        section = (section or '').strip().lower()
+        if section == 'all':
+            return construct_response(
+                data=data,
+                retmsg="Successfully retrieved static system info"
+            )
+        if section not in STATIC_INFO_SECTIONS:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg=(f"Unknown section '{section}'. "
+                        f"Valid sections: {', '.join(STATIC_INFO_SECTIONS)}, all")
+            )
+        return construct_response(
+            data=_project_sections(data, [section]),
+            retmsg="Successfully retrieved static system info"
+        )
+    except Exception as e:
+        logger.error(f"get_static_info_section failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+# Sections valid for /history projection span both snapshot types, since a
+# history query may return static and/or dynamic rows.  Union preserves order
+# and drops duplicates (cpu/memory/disk/gpu/npu appear in both).
+HISTORY_SECTIONS = tuple(dict.fromkeys(STATIC_INFO_SECTIONS + DYNAMIC_INFO_SECTIONS))
+
+
+def _parse_section_param(raw, valid_sections):
+    """Parse a comma-separated ``sections`` query value.
+
+    Returns ``(sections, error)``:
+      * ``sections`` is ``None`` when ``raw`` is empty (meaning "all sections"),
+        otherwise the requested names filtered to ``valid_sections`` order with
+        duplicates removed.
+      * ``error`` is a human-readable message when any requested name is
+        invalid, else ``None``.
+    """
+    raw = (raw or '').strip()
+    if not raw:
+        return None, None
+    requested = [s.strip().lower() for s in raw.split(',') if s.strip()]
+    invalid = [s for s in requested if s not in valid_sections]
+    if invalid:
+        return None, (f"Invalid section(s): {', '.join(invalid)}. "
+                      f"Valid sections: {', '.join(valid_sections)}")
+    requested_set = set(requested)
+    return [name for name in valid_sections if name in requested_set], None
+
+
+def _project_sections(data, sections):
+    """Return a copy of ``data`` keeping only ``collected_at`` + ``sections``.
+
+    Non-dict payloads (e.g. a raw string that failed to parse) pass through
+    unchanged.  Section names absent from ``data`` are silently skipped so the
+    same projection works across static and dynamic snapshots.
+    """
+    if not isinstance(data, dict):
+        return data
+    result = {}
+    if 'collected_at' in data:
+        result['collected_at'] = data['collected_at']
+    for name in sections:
+        if name in data:
+            result[name] = data[name]
+    return result
+
+
+def _respond_dynamic_info_full():
+    """Serve the full snapshot (all sections).
+
+    When everything is monitored (the default), the background collector's cache
+    already holds the whole snapshot, so we return it verbatim (fast path) and
+    collect once synchronously on a cold cache.  When only a subset is monitored,
+    we assemble all sections — monitored ones from the cache, the rest on demand
+    — so /dynamic_info always returns all sections regardless of config.
+    """
+    if not set(_get_monitored_sections()).issuperset(DYNAMIC_INFO_SECTIONS):
+        return _respond_dynamic_sections(list(DYNAMIC_INFO_SECTIONS))
 
     with _DYNAMIC_INFO_CACHE_LOCK:
         data = _DYNAMIC_INFO_CACHE.get("data")
 
     if data is None:
-        # Cache not yet populated — collect synchronously on first call.
+        # Cold cache (first call before the collector has produced a snapshot).
         try:
             monitor = _get_resource_monitor()
             spm = _get_system_pressure_monitor()
@@ -710,16 +934,121 @@ def get_dynamic_info():
                 _DYNAMIC_INFO_CACHE["ts"] = time.time()
         except Exception as e:
             logger.error(f"get_dynamic_info failed: {str(e)}")
-            return construct_response(
-                data={},
-                retcode=RetCode.EXCEPTION_ERROR,
-                retmsg=str(e)
-            )
+            return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
 
-    return construct_response(
-        data=data,
-        retmsg="Successfully retrieved dynamic system info"
-    )
+    payload = dict(data)
+    payload["monitored_sections_updated_at"] = _get_monitored_sections_updated_at()
+    return construct_response(data=payload, retmsg="Successfully retrieved dynamic system info")
+
+
+def _respond_dynamic_sections(sections):
+    """Serve a section-filtered dynamic_info response.
+
+    For each requested section: if it is one of the configured
+    ``monitored_sections``, serve it from the warm background cache (continuous,
+    no per-request collection).  Otherwise collect it on demand — the modular
+    path that never queries hardware the caller didn't ask for.  A short
+    per-section TTL cache coalesces rapid on-demand polls.
+    """
+    monitored = set(_get_monitored_sections())
+    result = {
+        "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "monitored_sections_updated_at": _get_monitored_sections_updated_at(),
+    }
+
+    # Monitored sections: slice from the background-refreshed full cache.
+    with _DYNAMIC_INFO_CACHE_LOCK:
+        cached = _DYNAMIC_INFO_CACHE.get("data")
+    on_demand = []
+    for name in sections:
+        if name in monitored and cached is not None and name in cached:
+            result[name] = cached[name]
+        else:
+            # Not monitored, or monitored but the cache isn't warm yet (startup).
+            on_demand.append(name)
+
+    if not on_demand:
+        return construct_response(data=result, retmsg="Successfully retrieved dynamic system info")
+
+    # On-demand sections: reuse the per-section TTL cache to coalesce polls.
+    now = time.time()
+    stale = []
+    with _DYNAMIC_SECTION_CACHE_LOCK:
+        for name in on_demand:
+            entry = _DYNAMIC_SECTION_CACHE.get(name)
+            if entry is not None and (now - entry["ts"]) < _DYNAMIC_SECTION_TTL_SEC:
+                result[name] = entry["data"]
+            else:
+                stale.append(name)
+
+    if stale:
+        try:
+            # Only construct the heavyweight monitors when a requested section
+            # actually needs them — a gpu/npu/cpu request touches neither.
+            need_rm = any(s in _SECTIONS_NEED_RM for s in stale)
+            need_spm = any(s in _SECTIONS_NEED_SPM for s in stale)
+            monitor = _get_resource_monitor() if need_rm else None
+            spm = _get_system_pressure_monitor() if need_spm else None
+            fresh = collect_dynamic_info(
+                resource_monitor=monitor,
+                system_pressure_monitor=spm,
+                sections=stale,
+            )
+        except Exception as e:
+            logger.error(f"get_dynamic_info (sections) failed: {str(e)}")
+            return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
+
+        ts = time.time()
+        with _DYNAMIC_SECTION_CACHE_LOCK:
+            for name in stale:
+                if name in fresh:
+                    _DYNAMIC_SECTION_CACHE[name] = {"data": fresh[name], "ts": ts}
+                    result[name] = fresh[name]
+
+    return construct_response(data=result, retmsg="Successfully retrieved dynamic system info")
+
+
+@monitor_bp.route('/dynamic_info', methods=['GET'])
+def get_dynamic_info():
+    """Return a dynamic system metrics snapshot (background-cached).
+
+    Returns the full snapshot by default.  An optional comma-separated
+    ``sections`` query parameter restricts the payload to specific hardware
+    groups, e.g. ``/dynamic_info?sections=cpu,gpu`` — this collects only those
+    sections on demand and does not start the full-collection background
+    thread.  Valid section names are listed in ``DYNAMIC_INFO_SECTIONS``.
+    """
+    sections, err = _parse_section_param(request.args.get('sections'), DYNAMIC_INFO_SECTIONS)
+    if err:
+        return construct_response(data={}, retcode=RetCode.ARGUMENT_ERROR, retmsg=err)
+
+    if sections is None:
+        _start_dynamic_info_auto_refresh()
+        return _respond_dynamic_info_full()
+    return _respond_dynamic_sections(sections)
+
+
+@monitor_bp.route('/dynamic_info/<section>', methods=['GET'])
+def get_dynamic_info_section(section):
+    """Return a single hardware section of the dynamic snapshot.
+
+    Convenience sub-resource for the common single-section case, e.g.
+    ``/dynamic_info/cpu`` — collects only that section on demand.
+    ``/dynamic_info/all`` returns the full snapshot (equivalent to
+    ``/dynamic_info``, served from the background cache).
+    """
+    section = (section or '').strip().lower()
+    if section == 'all':
+        _start_dynamic_info_auto_refresh()
+        return _respond_dynamic_info_full()
+    if section not in DYNAMIC_INFO_SECTIONS:
+        return construct_response(
+            data={},
+            retcode=RetCode.ARGUMENT_ERROR,
+            retmsg=(f"Unknown section '{section}'. "
+                    f"Valid sections: {', '.join(DYNAMIC_INFO_SECTIONS)}, all")
+        )
+    return _respond_dynamic_sections([section])
 
 
 @monitor_bp.route('/history', methods=['GET'])
@@ -735,6 +1064,16 @@ def get_history():
                 retcode=RetCode.ARGUMENT_ERROR,
                 retmsg="snapshot_type must be one of: static, dynamic, all"
             )
+
+        # Optional field projection: restrict each returned snapshot's `data`
+        # payload to the requested sections.  This is where filtering pays off
+        # most — a history query can return thousands of rows, each carrying a
+        # full snapshot, so projecting to e.g. `cpu` alone can shrink the
+        # response dramatically.  It only trims serialization/transfer; the
+        # rows are still read from the DB in full.
+        sections, err = _parse_section_param(request.args.get('sections'), HISTORY_SECTIONS)
+        if err:
+            return construct_response(data={}, retcode=RetCode.ARGUMENT_ERROR, retmsg=err)
 
         limit_raw = request.args.get('limit', '100')
         try:
@@ -824,6 +1163,9 @@ def get_history():
                 except Exception:
                     payload = row.data_json
 
+            if sections is not None:
+                payload = _project_sections(payload, sections)
+
             items.append({
                 'id': row.id,
                 'snapshot_type': row.snapshot_type,
@@ -839,6 +1181,7 @@ def get_history():
         return construct_response(
             data={
                 'snapshot_type': snapshot_type or 'all',
+                'sections': sections,  # null = all fields returned
                 'limit': limit,
                 'start_time': start_time,
                 'end_time': end_time,
@@ -1116,6 +1459,37 @@ def get_passive_control():
         )
     except Exception as e:
         logger.error(f"get_passive_control failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@monitor_bp.route('/config/monitored_sections', methods=['GET'])
+def get_monitored_sections_config():
+    """Get the effective dynamic-info monitored sections.
+
+    Returns both:
+      - sections: effective canonical section order currently used by monitor_api
+      - configured_sections: raw b_config.monitored_sections (None means "all")
+      - all_sections: full supported dynamic sections list
+    """
+    try:
+        from config.config import b_config
+        raw = b_config.monitored_sections
+        configured_sections = list(raw) if isinstance(raw, list) else None
+        return construct_response(
+            data={
+                "sections": _get_monitored_sections(),
+                "configured_sections": configured_sections,
+                "all_sections": list(DYNAMIC_INFO_SECTIONS),
+                "updated_at": _get_monitored_sections_updated_at(),
+            },
+            retmsg="Successfully retrieved monitored_sections configuration"
+        )
+    except Exception as e:
+        logger.error(f"get_monitored_sections_config failed: {str(e)}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,

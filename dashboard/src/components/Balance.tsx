@@ -36,6 +36,7 @@ import { COLORS } from '../styles/theme'
 import { api } from '../api/client'
 import type { AppInfo, ResourceLimitProfileData, PassiveControlData } from '../api/types'
 import { useAppEvents } from '../hooks/useAppEvents'
+import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 import { AddAppWizard } from './AddAppWizard'
 
 const { Text } = Typography
@@ -144,6 +145,7 @@ interface PassiveControlPanelProps {
 // auto-limit/auto-restore loop.  Network shaping and manual per-app limits are
 // not affected; flipping this only stops the passive top-consumer hunt.
 function PassiveControlPanel({ active }: PassiveControlPanelProps) {
+  const { publishNotice } = useGlobalConfigNotices()
   const [enabled, setEnabled] = useState<boolean | null>(null)
   const [updatedAt, setUpdatedAt] = useState<number | undefined>(undefined)
   const [loading, setLoading] = useState(false)
@@ -191,6 +193,12 @@ function PassiveControlPanel({ active }: PassiveControlPanelProps) {
           onOk: () => {
             setEnabled(Boolean(current.enabled))
             setUpdatedAt(newTs)
+            publishNotice({
+              title: 'Passive resource control updated',
+              description: `Another client changed passive control to ${current.enabled ? 'enabled' : 'disabled'} at ${tsLabel}.`,
+              scope: 'passive_control',
+              updatedAt: newTs,
+            })
           },
         })
         return
@@ -199,6 +207,14 @@ function PassiveControlPanel({ active }: PassiveControlPanelProps) {
       if (response.success) {
         setEnabled(response.enabled)
         setUpdatedAt(response.updated_at)
+        publishNotice({
+          title: 'Passive resource control updated',
+          description: response.enabled
+            ? 'Passive resource control is now enabled.'
+            : 'Passive resource control is now disabled.',
+          scope: 'passive_control',
+          updatedAt: response.updated_at,
+        })
         message.success(
           response.enabled
             ? 'Passive resource control enabled'

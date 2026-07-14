@@ -295,17 +295,16 @@ def _build_network_history(network: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
-    cpu = data.get("cpu") or {}
-    memory = data.get("memory") or {}
-    pressure = data.get("pressure") or {}
-    network = data.get("network") or {}
-    disk = data.get("disk") or {}
-    gpu = data.get("gpu") or {}
-    npu = data.get("npu") or {}
+    # Only persist the sections actually present in ``data``.  When the operator
+    # monitors a subset (e.g. gpu+npu), the collector produces just those
+    # sections, so the history row stays modular instead of being padded with
+    # null placeholders for sections that were never collected.  A full snapshot
+    # (all sections present) yields the exact same shape as before.
+    payload: Dict[str, Any] = {"collected_at": data.get("collected_at")}
 
-    return {
-        "collected_at": data.get("collected_at"),
-        "cpu": {
+    if "cpu" in data:
+        cpu = data.get("cpu") or {}
+        payload["cpu"] = {
             "usage_total": to_float(cpu.get("usage_total")),
             "p_core_usage": to_float(cpu.get("p_core_usage")),
             "e_core_usage": to_float(cpu.get("e_core_usage")),
@@ -320,11 +319,17 @@ def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
             "p_core_indices": cpu.get("p_core_indices") or [],
             "e_core_indices": cpu.get("e_core_indices") or [],
             "lpe_core_indices": cpu.get("lpe_core_indices") or [],
-        },
-        "memory": {
+        }
+
+    if "memory" in data:
+        memory = data.get("memory") or {}
+        payload["memory"] = {
             "usage_percent": to_float(memory.get("usage_percent")),
-        },
-        "pressure": {
+        }
+
+    if "pressure" in data:
+        pressure = data.get("pressure") or {}
+        payload["pressure"] = {
             "score": to_float(pressure.get("score")),
             "level": pressure.get("level"),
             "cpu": to_float(pressure.get("cpu")),
@@ -335,24 +340,36 @@ def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
             "network_busy_ratio": to_float(pressure.get("network_busy_ratio")),
             "network_busy_pct": to_float(pressure.get("network_busy_pct")),
             "network_busy_level": pressure.get("network_busy_level"),
-        },
-        "disk": {
+        }
+
+    if "disk" in data:
+        disk = data.get("disk") or {}
+        payload["disk"] = {
             **_build_disk_history(disk),
             "busy_disks": disk.get("busy_disks") or [],
             "total_disks": disk.get("total_disks"),
             "busy_ratio": to_float(disk.get("busy_ratio")),
             "busy_pct": to_float(disk.get("busy_pct")),
             "busy_level": disk.get("busy_level"),
-        },
-        "network": _build_network_history(network),
-        "gpu": {
+        }
+
+    if "network" in data:
+        payload["network"] = _build_network_history(data.get("network") or {})
+
+    if "gpu" in data:
+        gpu = data.get("gpu") or {}
+        payload["gpu"] = {
             "vram": gpu.get("vram") or {},
             "gpu_usage": _build_gpu_usage_history(gpu.get("gpu_usage") or {}),
-        },
-        "npu": {
+        }
+
+    if "npu" in data:
+        npu = data.get("npu") or {}
+        payload["npu"] = {
             "npu_smi": _build_npu_history(npu.get("npu_smi") or {}),
-        },
-    }
+        }
+
+    return payload
 
 
 def persist_dynamic_snapshot_if_due(data: Dict[str, Any]) -> None:

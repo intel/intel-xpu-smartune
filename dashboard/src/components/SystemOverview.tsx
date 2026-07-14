@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useId, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   Row,
   Col,
@@ -41,6 +41,9 @@ import type {
   DiskDeviceData,
 } from '../api/types'
 import { usePolling } from '../hooks/usePolling'
+import { useDocumentVisible } from '../hooks/useDocumentVisible'
+import { useMonitoredSections } from '../hooks/useMonitoredSections'
+import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 import '../styles/performance.css'
 
 const { Text, Title } = Typography
@@ -49,6 +52,11 @@ const { Text, Title } = Typography
 // The backend pre-caches data every ~2 s, so 2 s is the freshness lower bound;
 // larger intervals trade UI render rate / trend granularity for less work.
 const DEFAULT_REFRESH_INTERVAL_MS = 2000
+// While this tab is not in the foreground (another dashboard tab is selected,
+// or the page is hidden/minimized), keep sampling at a slower cadence to cut
+// background request load.  The slower samples are placed on their true time
+// coordinate (see pushTrendPoints) rather than compressed into 2s slots.
+const INACTIVE_REFRESH_INTERVAL_MS = 10000
 const REFRESH_INTERVAL_OPTIONS = [
   { label: '2s', value: 2000 },
   { label: '3s', value: 3000 },
@@ -59,6 +67,8 @@ const TREND_STORAGE_MAX_POINTS = 300
 const ENGINE_ORDER = ['vcs', 'vecs', 'ccs', 'rcs', 'bcs'] as const
 const MHZ_TO_GHZ = 1000
 const REFRESH_INDICATOR_STYLE: React.CSSProperties = { display: 'inline-flex', width: 18, height: 18, alignItems: 'center', justifyContent: 'center', flexShrink: 0 }
+// Fallback used only until the config endpoint responds.
+const DEFAULT_MONITORED_DYNAMIC_SECTIONS = ['cpu', 'memory', 'pressure', 'network', 'disk', 'gpu', 'npu'] as const
 
 const PERF_COLORS = {
   cpu: '#4cc9f0',
@@ -72,7 +82,25 @@ const PERF_COLORS = {
 
 const GPU_UTIL_COLORS = [PERF_COLORS.gpu, PERF_COLORS.memory, PERF_COLORS.cpu, PERF_COLORS.network, PERF_COLORS.npu] as const
 
+const SECTION_LABELS: Record<string, string> = {
+  cpu: 'CPU',
+  memory: 'Memory',
+  pressure: 'Pressure',
+  network: 'Network',
+  disk: 'Disk',
+  gpu: 'GPU',
+  npu: 'NPU',
+}
+
 type TrendSeries = Record<string, Array<number | null>>
+
+// Left-pad a trend series with nulls to a fixed window length so the newest
+// sample always lands on the right edge ("now").  When the series is already at
+// or beyond the window it is sliced to the most recent `length` points.
+const padSeriesLeft = (values: Array<number | null>, length: number): Array<number | null> => {
+  if (values.length >= length) return values.slice(-length)
+  return [...Array(length - values.length).fill(null), ...values]
+}
 type EngineKey = (typeof ENGINE_ORDER)[number]
 type SparkMode = 'axis' | 'points'
 type DataSourceKind = 'static' | 'dynamic'
@@ -583,6 +611,10 @@ function Sparkline({
     )
   }
 
+  // Leading nulls (before the first real sample) stay blank — the line/area
+  // only spans from the first numeric slot onward so a freshly-refreshed window
+  // fills in from the right instead of drawing a flat carry-forward line.
+  const firstIdx = cleaned.findIndex(isNumber)
   let lastValue = numeric[0]
   const normalized = cleaned.map((value) => {
     if (!isNumber(value)) return lastValue
@@ -599,17 +631,20 @@ function Sparkline({
   const range = clampedMax - min
   const denominator = Math.max(1, normalized.length - 1)
 
-  const pointCoords = normalized.map((value, index) => {
-    const plottedValue = Math.max(min, Math.min(value, clampedMax))
-    const x = chartLeft + (index / denominator) * chartWidth
-    const y = chartTop + chartHeight - ((plottedValue - min) / range) * chartHeight
-    return { x, y, value, index }
-  })
+  const pointCoords = normalized
+    .map((value, index) => {
+      const plottedValue = Math.max(min, Math.min(value, clampedMax))
+      const x = chartLeft + (index / denominator) * chartWidth
+      const y = chartTop + chartHeight - ((plottedValue - min) / range) * chartHeight
+      return { x, y, value, index }
+    })
+    .filter((p) => p.index >= firstIdx)
 
   const points = pointCoords.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)
 
   const linePath = `M ${points.join(' L ')}`
-  const areaPath = `${linePath} L ${chartRight} ${chartBottom} L ${chartLeft} ${chartBottom} Z`
+  const areaLeft = pointCoords.length ? pointCoords[0].x : chartLeft
+  const areaPath = `${linePath} L ${chartRight} ${chartBottom} L ${areaLeft} ${chartBottom} Z`
   const labelStep = pointCoords.length <= 20 ? 1 : pointCoords.length <= 40 ? 2 : 4
 
   return (
@@ -895,15 +930,16 @@ function MultiLineSparkline({
     const cleaned = padded.map((value) => (isNumber(value) ? value : null))
     const seed = cleaned.find(isNumber)
     if (!isNumber(seed)) {
-      return { ...item, values: [] as number[] }
+      return { ...item, values: [] as number[], firstIdx: 0 }
     }
+    const firstIdx = cleaned.findIndex(isNumber)
     let lastValue = seed
     const values = cleaned.map((value) => {
       if (!isNumber(value)) return lastValue
       lastValue = value
       return value
     })
-    return { ...item, values }
+    return { ...item, values, firstIdx }
   })
 
   const allValues = normalizedSeries.flatMap((item) => item.values)
@@ -968,12 +1004,15 @@ function MultiLineSparkline({
   const denominator = Math.max(1, maxLen - 1)
 
   const pathBySeries = normalizedSeries.map((item) => {
+    // Skip leading nulls so each line only starts at its first real sample,
+    // leaving the pre-data left region blank.
     const points = item.values.map((value, index) => {
+      if (index < item.firstIdx) return null
       const plotted = Math.max(axisMin, Math.min(value, axisMax))
       const x = chartLeft + (index / denominator) * chartWidth
       const y = chartTop + chartHeight - ((plotted - axisMin) / range) * chartHeight
       return `${x.toFixed(1)},${y.toFixed(1)}`
-    })
+    }).filter((p): p is string => p !== null)
     return {
       key: item.key,
       stroke: item.stroke,
@@ -1235,6 +1274,9 @@ function DualAxisSparkline({
 
   const buildPath = (series: Array<number | null>, minVal: number, maxVal: number) => {
     const seed = series.find(isNumber) ?? minVal
+    // Skip leading nulls so the line starts at the first real sample, leaving
+    // the pre-data left region blank.
+    const firstIdx = series.findIndex(isNumber)
     let lastValue = seed
     const range = maxVal - minVal
     const denominator = Math.max(1, maxLen - 1)
@@ -1242,11 +1284,12 @@ function DualAxisSparkline({
     const points = series.map((value, index) => {
       const nextValue = isNumber(value) ? value : lastValue
       lastValue = nextValue
+      if (firstIdx < 0 || index < firstIdx) return null
       const plotted = Math.max(minVal, Math.min(nextValue, maxVal))
       const x = chartLeft + (index / denominator) * chartWidth
       const y = chartTop + chartHeight - ((plotted - minVal) / range) * chartHeight
       return `${x.toFixed(1)},${y.toFixed(1)}`
-    })
+    }).filter((p): p is string => p !== null)
 
     return points.length ? `M ${points.join(' L ')}` : ''
   }
@@ -1972,6 +2015,7 @@ function NpuDetailCard({
                 <YAxis yAxisId="util" domain={[0, 100]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}%`} width={44}
                   label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 10, offset: 14 }} />
                 <YAxis yAxisId="freq" orientation="right" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} width={50}
+                  tickFormatter={(v: number) => `${Math.round(v)}`}
                   label={{ value: 'MHz', angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10, offset: 10 }} />
                 <Tooltip
                   contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 11 }}
@@ -1983,10 +2027,10 @@ function NpuDetailCard({
                   labelFormatter={() => ''}
                 />
                 <Line yAxisId="util" type="monotone" dataKey="npuUtil" name="NPU Utilization %"
-                  stroke={COLORS.accent} dot={false} strokeWidth={2} isAnimationActive={false}
+                  stroke={COLORS.accent} dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                   hide={hidden.has('npuUtil')} />
                 <Line yAxisId="freq" type="monotone" dataKey="freqMhz" name="NPU Freq MHz"
-                  stroke={PERF_COLORS.npu} dot={false} strokeWidth={2} isAnimationActive={false}
+                  stroke={PERF_COLORS.npu} dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                   hide={hidden.has('freqMhz')} />
               </LineChart>
             </ResponsiveContainer>
@@ -2026,13 +2070,13 @@ function NpuDetailCard({
                   labelFormatter={() => ''}
                 />
                 <Line yAxisId="left" type="monotone" dataKey="npuPower" name="NPU Power W"
-                  stroke={'#4cc9f0'} dot={false} strokeWidth={2} isAnimationActive={false}
+                  stroke={'#4cc9f0'} dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                   hide={hidden.has('npuPower')} />
                 <Line yAxisId="bw" type="monotone" dataKey="ddrBw" name="DDR BW MiB/s"
-                  stroke={'#cbd5e1'} strokeDasharray="5 3" dot={false} strokeWidth={2} isAnimationActive={false}
+                  stroke={'#cbd5e1'} strokeDasharray="5 3" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                   hide={hidden.has('ddrBw')} />
                 <Line yAxisId="left" type="monotone" dataKey="npuTemp" name="Temperature °C"
-                  stroke={'#fbbf24'} dot={false} strokeWidth={2} isAnimationActive={false}
+                  stroke={'#fbbf24'} dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                   hide={hidden.has('npuTemp')} />
               </LineChart>
             </ResponsiveContainer>
@@ -2299,7 +2343,7 @@ function GpuDeviceCard({
                     <XAxis dataKey="i" ticks={[0, data.length - 1]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(val: number) => val === 0 ? `-${trendWindow}` : 'now'} />
                     <YAxis yAxisId="pct" domain={[0, 100]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}%`} width={44}
                       label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 10, offset: 14 }} />
-                    <YAxis yAxisId="mhz" orientation="right" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}`} width={56}
+                    <YAxis yAxisId="mhz" orientation="right" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v: number) => `${Math.round(v)}`} width={56}
                       label={{ value: 'MHz', angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10, offset: 10 }} />
                     <Tooltip
                       contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 11 }}
@@ -2312,29 +2356,29 @@ function GpuDeviceCard({
                     />
                     {engineSeries.map((s) => (
                       <Line key={s.key} yAxisId="pct" type="monotone" dataKey={s.key} name={`${s.label} %`}
-                        stroke={s.stroke} dot={false} strokeWidth={2} isAnimationActive={false}
+                        stroke={s.stroke} dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                         hide={hidden.has(s.key)} />
                     ))}
                     <Line yAxisId="pct" type="monotone" dataKey="mem" name={memLabel}
-                      stroke={PERF_COLORS.memory} strokeDasharray="5 3" dot={false} strokeWidth={2} isAnimationActive={false}
+                      stroke={PERF_COLORS.memory} strokeDasharray="5 3" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                       hide={hidden.has('mem')} />
                     <Line yAxisId="mhz" type="monotone" dataKey="gt0Act" name="GT0 Act MHz"
-                      stroke={'#cbd5e1'} dot={false} strokeWidth={2} isAnimationActive={false}
+                      stroke={'#cbd5e1'} dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                       hide={hidden.has('gt0Act')} />
                     <Line yAxisId="mhz" type="monotone" dataKey="gt0Req" name="GT0 Req MHz"
-                      stroke={'#cbd5e1'} strokeDasharray="6 4" dot={false} strokeWidth={2} isAnimationActive={false}
+                      stroke={'#cbd5e1'} strokeDasharray="6 4" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                       hide={hidden.has('gt0Req')} />
                     <Line yAxisId="mhz" type="monotone" dataKey="gt1Act" name="GT1 Act MHz"
-                      stroke={'#34d399'} dot={false} strokeWidth={2} isAnimationActive={false}
+                      stroke={'#34d399'} dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                       hide={hidden.has('gt1Act')} />
                     <Line yAxisId="mhz" type="monotone" dataKey="gt1Req" name="GT1 Req MHz"
-                      stroke={'#34d399'} strokeDasharray="4 4" dot={false} strokeWidth={2} isAnimationActive={false}
+                      stroke={'#34d399'} strokeDasharray="4 4" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                       hide={hidden.has('gt1Req')} />
                     <Line yAxisId="pct" type="monotone" dataKey="gt0Rc6" name="GT0 RC6 %"
-                      stroke={'#2dd4bf'} strokeDasharray="3 2" dot={false} strokeWidth={2} isAnimationActive={false}
+                      stroke={'#2dd4bf'} strokeDasharray="3 2" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                       hide={hidden.has('gt0Rc6')} />
                     <Line yAxisId="pct" type="monotone" dataKey="gt1Rc6" name="GT1 RC6 %"
-                      stroke={'#a3e635'} strokeDasharray="3 2" dot={false} strokeWidth={2} isAnimationActive={false}
+                      stroke={'#a3e635'} strokeDasharray="3 2" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                       hide={hidden.has('gt1Rc6')} />
                   </LineChart>
                 </ResponsiveContainer>
@@ -2379,10 +2423,10 @@ function GpuDeviceCard({
                       labelFormatter={() => ''}
                     />
                     <Line type="monotone" dataKey="gpuPower" name="GPU Power W"
-                      stroke={'#4cc9f0'} dot={false} strokeWidth={2} isAnimationActive={false}
+                      stroke={'#4cc9f0'} dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                       hide={hidden.has('gpuPower')} />
                     <Line type="monotone" dataKey="pkgPower" name={`${pkgLabel} Power W`}
-                      stroke={'#ff9f1c'} strokeDasharray="5 3" dot={false} strokeWidth={2} isAnimationActive={false}
+                      stroke={'#ff9f1c'} strokeDasharray="5 3" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                       hide={hidden.has('pkgPower')} />
                   </LineChart>
                 </ResponsiveContainer>
@@ -2396,6 +2440,12 @@ function GpuDeviceCard({
 }
 
 export default function SystemOverview({ active }: Props) {
+  // Poll at the fast cadence only when this tab is selected AND the page is
+  // actually visible; a backgrounded tab or minimized window drops to the
+  // slower inactive cadence (browsers can't detect occlusion by another window,
+  // so a covered-but-not-minimized page still reads as visible).
+  const documentVisible = useDocumentVisible()
+  const foreground = active && documentVisible
   const [staticInfo, setStaticInfo] = useState<StaticInfoData | null>(null)
   const [dynamicInfo, setDynamicInfo] = useState<DynamicInfoData | null>(null)
   const [loadingDynamic, setLoadingDynamic] = useState(false)
@@ -2410,13 +2460,60 @@ export default function SystemOverview({ active }: Props) {
   const [showGpuDetails, setShowGpuDetails] = useState(true)
   const [showNpuDetails, setShowNpuDetails] = useState(true)
   const [trends, setTrends] = useState<TrendSeries>({})
+  const { publishNotice } = useGlobalConfigNotices()
+  const monitoredSectionsUpdatedAt = dynamicInfo?.monitored_sections_updated_at ?? null
+  const {
+    sections: monitoredSectionList,
+    sectionSet: monitoredSections,
+    lastChange: monitoredSectionsChange,
+    clearLastChange: clearMonitoredSectionsChange,
+  } =
+    useMonitoredSections(active, [...DEFAULT_MONITORED_DYNAMIC_SECTIONS], monitoredSectionsUpdatedAt)
+  // Fail-open: gate on the resolved section set, which starts from the full
+  // fallback and only narrows once the config endpoint responds.  If that
+  // endpoint is unavailable (older backend, transient error) every card stays
+  // visible — the pre-feature behaviour — rather than the dashboard going blank.
+  const showCpuSection = monitoredSections.has('cpu')
+  const showMemorySection = monitoredSections.has('memory')
+  const showDiskSection = monitoredSections.has('disk')
+  const showGpuSection = monitoredSections.has('gpu')
+  const showNpuSection = monitoredSections.has('npu')
+  const showPressureSection = monitoredSections.has('pressure')
+  const showNetworkSection = monitoredSections.has('network')
+  const showNetworkPressureCard = showPressureSection || showNetworkSection
+  // With no monitored sections (config `monitored_sections: []`) there is
+  // nothing to display, and a bare /dynamic_info request would otherwise be
+  // read by the backend as "collect everything".  Skip polling entirely; the
+  // fallback set is non-empty, so this only ever goes false once the config
+  // endpoint has actually resolved to an empty set.
+  const hasMonitoredSections = monitoredSectionList.length > 0
+
+  // Wall-clock of the previous sample, so a slower cadence (e.g. the 10s
+  // background interval) advances the trend by the right number of fixed
+  // `refreshIntervalMs` slots instead of a single one.  Without this a 10s
+  // sample would be plotted 2s to the right of the last, compressing the time
+  // axis whenever the poll rate differs from the slot unit.
+  const lastPushAtRef = useRef<number | null>(null)
 
   const pushTrendPoints = useCallback((updates: Record<string, number | null>) => {
+    const now = Date.now()
+    const last = lastPushAtRef.current
+    lastPushAtRef.current = now
+    // How many slots (each = refreshIntervalMs) elapsed since the last sample.
+    // The skipped slots are filled with null so the new point lands on its true
+    // time coordinate; foreground steady polling yields 1 (unchanged behaviour).
+    const slots = last == null
+      ? 1
+      : Math.max(1, Math.min(TREND_STORAGE_MAX_POINTS, Math.round((now - last) / refreshIntervalMs)))
+
     setTrends((prev) => {
       const next: TrendSeries = { ...prev }
       Object.entries(updates).forEach(([key, value]) => {
         const current = prev[key] || []
-        const updated = [...current, value]
+        // Pad the (slots - 1) skipped intervals with null, then the sample.
+        const updated = slots > 1
+          ? [...current, ...Array(slots - 1).fill(null), value]
+          : [...current, value]
         if (updated.length > TREND_STORAGE_MAX_POINTS) {
           updated.splice(0, updated.length - TREND_STORAGE_MAX_POINTS)
         }
@@ -2424,7 +2521,7 @@ export default function SystemOverview({ active }: Props) {
       })
       return next
     })
-  }, [])
+  }, [refreshIntervalMs])
 
   const fetchStatic = useCallback(async () => {
     if (!active) return
@@ -2440,21 +2537,31 @@ export default function SystemOverview({ active }: Props) {
   const fetchDynamic = useCallback(async () => {
     setLoadingDynamic(true)
     try {
-      const data = await api.getDynamicInfo()
-      setDynamicInfo(data)
+      const data = await api.getDynamicInfo(monitoredSectionList)
+      setDynamicInfo((prev) => ({
+        ...data,
+        // Keep previous CPU payload if CPU is enabled and this tick briefly omits it.
+        cpu: data.cpu ?? (showCpuSection ? prev?.cpu : undefined),
+      }))
       setErrorDynamic(null)
 
       const updates: Record<string, number | null> = {
-        'pressure:score': isNumber(data.pressure?.score) ? data.pressure.score! * 100 : null,
-        'npu:availability': data.npu.npu_smi.available ? 100 : 0,
-        'cpu:p': normalizePercent(data.cpu.p_core_usage),
-        'cpu:e': normalizePercent(data.cpu.e_core_usage),
-        'cpu:lpe': normalizePercent(data.cpu.lpe_core_usage),
-        'util:cpu': normalizePercent(data.cpu.usage_total),
-        'util:memory': normalizePercent(data.memory.usage_percent),
+        'npu:availability': data.npu?.npu_smi?.available ? 100 : 0,
+      }
+      if (showCpuSection) {
+        updates['cpu:p'] = normalizePercent(data.cpu?.p_core_usage)
+        updates['cpu:e'] = normalizePercent(data.cpu?.e_core_usage)
+        updates['cpu:lpe'] = normalizePercent(data.cpu?.lpe_core_usage)
+        updates['util:cpu'] = normalizePercent(data.cpu?.usage_total)
+      }
+      if (showMemorySection) {
+        updates['util:memory'] = normalizePercent(data.memory?.usage_percent)
+      }
+      if (showPressureSection) {
+        updates['pressure:score'] = isNumber(data.pressure?.score) ? data.pressure.score! * 100 : null
       }
 
-      const npuRawParsed = parseNpuRaw(data.npu.npu_smi.raw)
+      const npuRawParsed = parseNpuRaw(data.npu?.npu_smi?.raw)
       if (npuRawParsed) {
         updates['npu:util'] = typeof npuRawParsed.utilization_percent === 'number' ? normalizePercent(npuRawParsed.utilization_percent as number) : null
         updates['npu:power_w'] = typeof npuRawParsed.power_w === 'number' ? npuRawParsed.power_w : null
@@ -2464,89 +2571,99 @@ export default function SystemOverview({ active }: Props) {
         updates['npu:memory_mb'] = typeof npuRawParsed.memory_bytes === 'number' ? (npuRawParsed.memory_bytes as number) / (1024 * 1024) : null
       }
 
-      updates['pressure:peak'] = updates['pressure:score'] ?? null
-
-      data.cpu.per_core_usage.forEach((value, index) => {
-        updates[`cpu:core:${index}`] = normalizePercent(value)
-        updates[`cpu:core_freq:${index}`] = isNumber(data.cpu.per_core_freq_mhz?.[index])
-          ? data.cpu.per_core_freq_mhz[index]
-          : null
-      })
-
-      const dynamicDiskDevices = Object.values(data.disk?.disk_io || {})
-      updates['util:disk'] = dynamicDiskDevices.length
-        ? Math.max(...dynamicDiskDevices.map((disk) => normalizePercent(disk.utilization) || 0))
-        : null
-
-      Object.entries(data.disk?.disk_io || {}).forEach(([diskName, diskData]) => {
-        updates[`disk:${diskName}:util`] = normalizePercent(diskData.utilization)
-      })
-
-      // Per-NIC trend data for each valid physical NIC
-      const validNics = staticInfo?.io?.valid_nics || []
-      const allNetworkUtils: number[] = []
-      for (const nic of validNics) {
-        const nicName = nic.name
-        const nicData = data.network?.interfaces?.[nicName]
-        const nicRx = isNumber(nicData?.rx_bytes_per_sec) ? nicData.rx_bytes_per_sec : null
-        const nicTx = isNumber(nicData?.tx_bytes_per_sec) ? nicData.tx_bytes_per_sec : null
-        const rxMbps = toMbps(nicRx)
-        const txMbps = toMbps(nicTx)
-        // Store raw Mbps for bandwidth sparklines
-        updates[`bw:network:${nicName}:rx_mbps`] = rxMbps
-        updates[`bw:network:${nicName}:tx_mbps`] = txMbps
-        // Compute utilization against static NIC link speed
-        const nicSpeedMbps = nic.speed_mbps > 0 ? nic.speed_mbps : null
-        const nicRxUtil = isNumber(rxMbps) && isNumber(nicSpeedMbps) && nicSpeedMbps > 0 ? Math.min(rxMbps / nicSpeedMbps * 100, 100) : null
-        const nicTxUtil = isNumber(txMbps) && isNumber(nicSpeedMbps) && nicSpeedMbps > 0 ? Math.min(txMbps / nicSpeedMbps * 100, 100) : null
-        updates[`util:network:${nicName}:rx`] = nicRxUtil
-        updates[`util:network:${nicName}:tx`] = nicTxUtil
-        const nicUtils = [nicRxUtil, nicTxUtil].filter(isNumber)
-        const nicUtilMax = nicUtils.length ? Math.max(...nicUtils) : null
-        updates[`util:network:${nicName}`] = nicUtilMax
-        if (isNumber(nicUtilMax)) allNetworkUtils.push(nicUtilMax)
+      if (showPressureSection) {
+        updates['pressure:peak'] = updates['pressure:score'] ?? null
       }
-      // Fallback: if no valid NICs, use aggregated total with static peak bandwidth
-      if (validNics.length === 0) {
-        const totalNet = data.network?.total
-        const fallbackRx = isNumber(totalNet?.rx_bytes_per_sec) ? totalNet?.rx_bytes_per_sec : null
-        const fallbackTx = isNumber(totalNet?.tx_bytes_per_sec) ? totalNet?.tx_bytes_per_sec : null
-        const rxMbps = toMbps(fallbackRx)
-        const txMbps = toMbps(fallbackTx)
-        updates['bw:network:rx_mbps'] = rxMbps
-        updates['bw:network:tx_mbps'] = txMbps
-        const staticPeak = staticInfo?.io?.network_peak_mbps
-        const staticPeakMbps = isNumber(staticPeak) && staticPeak > 0 ? staticPeak : null
-        const rxUtil = isNumber(rxMbps) && isNumber(staticPeakMbps) && staticPeakMbps > 0 ? Math.min(rxMbps / staticPeakMbps * 100, 100) : null
-        const txUtil = isNumber(txMbps) && isNumber(staticPeakMbps) && staticPeakMbps > 0 ? Math.min(txMbps / staticPeakMbps * 100, 100) : null
-        updates['util:network:rx'] = rxUtil
-        updates['util:network:tx'] = txUtil
-        const fallbackUtils = [rxUtil, txUtil].filter(isNumber)
-        if (fallbackUtils.length) allNetworkUtils.push(Math.max(...fallbackUtils))
-      }
-      updates['util:network'] = allNetworkUtils.length ? Math.max(...allNetworkUtils) : null
 
-      const gpuDevices = buildGpuDevices(staticInfo, data)
-      const gpuUtils: number[] = []
-      gpuDevices.forEach((device) => {
-        updates[`gpu:${device.id}:util`] = device.utilization
-        updates[`gpu:${device.id}:power:gpu_cur_power`] = device.powerGpu
-        updates[`gpu:${device.id}:power:pkg_cur_power`] = device.powerPkg
-        updates[`gpu:${device.id}:freq:gt0:cur_mhz`] = device.frequencies.gt0?.act_mhz ?? null
-        updates[`gpu:${device.id}:freq:gt1:cur_mhz`] = device.frequencies.gt1?.act_mhz ?? null
-        updates[`gpu:${device.id}:freq:gt0:act_mhz`] = device.frequencies.gt0?.act_mhz ?? null
-        updates[`gpu:${device.id}:freq:gt0:req_mhz`] = device.frequencies.gt0?.cur_mhz ?? null
-        updates[`gpu:${device.id}:freq:gt1:act_mhz`] = device.frequencies.gt1?.act_mhz ?? null
-        updates[`gpu:${device.id}:freq:gt1:req_mhz`] = device.frequencies.gt1?.cur_mhz ?? null
-        updates[`gpu:${device.id}:freq:gt0:rc6_pct`] = device.frequencies.gt0?.rc6_pct ?? null
-        updates[`gpu:${device.id}:freq:gt1:rc6_pct`] = device.frequencies.gt1?.rc6_pct ?? null
-        updates[`gpu:${device.id}:vram_usage`] = device.vramUsage
-        if (isNumber(device.utilization)) gpuUtils.push(device.utilization)
-        ENGINE_ORDER.forEach((engine) => {
-          updates[`gpu:${device.id}:engine:${engine}`] = device.engineUtil[engine]
+      if (showCpuSection && data.cpu?.per_core_usage) {
+        data.cpu.per_core_usage.forEach((value, index) => {
+          updates[`cpu:core:${index}`] = normalizePercent(value)
+          updates[`cpu:core_freq:${index}`] = isNumber(data.cpu?.per_core_freq_mhz?.[index])
+            ? data.cpu!.per_core_freq_mhz[index]
+            : null
         })
-      })
-      updates['gpu:aggregate'] = gpuUtils.length ? Math.max(...gpuUtils) : null
+      }
+
+      if (showDiskSection) {
+        const dynamicDiskDevices = Object.values(data.disk?.disk_io || {})
+        updates['util:disk'] = dynamicDiskDevices.length
+          ? Math.max(...dynamicDiskDevices.map((disk) => normalizePercent(disk.utilization) || 0))
+          : null
+
+        Object.entries(data.disk?.disk_io || {}).forEach(([diskName, diskData]) => {
+          updates[`disk:${diskName}:util`] = normalizePercent(diskData.utilization)
+        })
+      }
+
+      if (showNetworkSection) {
+        // Per-NIC trend data for each valid physical NIC
+        const validNics = staticInfo?.network?.valid_nics || []
+        const allNetworkUtils: number[] = []
+        for (const nic of validNics) {
+          const nicName = nic.name
+          const nicData = data.network?.interfaces?.[nicName]
+          const nicRx = isNumber(nicData?.rx_bytes_per_sec) ? nicData.rx_bytes_per_sec : null
+          const nicTx = isNumber(nicData?.tx_bytes_per_sec) ? nicData.tx_bytes_per_sec : null
+          const rxMbps = toMbps(nicRx)
+          const txMbps = toMbps(nicTx)
+          // Store raw Mbps for bandwidth sparklines
+          updates[`bw:network:${nicName}:rx_mbps`] = rxMbps
+          updates[`bw:network:${nicName}:tx_mbps`] = txMbps
+          // Compute utilization against static NIC link speed
+          const nicSpeedMbps = nic.speed_mbps > 0 ? nic.speed_mbps : null
+          const nicRxUtil = isNumber(rxMbps) && isNumber(nicSpeedMbps) && nicSpeedMbps > 0 ? Math.min(rxMbps / nicSpeedMbps * 100, 100) : null
+          const nicTxUtil = isNumber(txMbps) && isNumber(nicSpeedMbps) && nicSpeedMbps > 0 ? Math.min(txMbps / nicSpeedMbps * 100, 100) : null
+          updates[`util:network:${nicName}:rx`] = nicRxUtil
+          updates[`util:network:${nicName}:tx`] = nicTxUtil
+          const nicUtils = [nicRxUtil, nicTxUtil].filter(isNumber)
+          const nicUtilMax = nicUtils.length ? Math.max(...nicUtils) : null
+          updates[`util:network:${nicName}`] = nicUtilMax
+          if (isNumber(nicUtilMax)) allNetworkUtils.push(nicUtilMax)
+        }
+        // Fallback: if no valid NICs, use aggregated total with static peak bandwidth
+        if (validNics.length === 0) {
+          const totalNet = data.network?.total
+          const fallbackRx = isNumber(totalNet?.rx_bytes_per_sec) ? totalNet?.rx_bytes_per_sec : null
+          const fallbackTx = isNumber(totalNet?.tx_bytes_per_sec) ? totalNet?.tx_bytes_per_sec : null
+          const rxMbps = toMbps(fallbackRx)
+          const txMbps = toMbps(fallbackTx)
+          updates['bw:network:rx_mbps'] = rxMbps
+          updates['bw:network:tx_mbps'] = txMbps
+          const staticPeak = staticInfo?.network?.network_peak_mbps
+          const staticPeakMbps = isNumber(staticPeak) && staticPeak > 0 ? staticPeak : null
+          const rxUtil = isNumber(rxMbps) && isNumber(staticPeakMbps) && staticPeakMbps > 0 ? Math.min(rxMbps / staticPeakMbps * 100, 100) : null
+          const txUtil = isNumber(txMbps) && isNumber(staticPeakMbps) && staticPeakMbps > 0 ? Math.min(txMbps / staticPeakMbps * 100, 100) : null
+          updates['util:network:rx'] = rxUtil
+          updates['util:network:tx'] = txUtil
+          const fallbackUtils = [rxUtil, txUtil].filter(isNumber)
+          if (fallbackUtils.length) allNetworkUtils.push(Math.max(...fallbackUtils))
+        }
+        updates['util:network'] = allNetworkUtils.length ? Math.max(...allNetworkUtils) : null
+      }
+
+      if (showGpuSection) {
+        const gpuDevices = buildGpuDevices(staticInfo, data)
+        const gpuUtils: number[] = []
+        gpuDevices.forEach((device) => {
+          updates[`gpu:${device.id}:util`] = device.utilization
+          updates[`gpu:${device.id}:power:gpu_cur_power`] = device.powerGpu
+          updates[`gpu:${device.id}:power:pkg_cur_power`] = device.powerPkg
+          updates[`gpu:${device.id}:freq:gt0:cur_mhz`] = device.frequencies.gt0?.act_mhz ?? null
+          updates[`gpu:${device.id}:freq:gt1:cur_mhz`] = device.frequencies.gt1?.act_mhz ?? null
+          updates[`gpu:${device.id}:freq:gt0:act_mhz`] = device.frequencies.gt0?.act_mhz ?? null
+          updates[`gpu:${device.id}:freq:gt0:req_mhz`] = device.frequencies.gt0?.cur_mhz ?? null
+          updates[`gpu:${device.id}:freq:gt1:act_mhz`] = device.frequencies.gt1?.act_mhz ?? null
+          updates[`gpu:${device.id}:freq:gt1:req_mhz`] = device.frequencies.gt1?.cur_mhz ?? null
+          updates[`gpu:${device.id}:freq:gt0:rc6_pct`] = device.frequencies.gt0?.rc6_pct ?? null
+          updates[`gpu:${device.id}:freq:gt1:rc6_pct`] = device.frequencies.gt1?.rc6_pct ?? null
+          updates[`gpu:${device.id}:vram_usage`] = device.vramUsage
+          if (isNumber(device.utilization)) gpuUtils.push(device.utilization)
+          ENGINE_ORDER.forEach((engine) => {
+            updates[`gpu:${device.id}:engine:${engine}`] = device.engineUtil[engine]
+          })
+        })
+        updates['gpu:aggregate'] = gpuUtils.length ? Math.max(...gpuUtils) : null
+      }
 
       pushTrendPoints(updates)
     } catch (e: unknown) {
@@ -2554,13 +2671,46 @@ export default function SystemOverview({ active }: Props) {
     } finally {
       setLoadingDynamic(false)
     }
-  }, [pushTrendPoints, staticInfo])
+  }, [
+    pushTrendPoints,
+    staticInfo,
+    monitoredSectionList,
+    showCpuSection,
+    showMemorySection,
+    showDiskSection,
+    showGpuSection,
+    showNpuSection,
+    showPressureSection,
+    showNetworkSection,
+  ])
 
   useEffect(() => {
     fetchStatic()
   }, [fetchStatic])
 
-  usePolling(fetchDynamic, refreshIntervalMs, true)
+  usePolling(fetchDynamic, foreground ? refreshIntervalMs : INACTIVE_REFRESH_INTERVAL_MS, hasMonitoredSections)
+
+  // Refetch immediately when the *content* of the monitored section set changes
+  // (not on every fetchDynamic identity change) so newly enabled cards fill in
+  // without waiting a full poll.  Keyed on the joined section names and calling
+  // through a ref keeps this decoupled from fetchDynamic's identity — otherwise
+  // every re-render that rebuilt fetchDynamic (e.g. a window-focus resync, or
+  // dev StrictMode) would fire an extra request on top of the poll.  The first
+  // run is skipped because the initial fetch is already driven by usePolling.
+  const fetchDynamicRef = useRef(fetchDynamic)
+  fetchDynamicRef.current = fetchDynamic
+  const monitoredSectionsKey = monitoredSectionList.join('|')
+  const skipFirstSectionsFetch = useRef(true)
+  useEffect(() => {
+    if (!active) return
+    if (skipFirstSectionsFetch.current) {
+      skipFirstSectionsFetch.current = false
+      return
+    }
+    // Nothing monitored → nothing to fetch (a bare request would pull everything).
+    if (!monitoredSectionList.length) return
+    void fetchDynamicRef.current()
+  }, [active, monitoredSectionsKey, monitoredSectionList.length])
 
   const gpuDevices = useMemo(() => buildGpuDevices(staticInfo, dynamicInfo), [staticInfo, dynamicInfo])
 
@@ -2578,8 +2728,12 @@ export default function SystemOverview({ active }: Props) {
 
   const getSeries = useCallback(
     (key: string) => {
+      // Left-pad to a fixed window so the newest sample always sits at the
+      // right edge ("now") and the not-yet-collected left portion stays blank
+      // until data fills in from the right, rather than stretching whatever
+      // points exist across the full chart width.
       const values = trends[key] || []
-      return values.slice(-trendPoints)
+      return padSeriesLeft(values, trendPoints)
     },
     [trends, trendPoints],
   )
@@ -2589,7 +2743,7 @@ export default function SystemOverview({ active }: Props) {
     return gpuDevices.filter((d) => d.id === gpuFilter)
   }, [gpuDevices, gpuFilter])
 
-  const validNics = useMemo(() => staticInfo?.io?.valid_nics || [], [staticInfo?.io?.valid_nics])
+  const validNics = useMemo(() => staticInfo?.network?.valid_nics || [], [staticInfo?.network?.valid_nics])
 
   // Per-NIC series helper: generates utilization and bandwidth series for a given NIC name.
   // When nicName is null, uses the legacy fallback keys (util:network:rx, bw:network:rx_mbps).
@@ -2781,7 +2935,7 @@ export default function SystemOverview({ active }: Props) {
   }, [validNics, dynamicInfo])
 
   // Fallback for when no valid NICs exist (keep legacy single-card behavior)
-  const primaryInterface = staticInfo?.io?.primary_interface
+  const primaryInterface = staticInfo?.network?.primary_interface
   const primaryInterfaceName = typeof primaryInterface === 'string'
     ? primaryInterface
     : null
@@ -2793,7 +2947,7 @@ export default function SystemOverview({ active }: Props) {
   // Use static peak bandwidth for fallback utilization
   const fbRxMbps = toMbps(fallbackRxRate)
   const fbTxMbps = toMbps(fallbackTxRate)
-  const fbStaticPeak = staticInfo?.io?.network_peak_mbps
+  const fbStaticPeak = staticInfo?.network?.network_peak_mbps
   const fbStaticPeakMbps = isNumber(fbStaticPeak) && fbStaticPeak > 0 ? fbStaticPeak : null
   const fallbackRxUtil = isNumber(fbRxMbps) && isNumber(fbStaticPeakMbps) && fbStaticPeakMbps > 0 ? Math.min(fbRxMbps / fbStaticPeakMbps * 100, 100) : null
   const fallbackTxUtil = isNumber(fbTxMbps) && isNumber(fbStaticPeakMbps) && fbStaticPeakMbps > 0 ? Math.min(fbTxMbps / fbStaticPeakMbps * 100, 100) : null
@@ -2931,13 +3085,13 @@ export default function SystemOverview({ active }: Props) {
   )
 
   const networkPeakText = useMemo(
-    () => formatNetworkSpeed(staticInfo?.io?.network_peak_mbps),
-    [staticInfo?.io?.network_peak_mbps]
+    () => formatNetworkSpeed(staticInfo?.network?.network_peak_mbps),
+    [staticInfo?.network?.network_peak_mbps]
   )
 
   const networkSpeedMapText = useMemo(
-    () => summarizeNetworkSpeeds(staticInfo?.io?.network_speeds_mbps),
-    [staticInfo?.io?.network_speeds_mbps]
+    () => summarizeNetworkSpeeds(staticInfo?.network?.network_speeds_mbps),
+    [staticInfo?.network?.network_speeds_mbps]
   )
 
   const diskStaticTotalText = useMemo(
@@ -2980,13 +3134,43 @@ export default function SystemOverview({ active }: Props) {
     return options
   }, [gpuDevices])
 
+  const monitoredChangeMessage = useMemo(() => {
+    if (!monitoredSectionsChange) return null
+    const added = monitoredSectionsChange.added
+      .map((name) => SECTION_LABELS[name] || name)
+      .join(', ')
+    const removed = monitoredSectionsChange.removed
+      .map((name) => SECTION_LABELS[name] || name)
+      .join(', ')
+    const chunks: string[] = []
+    if (added) chunks.push(`Enabled: ${added}`)
+    if (removed) chunks.push(`Disabled: ${removed}`)
+    return chunks.join(' | ')
+  }, [monitoredSectionsChange])
+
+  useEffect(() => {
+    if (!monitoredSectionsChange || !monitoredChangeMessage) return
+    publishNotice({
+      title: 'Monitoring configuration updated',
+      description: monitoredChangeMessage,
+      scope: 'monitoring_sections',
+      updatedAt: monitoredSectionsChange.updatedAt,
+    })
+    clearMonitoredSectionsChange()
+  }, [
+    monitoredSectionsChange,
+    monitoredChangeMessage,
+    clearMonitoredSectionsChange,
+    publishNotice,
+  ])
+
   return (
     <div className="perf-root">
       <div className="perf-ambient perf-ambient--blue" />
       <div className="perf-ambient perf-ambient--orange" />
       <div className="perf-ambient perf-ambient--teal" />
 
-      <div className="perf-header">
+      <div className="perf-header perf-header--sticky">
         <div>
           <Title level={3} style={{ color: COLORS.text, margin: 0 }}>
             Performance
@@ -3033,6 +3217,17 @@ export default function SystemOverview({ active }: Props) {
         <Alert message="Dynamic Info Error" description={errorDynamic} type="error" showIcon style={{ marginBottom: 12 }} />
       )}
 
+      {!hasMonitoredSections && (
+        <Alert
+          message="No sections are being monitored"
+          description="Dynamic monitoring is disabled (monitored_sections is empty in the server config), so live metrics polling and history collection are paused. Enable one or more sections in the configuration to resume."
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+        />
+      )}
+
+      {(showPressureSection || showNetworkSection) && (
       <Card className="perf-card perf-rise" bodyStyle={{ padding: 18, marginBottom: 18 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
           <Space size={8}>
@@ -3041,48 +3236,55 @@ export default function SystemOverview({ active }: Props) {
           </Space>
         </div>
         <Row gutter={[16, 12]}>
-          {/* Disk IO Pressure: fraction of busy disks; subtitle lists busy vs OK devices */}
-          <Col xs={24} md={8}>
-            <PressurePointerGauge
-              title="Disk IO Pressure"
-              valuePct={diskBusyPct}
-              levelLabel={diskBusyLevelLabel}
-              subtitle={[
-                diskBusyCount > 0 ? `Busy: ${diskBusyNames.join(', ')}` : null,
-                diskTotalCount > 0 ? `${diskBusyCount}/${diskTotalCount} disks busy` : null,
-                isNumber(diskIoWait) ? `iowait: ${diskIoWait.toFixed(1)}%` : null,
-              ].filter(Boolean).join(' | ')}
-              description="Fraction of busy disks across all devices"
-            />
-          </Col>
+          {showPressureSection && (
+            <>
+              {/* Disk IO Pressure: fraction of busy disks; subtitle lists busy vs OK devices */}
+              <Col xs={24} md={showNetworkPressureCard ? 8 : 12}>
+                <PressurePointerGauge
+                  title="Disk IO Pressure"
+                  valuePct={diskBusyPct}
+                  levelLabel={diskBusyLevelLabel}
+                  subtitle={[
+                    diskBusyCount > 0 ? `Busy: ${diskBusyNames.join(', ')}` : null,
+                    diskTotalCount > 0 ? `${diskBusyCount}/${diskTotalCount} disks busy` : null,
+                    isNumber(diskIoWait) ? `iowait: ${diskIoWait.toFixed(1)}%` : null,
+                  ].filter(Boolean).join(' | ')}
+                  description="Fraction of busy disks across all devices"
+                />
+              </Col>
 
-          {/* System Pressure (middle): weighted composite score from SystemPressureMonitor */}
-          <Col xs={24} md={8}>
-            <PressurePointerGauge
-              title="System Pressure"
-              valuePct={systemPressurePct}
-              subtitle={pressureLevel
-                ? `Level: ${pressureLevel.toUpperCase()} | Score: ${isNumber(pressureScore) ? (pressureScore / 100).toFixed(2) : 'N/A'}`
-                : undefined}
-              description="Weighted composite score (PSI × resource usage)"
-            />
-          </Col>
+              {/* System Pressure (middle): weighted composite score from SystemPressureMonitor */}
+              <Col xs={24} md={showNetworkPressureCard ? 8 : 12}>
+                <PressurePointerGauge
+                  title="System Pressure"
+                  valuePct={systemPressurePct}
+                  subtitle={pressureLevel
+                    ? `Level: ${pressureLevel.toUpperCase()} | Score: ${isNumber(pressureScore) ? (pressureScore / 100).toFixed(2) : 'N/A'}`
+                    : undefined}
+                  description="Weighted composite score (PSI × resource usage)"
+                />
+              </Col>
+            </>
+          )}
 
           {/* Network IO Pressure: fraction of busy NICs based on actual link speed */}
-          <Col xs={24} md={8}>
-            <PressurePointerGauge
-              title="Network IO Pressure"
-              valuePct={networkPressurePct}
-              levelLabel={networkBusyLevelLabel}
-              subtitle={[
-                networkBusyCount > 0 ? `Busy: ${networkBusyNics.join(', ')}` : null,
-                networkTotalCount > 0 ? `${networkBusyCount}/${networkTotalCount} NICs busy` : null,
-              ].filter(Boolean).join(' | ')}
-              description="Fraction of busy NICs based on actual link speed"
-            />
-          </Col>
+          {showNetworkPressureCard && (
+            <Col xs={24} md={showPressureSection ? 8 : 12}>
+              <PressurePointerGauge
+                title="Network IO Pressure"
+                valuePct={networkPressurePct}
+                levelLabel={networkBusyLevelLabel}
+                subtitle={[
+                  networkBusyCount > 0 ? `Busy: ${networkBusyNics.join(', ')}` : null,
+                  networkTotalCount > 0 ? `${networkBusyCount}/${networkTotalCount} NICs busy` : null,
+                ].filter(Boolean).join(' | ')}
+                description="Fraction of busy NICs based on actual link speed"
+              />
+            </Col>
+          )}
         </Row>
       </Card>
+      )}
 
       <SectionTitle
         title="Utilization Insights"
@@ -3091,6 +3293,7 @@ export default function SystemOverview({ active }: Props) {
       />
 
       <Row className="perf-insights-grid" gutter={[16, 16]} style={{ marginBottom: 24 }}>
+        {showCpuSection && (
         <Col xs={24} md={12} xl={8}>
           <TrendPanel
             title="CPU"
@@ -3122,7 +3325,9 @@ export default function SystemOverview({ active }: Props) {
             trendWindow={trendWindow}
           />
         </Col>
+        )}
 
+        {showMemorySection && (
         <Col xs={24} md={12} xl={8}>
           <TrendPanel
             title="Memory"
@@ -3160,8 +3365,9 @@ export default function SystemOverview({ active }: Props) {
             trendWindow={trendWindow}
           />
         </Col>
+        )}
 
-        {diskDevices.map(([diskName, diskData]) => (
+        {showDiskSection && diskDevices.map(([diskName, diskData]) => (
           <Col xs={24} md={12} xl={8} key={diskName}>
             <TrendPanel
               title={`Disk: ${diskName}`}
@@ -3186,7 +3392,7 @@ export default function SystemOverview({ active }: Props) {
           </Col>
         ))}
 
-        {networkNicCards.length > 1 ? networkNicCards.map((nic) => {
+        {showNetworkSection && (networkNicCards.length > 1 ? networkNicCards.map((nic) => {
           const nicSeries = getNetworkNicSeries(nic.nicName)
           return (
             <Col xs={24} md={12} xl={8} key={`nic-${nic.nicName}`}>
@@ -3264,10 +3470,10 @@ export default function SystemOverview({ active }: Props) {
               ]}
               subtitle={networkNicCards.length === 1
                 ? `Peak BW: ${formatNetworkSpeed(networkNicCards[0].bandwidth)}`
-                : staticInfo?.io
+                : staticInfo?.network
                   ? [
-                      `NIC ${formatPlain(staticInfo.io.nic_count ?? 0)}`,
-                      staticInfo.io.network_speeds_mbps ? summarizeNetworkSpeeds(staticInfo.io.network_speeds_mbps) : null,
+                      `NIC ${formatPlain(staticInfo.network.nic_count ?? 0)}`,
+                      staticInfo.network.network_speeds_mbps ? summarizeNetworkSpeeds(staticInfo.network.network_speeds_mbps) : null,
                     ].filter(Boolean).join(' | ')
                   : 'No data'
               }
@@ -3315,8 +3521,9 @@ export default function SystemOverview({ active }: Props) {
               primaryChartLabel="Utilization Trend"
             />
           </Col>
-        )}
+        ))}
 
+        {showNpuSection && (
         <Col xs={24} md={12} xl={8}>
           <TrendPanel
             title="NPU"
@@ -3344,8 +3551,9 @@ export default function SystemOverview({ active }: Props) {
             trendWindow={trendWindow}
           />
         </Col>
+        )}
 
-        {gpuDevices.length === 0 ? null : [...gpuDevices].sort((a, b) => {
+        {showGpuSection && (gpuDevices.length === 0 ? null : [...gpuDevices].sort((a, b) => {
           const aIsIgpu = a.label === 'iGPU' ? 0 : 1
           const bIsIgpu = b.label === 'iGPU' ? 0 : 1
           return aIsIgpu - bIsIgpu
@@ -3405,10 +3613,12 @@ export default function SystemOverview({ active }: Props) {
               trendWindow={trendWindow}
             />
           </Col>
-        ))}
+        )))}
 
       </Row>
 
+      {showCpuSection && (
+      <>
       <SectionTitle
         title="Per-Core CPU"
         subtitle="Grouped by P / E cores with dual-axis util/freq trends"
@@ -3502,7 +3712,11 @@ export default function SystemOverview({ active }: Props) {
         )}
       </Row>
       )}
+      </>
+      )}
 
+      {showNpuSection && (
+      <>
       <SectionTitle
         title="NPU Details"
         subtitle="Intel NPU telemetry with utilization, power, frequency and bandwidth trends"
@@ -3541,7 +3755,11 @@ export default function SystemOverview({ active }: Props) {
         </Col>
       </Row>
       )}
+      </>
+      )}
 
+      {showGpuSection && (
+      <>
       <SectionTitle
         title="GPU Devices"
         subtitle="Device-level telemetry (iGPU / dGPU) with engine trends"
@@ -3590,6 +3808,8 @@ export default function SystemOverview({ active }: Props) {
           ))
         )}
       </Row>
+      )}
+      </>
       )}
 
       {!dynamicInfo && (

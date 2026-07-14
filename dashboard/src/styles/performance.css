@@ -78,6 +78,18 @@
   z-index: 1;
 }
 
+.perf-header--sticky {
+  position: sticky;
+  /* Pin below the sticky app header + tab bar (measured in App.tsx); the
+     fallback covers the initial paint before the variable is set. */
+  top: var(--app-sticky-top, 128px);
+  z-index: 25;
+  background: rgba(9, 12, 20, 0.88);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid rgba(120, 176, 255, 0.16);
+  margin-bottom: 12px;
+}
+
 .perf-section-title {
   display: flex;
   align-items: center;

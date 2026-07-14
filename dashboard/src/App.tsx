@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect } from 'react'
-import { Tabs, Layout, Typography, Space, Badge, Tooltip, Alert } from 'antd'
+import { Tabs, Layout, Typography, Space, Badge, Alert } from 'antd'
 import {
   DashboardOutlined,
   AppstoreOutlined,
@@ -17,9 +17,6 @@ import About from './components/About'
 import { COLORS } from './styles/theme'
 import { api } from './api/client'
 import { GlobalConfigNoticesProvider, useGlobalConfigNotices } from './hooks/useGlobalConfigNotices'
-
-const MONITOR_ONLY_MSG =
-  'The current server is running in monitor-only mode; balancer control is not available.'
 
 const { Header, Content } = Layout
 
@@ -116,24 +113,22 @@ export default function App() {
       ),
       children: <HistoryDashboard active={activeTab === '4'} />,
     },
-    {
-      key: '5',
-      disabled: !balancerEnabled,
-      label: balancerEnabled ? (
-        <Space>
-          <ControlOutlined />
-          Balancer
-        </Space>
-      ) : (
-        <Tooltip title={MONITOR_ONLY_MSG}>
-          <Space>
-            <ControlOutlined />
-            Balancer
-          </Space>
-        </Tooltip>
-      ),
-      children: <Balance active={activeTab === '5' && balancerEnabled} balancerEnabled={balancerEnabled} />,
-    },
+    // Balancer tab is only shown when the server supports balancing; in
+    // monitor-only mode it is omitted entirely rather than shown as disabled.
+    ...(balancerEnabled
+      ? [
+          {
+            key: '5',
+            label: (
+              <Space>
+                <ControlOutlined />
+                Balancer
+              </Space>
+            ),
+            children: <Balance active={activeTab === '5'} balancerEnabled={balancerEnabled} />,
+          },
+        ]
+      : []),
     {
       key: '6',
       label: (

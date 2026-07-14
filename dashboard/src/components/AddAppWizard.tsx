@@ -50,7 +50,16 @@ export function AddAppWizard({ open, onClose, onSuccess }: Props) {
   const [appName, setAppName] = useState('')
   const [searchInput, setSearchInput] = useState('')
   const [candidates, setCandidates] = useState<DiscoverCandidate[]>([])
-  const [selectedPids, setSelectedPids] = useState<number[]>([])
+  // Selected processes form a "basket" that persists across multiple keyword
+  // searches, keyed by pid so a pick stays visible/removable even after the
+  // search that surfaced it has been replaced by a different query.  Only the
+  // pids reach the backend; we keep the full candidate so the basket can show
+  // comm/pid and so we don't need the process to still be in the results.
+  const [selected, setSelected] = useState<Record<number, DiscoverCandidate>>({})
+  const selectedPids = useMemo(
+    () => Object.keys(selected).map(Number),
+    [selected],
+  )
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState<string | null>(null)
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -90,7 +99,7 @@ export function AddAppWizard({ open, onClose, onSuccess }: Props) {
     setAppName('')
     setSearchInput('')
     setCandidates([])
-    setSelectedPids([])
+    setSelected({})
     setSearching(false)
     setSearchError(null)
     setAppId('')
@@ -142,9 +151,9 @@ export function AddAppWizard({ open, onClose, onSuccess }: Props) {
     try {
       const res = await api.discoverSearch(keywords)
       if (mySeq !== searchSeq.current) return
+      // Replace only the browse list; the selection basket persists across
+      // searches so the user can accumulate processes from several keywords.
       setCandidates(res.candidates ?? [])
-      const stillVisible = new Set(res.candidates.map((c) => c.pid))
-      setSelectedPids((prev) => prev.filter((pid) => stillVisible.has(pid)))
     } catch (e) {
       if (mySeq !== searchSeq.current) return
       setSearchError(e instanceof Error ? e.message : 'Search failed')
@@ -289,9 +298,33 @@ export function AddAppWizard({ open, onClose, onSuccess }: Props) {
     [],
   )
 
+  const addToBasket = useCallback((rows: DiscoverCandidate[]) => {
+    setSelected((prev) => {
+      const next = { ...prev }
+      for (const r of rows) next[r.pid] = r
+      return next
+    })
+  }, [])
+
+  const removeFromBasket = useCallback((pids: number[]) => {
+    setSelected((prev) => {
+      const next = { ...prev }
+      for (const pid of pids) delete next[pid]
+      return next
+    })
+  }, [])
+
+  // Per-row toggles (onSelect/onSelectAll) rather than onChange: the basket
+  // spans multiple searches, so we must add/remove individual rows instead of
+  // replacing the whole selection with only the currently-visible keys.
   const rowSelection: TableRowSelection<DiscoverCandidate> = {
     selectedRowKeys: selectedPids,
-    onChange: (keys) => setSelectedPids(keys.map((k) => Number(k))),
+    onSelect: (record, checked) =>
+      checked ? addToBasket([record]) : removeFromBasket([record.pid]),
+    onSelectAll: (checked, _rows, changeRows) =>
+      checked
+        ? addToBasket(changeRows)
+        : removeFromBasket(changeRows.map((r) => r.pid)),
   }
 
   // ---------- footer buttons (one set per step) ----------
@@ -366,7 +399,10 @@ export function AddAppWizard({ open, onClose, onSuccess }: Props) {
             Make sure the application is <b>currently running</b>, give it an
             App name, then type part of its process name in the search box —
             matching processes appear below.  Multi-select all processes that
-            belong to this application (multiple cgroups are fine).
+            belong to this application (multiple cgroups are fine).  You can
+            search again with a <b>different keyword</b> and keep selecting —
+            picks accumulate in the basket below and are kept until you remove
+            them.
           </Paragraph>
 
           <div style={{ marginBottom: 12 }}>
@@ -404,6 +440,39 @@ export function AddAppWizard({ open, onClose, onSuccess }: Props) {
             pagination={{ pageSize: 8, hideOnSinglePage: true }}
             locale={{ emptyText: emptyHint }}
           />
+
+          {/* Selection basket — accumulates picks across searches so a
+              multi-keyword app can gather unrelated processes into one entry. */}
+          <div style={{ marginTop: 12 }}>
+            <Space size="small">
+              <Text strong>Selected processes ({selectedPids.length})</Text>
+              {selectedPids.length > 0 && (
+                <a onClick={() => setSelected({})}>Clear all</a>
+              )}
+            </Space>
+            {selectedPids.length === 0 ? (
+              <Paragraph type="secondary" style={{ fontSize: 12, marginTop: 4 }}>
+                Nothing selected yet. Tick rows above; they stay here even after
+                you change the search keyword.
+              </Paragraph>
+            ) : (
+              <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {selectedPids.map((pid) => {
+                  const c = selected[pid]
+                  return (
+                    <Tag
+                      key={pid}
+                      color="blue"
+                      closable
+                      onClose={() => removeFromBasket([pid])}
+                    >
+                      {c.comm || c.exe || 'proc'} · {pid}
+                    </Tag>
+                  )
+                })}
+              </div>
+            )}
+          </div>
         </div>
       )}
 

@@ -14,6 +14,7 @@ from threading import Lock
 from flask import Flask, request, Response, stream_with_context
 
 from balancer.balancer import DynamicBalancer
+from balancer.controller.process_control import kill_process, suspend_process
 from db.DatabaseModel import AIAppPriority, DBStatus, init_database
 from monitor.monitor_api import (
     monitor_bp,
@@ -928,6 +929,66 @@ def set_oom_score():
         )
     except Exception as e:
         logger.error(f"Set OOM score failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/kill_process', methods=['POST'])
+def kill_process_route():
+    """Terminate (SIGTERM) or force-kill (SIGKILL) an arbitrary process by PID."""
+    try:
+        data = request.get_json() or {}
+        pid = data.get('pid')
+        force = bool(data.get('force'))
+
+        if not isinstance(pid, int):
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="pid must be an integer"
+            )
+
+        ok, msg = kill_process(pid, force)
+        return construct_response(
+            data={},
+            retcode=RetCode.SUCCESS if ok else RetCode.OPERATING_ERROR,
+            retmsg=msg
+        )
+    except Exception as e:
+        logger.error(f"Kill process failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/suspend_process', methods=['POST'])
+def suspend_process_route():
+    """Freeze (SIGSTOP) or resume (SIGCONT) an arbitrary process by PID."""
+    try:
+        data = request.get_json() or {}
+        pid = data.get('pid')
+        resume = bool(data.get('resume'))
+
+        if not isinstance(pid, int):
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="pid must be an integer"
+            )
+
+        ok, msg = suspend_process(pid, resume)
+        return construct_response(
+            data={},
+            retcode=RetCode.SUCCESS if ok else RetCode.OPERATING_ERROR,
+            retmsg=msg
+        )
+    except Exception as e:
+        logger.error(f"Suspend process failed: {str(e)}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,

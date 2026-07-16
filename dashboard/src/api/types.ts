@@ -101,16 +101,45 @@ export interface ProcessEntry {
   pid: number
   name: string
   username: string
+  uid: number | null
   cpu_percent: number
   memory_percent: number
   mem_rss_kb: number
+  mem_shared_kb: number
   status: string
+  create_time: number | null
+  cgroup: string
   cmdline: string
+  // Present only when fetched with gpu=1 and the PID holds a GPU fd.
+  // Keyed by PCI address (drm-pdev); mapped to igpu/dgpu labels client-side.
+  gpu_devices?: Record<string, { gpu_util: number; gpu_mem_mb: number }>
+  // Present only when fetched with io=1; bytes/s over the polling interval.
+  io_read_rate?: number
+  io_write_rate?: number
+  // SmartTune's own processes — never offered for balancer management or kill.
+  is_self?: boolean
+  // False for shells / blacklisted daemons / self — hides "Add to balancer".
+  balancer_candidate?: boolean
 }
 
 export interface ProcessListData {
   count: number
   processes: ProcessEntry[]
+}
+
+export interface ProcessDetailData {
+  pid: number
+  name: string
+  exe: string
+  cwd: string
+  username: string
+  status: string
+  ppid: number | null
+  num_threads: number | null
+  num_fds: number | null
+  nice: number | null
+  create_time: number | null
+  cmdline: string
 }
 
 export type AppListData = AppInfo[]

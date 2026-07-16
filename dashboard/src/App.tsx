@@ -48,6 +48,8 @@ export default function App() {
   // 1 = balancer + monitor, 0 = monitor only. Default to enabled so older
   // servers without the /smartune/capabilities endpoint keep full behaviour.
   const [balancerEnabled, setBalancerEnabled] = useState(true)
+  // Set from the Processes tab's "Add to balancer" action; consumed by the Balance tab.
+  const [registerKeyword, setRegisterKeyword] = useState<string | null>(null)
 
   useEffect(() => {
     api
@@ -101,7 +103,20 @@ export default function App() {
           Processes
         </Space>
       ),
-      children: <Processes active={activeTab === '3'} />,
+      children: (
+        <Processes
+          active={activeTab === '3'}
+          balancerEnabled={balancerEnabled}
+          onRegister={
+            balancerEnabled
+              ? (name) => {
+                  setRegisterKeyword(name)
+                  setActiveTab('5')
+                }
+              : undefined
+          }
+        />
+      ),
     },
     {
       key: '4',
@@ -125,7 +140,14 @@ export default function App() {
                 Balancer
               </Space>
             ),
-            children: <Balance active={activeTab === '5'} balancerEnabled={balancerEnabled} />,
+            children: (
+              <Balance
+                active={activeTab === '5'}
+                balancerEnabled={balancerEnabled}
+                registerKeyword={registerKeyword}
+                onRegisterConsumed={() => setRegisterKeyword(null)}
+              />
+            ),
           },
         ]
       : []),

@@ -145,6 +145,16 @@ def _is_blacklisted(comm: str, exe_basename: str) -> bool:
     return False
 
 
+def is_noise_process(comm: str, exe_basename: str = "") -> bool:
+    """Public wrapper: True for shells / tiny tools / blacklisted daemons.
+
+    Reused by the process list to hide "Add to balancer" on processes that would
+    never be the app a user wants to monitor.  Single source of truth for the
+    shell/blacklist filter shared with the discovery wizard.
+    """
+    return _is_blacklisted(comm, exe_basename)
+
+
 def _matches_any_keyword(info: dict, keywords_lower: list[str]) -> bool:
     haystacks = (
         info["comm"].lower(),

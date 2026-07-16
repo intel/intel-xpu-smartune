@@ -107,8 +107,10 @@ def _parse_fdinfo_engines(content):
 def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
     """Read Intel GPU DRM engine times and memory from /proc/<pid>/fdinfo.
 
-    Returns ``{"engines": {name: {cycles, total_cycles, time_ns}}, "mem_bytes": int}``
+    Returns ``{"engines", "mem_bytes", "per_pdev": {pdev: {engines, mem_bytes}}}``
     when the process holds at least one Intel GPU fd, or ``None`` otherwise.
+    ``engines``/``mem_bytes`` are merged across devices; ``per_pdev`` keeps them
+    split per GPU (PCI address, e.g. igpu vs dgpu).
     """
     fd_dir = f'/proc/{pid}/fd'
     fdinfo_dir = f'/proc/{pid}/fdinfo'
@@ -123,6 +125,7 @@ def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
 
     all_engines = {}
     total_mem_bytes = 0
+    per_pdev = {}
     found = False
     _seen = seen_client_ids if seen_client_ids is not None else set()
 
@@ -143,6 +146,7 @@ def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
 
         driver = None
         client_id = None
+        pdev = None
         for line in fdinfo_content.splitlines():
             if line.startswith('drm-driver:'):
                 driver = line.split(':', 1)[1].strip()
@@ -151,6 +155,8 @@ def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
                     client_id = int(line.split(':', 1)[1].strip())
                 except ValueError:
                     pass
+            elif line.startswith('drm-pdev:'):
+                pdev = line.split(':', 1)[1].strip()
 
         if driver not in _GPU_DRM_DRIVERS:
             continue
@@ -163,22 +169,28 @@ def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
             _seen.add(client_id)
 
         is_xe = (driver == 'xe')
+        # Fall back to the DRM node name (renderD128, ...) when drm-pdev is absent.
+        dev_key = pdev or os.path.basename(link)
+        dev = per_pdev.setdefault(dev_key, {'engines': {}, 'mem_bytes': 0})
 
         fd_engines = _parse_fdinfo_engines(fdinfo_content)
         for eng, data in fd_engines.items():
-            if eng not in all_engines:
-                all_engines[eng] = {"cycles": 0, "total_cycles": 0, "time_ns": 0}
-            all_engines[eng]["cycles"] += data["cycles"]
-            all_engines[eng]["total_cycles"] += data["total_cycles"]
-            all_engines[eng]["time_ns"] += data["time_ns"]
+            for target in (all_engines, dev['engines']):
+                if eng not in target:
+                    target[eng] = {"cycles": 0, "total_cycles": 0, "time_ns": 0}
+                target[eng]["cycles"] += data["cycles"]
+                target[eng]["total_cycles"] += data["total_cycles"]
+                target[eng]["time_ns"] += data["time_ns"]
 
         for line in fdinfo_content.splitlines():
-            total_mem_bytes += _parse_fdinfo_mem_bytes(line, is_xe)
+            mem = _parse_fdinfo_mem_bytes(line, is_xe)
+            total_mem_bytes += mem
+            dev['mem_bytes'] += mem
 
     if not found:
         return None
 
-    return {'engines': all_engines, 'mem_bytes': total_mem_bytes}
+    return {'engines': all_engines, 'mem_bytes': total_mem_bytes, 'per_pdev': per_pdev}
 
 
 def _accumulate_engine_delta(out, t0_engines, t1_engines):
@@ -196,6 +208,21 @@ def _accumulate_engine_delta(out, t0_engines, t1_engines):
         out[eng]["time_ns"] += max(0, d1["time_ns"] - d0["time_ns"])
 
 
+def _peak_engine_util(engine_delta, elapsed_ns):
+    """Peak engine utilisation % from a delta dict (Xe cycles, i915 time)."""
+    util = 0.0
+    for d in engine_delta.values():
+        if d["total_cycles"] > 0:
+            u = (d["cycles"] / d["total_cycles"]) * 100
+        elif elapsed_ns > 0 and d["time_ns"] > 0:
+            u = (d["time_ns"] / elapsed_ns) * 100
+        else:
+            u = 0.0
+        if u > util:
+            util = u
+    return round(min(util, 100.0), 1)
+
+
 
 class ResourceMonitor:
     def __init__(self):
@@ -204,6 +231,7 @@ class ResourceMonitor:
         self.cpu_cores = os.cpu_count() or 16
         self.prev_io = psutil.disk_io_counters(perdisk=True)
         self.prev_time = time.time()
+        self._prev_pid_io = {}  # pid -> (read_bytes, write_bytes, ts) for per-pid IO rates
         # Desktop application metadata
         try:
             self.desktop_apps = {app["app_id"]: app for app in fetch_all_apps()}
@@ -996,6 +1024,72 @@ class ResourceMonitor:
             'gpu_util': round(min(gpu_util, 100.0), 1),
             'gpu_mem_mb': round(total_mem_bytes / (1024 * 1024), 1),
         }
+
+    def get_per_pid_gpu_stats(self, sample_interval=_GPU_SAMPLE_INTERVAL):
+        """Per-PID Intel GPU utilisation and memory via fdinfo, split per device.
+
+        Returns {pid: {pdev: {'gpu_util', 'gpu_mem_mb'}}} for PIDs holding a GPU fd.
+        """
+        t0_data = {}
+        for pid in psutil.pids():
+            try:
+                data = _read_pid_fdinfo_gpu(pid)
+            except Exception:
+                continue
+            if data is not None:
+                t0_data[pid] = data
+
+        if not t0_data:
+            return {}
+
+        time.sleep(sample_interval)
+        elapsed_ns = sample_interval * 1e9
+
+        result = {}
+        for pid, t0 in t0_data.items():
+            try:
+                t1 = _read_pid_fdinfo_gpu(pid)
+            except Exception:
+                continue
+            if t1 is None:
+                continue
+
+            devices = {}
+            for pdev, d1 in t1['per_pdev'].items():
+                d0 = t0['per_pdev'].get(pdev, {'engines': {}, 'mem_bytes': 0})
+                delta = {}
+                _accumulate_engine_delta(delta, d0['engines'], d1['engines'])
+                devices[pdev] = {
+                    'gpu_util': _peak_engine_util(delta, elapsed_ns),
+                    'gpu_mem_mb': round(d1['mem_bytes'] / (1024 * 1024), 1),
+                }
+            if devices:
+                result[pid] = devices
+
+        return result
+
+    def get_per_pid_io_rates(self):
+        """Per-PID disk read/write rates (bytes/s) from io_counters deltas since last call."""
+        now = time.time()
+        rates = {}
+        snapshot = {}
+        for p in psutil.process_iter(['pid']):
+            pid = p.info['pid']
+            try:
+                io = p.io_counters()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, NotImplementedError):
+                continue
+            snapshot[pid] = (io.read_bytes, io.write_bytes, now)
+            prev = self._prev_pid_io.get(pid)
+            if prev:
+                dt = now - prev[2]
+                if dt > 0:
+                    rates[pid] = {
+                        'io_read_rate': max(0, io.read_bytes - prev[0]) / dt,
+                        'io_write_rate': max(0, io.write_bytes - prev[1]) / dt,
+                    }
+        self._prev_pid_io = snapshot
+        return rates
 
     def get_app_resource_stats(self, n=10):
         """Return per-application CPU and memory usage data for the App Resources view (no threshold filtering).

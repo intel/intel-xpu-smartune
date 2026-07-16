@@ -26,6 +26,8 @@ interface Props {
   open: boolean
   onClose: () => void
   onSuccess: () => void
+  // Pre-fill the process search (and app name) when opened from the Processes tab.
+  initialKeyword?: string
 }
 
 const PRIORITY_OPTIONS = [
@@ -43,7 +45,7 @@ const STEP_DONE = 2
 
 const SEARCH_DEBOUNCE_MS = 300
 
-export function AddAppWizard({ open, onClose, onSuccess }: Props) {
+export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props) {
   const [step, setStep] = useState(STEP_PICK)
 
   // Step 1 — app name + live process search/multi-select
@@ -171,6 +173,14 @@ export function AddAppWizard({ open, onClose, onSuccess }: Props) {
       if (searchTimer.current) clearTimeout(searchTimer.current)
     }
   }, [searchInput, open, step, runSearch])
+
+  // Pre-fill the search + app name when opened with a keyword (from Processes tab).
+  useEffect(() => {
+    if (open && initialKeyword) {
+      setSearchInput(initialKeyword)
+      setAppName(initialKeyword)
+    }
+  }, [open, initialKeyword])
 
   // ---------- step transitions ----------
   const goToConfirm = useCallback(async () => {

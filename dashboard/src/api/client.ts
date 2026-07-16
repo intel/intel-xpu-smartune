@@ -7,6 +7,7 @@ import type {
   AppResourceStatsData,
   AppDiskIoStatsData,
   ProcessListData,
+  ProcessDetailData,
   AppListData,
   StaticInfoData,
   DynamicInfoData,
@@ -71,7 +72,12 @@ export const api = {
   getCapabilities: () => get<{ capabilities: number }>('/smartune/capabilities'),
   getAppResourceStats: (n = 10) => get<AppResourceStatsData>(`/monitor/app_resource_stats?n=${n}`),
   getAppDiskIoStats: (n = 10) => get<AppDiskIoStatsData>(`/monitor/app_disk_io_stats?n=${n}`),
-  getProcesses: () => get<ProcessListData>('/monitor/processes'),
+  getProcesses: (gpu = false, io = false) => {
+    const params = [gpu && 'gpu=1', io && 'io=1'].filter(Boolean)
+    return get<ProcessListData>(`/monitor/processes${params.length ? `?${params.join('&')}` : ''}`)
+  },
+  getProcessDetail: (pid: number) =>
+    get<ProcessDetailData>(`/monitor/process_detail?pid=${pid}`),
   getStaticInfo: () => get<StaticInfoData>('/monitor/static_info'),
   refreshStaticInfo: () => get<StaticInfoData>('/monitor/static_info?force_refresh=1'),
   getDynamicInfo: (sections?: string[]) => {
@@ -146,6 +152,10 @@ export const api = {
     post<void>('/app/set_priority', payload),
   setOomScore: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<void>('/app/set_oom_score', payload),
+  killProcess: (pid: number, force = false) =>
+    post<void>('/app/kill_process', { pid, force }),
+  suspendProcess: (pid: number, resume = false) =>
+    post<void>('/app/suspend_process', { pid, resume }),
   cancelRelaunch: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<void>('/app/cancel_relaunch', payload),
   // Server returns {skipped: true} (with retmsg = human-readable reason) when

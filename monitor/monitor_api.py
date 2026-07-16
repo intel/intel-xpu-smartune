@@ -19,8 +19,11 @@ from monitor.system_info import (
     STATIC_INFO_SECTIONS,
     DYNAMIC_INFO_SECTIONS,
 )
+from monitor.app_discovery import is_noise_process
+from utils.app_utils import get_cgroup_path_by_pid
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
+from utils.self_ident import is_own_process
 
 monitor_bp = Blueprint('monitor', __name__, url_prefix='/monitor')
 
@@ -754,26 +757,61 @@ def get_processes():
     """Return all running processes sorted by CPU usage."""
     try:
         procs = []
+        # Normalise per-process CPU% to the whole machine (0-100%) so it shares
+        # the summary bar's scale instead of psutil's per-core value (>100%).
+        cpu_count = psutil.cpu_count() or 1
         attrs = ['pid', 'name', 'username', 'cpu_percent', 'memory_percent',
-                 'status', 'cmdline', 'memory_info']
+                 'status', 'cmdline', 'memory_info', 'create_time', 'uids']
         for p in psutil.process_iter(attrs):
             try:
                 info = p.info
-                mem_rss_kb = round(info['memory_info'].rss / 1024, 0) if info.get('memory_info') else 0
+                mem = info.get('memory_info')
+                mem_rss_kb = round(mem.rss / 1024, 0) if mem else 0
+                mem_shared_kb = round(getattr(mem, 'shared', 0) / 1024, 0) if mem else 0
                 cmdline_parts = info.get('cmdline') or []
                 cmdline = ' '.join(cmdline_parts) if cmdline_parts else (info.get('name') or '')
+                uids = info.get('uids')
+                name = info.get('name') or ''
+                # SmartTune's own processes must never be managed/killed via the UI;
+                # shells and blacklisted daemons are never a meaningful "app" to
+                # balance, so both are surfaced to the front-end as flags.
+                is_self = is_own_process(info['pid'], cmdline)
+                balancer_candidate = not is_self and not is_noise_process(name)
                 procs.append({
                     'pid': info['pid'],
-                    'name': info.get('name') or '',
+                    'name': name,
                     'username': info.get('username') or '',
-                    'cpu_percent': round(info.get('cpu_percent') or 0, 1),
+                    'uid': uids.real if uids else None,
+                    'cpu_percent': round((info.get('cpu_percent') or 0) / cpu_count, 1),
                     'memory_percent': round(info.get('memory_percent') or 0, 2),
                     'mem_rss_kb': mem_rss_kb,
+                    'mem_shared_kb': mem_shared_kb,
                     'status': info.get('status') or '',
+                    'create_time': info.get('create_time'),
+                    'cgroup': get_cgroup_path_by_pid(info['pid']) or '',
                     'cmdline': cmdline,
+                    'is_self': is_self,
+                    'balancer_candidate': balancer_candidate,
                 })
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
+        # Optional fdinfo-sampled per-PID GPU stats (adds a ~0.3s sampling window).
+        if request.args.get('gpu') in ('1', 'true', 'yes'):
+            gpu_stats = _get_resource_monitor().get_per_pid_gpu_stats()
+            for p in procs:
+                devs = gpu_stats.get(p['pid'])
+                if devs:
+                    p['gpu_devices'] = devs
+
+        # Optional per-PID disk IO rates (delta since the previous call, no sleep).
+        if request.args.get('io') in ('1', 'true', 'yes'):
+            io_rates = _get_resource_monitor().get_per_pid_io_rates()
+            for p in procs:
+                r = io_rates.get(p['pid'])
+                if r:
+                    p['io_read_rate'] = round(r['io_read_rate'], 1)
+                    p['io_write_rate'] = round(r['io_write_rate'], 1)
+
         procs.sort(key=lambda x: x['cpu_percent'], reverse=True)
         return construct_response(
             data={'count': len(procs), 'processes': procs},
@@ -786,6 +824,46 @@ def get_processes():
             retcode=RetCode.EXCEPTION_ERROR,
             retmsg=str(e)
         )
+
+
+@monitor_bp.route('/process_detail', methods=['GET'])
+def get_process_detail():
+    """Return detailed read-only info for a single PID (Properties dialog)."""
+    try:
+        pid = int(request.args.get('pid', 0))
+    except (TypeError, ValueError):
+        return construct_response(data={}, retcode=RetCode.ARGUMENT_ERROR, retmsg="Invalid pid")
+
+    def _safe(fn, default=None):
+        try:
+            return fn()
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            return default
+
+    try:
+        p = psutil.Process(pid)
+        with p.oneshot():
+            cmdline_parts = _safe(p.cmdline, []) or []
+            detail = {
+                'pid': pid,
+                'name': _safe(p.name, '') or '',
+                'exe': _safe(p.exe, '') or '',
+                'cwd': _safe(p.cwd, '') or '',
+                'username': _safe(p.username, '') or '',
+                'status': _safe(p.status, '') or '',
+                'ppid': _safe(p.ppid),
+                'num_threads': _safe(p.num_threads),
+                'num_fds': _safe(p.num_fds),
+                'nice': _safe(p.nice),
+                'create_time': _safe(p.create_time),
+                'cmdline': ' '.join(cmdline_parts),
+            }
+        return construct_response(data=detail, retmsg="Successfully retrieved process detail")
+    except psutil.NoSuchProcess:
+        return construct_response(data={}, retcode=RetCode.NOT_EXISTING, retmsg=f"Process {pid} not found")
+    except Exception as e:
+        logger.error(f"get_process_detail failed: {str(e)}")
+        return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
 
 
 def _static_force_refresh() -> bool:

@@ -56,6 +56,9 @@ interface Props {
   // false = monitor-only server: the balancer is not available, so this tab
   // renders a notice and performs no balancer calls.
   balancerEnabled?: boolean
+  // Set by the Processes tab's "Add to balancer"; opens the wizard pre-filled.
+  registerKeyword?: string | null
+  onRegisterConsumed?: () => void
 }
 
 interface LimitDialogState {
@@ -274,7 +277,12 @@ function PassiveControlPanel({ active }: PassiveControlPanelProps) {
   )
 }
 
-export default function Balance({ active, balancerEnabled = true }: Props) {
+export default function Balance({
+  active,
+  balancerEnabled = true,
+  registerKeyword,
+  onRegisterConsumed,
+}: Props) {
   const [allApps, setAllApps] = useState<AppInfo[]>([])
   const [controlledApps, setControlledApps] = useState<AppInfo[]>([])
   const [pendingApps, setPendingApps] = useState<AppInfo[]>([])
@@ -288,6 +296,11 @@ export default function Balance({ active, balancerEnabled = true }: Props) {
   const [remark, setRemark] = useState('')
   const [adding, setAdding] = useState(false)
   const [wizardOpen, setWizardOpen] = useState(false)
+
+  // Opened from the Processes tab: pop the Add-App wizard pre-filled.
+  useEffect(() => {
+    if (registerKeyword) setWizardOpen(true)
+  }, [registerKeyword])
 
   // Per-row priority edit state
   const [rowPriorities, setRowPriorities] = useState<Record<string, string>>({})
@@ -1259,7 +1272,11 @@ export default function Balance({ active, balancerEnabled = true }: Props) {
 
       <AddAppWizard
         open={wizardOpen}
-        onClose={() => setWizardOpen(false)}
+        initialKeyword={registerKeyword ?? undefined}
+        onClose={() => {
+          setWizardOpen(false)
+          onRegisterConsumed?.()
+        }}
         onSuccess={() => {
           fetchData()
         }}

@@ -93,7 +93,20 @@ export default function App() {
           App Resources
         </Space>
       ),
-      children: <AppResources active={activeTab === '2'} />,
+      children: (
+        <AppResources
+          active={activeTab === '2'}
+          balancerEnabled={balancerEnabled}
+          onRegister={
+            balancerEnabled
+              ? (name) => {
+                  setRegisterKeyword(name)
+                  setActiveTab('5')
+                }
+              : undefined
+          }
+        />
+      ),
     },
     {
       key: '3',

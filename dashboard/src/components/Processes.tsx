@@ -10,11 +10,8 @@ import {
   Space,
   Tooltip,
   Input,
-  Dropdown,
-  Modal,
   message,
   Checkbox,
-  Descriptions,
   Button,
 } from 'antd'
 import {
@@ -22,13 +19,14 @@ import {
   SearchOutlined,
   DownOutlined,
   RightOutlined,
-  MoreOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
 import { api } from '../api/client'
-import type { ProcessEntry, DynamicInfoData, ProcessDetailData } from '../api/types'
+import type { ProcessEntry, DynamicInfoData } from '../api/types'
 import { usePolling } from '../hooks/usePolling'
+import { ProcessActionsMenu, useProcessDetail } from './ProcessActions'
+import { buildGpuLabelMap } from '../utils/gpu'
 
 const { Text, Title } = Typography
 
@@ -55,22 +53,15 @@ function formatGB(gb: number): string {
 }
 
 // A single GPU device's utilisation: prefer the device-level value, falling
-// back to the busiest engine when it is absent.  A short display label is
-// derived so igpu/dgpu can be told apart at a glance.
-// dev_type is typically "integrated"/"discrete" → iGPU/dGPU.
-function friendlyGpuLabel(devType?: string | null, fallback = 'GPU'): string {
-  const t = devType?.toLowerCase()
-  if (t?.startsWith('int')) return 'iGPU'
-  if (t?.startsWith('dis')) return 'dGPU'
-  return devType || fallback
-}
-
+// back to the busiest engine when it is absent.  The display label comes from
+// the shared label map so igpu/dgpu (and multiple same-type GPUs) can be told
+// apart at a glance.
 interface GpuDevStat {
   name: string
   util: number | null
 }
 
-function gpuDeviceStats(dyn: DynamicInfoData | null): GpuDevStat[] {
+function gpuDeviceStats(dyn: DynamicInfoData | null, labels: Map<string, string>): GpuDevStat[] {
   const devices = dyn?.gpu?.gpu_usage?.parsed?.devices
   if (!devices || devices.length === 0) return []
   return devices.map((d, i) => {
@@ -81,8 +72,8 @@ function gpuDeviceStats(dyn: DynamicInfoData | null): GpuDevStat[] {
       )
       if (vals.length) util = Math.max(...vals)
     }
-    const name = friendlyGpuLabel(d.dev_type, d.drv_name || d.pci_dev || `GPU ${i}`)
-    return { name, util }
+    const key = d.pci_dev || `GPU ${i}`
+    return { name: labels.get(key) ?? key, util }
   })
 }
 
@@ -381,9 +372,7 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
   const [filter, setFilter] = useState('')
   const [hideSystem, setHideSystem] = useState(false)
   const [groupByApp, setGroupByApp] = useState(false)
-  const [detail, setDetail] = useState<ProcessDetailData | null>(null)
-  const [detailOpen, setDetailOpen] = useState(false)
-  const [detailLoading, setDetailLoading] = useState(false)
+  const { openDetail, detailModal } = useProcessDetail()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
@@ -412,49 +401,13 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
 
   usePolling(fetchData, 5000, active)
 
-  const handleKill = useCallback(
-    (p: ProcessEntry, force: boolean) => {
-      Modal.confirm({
-        title: force ? `Force kill ${p.name}?` : `End process ${p.name}?`,
-        content: force
-          ? `PID ${p.pid} will be killed immediately (SIGKILL). Unsaved work may be lost.`
-          : `PID ${p.pid} will be asked to terminate (SIGTERM).`,
-        okText: force ? 'Force kill' : 'End process',
-        okButtonProps: { danger: true },
-        cancelText: 'Cancel',
-        onOk: async () => {
-          try {
-            await api.killProcess(p.pid, force)
-            message.success(`Signal sent to ${p.name} (${p.pid})`)
-            fetchData()
-          } catch (e) {
-            message.error(e instanceof Error ? e.message : 'Failed to signal process')
-          }
-        },
-      })
-    },
-    [fetchData],
-  )
-
-  const openDetail = useCallback(async (pid: number) => {
-    setDetailOpen(true)
-    setDetailLoading(true)
-    setDetail(null)
-    try {
-      setDetail(await api.getProcessDetail(pid))
-    } catch (e) {
-      message.error(e instanceof Error ? e.message : 'Failed to load process detail')
-      setDetailOpen(false)
-    } finally {
-      setDetailLoading(false)
-    }
-  }, [])
-
-  const handleSuspend = useCallback(
-    async (p: ProcessEntry, resume: boolean) => {
+  // The row menu lives in the shared <ProcessActionsMenu>; this is only the
+  // one-click Resume used by the "suspended" banner below.
+  const resumeProcess = useCallback(
+    async (p: ProcessEntry) => {
       try {
-        await api.suspendProcess(p.pid, resume)
-        message.success(`${resume ? 'Resumed' : 'Suspended'} ${p.name} (${p.pid})`)
+        await api.suspendProcess(p.pid, true)
+        message.success(`Resumed ${p.name} (${p.pid})`)
         fetchData()
       } catch (e) {
         message.error(e instanceof Error ? e.message : 'Failed to signal process')
@@ -462,31 +415,6 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
     },
     [fetchData],
   )
-
-  const copyText = useCallback(async (text: string, label: string) => {
-    // navigator.clipboard only exists in a secure context (HTTPS / localhost);
-    // when the dashboard is opened over http://<ip> it is undefined, so fall
-    // back to the legacy execCommand path via a hidden textarea.
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(text)
-      } else {
-        const ta = document.createElement('textarea')
-        ta.value = text
-        ta.style.position = 'fixed'
-        ta.style.opacity = '0'
-        document.body.appendChild(ta)
-        ta.focus()
-        ta.select()
-        const ok = document.execCommand('copy')
-        document.body.removeChild(ta)
-        if (!ok) throw new Error('execCommand copy failed')
-      }
-      message.success(`${label} copied`)
-    } catch {
-      message.error('Copy failed')
-    }
-  }, [])
 
   const filterLower = filter.toLowerCase()
   const textFiltered = filterLower
@@ -527,11 +455,10 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
     },
   ]
 
-  // Map a PCI address (drm-pdev) to an iGPU/dGPU label via the dynamic_info device list.
-  const gpuLabel = (pdev: string): string => {
-    const dev = dyn?.gpu?.gpu_usage?.parsed?.devices?.find((d) => d.pci_dev === pdev)
-    return friendlyGpuLabel(dev?.dev_type, pdev)
-  }
+  // Map a PCI address (drm-pdev) to an iGPU/dGPU label via the dynamic_info device
+  // list; multiple same-type GPUs are disambiguated by their PCI address.
+  const gpuLabelMap = buildGpuLabelMap(dyn?.gpu?.gpu_usage?.parsed?.devices)
+  const gpuLabel = (pdev: string): string => gpuLabelMap.get(pdev) ?? pdev
 
   const peakUtil = (p: ProcessEntry): number =>
     p.gpu_devices ? Math.max(0, ...Object.values(p.gpu_devices).map((d) => d.gpu_util)) : 0
@@ -611,7 +538,15 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
       render: (v: string, p: Row) => (
         <Tooltip title={p.isGroup ? p.cgroup : undefined}>
           <Space size={4}>
-            <Text style={{ color: COLORS.accent, fontWeight: p.isGroup ? 700 : 500, fontSize: 12 }}>{v}</Text>
+            <Text
+              style={{
+                color: groupByApp && !p.isGroup ? COLORS.text : COLORS.accent,
+                fontWeight: p.isGroup ? 700 : 500,
+                fontSize: 12,
+              }}
+            >
+              {v}
+            </Text>
             {!p.isGroup && p.status === 'stopped' && (
               <Tag
                 color="warning"
@@ -737,61 +672,24 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
       width: 90,
       align: 'center' as const,
       fixed: 'right' as const,
-      render: (_: unknown, p: Row) => {
-        if (p.isGroup) return null
-        // SmartTune's own processes must never be managed/killed from the UI.
-        // Shells / blacklisted daemons can still be killed, just not "added".
-        const canRegister = balancerEnabled && !!onRegister && p.balancer_candidate !== false
-        const stopped = p.status === 'stopped'
-        return (
-          <Dropdown
-            trigger={['click']}
-            menu={{
-              items: [
-                // Balancer-dependent actions; hidden in monitor-only mode.
-                ...(canRegister
-                  ? [{ key: 'register', label: 'Add to balancer', onClick: () => onRegister!(p.name) }]
-                  : []),
-                ...(balancerEnabled
-                  ? [
-                      {
-                        key: 'suspend',
-                        label: stopped ? 'Resume' : 'Suspend',
-                        disabled: !!p.is_self,
-                        onClick: () => handleSuspend(p, stopped),
-                      },
-                      {
-                        key: 'term',
-                        label: <span style={{ fontWeight: 600 }}>End process</span>,
-                        disabled: !!p.is_self,
-                        onClick: () => handleKill(p, false),
-                      },
-                      {
-                        key: 'kill',
-                        label: <span style={{ fontWeight: 600 }}>Force kill</span>,
-                        disabled: !!p.is_self,
-                        onClick: () => handleKill(p, true),
-                      },
-                      { key: 'div1', type: 'divider' as const },
-                    ]
-                  : []),
-                { key: 'copypid', label: 'Copy PID', onClick: () => copyText(String(p.pid), 'PID') },
-                {
-                  key: 'copycmd',
-                  label: 'Copy command',
-                  disabled: !p.cmdline,
-                  onClick: () => copyText(p.cmdline, 'Command'),
-                },
-                { key: 'div2', type: 'divider' as const },
-                // Properties is read-only (monitor); always available, shown last.
-                { key: 'props', label: 'Properties', onClick: () => openDetail(p.pid) },
-              ],
+      render: (_: unknown, p: Row) =>
+        p.isGroup ? null : (
+          <ProcessActionsMenu
+            target={{
+              name: p.name,
+              pids: [p.pid],
+              representativePid: p.pid,
+              cmdline: p.cmdline,
+              status: p.status,
+              isSelf: p.is_self,
+              balancerCandidate: p.balancer_candidate,
             }}
-          >
-            <MoreOutlined style={{ cursor: 'pointer', color: COLORS.accent, fontSize: 18 }} />
-          </Dropdown>
-        )
-      },
+            balancerEnabled={balancerEnabled}
+            onRegister={onRegister}
+            onChanged={fetchData}
+            onShowDetail={openDetail}
+          />
+        ),
     },
   ]
 
@@ -878,7 +776,7 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
           const nics = Object.entries(dyn?.network?.interfaces ?? {})
 
           const disk = diskStats(dyn)
-          const gpuDevs = gpuDeviceStats(dyn)
+          const gpuDevs = gpuDeviceStats(dyn, gpuLabelMap)
           const gpu = busiestGpu(gpuDevs)
 
           return (
@@ -1002,7 +900,7 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
                         type="link"
                         size="small"
                         style={{ padding: '0 4px', height: 'auto' }}
-                        onClick={() => handleSuspend(p, true)}
+                        onClick={() => resumeProcess(p)}
                       >
                         Resume
                       </Button>
@@ -1028,7 +926,13 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
                 }
               : undefined
           }
-          rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
+          rowClassName={(record, idx) =>
+            groupByApp && !record.isGroup
+              ? 'table-row-child'
+              : idx % 2 === 1
+                ? 'table-row-alt'
+                : ''
+          }
           locale={{
             emptyText: (
               <div style={{ padding: 40, color: COLORS.textMuted, textAlign: 'center' }}>
@@ -1040,6 +944,8 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
 
         <style>{`
           .table-row-alt td { background: ${COLORS.rowAlt} !important; }
+          .table-row-child > td { background: ${COLORS.accent}14 !important; }
+          .table-row-child:hover > td { background: ${COLORS.accent}22 !important; }
           .ant-table { background: transparent !important; }
           .ant-table-thead > tr > th {
             background: ${COLORS.headerBg} !important;
@@ -1058,40 +964,7 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
         `}</style>
       </div>
 
-      <Modal
-        open={detailOpen}
-        title={detail ? `${detail.name} (PID ${detail.pid})` : 'Process details'}
-        onCancel={() => setDetailOpen(false)}
-        footer={null}
-        width={640}
-      >
-        {detailLoading || !detail ? (
-          <div style={{ padding: 24, textAlign: 'center' }}>
-            <Spin />
-          </div>
-        ) : (
-          <Descriptions column={1} size="small" bordered>
-            <Descriptions.Item label="Executable">
-              {detail.exe ? <Text copyable>{detail.exe}</Text> : '—'}
-            </Descriptions.Item>
-            <Descriptions.Item label="Working dir">
-              {detail.cwd ? <Text copyable>{detail.cwd}</Text> : '—'}
-            </Descriptions.Item>
-            <Descriptions.Item label="Command">
-              {detail.cmdline ? <Text copyable>{detail.cmdline}</Text> : '—'}
-            </Descriptions.Item>
-            <Descriptions.Item label="User">{detail.username || '—'}</Descriptions.Item>
-            <Descriptions.Item label="Status">{detail.status || '—'}</Descriptions.Item>
-            <Descriptions.Item label="Parent PID">{detail.ppid ?? '—'}</Descriptions.Item>
-            <Descriptions.Item label="Threads">{detail.num_threads ?? '—'}</Descriptions.Item>
-            <Descriptions.Item label="Open FDs">{detail.num_fds ?? '—'}</Descriptions.Item>
-            <Descriptions.Item label="Nice">{detail.nice ?? '—'}</Descriptions.Item>
-            <Descriptions.Item label="Started">
-              {detail.create_time ? formatStartTime(detail.create_time) : '—'}
-            </Descriptions.Item>
-          </Descriptions>
-        )}
-      </Modal>
+      {detailModal}
     </div>
   )
 }

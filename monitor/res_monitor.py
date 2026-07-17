@@ -17,9 +17,37 @@ from utils.app_utils import fetch_all_apps, get_cgroup_path_by_pid, get_pids_in_
 from utils.logger import logger
 
 from monitor import PSIMonitor
+from monitor.app_discovery import is_noise_process
+from utils.self_ident import is_own_process
 
 _GPU_DRM_DRIVERS = frozenset({'i915', 'xe'})
 _GPU_SAMPLE_INTERVAL = 0.3  # seconds between the two fdinfo snapshots for GPU utilisation
+
+
+def _process_control_flags(pids, name, cmdline):
+    """Per-app control hints for the dashboard "Operation" menu.
+
+    An app can span several PIDs, so kill/suspend act on the whole set; the
+    flags mirror those the /processes endpoint attaches to individual rows:
+      - is_self: any PID belongs to SmartTune itself -> never signal it
+      - balancer_candidate: worth offering "Add to balancer" (not a shell/self)
+      - status: 'stopped' when any PID is SIGSTOP'd, else a representative state
+    """
+    pid_list = [p for p in pids if isinstance(p, int)]
+    is_self = is_own_process(cmdline=cmdline) or any(is_own_process(p) for p in pid_list)
+    balancer_candidate = not is_self and not is_noise_process(name)
+    status = ''
+    for p in pid_list:
+        try:
+            st = psutil.Process(p).status()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        if st == psutil.STATUS_STOPPED:
+            status = 'stopped'
+            break
+        if not status:
+            status = st
+    return pid_list, is_self, balancer_candidate, status
 
 
 def _parse_fdinfo_mem_bytes(line, is_xe):
@@ -1173,12 +1201,18 @@ class ResourceMonitor:
 
             gpu_stats = gpu_stats_by_cgroup.get(process['cgroup'], {'gpu_util': 0.0, 'gpu_mem_mb': 0.0})
 
+            pid_list, is_self, balancer_candidate, status = _process_control_flags(
+                process['pids'], process_name, process_cmdline)
             results.append({
                 'app_id': app_id,
                 'app_name': app_name,
                 'pid': next(iter(process['pids']), None),
+                'pids': pid_list,
                 'process_name': process_name,
                 'cmdline': process_cmdline,
+                'status': status,
+                'is_self': is_self,
+                'balancer_candidate': balancer_candidate,
                 'cpu_usage': round(process['cpu_avg'] / 100, 4),       # normalize to 0-1
                 'memory_mb': round(process['mem_rss'] * 1024, 1),      # GB -> MB
                 'io_read_rate': process['io_read_rate'],                # MB/s
@@ -1219,11 +1253,17 @@ class ResourceMonitor:
             # Use resolved app name as display name; fall back to dominant process name
             app_name = app_match['name'] if app_match else process_name
 
+            pid_list, is_self, balancer_candidate, status = _process_control_flags(
+                process['pids'], process_name, process_cmdline)
             results.append({
                 'pid': next(iter(process['pids']), None),
+                'pids': pid_list,
                 'name': process_name,
                 'app_name': app_name,
                 'cmdline': process_cmdline,
+                'status': status,
+                'is_self': is_self,
+                'balancer_candidate': balancer_candidate,
                 'io_read_rate': process['io_read_rate'],                # MB/s
                 'io_write_rate': process['io_write_rate'],              # MB/s
                 'io_read_iops': process['io_read_iops'],                # ops/s

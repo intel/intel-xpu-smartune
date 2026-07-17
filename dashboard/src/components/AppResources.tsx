@@ -14,19 +14,33 @@ import {
   Modal,
   Form,
   InputNumber,
+  Tooltip,
   message,
 } from 'antd'
 import { ReloadOutlined, ThunderboltOutlined, SettingOutlined, SaveOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
 import { api } from '../api/client'
-import type { AppResourceEntry, AppDiskIoEntry, WeightsTopData } from '../api/types'
+import type { AppResourceEntry, AppDiskIoEntry, ProcessEntry, WeightsTopData, DynamicInfoData } from '../api/types'
 import { usePolling } from '../hooks/usePolling'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
+import { ProcessActionsMenu, useProcessDetail } from './ProcessActions'
+import { buildGpuLabelMap } from '../utils/gpu'
 
 const { Text, Title } = Typography
 
-interface AppRow {
+// Fields shared by both tables that drive the row's Operation menu and its
+// expandable child-process list.  pids spans every process the app owns.
+interface AppControl {
+  pid: number
+  pids: number[]
+  cmdline: string
+  status?: string
+  is_self?: boolean
+  balancer_candidate?: boolean
+}
+
+interface AppRow extends AppControl {
   key: string
   app_id: string
   app_name: string
@@ -39,12 +53,10 @@ interface AppRow {
   gpu_mem_mb: number
 }
 
-interface DiskIoRow {
+interface DiskIoRow extends AppControl {
   key: string
-  pid: number
   name: string
   app_name: string
-  cmdline: string
   io_read_rate: number
   io_write_rate: number
   io_read_iops: number
@@ -54,6 +66,9 @@ interface DiskIoRow {
 
 interface Props {
   active: boolean
+  balancerEnabled: boolean
+  // Jump to the Balancer tab's Add-App wizard pre-filled with this name.
+  onRegister?: (name: string) => void
 }
 
 function formatBytes(mb: number): string {
@@ -61,6 +76,18 @@ function formatBytes(mb: number): string {
   return `${mb.toFixed(1)} MB/s`
 }
 
+function formatMemory(kb: number): string {
+  if (kb < 1024) return `${kb.toFixed(0)} KB`
+  if (kb < 1024 * 1024) return `${(kb / 1024).toFixed(1)} MB`
+  return `${(kb / 1024 / 1024).toFixed(2)} GB`
+}
+
+function formatRate(bytesPerSec: number): string {
+  if (bytesPerSec < 1024) return `${bytesPerSec.toFixed(0)} B/s`
+  if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`
+  if (bytesPerSec < 1024 * 1024 * 1024) return `${(bytesPerSec / 1024 / 1024).toFixed(1)} MB/s`
+  return `${(bytesPerSec / 1024 / 1024 / 1024).toFixed(2)} GB/s`
+}
 
 // ========== Settings Modal Component ==========
 
@@ -301,25 +328,41 @@ function SettingsModal({ visible, onClose }: SettingsModalProps) {
 
 // ========== Main Component ==========
 
-export default function AppResources({ active }: Props) {
+export default function AppResources({ active, balancerEnabled, onRegister }: Props) {
   const [rows, setRows] = useState<AppRow[]>([])
   const [diskRows, setDiskRows] = useState<DiskIoRow[]>([])
+  // pid -> full process detail, used to render each app's expandable child list.
+  const [procMap, setProcMap] = useState<Map<number, ProcessEntry>>(new Map())
+  // System dynamic snapshot — only its GPU device list is needed here, to map
+  // each child process's PCI address to an iGPU/dGPU label.
+  const [dyn, setDyn] = useState<DynamicInfoData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [settingsVisible, setSettingsVisible] = useState(false)
+  const { openDetail, detailModal } = useProcessDetail()
 
   const fetchData = useCallback(async () => {
     try {
-      const [resourceData, diskData] = await Promise.all([
+      // The process list backs the expandable child rows (joined by PID); its
+      // failure must not blank the app tables, so it is tolerated separately.
+      const [resourceData, diskData, procData, dynData] = await Promise.all([
         api.getAppResourceStats(3),
         api.getAppDiskIoStats(3),
+        api.getProcesses(true, true).catch(() => null),
+        api.getDynamicInfo(['gpu']).catch(() => null),
       ])
 
       const appRows: AppRow[] = resourceData.apps.map((entry: AppResourceEntry) => ({
         key: entry.app_id,
         app_id: entry.app_id,
         app_name: entry.app_name,
+        pid: entry.pid ?? 0,
+        pids: entry.pids ?? (entry.pid ? [entry.pid] : []),
+        cmdline: entry.cmdline ?? '',
+        status: entry.status,
+        is_self: entry.is_self,
+        balancer_candidate: entry.balancer_candidate,
         cpu_usage: entry.cpu_usage,
         memory_mb: entry.memory_mb,
         io_read_rate: entry.io_read_rate,
@@ -333,9 +376,13 @@ export default function AppResources({ active }: Props) {
       const dRows: DiskIoRow[] = diskData.apps.map((entry: AppDiskIoEntry, idx: number) => ({
         key: `${entry.pid ?? idx}`,
         pid: entry.pid ?? 0,
+        pids: entry.pids ?? (entry.pid ? [entry.pid] : []),
         name: entry.name ?? 'Unknown',
         app_name: entry.app_name ?? '',
         cmdline: entry.cmdline ?? '',
+        status: entry.status,
+        is_self: entry.is_self,
+        balancer_candidate: entry.balancer_candidate,
         io_read_rate: entry.io_read_rate ?? 0,
         io_write_rate: entry.io_write_rate ?? 0,
         io_read_iops: entry.io_read_iops ?? 0,
@@ -343,6 +390,11 @@ export default function AppResources({ active }: Props) {
         score: entry.score ?? 0,
       }))
       setDiskRows(dRows)
+
+      if (procData) {
+        setProcMap(new Map(procData.processes.map((p) => [p.pid, p])))
+      }
+      setDyn(dynData)
 
       setError(null)
       setLastUpdated(new Date())
@@ -355,6 +407,266 @@ export default function AppResources({ active }: Props) {
 
   usePolling(fetchData, 5000, active)
 
+  // Suspended (SIGSTOP'd) processes sink to the bottom of the score-sorted tables
+  // and may not surface at all on the 5 s refresh, so — like the Processes tab —
+  // give them a one-click Resume regardless of the current sort/filter.
+  const resumeProcess = useCallback(
+    async (p: ProcessEntry) => {
+      try {
+        await api.suspendProcess(p.pid, true)
+        message.success(`Resumed ${p.name} (${p.pid})`)
+        fetchData()
+      } catch (e) {
+        message.error(e instanceof Error ? e.message : 'Failed to signal process')
+      }
+    },
+    [fetchData],
+  )
+
+  // Map each child process's PCI address (drm-pdev) to an iGPU/dGPU label, with
+  // multiple same-type GPUs disambiguated by PCI address.  Mirrors the Processes
+  // tab so an expanded app row shows the same per-device breakdown.
+  const gpuLabelMap = buildGpuLabelMap(dyn?.gpu?.gpu_usage?.parsed?.devices)
+  const gpuLabel = (pdev: string): string => gpuLabelMap.get(pdev) ?? pdev
+
+  // Shared bits for both tables: the app-level Operation menu and the expandable
+  // child-process list (joined from the full process snapshot by PID).
+  const appNameCell = (label: string, pids: number[]) => (
+    <Space size={6}>
+      <Tag
+        style={{
+          margin: 0,
+          padding: '0 6px',
+          fontSize: 11,
+          color: COLORS.textMuted,
+          borderColor: COLORS.border,
+          background: 'transparent',
+        }}
+      >
+        {pids.length}
+      </Tag>
+      <Text style={{ color: COLORS.accent, fontWeight: 500 }} ellipsis>
+        {label}
+      </Text>
+    </Space>
+  )
+
+  const actionsColumn = <RowT extends AppControl & { app_name?: string; name?: string }>(): ColumnsType<RowT>[number] => ({
+    title: 'Operation',
+    key: 'actions',
+    width: 90,
+    align: 'center' as const,
+    render: (_: unknown, row: RowT) => (
+      <ProcessActionsMenu
+        target={{
+          name: row.app_name || row.name || row.cmdline || String(row.pid),
+          pids: row.pids.length ? row.pids : [row.pid],
+          representativePid: row.pid,
+          cmdline: row.cmdline,
+          status: row.status,
+          isSelf: row.is_self,
+          balancerCandidate: row.balancer_candidate,
+        }}
+        balancerEnabled={balancerEnabled}
+        onRegister={onRegister}
+        onChanged={fetchData}
+        onShowDetail={openDetail}
+        allowSuspend={false}
+      />
+    ),
+  })
+
+  // Child-process columns for an expanded app row.  Widths are percentages so
+  // the nested table lines up with the parent above; GPU columns are dropped
+  // for the Disk I/O table.
+  const buildChildColumns = (showGpu: boolean): ColumnsType<ProcessEntry> => [
+    {
+      title: 'PID',
+      dataIndex: 'pid',
+      key: 'pid',
+      width: '7%',
+      render: (v: number) => (
+        <Text style={{ color: COLORS.textMuted, fontFamily: 'monospace', fontSize: 11 }}>{v}</Text>
+      ),
+    },
+    {
+      title: 'Name',
+      dataIndex: 'name',
+      key: 'name',
+      width: '21%',
+      ellipsis: true,
+      render: (v: string, p: ProcessEntry) => (
+        <Space size={4}>
+          <Text style={{ color: COLORS.text, fontWeight: 500, fontSize: 12 }}>{v}</Text>
+          {p.status === 'stopped' && (
+            <Tag color="warning" style={{ fontSize: 10, lineHeight: '16px', margin: 0, padding: '0 4px' }}>
+              Suspended
+            </Tag>
+          )}
+        </Space>
+      ),
+    },
+    {
+      title: 'CPU %',
+      dataIndex: 'cpu_percent',
+      key: 'cpu_percent',
+      width: showGpu ? '10%' : '11%',
+      render: (v: number) => {
+        const color = v > 80 ? COLORS.red : v > 50 ? COLORS.orange : COLORS.green
+        return (
+          <Space direction="vertical" size={2} style={{ width: '100%' }}>
+            <Text style={{ color, fontSize: 11 }}>{v.toFixed(1)}%</Text>
+            <Progress
+              percent={Math.min(v, 100)}
+              showInfo={false}
+              strokeColor={color}
+              trailColor={COLORS.border}
+              size="small"
+            />
+          </Space>
+        )
+      },
+    },
+    {
+      title: 'Mem %',
+      dataIndex: 'memory_percent',
+      key: 'memory_percent',
+      width: showGpu ? '8%' : '9%',
+      render: (v: number) => {
+        const color = v > 10 ? COLORS.orange : COLORS.text
+        return <Text style={{ color, fontSize: 12 }}>{v.toFixed(1)}%</Text>
+      },
+    },
+    {
+      title: 'RSS',
+      dataIndex: 'mem_rss_kb',
+      key: 'mem_rss_kb',
+      width: showGpu ? '9%' : '10%',
+      render: (v: number) => <Text style={{ color: COLORS.text, fontSize: 12 }}>{formatMemory(v)}</Text>,
+    },
+    {
+      title: 'Disk I/O',
+      key: 'disk_io',
+      width: showGpu ? '11%' : '12%',
+      render: (_: unknown, p: ProcessEntry) => {
+        if (p.io_read_rate == null && p.io_write_rate == null)
+          return <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>—</Text>
+        return (
+          <Space direction="vertical" size={0} style={{ width: '100%' }}>
+            <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>↓{formatRate(p.io_read_rate || 0)}</Text>
+            <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>↑{formatRate(p.io_write_rate || 0)}</Text>
+          </Space>
+        )
+      },
+    },
+    ...(showGpu
+      ? [
+          {
+            title: 'GPU %',
+            key: 'gpu_util',
+            width: '9%',
+            render: (_: unknown, p: ProcessEntry) => {
+              const devs = p.gpu_devices
+              if (!devs) return <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>—</Text>
+              return (
+                <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                  {Object.entries(devs).map(([pdev, s]) => {
+                    const color =
+                      s.gpu_util > 80 ? COLORS.red : s.gpu_util > 50 ? COLORS.orange : s.gpu_util > 0 ? COLORS.green : COLORS.textMuted
+                    return (
+                      <div key={pdev} style={{ display: 'flex', justifyContent: 'space-between', gap: 6 }}>
+                        <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>{gpuLabel(pdev)}</Text>
+                        <Text style={{ color, fontSize: 11 }}>{s.gpu_util.toFixed(1)}%</Text>
+                      </div>
+                    )
+                  })}
+                </Space>
+              )
+            },
+          },
+          {
+            title: 'GPU Mem',
+            key: 'gpu_mem',
+            width: '10%',
+            render: (_: unknown, p: ProcessEntry) => {
+              const devs = p.gpu_devices
+              if (!devs) return <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>—</Text>
+              return (
+                <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                  {Object.entries(devs).map(([pdev, s]) => (
+                    <div key={pdev} style={{ display: 'flex', justifyContent: 'space-between', gap: 6 }}>
+                      <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>{gpuLabel(pdev)}</Text>
+                      <Text style={{ color: COLORS.text, fontSize: 11 }}>{formatMemory(s.gpu_mem_mb * 1024)}</Text>
+                    </div>
+                  ))}
+                </Space>
+              )
+            },
+          },
+        ]
+      : []),
+    {
+      title: 'Command',
+      dataIndex: 'cmdline',
+      key: 'cmdline',
+      width: showGpu ? '8%' : '22%',
+      ellipsis: true,
+      render: (v: string) => (
+        <Tooltip title={v} overlayStyle={{ maxWidth: 500 }}>
+          <Text style={{ color: COLORS.textMuted, fontFamily: 'monospace', fontSize: 11 }}>{v || '—'}</Text>
+        </Tooltip>
+      ),
+    },
+    {
+      title: 'Operation',
+      key: 'actions',
+      width: showGpu ? '7%' : '8%',
+      align: 'center' as const,
+      render: (_: unknown, p: ProcessEntry) => (
+        <ProcessActionsMenu
+          target={{
+            name: p.name,
+            pids: [p.pid],
+            representativePid: p.pid,
+            cmdline: p.cmdline,
+            status: p.status,
+            isSelf: p.is_self,
+            balancerCandidate: p.balancer_candidate,
+          }}
+          balancerEnabled={balancerEnabled}
+          onRegister={onRegister}
+          onChanged={fetchData}
+          onShowDetail={openDetail}
+        />
+      ),
+    },
+  ]
+
+  const expandableFor = <RowT extends AppControl>(showGpu: boolean) => ({
+    rowExpandable: (row: RowT) => (row.pids?.length ?? 0) > 0,
+    expandedRowRender: (row: RowT) => {
+      const children = (row.pids || [])
+        .map((pid) => procMap.get(pid))
+        .filter((p): p is ProcessEntry => !!p)
+      return (
+        <Table
+          columns={buildChildColumns(showGpu)}
+          dataSource={children.map((p) => ({ ...p, key: String(p.pid) }))}
+          size="small"
+          pagination={false}
+          tableLayout="fixed"
+          locale={{
+            emptyText: (
+              <div style={{ padding: 12, color: COLORS.textMuted, textAlign: 'center', fontSize: 12 }}>
+                No live process details for this app
+              </div>
+            ),
+          }}
+        />
+      )
+    },
+  })
+
   const appColumns: ColumnsType<AppRow> = [
     {
       title: 'App Name',
@@ -362,9 +674,7 @@ export default function AppResources({ active }: Props) {
       key: 'app_name',
       width: '28%',
       ellipsis: true,
-      render: (name: string) => (
-        <Text style={{ color: COLORS.accent, fontWeight: 500 }}>{name}</Text>
-      ),
+      render: (name: string, row: AppRow) => appNameCell(name, row.pids),
       sorter: (a, b) => a.app_name.localeCompare(b.app_name),
     },
     {
@@ -461,6 +771,7 @@ export default function AppResources({ active }: Props) {
         )
       },
     },
+    actionsColumn<AppRow>(),
   ]
 
   const diskColumns: ColumnsType<DiskIoRow> = [
@@ -470,9 +781,7 @@ export default function AppResources({ active }: Props) {
       key: 'app_name',
       width: '28%',
       ellipsis: true,
-      render: (v: string, row: DiskIoRow) => (
-        <Text style={{ color: COLORS.accent, fontWeight: 500 }}>{v ?? row.name}</Text>
-      ),
+      render: (v: string, row: DiskIoRow) => appNameCell(v || row.name, row.pids),
     },
     {
       title: 'IO Read',
@@ -517,6 +826,7 @@ export default function AppResources({ active }: Props) {
         return <Text style={{ color, fontWeight: 600 }}>{formatBytes(total)}</Text>
       },
     },
+    actionsColumn<DiskIoRow>(),
   ]
 
   const tableStyle = `
@@ -571,6 +881,36 @@ export default function AppResources({ active }: Props) {
         />
       </div>
 
+      {(() => {
+        const suspended = Array.from(procMap.values()).filter((p) => p.status === 'stopped')
+        if (!suspended.length) return null
+        return (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={`${suspended.length} suspended process${suspended.length > 1 ? 'es' : ''}`}
+            description={
+              <Space size={[8, 8]} wrap>
+                {suspended.map((p) => (
+                  <Tag key={p.pid} style={{ margin: 0, paddingRight: 4 }}>
+                    {p.name} ({p.pid})
+                    <Button
+                      type="link"
+                      size="small"
+                      style={{ padding: '0 4px', height: 'auto' }}
+                      onClick={() => resumeProcess(p)}
+                    >
+                      Resume
+                    </Button>
+                  </Tag>
+                ))}
+              </Space>
+            }
+          />
+        )
+      })()}
+
       <Row gutter={[16, 16]}>
         {/* Top Resource Consumer */}
         <Col span={24}>
@@ -594,6 +934,7 @@ export default function AppResources({ active }: Props) {
               size="small"
               pagination={false}
               tableLayout="fixed"
+              expandable={expandableFor<AppRow>(true)}
               rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
               style={{ color: COLORS.text }}
               locale={{
@@ -631,6 +972,7 @@ export default function AppResources({ active }: Props) {
               size="small"
               pagination={false}
               tableLayout="fixed"
+              expandable={expandableFor<DiskIoRow>(false)}
               rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
               style={{ color: COLORS.text }}
               locale={{
@@ -649,6 +991,7 @@ export default function AppResources({ active }: Props) {
         visible={settingsVisible}
         onClose={() => setSettingsVisible(false)}
       />
+      {detailModal}
     </div>
   )
 }

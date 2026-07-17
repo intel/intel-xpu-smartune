@@ -66,8 +66,12 @@ export interface AppResourceEntry {
   app_id: string
   app_name: string
   pid: number
+  pids?: number[]         // all PIDs of the app; kill/suspend act on the whole set
   process_name: string
   cmdline: string
+  status?: string         // representative status; 'stopped' when any PID is suspended
+  is_self?: boolean       // any PID belongs to SmartTune itself — never signal
+  balancer_candidate?: boolean  // false for shells / self — hides "Add to balancer"
   cpu_usage: number       // fraction of total CPU capacity (0-1)
   memory_mb: number       // resident memory in MB
   io_read_rate: number    // MB/s
@@ -83,9 +87,13 @@ export interface AppResourceStatsData {
 
 export interface AppDiskIoEntry {
   pid: number
+  pids?: number[]         // all PIDs of the app; kill/suspend act on the whole set
   name: string
   app_name: string
   cmdline: string
+  status?: string         // representative status; 'stopped' when any PID is suspended
+  is_self?: boolean       // any PID belongs to SmartTune itself — never signal
+  balancer_candidate?: boolean  // false for shells / self — hides "Add to balancer"
   io_read_rate: number    // MB/s
   io_write_rate: number   // MB/s
   io_read_iops: number    // ops/s

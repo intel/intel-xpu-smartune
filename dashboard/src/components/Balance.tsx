@@ -16,7 +16,6 @@ import {
   message,
   Switch,
   InputNumber,
-  Tabs,
 } from 'antd'
 import {
   PlusOutlined,
@@ -30,11 +29,13 @@ import {
   ReloadOutlined,
   QuestionCircleOutlined,
   SearchOutlined,
+  DownOutlined,
+  RightOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
 import { api } from '../api/client'
-import type { AppInfo, ResourceLimitProfileData, PassiveControlData } from '../api/types'
+import type { AppInfo, ResourceLimitProfileData, PassiveControlData, ProcessStatusRow } from '../api/types'
 import { useAppEvents } from '../hooks/useAppEvents'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 import { AddAppWizard } from './AddAppWizard'
@@ -91,6 +92,7 @@ interface LimitFormValues {
   readIopsMax: number
   processNames: string[]
   cgroupIds: string[]
+  targetProcesses: Array<{ pid: number; name: string }>
 }
 
 const PRIORITY_OPTIONS = [
@@ -135,9 +137,58 @@ function PriorityTag({ priority }: { priority?: string }) {
   )
 }
 
+function appSummaryTag(summary?: string) {
+  switch (summary) {
+    case 'Limited':
+      return <Tag color="warning" style={{ marginInlineEnd: 0 }}>Limited</Tag>
+    case 'Partial Limited':
+      return <Tag color="gold" style={{ marginInlineEnd: 0 }}>Partial Limited</Tag>
+    case 'Not Limited':
+      return <Tag color="success" style={{ marginInlineEnd: 0 }}>Not Limited</Tag>
+    case 'No Running Process':
+      return <Tag color="default" style={{ marginInlineEnd: 0 }}>No Running Process</Tag>
+    default:
+      return <Tag color="default" style={{ marginInlineEnd: 0 }}>N/A</Tag>
+  }
+}
+
+function runtimeHintTag(runtime?: string) {
+  switch (runtime) {
+    case 'Running':
+      return <Tag color="success" style={{ marginInlineEnd: 0 }}>Running</Tag>
+    case 'Pending':
+      return <Tag color="processing" style={{ marginInlineEnd: 0 }}>Pending</Tag>
+    case 'Stopped':
+      return <Tag color="default" style={{ marginInlineEnd: 0 }}>Stopped</Tag>
+    default:
+      return <Tag color="default" style={{ marginInlineEnd: 0 }}>-</Tag>
+  }
+}
+
 function formatPassiveControlTimestamp(ts: number | undefined | null): string {
   if (!ts) return 'unknown time'
   return new Date(ts * 1000).toLocaleString()
+}
+
+function deriveDisplayProcessName(row: ProcessStatusRow): string {
+  const rawName = (row.process_name || '').trim()
+  const cmdline = (row.cmdline || '').trim()
+  if (!cmdline) return rawName || '-'
+
+  // Strip common wrappers so we can show the actual target process/script.
+  const withoutSudo = cmdline.replace(/^sudo\s+/, '')
+  const pythonScriptMatch = withoutSudo.match(/^(?:python\d*(?:\.\d+)?)\s+([^\s]+)/i)
+  if (pythonScriptMatch?.[1]) {
+    const script = pythonScriptMatch[1].split('/').pop()
+    if (script) return script
+  }
+
+  if (rawName && !['sudo', 'python', 'python2', 'python3'].includes(rawName.toLowerCase())) {
+    return rawName
+  }
+
+  const firstToken = withoutSudo.split(/\s+/)[0] || rawName
+  return firstToken.split('/').pop() || firstToken || '-'
 }
 
 interface PassiveControlPanelProps {
@@ -296,6 +347,8 @@ export default function Balance({
   const [remark, setRemark] = useState('')
   const [adding, setAdding] = useState(false)
   const [wizardOpen, setWizardOpen] = useState(false)
+  const [expandedProcessRows, setExpandedProcessRows] = useState<React.Key[]>([])
+  const [selectedTargetCgroups, setSelectedTargetCgroups] = useState<Record<string, string[]>>({})
 
   // Opened from the Processes tab: pop the Add-App wizard pre-filled.
   useEffect(() => {
@@ -334,11 +387,8 @@ export default function Balance({
     readIopsMax: 20000,
     processNames: [],
     cgroupIds: [],
+    targetProcesses: [],
   })
-  // Per-cgroup independent form state for multi-cgroup apps.
-  // Key = cgroup_id. Only populated when cgroupIds.length > 1.
-  const [perTargetForms, setPerTargetForms] = useState<Record<string, LimitFormValues>>({})
-  const [activeLimitTarget, setActiveLimitTarget] = useState<string>('')
 
   const fetchData = useCallback(async () => {
     try {
@@ -399,6 +449,46 @@ export default function Balance({
         fetchData()
       }
     }
+  }, [active, fetchData])
+
+  // Per app, remember which running cgroups are selected as limit targets.
+  // Defaults to "all running" and tracks process churn over time.
+  useEffect(() => {
+    setSelectedTargetCgroups((prev) => {
+      const next: Record<string, string[]> = {}
+      for (const app of controlledApps) {
+        const available = Array.from(new Set(
+          (app.process_status_rows ?? [])
+            .filter((row) => row.runtime_status === 'Running')
+            .map((row) => (row.cgroup || '').trim())
+            .filter(Boolean)
+        ))
+
+        if (available.length === 0) continue
+
+        const existing = prev[app.app_id]
+        if (!existing || existing.length === 0) {
+          next[app.app_id] = available
+          continue
+        }
+
+        const filtered = existing.filter((cg) => available.includes(cg))
+        next[app.app_id] = filtered.length > 0 ? filtered : available
+      }
+      return next
+    })
+  }, [controlledApps])
+
+  // Keep per-process runtime rows fresh even when the overall app status does
+  // not transition (e.g. one instance stops but another is still running).
+  // SSE emits app-level changes, but partial per-instance changes may not
+  // produce an event, so do a light periodic sync while this tab is active.
+  useEffect(() => {
+    if (!active) return
+    const timer = window.setInterval(() => {
+      fetchData()
+    }, 5000)
+    return () => window.clearInterval(timer)
   }, [active, fetchData])
 
   // SSE: push updates from server instead of polling every 5 s
@@ -551,21 +641,14 @@ export default function Balance({
       readIopsMax: profile.disk_io.read_iops.max,
       processNames: profile.process_names ?? [],
       cgroupIds: cgIds,
+      targetProcesses: (profile.target_processes ?? []).map((x) => ({
+        pid: Number(x.pid),
+        name: (x.name || '').trim(),
+      })).filter((x) => Number.isFinite(x.pid) && x.pid > 0),
     }
 
     setLimitForm(baseForm)
 
-    // For multi-cgroup apps, initialise each tab with the same defaults so
-    // they can be edited independently before submitting.
-    if (cgIds.length > 1) {
-      const initialPerTarget: Record<string, LimitFormValues> = {}
-      cgIds.forEach((cg) => { initialPerTarget[cg] = { ...baseForm } })
-      setPerTargetForms(initialPerTarget)
-      setActiveLimitTarget(cgIds[0])
-    } else {
-      setPerTargetForms({})
-      setActiveLimitTarget(cgIds[0] ?? '')
-    }
   }
 
   const handleResourceLimit = async (app: AppInfo) => {
@@ -592,60 +675,44 @@ export default function Balance({
     setLimitDialog((prev) => ({ ...prev, submitting: true }))
     try {
       const priority = rowPriorities[limitDialog.app.app_id] ?? limitDialog.app.priority ?? 'medium'
-      const isMultiTarget = limitForm.cgroupIds.length > 1
-
-      let res: { skipped: boolean; message: string }
-      if (isMultiTarget && !useInlineProcessHint) {
-        const selectedTarget = activeLimitTarget || limitForm.cgroupIds[0]
-        const form = perTargetForms[selectedTarget] ?? limitForm
-        res = await api.resourceLimit({
-          app_id: limitDialog.app.app_id,
-          app_name: limitDialog.app.app_name,
-          priority,
-          cgroup_id: selectedTarget,
-          limit_overrides: {
-            cpu: { enabled: form.cpuEnabled, rate: form.cpuPercent / 100 },
-            memory: { enabled: form.memEnabled, rate: form.memPercent / 100 },
-            disk_io: {
-              enabled: form.diskEnabled,
-              rate: {
-                write: form.writeMbps,
-                read: form.readMbps,
-                write_iops: form.writeIops,
-                read_iops: form.readIops,
-              },
-            },
-          },
-        })
-      } else {
-        res = await api.resourceLimit({
-          app_id: limitDialog.app.app_id,
-          app_name: limitDialog.app.app_name,
-          priority,
-          limit_overrides: {
-            cpu: { enabled: limitForm.cpuEnabled, rate: limitForm.cpuPercent / 100 },
-            memory: { enabled: limitForm.memEnabled, rate: limitForm.memPercent / 100 },
-            disk_io: {
-              enabled: limitForm.diskEnabled,
-              rate: {
-                write: limitForm.writeMbps,
-                read: limitForm.readMbps,
-                write_iops: limitForm.writeIops,
-                read_iops: limitForm.readIops,
-              },
-            },
-          },
-        })
+      const targetCgroups = selectedDialogCgroups
+      if (targetCgroups.length === 0) {
+        messageApi.warning('No running process selected. Expand the app row and tick at least one process scope first.')
+        setLimitDialog((prev) => ({ ...prev, submitting: false }))
+        return
       }
+      const isMultiTarget = targetCgroups.length > 1
+
+      const res = await api.resourceLimit({
+        app_id: limitDialog.app.app_id,
+        app_name: limitDialog.app.app_name,
+        priority,
+        target_cgroups: targetCgroups,
+        limit_overrides: {
+          cpu: { enabled: limitForm.cpuEnabled, rate: limitForm.cpuPercent / 100 },
+          memory: { enabled: limitForm.memEnabled, rate: limitForm.memPercent / 100 },
+          disk_io: {
+            enabled: limitForm.diskEnabled,
+            rate: {
+              write: limitForm.writeMbps,
+              read: limitForm.readMbps,
+              write_iops: limitForm.writeIops,
+              read_iops: limitForm.readIops,
+            },
+          },
+        },
+      })
       if (res.skipped) {
         // Server intentionally skipped the limit (negligible usage / undetectable
         // process). Surface the server-provided reason and close the dialog.
         messageApi.warning(res.message)
       } else {
-        messageApi.success(`Resource limit applied to ${limitDialog.app.app_name}`)
+        messageApi.success(
+          isMultiTarget
+            ? `Unified resource limit applied to ${limitDialog.app.app_name} across ${targetCgroups.length} cgroups`
+            : `Resource limit applied to ${limitDialog.app.app_name}`
+        )
       }
-      setActiveLimitTarget('')
-      setPerTargetForms({})
       setLimitDialog({ app: null, open: false, loadingProfile: false, submitting: false })
       await fetchData()
     } catch (e: unknown) {
@@ -678,16 +745,35 @@ export default function Balance({
       title: 'App Name',
       dataIndex: 'app_name',
       key: 'app_name',
-      width: 180,
+      width: 240,
       render: (name: string, record) => {
         const displayName = name || record.app_id
         const tooltipContent = record.remark ? `${displayName} — ${record.remark}` : displayName
+        const procCount = record.process_status_rows?.length ?? 0
+        const expanded = expandedProcessRows.includes(record.app_id)
         return (
-          <Tooltip title={tooltipContent}>
-            <div style={{ color: COLORS.accent, fontWeight: 500, lineHeight: 1.2 }}>
-              <div>{displayName}</div>
-            </div>
-          </Tooltip>
+          <Space direction="vertical" size={2} style={{ lineHeight: 1.25 }}>
+            <Tooltip title={tooltipContent}>
+              <div style={{ color: COLORS.accent, fontWeight: 500 }}>{displayName}</div>
+            </Tooltip>
+            {procCount > 0 && (
+              <Button
+                size="small"
+                type="link"
+                icon={expanded ? <DownOutlined /> : <RightOutlined />}
+                style={{ padding: 0, height: 'auto', textAlign: 'left', fontSize: 12 }}
+                onClick={() => {
+                  setExpandedProcessRows((prev) => (
+                    prev.includes(record.app_id)
+                      ? prev.filter((k) => k !== record.app_id)
+                      : [...prev, record.app_id]
+                  ))
+                }}
+              >
+                {expanded ? 'Hide Processes' : `View Processes (${procCount})`}
+              </Button>
+            )}
+          </Space>
         )
       },
     },
@@ -723,23 +809,27 @@ export default function Balance({
       ),
     },
     {
-      title: 'Status',
-      key: 'status',
-      width: 150,
+      title: 'Runtime Status',
+      key: 'runtime_status',
+      width: 160,
       render: (_: unknown, record: AppInfo) => {
-        const s = record.status ?? APP_STATUS.NA
-        const tag =
-          s === APP_STATUS.RUNNING ? <Tag color="success" style={{ marginInlineEnd: 0 }}>Running</Tag>
-          : s === APP_STATUS.STOPPED ? <Tag color="default" style={{ marginInlineEnd: 0 }}>Stopped</Tag>
-          : (s === APP_STATUS.LIMITED || s === APP_STATUS.A_LIMITED)
-              ? <Tag color="warning" style={{ marginInlineEnd: 0 }}>Limited</Tag>
-          : s === APP_STATUS.PENDING ? <Tag color="processing" style={{ marginInlineEnd: 0 }}>Pending</Tag>
-          : <Tag color="default" style={{ marginInlineEnd: 0 }}>NA</Tag>
+        const summary = record.app_summary_status
+          ?? ((record.status === APP_STATUS.LIMITED || record.status === APP_STATUS.A_LIMITED)
+            ? 'Limited'
+            : record.status === APP_STATUS.RUNNING
+              ? 'Not Limited'
+              : 'No Running Process')
+        const isPending = record.status === APP_STATUS.PENDING || record.runtime_hint === 'Pending'
+        const runtimeTag = isPending
+          ? runtimeHintTag('Pending')
+          : summary === 'No Running Process'
+            ? runtimeHintTag('Stopped')
+            : runtimeHintTag('Running')
 
         return (
-          <Space size={6} wrap={false}>
-            <div style={{ width: 120, display: 'flex' }}>{tag}</div>
-            {s === APP_STATUS.PENDING && (
+          <Space size={6}>
+            {runtimeTag}
+            {record.status === APP_STATUS.PENDING && (
               <Tooltip title="Cancel Relaunch">
                 <Button
                   size="small"
@@ -752,6 +842,20 @@ export default function Balance({
             )}
           </Space>
         )
+      },
+    },
+    {
+      title: 'Limit Status',
+      key: 'limit_status',
+      width: 150,
+      render: (_: unknown, record: AppInfo) => {
+        const summary = record.app_summary_status
+          ?? ((record.status === APP_STATUS.LIMITED || record.status === APP_STATUS.A_LIMITED)
+            ? 'Limited'
+            : record.status === APP_STATUS.RUNNING
+              ? 'Not Limited'
+              : 'No Running Process')
+        return appSummaryTag(summary)
       },
     },
     {
@@ -891,6 +995,84 @@ export default function Balance({
     },
   ]
 
+  const processStatusColumns: ColumnsType<ProcessStatusRow> = [
+    {
+      title: 'Process Name',
+      dataIndex: 'process_name',
+      key: 'process_name',
+      width: 200,
+      render: (_name: string, row) => (
+        <Text style={{ color: COLORS.text }}>
+          {deriveDisplayProcessName(row)}
+          {row.pid ? <Text style={{ color: COLORS.textMuted }}>{` · PID ${row.pid}`}</Text> : ''}
+        </Text>
+      ),
+    },
+    {
+      title: 'Command',
+      dataIndex: 'cmdline',
+      key: 'cmdline',
+      width: 280,
+      ellipsis: true,
+      render: (cmdline: string) => {
+        const label = (cmdline || '').trim() || 'Not set'
+        return (
+          <Tooltip title={label}>
+            <Text style={{ color: COLORS.textMuted, fontSize: 12, fontFamily: 'monospace' }} ellipsis>
+              {label}
+            </Text>
+          </Tooltip>
+        )
+      },
+    },
+    {
+      title: 'Scope (cgroup)',
+      dataIndex: 'cgroup',
+      key: 'cgroup',
+      width: 220,
+      ellipsis: true,
+      render: (cgroup: string) => {
+        const label = (cgroup || '').trim() || '-'
+        return (
+          <Tooltip title={label}>
+            <Text style={{ color: COLORS.textMuted, fontSize: 12, fontFamily: 'monospace' }} ellipsis>
+              {label}
+            </Text>
+          </Tooltip>
+        )
+      },
+    },
+    {
+      title: 'Runtime Status',
+      dataIndex: 'runtime_status',
+      key: 'runtime_status',
+      width: 130,
+      render: (status: string) => runtimeHintTag(status),
+    },
+    {
+      title: 'Limit Status',
+      dataIndex: 'limit_status',
+      key: 'limit_status',
+      width: 130,
+      render: (status: string) => {
+        if (status === 'Limited') return <Tag color="warning" style={{ marginInlineEnd: 0 }}>Limited</Tag>
+        if (status === 'Not Limited') return <Tag color="default" style={{ marginInlineEnd: 0 }}>Not Limited</Tag>
+        return <Tag color="default" style={{ marginInlineEnd: 0 }}>N/A</Tag>
+      },
+    },
+    {
+      title: 'Applied At',
+      dataIndex: 'applied_at',
+      key: 'applied_at',
+      width: 170,
+      render: (appliedAt: number | null | undefined) => (
+        <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
+          {appliedAt ? formatPassiveControlTimestamp(appliedAt) : '-'}
+        </Text>
+      ),
+    },
+  ]
+
   const uncontrolledApps = allApps.filter(
     (a) => !controlledApps.some((c) => c.app_id === a.app_id)
   )
@@ -909,22 +1091,46 @@ export default function Balance({
     )
     : <Text strong>Limit Configuration</Text>
 
-  // Show multi-tab only when there are genuinely distinct cgroups.
-  // Use process names as labels when there is a 1:1 match with cgroup IDs.
-  const tabTargets = useMemo(() => {
-    const cgIds = limitForm.cgroupIds
-    const procNames = limitForm.processNames
-    if (cgIds.length <= 1) return []
-    return cgIds.map((cg, i) => ({
-      key: cg,
-      label: procNames.length === cgIds.length ? procNames[i] : cg,
-    }))
-  }, [limitForm.cgroupIds, limitForm.processNames])
   const inlineProcessNames = useMemo(
     () => limitForm.processNames.map((name) => name.trim()).filter(Boolean),
     [limitForm.processNames]
   )
-  const useInlineProcessHint = inlineProcessNames.length > 1
+  const selectedDialogCgroups = useMemo(() => {
+    const appId = limitDialog.app?.app_id
+    if (!appId) return []
+
+    const preferred = selectedTargetCgroups[appId]
+    if (preferred && preferred.length > 0) return preferred
+
+    const runningFromRows = Array.from(new Set(
+      (limitDialog.app?.process_status_rows ?? [])
+        .filter((row) => row.runtime_status === 'Running')
+        .map((row) => (row.cgroup || '').trim())
+        .filter(Boolean)
+    ))
+    if (runningFromRows.length > 0) return runningFromRows
+
+    return (limitForm.cgroupIds ?? []).map((x) => String(x).trim()).filter(Boolean)
+  }, [limitDialog.app, limitForm.cgroupIds, selectedTargetCgroups])
+
+  const targetRows = useMemo(() => {
+    if (!limitDialog.app) return []
+
+    const selectedSet = new Set(selectedDialogCgroups)
+    const namesByCgroup = new Map<string, Set<string>>()
+    for (const row of (limitDialog.app.process_status_rows ?? [])) {
+      const cgroup = (row.cgroup || '').trim()
+      if (!cgroup || !selectedSet.has(cgroup)) continue
+      const name = deriveDisplayProcessName(row)
+      if (!namesByCgroup.has(cgroup)) namesByCgroup.set(cgroup, new Set())
+      namesByCgroup.get(cgroup)!.add(name)
+    }
+
+    return selectedDialogCgroups.map((cgroupId) => ({
+      cgroupId,
+      processName: Array.from(namesByCgroup.get(cgroupId) ?? []).join(', ') || inlineProcessNames[0] || '-',
+    }))
+  }, [inlineProcessNames, limitDialog.app, selectedDialogCgroups])
 
   // renderLimitSettings accepts a form snapshot and a typed setter so each
   // context (single-cgroup or per-tab) can be fully independent.
@@ -1277,8 +1483,36 @@ export default function Balance({
           setWizardOpen(false)
           onRegisterConsumed?.()
         }}
-        onSuccess={() => {
-          fetchData()
+        onSuccess={async (result) => {
+          if (result?.openLimit) {
+            const localTarget = controlledApps.find((a) => a.app_id === result.appId)
+              || controlledApps.find((a) => a.app_name === result.appName)
+
+            let serverTarget: AppInfo | undefined
+            if (!localTarget) {
+              try {
+                const latest = await api.getControlledApps()
+                serverTarget = latest.find((a) => a.app_id === result.appId)
+                  || latest.find((a) => a.app_name === result.appName)
+              } catch (e) {
+                console.error('[Balance] resolve target for limit dialog failed:', e)
+              }
+            }
+
+            const fallbackTarget: AppInfo = {
+              app_id: result.appId,
+              app_name: result.appName,
+              cpu_usage: 0,
+              memory_mb: 0,
+              io_read_rate: 0,
+              priority: 'medium',
+              status: APP_STATUS.RUNNING,
+            }
+
+            await handleResourceLimit(localTarget || serverTarget || fallbackTarget)
+          }
+
+          await fetchData()
         }}
       />
 
@@ -1299,6 +1533,13 @@ export default function Balance({
         headStyle={{ borderBottom: `1px solid ${COLORS.border}`, padding: '8px 16px', minHeight: 40 }}
         bodyStyle={{ padding: '0' }}
       >
+        <div style={{ padding: '8px 16px', borderBottom: `1px solid ${COLORS.border}55` }}>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            Scope note: each app is identified by its program name(s). Every running process with a
+            matching name — in any terminal, including instances started later — belongs to the app and
+            is limited when you apply a limit. Expand an app to see its current instances.
+          </Text>
+        </div>
         <Table
           columns={controlledColumns}
           dataSource={controlledApps.map((a) => ({ ...a, key: a.app_id }))}
@@ -1307,6 +1548,52 @@ export default function Balance({
           pagination={false}
           scroll={{ x: 'max-content' }}
           rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
+          expandable={{
+            showExpandColumn: false,
+            expandedRowKeys: expandedProcessRows,
+            onExpandedRowsChange: (keys) => setExpandedProcessRows([...keys]),
+            expandedRowRender: (record) => {
+              const rows = record.process_status_rows ?? []
+              const selected = selectedTargetCgroups[record.app_id] ?? []
+              const selectedSet = new Set(selected)
+              const selectedRowKeys = rows
+                .filter((row) => selectedSet.has((row.cgroup || '').trim()))
+                .map((row) => row.key)
+
+              return (
+                <div style={{ padding: '4px 8px 8px 8px' }}>
+                  <div style={{ marginBottom: 8 }}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      Tick running process scopes to choose where the Limit action applies. Default: all running scopes selected.
+                    </Text>
+                  </div>
+                  <Table
+                    columns={processStatusColumns}
+                    dataSource={rows}
+                    size="small"
+                    pagination={false}
+                    rowKey={(row) => row.key}
+                    rowSelection={{
+                      selectedRowKeys,
+                      onChange: (_keys, selectedRows) => {
+                        const nextCgroups = Array.from(new Set(
+                          selectedRows
+                            .filter((row) => row.runtime_status === 'Running')
+                            .map((row) => (row.cgroup || '').trim())
+                            .filter(Boolean)
+                        ))
+                        setSelectedTargetCgroups((prev) => ({ ...prev, [record.app_id]: nextCgroups }))
+                      },
+                      getCheckboxProps: (row) => ({
+                        disabled: row.runtime_status !== 'Running' || !(row.cgroup || '').trim(),
+                      }),
+                    }}
+                  />
+                </div>
+              )
+            },
+            rowExpandable: (record) => (record.process_status_rows?.length ?? 0) > 0,
+          }}
           locale={{
             emptyText: (
               <div style={{ padding: 30, color: COLORS.textMuted, textAlign: 'center' }}>
@@ -1376,8 +1663,6 @@ export default function Balance({
         )}
         open={limitDialog.open}
         onCancel={() => {
-          setActiveLimitTarget('')
-          setPerTargetForms({})
           setLimitDialog({ app: null, open: false, loadingProfile: false, submitting: false })
         }}
         onOk={submitResourceLimit}
@@ -1389,46 +1674,27 @@ export default function Balance({
       >
         <div style={{ opacity: limitDialog.loadingProfile ? 0.6 : 1, pointerEvents: limitDialog.loadingProfile ? 'none' : 'auto' }}>
           <Space direction="vertical" size={12} style={{ width: '100%' }}>
-            {tabTargets.length > 1 && !useInlineProcessHint && (
-              <Tabs
-                activeKey={activeLimitTarget || tabTargets[0].key}
-                onChange={setActiveLimitTarget}
-                items={tabTargets.map(({ key, label }) => ({
-                  key,
-                  label,
-                  children: (
-                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
-                      {renderLimitSettings(
-                        perTargetForms[key] ?? limitForm,
-                        (updater) => setPerTargetForms((prev) => ({
-                          ...prev,
-                          [key]: updater(prev[key] ?? limitForm),
-                        }))
-                      )}
-                    </Space>
-                  ),
-                }))}
-              />
-            )}
-            {useInlineProcessHint && (
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                Target Processes: {inlineProcessNames.join(' | ')}
-              </Text>
-            )}
-
-            {tabTargets.length === 0 && limitForm.cgroupIds.length === 1 && (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              The limit is applied to all instances of this app running right now (matched by name).
+              Use the process checkboxes in the expanded app row to choose specific scopes.
+            </Text>
+            {targetRows.length > 0 && (
               <div>
                 <Text type="secondary" style={{ fontSize: 12 }}>Target</Text>
-                <div style={{ marginTop: 6 }}>
-                  <Tag color="blue" style={{ marginBottom: 6 }}>
-                    {limitForm.processNames.length > 0
-                      ? limitForm.processNames.join(' | ')
-                      : limitForm.cgroupIds[0]}
-                  </Tag>
+                <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {targetRows.map((row, idx) => (
+                    <Tag
+                      key={`target-row-${idx}`}
+                      color="blue"
+                      style={{ marginBottom: 0, maxWidth: '100%', whiteSpace: 'normal', wordBreak: 'break-all' }}
+                    >
+                      Process: {row.processName || '-'} | Scope: {row.cgroupId || '-'}
+                    </Tag>
+                  ))}
                 </div>
               </div>
             )}
-            {(tabTargets.length <= 1 || useInlineProcessHint) && renderLimitSettings(limitForm, setLimitForm)}
+            {renderLimitSettings(limitForm, setLimitForm)}
           </Space>
         </div>
       </Modal>

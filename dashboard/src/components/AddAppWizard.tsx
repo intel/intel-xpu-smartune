@@ -25,7 +25,7 @@ const { Text, Paragraph } = Typography
 interface Props {
   open: boolean
   onClose: () => void
-  onSuccess: () => void
+  onSuccess: (result?: { appId: string; appName: string; openLimit?: boolean }) => void
   // Pre-fill the process search (and app name) when opened from the Processes tab.
   initialKeyword?: string
 }
@@ -78,7 +78,6 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
   // discover_extract so the user can see them as suggestions, but only the
   // value in `commandline` ever reaches the backend.
   const [commandline, setCommandline] = useState<string>('')
-  const [commandlineSuggestions, setCommandlineSuggestions] = useState<string[]>([])
   const [extracting, setExtracting] = useState(false)
   const [extractError, setExtractError] = useState<string | null>(null)
 
@@ -86,6 +85,8 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
   const [committing, setCommitting] = useState(false)
   const [commitError, setCommitError] = useState<string | null>(null)
   const [committed, setCommitted] = useState(false)
+  const [openLimitAfterAdd, setOpenLimitAfterAdd] = useState(false)
+  const [committedApp, setCommittedApp] = useState<{ appId: string; appName: string } | null>(null)
   // Conflict state — set when the backend rejects with retcode CONFLICT.
   // Holds the existing app's id so we can offer a "purge & re-add" button.
   const [conflict, setConflict] = useState<{
@@ -110,12 +111,13 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
     setBpfNames([])
     setProcessNames([])
     setCommandline('')
-    setCommandlineSuggestions([])
     setExtracting(false)
     setExtractError(null)
     setCommitting(false)
     setCommitError(null)
     setCommitted(false)
+    setOpenLimitAfterAdd(false)
+    setCommittedApp(null)
     setConflict(null)
     setPurging(false)
     if (searchTimer.current) {
@@ -124,14 +126,20 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
     }
   }, [])
 
-  const handleClose = useCallback(() => {
+  const handleClose = useCallback((openLimitNow = false) => {
     // No toast on close — the Done step inside the modal already confirmed
     // success, and the user can see the new row appear in the table behind
     // the dialog.  Just refresh the parent and dismiss.
-    if (committed) onSuccess()
+    if (committed && committedApp) {
+      onSuccess({
+        appId: committedApp.appId,
+        appName: committedApp.appName,
+        openLimit: openLimitNow || openLimitAfterAdd,
+      })
+    }
     reset()
     onClose()
-  }, [committed, onClose, onSuccess, reset])
+  }, [committed, committedApp, openLimitAfterAdd, onClose, onSuccess, reset])
 
   // ---------- live search ----------
   // Debounce the searchInput → discoverSearch call so that typing doesn't
@@ -190,9 +198,10 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
       const res: DiscoverExtractData = await api.discoverExtract(selectedPids, appName.trim())
       setBpfNames(res.bpf_name ?? [])
       setProcessNames(res.process_names ?? [])
+      // cgroup_ids from discovery are intentionally ignored: app identity is
+      // name-based, so we never pin the app to specific (ephemeral) cgroups.
       const cmds = res.commandline ?? []
       setCommandline(cmds[0] ?? '')
-      setCommandlineSuggestions(cmds.slice(1))
       // Backend returns id_suggestion as either the shared systemd unit or
       // <slug-of-name>.id as a fallback.  Only auto-fill if the user hasn't
       // already typed an id manually.
@@ -221,6 +230,7 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
       }
       const res = await api.newControlledApp(payload)
       if (res.status === 'ok') {
+        setCommittedApp({ appId: res.data.id, appName: res.data.name })
         setCommitted(true)
         setStep(STEP_DONE)
       } else if (res.status === 'conflict') {
@@ -268,18 +278,24 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
   const step2Valid =
     appName.trim().length > 0 &&
     appId.trim().length > 0 &&
-    bpfNames.length > 0
+    processNames.length > 0
 
   // ---------- step 1 candidate table ----------
   const candidateColumns: ColumnsType<DiscoverCandidate> = useMemo(
     () => [
       { title: 'PID', dataIndex: 'pid', key: 'pid', width: 80 },
       {
-        title: 'comm',
+        title: 'Program Name',
         dataIndex: 'comm',
         key: 'comm',
         width: 160,
-        render: (v: string) => <Text code>{v}</Text>,
+        render: (_v: string, record) => {
+          const label = (record.process_name || '').trim() || (record.comm || '').trim() || '-'
+          const raw = (record.comm || '').trim()
+          return (
+            <Text code title={raw ? `comm: ${raw}` : undefined}>{label}</Text>
+          )
+        },
       },
       {
         title: 'Executable',
@@ -294,15 +310,6 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
         key: 'cmdline',
         ellipsis: true,
         render: (v: string) => <Text style={{ fontSize: 12 }}>{v || '-'}</Text>,
-      },
-      {
-        title: 'cgroup unit',
-        dataIndex: 'cgroup_unit',
-        key: 'cgroup_unit',
-        width: 220,
-        ellipsis: true,
-        render: (v: string) =>
-          v ? <Tag color="blue">{v}</Tag> : <Text type="secondary">-</Text>,
       },
     ],
     [],
@@ -341,7 +348,7 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
   const footer = useMemo(() => {
     if (step === STEP_PICK) {
       return [
-        <Button key="cancel" onClick={handleClose}>Cancel</Button>,
+        <Button key="cancel" onClick={() => handleClose()}>Cancel</Button>,
         <Button
           key="next"
           type="primary"
@@ -368,7 +375,16 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
       ]
     }
     return [
-      <Button key="close" type="primary" onClick={handleClose}>Close</Button>,
+      <Button key="close" onClick={() => handleClose()}>Close</Button>,
+      <Button
+        key="limit-now"
+        type="primary"
+        onClick={() => {
+          handleClose(true)
+        }}
+      >
+        Set Limit Now
+      </Button>,
     ]
   }, [
     step, step1Valid, step2Valid,
@@ -386,7 +402,7 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
     <Modal
       title="Add Application Wizard"
       open={open}
-      onCancel={handleClose}
+      onCancel={() => handleClose()}
       width={900}
       footer={footer}
       destroyOnClose
@@ -407,12 +423,14 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
         <div>
           <Paragraph>
             Make sure the application is <b>currently running</b>, give it an
-            App name, then type part of its process name in the search box —
-            matching processes appear below.  Multi-select all processes that
-            belong to this application (multiple cgroups are fine).  You can
-            search again with a <b>different keyword</b> and keep selecting —
-            picks accumulate in the basket below and are kept until you remove
-            them.
+            App name, then type part of its program name in the search box.
+            Tick the matching rows — these are just <b>samples</b> used to read
+            off the <b>program name(s)</b> this app runs as. The app is then
+            controlled <b>by name</b>: every process with a matching name — in
+            any terminal, now or after a restart — belongs to this app. If your
+            app runs several differently-named processes (e.g. a service plus
+            workers), search different keywords and keep ticking; the picks
+            accumulate below.
           </Paragraph>
 
           <div style={{ marginBottom: 12 }}>
@@ -430,7 +448,7 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
             <Input.Search
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
-              placeholder="Type part of the comm/exe/cmdline; separate multiple keywords with space"
+              placeholder="Type part of the program name/exe/cmdline; separate multiple keywords with space"
               loading={searching}
               allowClear
               style={{ marginTop: 4 }}
@@ -451,38 +469,6 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
             locale={{ emptyText: emptyHint }}
           />
 
-          {/* Selection basket — accumulates picks across searches so a
-              multi-keyword app can gather unrelated processes into one entry. */}
-          <div style={{ marginTop: 12 }}>
-            <Space size="small">
-              <Text strong>Selected processes ({selectedPids.length})</Text>
-              {selectedPids.length > 0 && (
-                <a onClick={() => setSelected({})}>Clear all</a>
-              )}
-            </Space>
-            {selectedPids.length === 0 ? (
-              <Paragraph type="secondary" style={{ fontSize: 12, marginTop: 4 }}>
-                Nothing selected yet. Tick rows above; they stay here even after
-                you change the search keyword.
-              </Paragraph>
-            ) : (
-              <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                {selectedPids.map((pid) => {
-                  const c = selected[pid]
-                  return (
-                    <Tag
-                      key={pid}
-                      color="blue"
-                      closable
-                      onClose={() => removeFromBasket([pid])}
-                    >
-                      {c.comm || c.exe || 'proc'} · {pid}
-                    </Tag>
-                  )
-                })}
-              </div>
-            )}
-          </div>
         </div>
       )}
 
@@ -552,25 +538,10 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
 
             <div>
               <Text>
-                bpf_name <Text type="danger">*</Text>{' '}
+                Program names <Text type="danger">*</Text>{' '}
                 <Text type="secondary" style={{ fontSize: 12 }}>
-                  (BPF watches these comm names — note 15-byte truncation)
-                </Text>
-              </Text>
-              <Select
-                mode="tags"
-                value={bpfNames}
-                onChange={setBpfNames}
-                style={{ width: '100%', marginTop: 4 }}
-                placeholder="comm names"
-              />
-            </div>
-
-            <div>
-              <Text>
-                process_names{' '}
-                <Text type="secondary" style={{ fontSize: 12 }}>
-                  (executable basenames; required only for multi-cgroup apps)
+                  (this app's identity — every running process with one of these
+                  names belongs to it; script basename for python/bash)
                 </Text>
               </Text>
               <Select
@@ -578,34 +549,10 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
                 value={processNames}
                 onChange={setProcessNames}
                 style={{ width: '100%', marginTop: 4 }}
-                placeholder="exe basenames"
+                placeholder="program / exe basenames"
               />
             </div>
 
-            <div>
-              <Text>
-                commandline{' '}
-                <Text type="secondary" style={{ fontSize: 12 }}>
-                  (used by pgrep when adjusting OOM score)
-                </Text>
-              </Text>
-              <Input
-                value={commandline}
-                onChange={(e) => setCommandline(e.target.value)}
-                placeholder="argv[0] of the main process"
-                style={{ marginTop: 4 }}
-              />
-              {commandlineSuggestions.length > 0 && (
-                <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 4 }}>
-                  Other detected: {commandlineSuggestions.map((s, i) => (
-                    <span key={s}>
-                      {i > 0 && ', '}
-                      <a onClick={() => setCommandline(s)}>{s}</a>
-                    </span>
-                  ))}
-                </Text>
-              )}
-            </div>
           </Space>
 
           {conflict && (
@@ -655,6 +602,9 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
             The new entry has been written to <Text code>config.yaml</Text>{' '}
             and the BPF match cache was refreshed. Closing this dialog will
             refresh the controlled-apps list.
+          </Paragraph>
+          <Paragraph type="secondary" style={{ marginBottom: 0 }}>
+            You can set a unified resource limit now, or close and configure it later.
           </Paragraph>
         </div>
       )}

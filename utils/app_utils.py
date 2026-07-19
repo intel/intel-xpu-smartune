@@ -4,6 +4,7 @@
 import os
 import queue as _queue
 import re
+import shlex
 import subprocess # nosec
 import time
 import psutil
@@ -12,7 +13,7 @@ from datetime import datetime
 
 from utils.logger import logger
 from db.DatabaseModel import AIAppPriority, DBStatus
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from config.config import b_config
 
 _original_oom_scores: dict[str, str] = {}
@@ -73,13 +74,28 @@ class ClientCallbackManager:
         """Send callback notification (thread-safe)."""
         if store:
             try:
-                result = AIAppPriority.update_record(
-                    id=data['app_id'],
-                    status=data['status'],
-                    up_time=datetime.now()
-                )
-                if result != DBStatus.SUCCESS:
-                    logger.warning(f"Failed to update database record for {data['app_id']}")
+                next_status = str(data.get('status', '') or '').lower()
+                if next_status == 'running':
+                    # Refresh/startup scans may re-detect alive processes.
+                    # Never downgrade a manually/auto limited app to running
+                    # via this generic callback persistence path.
+                    rec = AIAppPriority.query().where(AIAppPriority.app_id == data.get('app_id')).first()
+                    current_status = str(getattr(rec, 'status', '') or '').lower()
+                    if current_status in {'limited', 'a_limited'}:
+                        logger.info(
+                            "Skip running overwrite for app_id=%s (current=%s)",
+                            data.get('app_id'), current_status,
+                        )
+                        store = False
+
+                if store:
+                    result = AIAppPriority.update_record(
+                        id=data['app_id'],
+                        status=data['status'],
+                        up_time=datetime.now()
+                    )
+                    if result != DBStatus.SUCCESS:
+                        logger.warning(f"Failed to update database record for {data['app_id']}")
             except Exception as db_error:
                 logger.error(f"Database update error: {db_error}")
 
@@ -244,14 +260,58 @@ def get_app_control_info(app_id: str = None, app_name: str = None):
 
 
 def get_app_processes(app_name):
-    """Return all running PIDs for an application via pgrep.
+    """Return all running PIDs for an application.
+
+    Matching rule:
+    - If ``app_name`` includes command-line parameters (e.g. "bench -m aaa"),
+      match by full process cmdline tokens.
+    - Otherwise keep the existing fuzzy ``pgrep -fi`` behavior.
 
     :return:
         list[int]: e.g. [1234, 5678]
     """
+    query = (app_name or '').strip()
+    if not query:
+        return []
+
+    # If the configured process_name carries arguments, use cmdline-level
+    # matching so similarly named processes with different args are separated.
+    try:
+        tokens = shlex.split(query)
+    except ValueError:
+        tokens = query.split()
+
+    if len(tokens) > 1:
+        target_prog = os.path.basename(tokens[0]).lower()
+        required_tokens = [t.lower() for t in tokens[1:] if t.strip()]
+        matched: set[int] = set()
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
+                try:
+                    cmdline = proc.info.get('cmdline') or []
+                    if not cmdline:
+                        continue
+
+                    argv0 = os.path.basename((cmdline[0] or '').strip()).lower()
+                    pname = (proc.info.get('name') or '').strip().lower()
+                    pexe = os.path.basename((proc.info.get('exe') or '').strip()).lower()
+
+                    if target_prog not in {argv0, pname, pexe}:
+                        continue
+
+                    cmdline_lower = [str(x).strip().lower() for x in cmdline if str(x).strip()]
+                    if all(tok in cmdline_lower for tok in required_tokens):
+                        matched.add(int(proc.info['pid']))
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            return sorted(matched)
+        except Exception as e:
+            logger.warning(f"cmdline match failed for {app_name}: {str(e)}")
+            return []
+
     try:
         result = subprocess.run(
-            ['pgrep', '-fi', app_name],
+            ['pgrep', '-fi', query],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
@@ -261,6 +321,41 @@ def get_app_processes(app_name):
     except Exception as e:
         logger.warning(f"pgrep failed for {app_name}: {str(e)}")
     return []
+
+
+def _get_controlled_app_entry(app_id: str = None, app_name: str = None) -> Optional[dict]:
+    """Return the matching controlled_apps entry, or None when not found."""
+    apps = getattr(b_config, 'controlled_apps', None) or []
+    app_name_lower = app_name.lower() if app_name else None
+    for app in apps:
+        if not isinstance(app, dict):
+            continue
+        if app_id and app.get('id') == app_id:
+            return app
+        if app_name_lower and app.get('name', '').lower() == app_name_lower:
+            return app
+    return None
+
+
+def _filter_pids_by_cgroup_scope(
+    pids: List[int],
+    app_id: str = None,
+    app_name: str = None,
+) -> List[int]:
+    """Deprecated cgroup-scope filter — now a no-op passthrough.
+
+    An application's identity is its process *name* set, not the ephemeral
+    cgroup its instances happen to live in.  Filtering by ``cgroup_ids`` broke
+    monitoring whenever a process restarted into a new scope (e.g. a fresh
+    ``tmux-spawn-*.scope``).  The signature is kept so callers stay unchanged;
+    it now returns every matching PID, deduplicated and sorted.
+    """
+    return sorted({int(pid) for pid in pids})
+
+
+def get_app_processes_for_app(process_query: str, app_id: str = None, app_name: str = None) -> List[int]:
+    """Find app PIDs by name. Identity is name-based, so no cgroup scoping."""
+    return sorted({int(pid) for pid in get_app_processes(process_query)})
 
 
 def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.0) -> tuple[bool, str]:
@@ -536,11 +631,11 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
         # Find a representative PID to locate the cgroup.
         # Try app_name first; if that yields nothing, fall back to app_id (e.g. "benchmark.py")
         # so that processes whose argv[0] was renamed (e.g. via perl $0=) are still found.
-        pids = get_app_processes(app_name)
+        pids = get_app_processes_for_app(app_name, app_id=app_id, app_name=app_name)
         logger.debug(f"[resource_usage] app_name='{app_name}' -> pids from pgrep: {pids}")
         if not pids and app_id:
             fallback_name = os.path.basename(app_id)
-            pids = get_app_processes(fallback_name)
+            pids = get_app_processes_for_app(fallback_name, app_id=app_id, app_name=app_name)
             logger.debug(f"[resource_usage] fallback app_id basename='{fallback_name}' -> pids: {pids}")
         if not pids:
             logger.warning(f"No processes found for app {app_name} (ID: {app_id})")
@@ -744,12 +839,9 @@ def _get_app_process_names(app_id: str = None, app_name: str = None) -> list:
     (case-insensitive) and returns the ``process_names`` field.
     Returns an empty list when no match is found or the config is absent.
     """
-    apps = getattr(b_config, 'controlled_apps', None) or []
-    app_name_lower = app_name.lower() if app_name else None
-    for app in apps:
-        if (app_id and app.get('id') == app_id) or \
-                (app_name_lower and app.get('name', '').lower() == app_name_lower):
-            return app.get('process_names', []) or []
+    app = _get_controlled_app_entry(app_id=app_id, app_name=app_name)
+    if app:
+        return app.get('process_names', []) or []
     return []
 
 
@@ -759,9 +851,9 @@ def check_app_running_status(app_id: str, app_name: str, cmdline: str = "") -> s
     Two modes depending on configuration:
 
     **Multi-process mode** (``process_names`` is non-empty in ``controlled_apps``):
-        ALL configured process names must be found among running processes.
-        Returns ``"running"`` only when every name is matched; otherwise
-        ``"stopped"``.
+        Any configured process name found among running processes is enough to
+        treat the app as running. This avoids false "stopped" for apps where
+        helper/child processes are optional or short-lived.
 
     **Standard mode** (``process_names`` is empty / not configured):
         Any single match is sufficient.  The function tries, in order:
@@ -781,35 +873,40 @@ def check_app_running_status(app_id: str, app_name: str, cmdline: str = "") -> s
     # --- Multi-process mode ---
     process_names = _get_app_process_names(app_id=app_id, app_name=app_name)
     if process_names:
-        # ALL named processes must be running
+        # At least one named process running means app is running.
+        found = []
         for proc_name in process_names:
-            if not get_app_processes(proc_name):
-                logger.debug(
-                    f"[running_status] '{app_name}': required process '{proc_name}' not found → stopped"
-                )
-                return "stopped"
+            if get_app_processes_for_app(proc_name, app_id=app_id, app_name=app_name):
+                found.append(proc_name)
+
+        if found:
+            logger.debug(
+                f"[running_status] '{app_name}': matched process_names {found} (configured={process_names}) → running"
+            )
+            return "running"
+
         logger.debug(
-            f"[running_status] '{app_name}': all process_names {process_names} found → running"
+            f"[running_status] '{app_name}': no configured process_names matched {process_names} → stopped"
         )
-        return "running"
+        return "stopped"
 
     # --- Standard mode: any one match is enough ---
     # 1. Try app_name
-    if app_name and get_app_processes(app_name):
+    if app_name and get_app_processes_for_app(app_name, app_id=app_id, app_name=app_name):
         logger.debug(f"[running_status] '{app_name}' matched by app_name → running")
         return "running"
 
     # 2. Try app_id basename (e.g. "benchmark.py")
     if app_id:
         id_basename = os.path.basename(app_id)
-        if id_basename and id_basename != app_name and get_app_processes(id_basename):
+        if id_basename and id_basename != app_name and get_app_processes_for_app(id_basename, app_id=app_id, app_name=app_name):
             logger.debug(f"[running_status] '{app_name}' matched by app_id basename '{id_basename}' → running")
             return "running"
 
     # 3. Try the executable from the configured commandline
     if cmdline:
         exe = _get_executable_name(app_name, cmdline)
-        if exe and exe != app_name.lower() and get_app_processes(exe):
+        if exe and exe != app_name.lower() and get_app_processes_for_app(exe, app_id=app_id, app_name=app_name):
             logger.debug(f"[running_status] '{app_name}' matched by cmdline exe '{exe}' → running")
             return "running"
 
@@ -874,8 +971,10 @@ def _get_multi_process_app_resource_usage(app_id: str, app_name: str, process_na
     # --- Discover PIDs and cgroups ---
     all_pids: list[int] = []
     cgroup_paths: set[str] = set()
+    # get_app_processes_for_app already scope-filters the PIDs, so every cgroup
+    # discovered below is guaranteed to be within the app's configured scope.
     for proc_name in process_names:
-        pids = get_app_processes(proc_name)
+        pids = get_app_processes_for_app(proc_name, app_id=app_id, app_name=app_name)
         logger.debug(f"[multi_process_resource] app='{app_name}' proc_name='{proc_name}' -> pids: {pids}")
         all_pids.extend(pids)
         for pid in pids:

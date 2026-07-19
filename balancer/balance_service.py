@@ -7,6 +7,7 @@ import os
 import queue as _queue
 import signal
 import ssl
+import psutil
 from datetime import datetime
 from threading import Lock
 
@@ -24,7 +25,7 @@ from monitor.monitor_api import (
 )
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
 from smartune_api import auth_bp, smartune_bp, set_balancer_available
-from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, get_priority_value
+from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, get_priority_value, get_app_processes_for_app, get_cgroup_path_by_pid
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
 
@@ -65,14 +66,21 @@ class DynamicService:
     def cancel_relaunch(self, app_id):
         return self.balancer.cancel_relaunch_by_app_id(app_id)
 
-    def resource_limit(self, app_id, app_name, priority, limit_overrides=None):
-        return self.balancer.set_resource_limit(app_id, app_name, priority, limit_overrides=limit_overrides)
+    def resource_limit(self, app_id, app_name, priority, limit_overrides=None, target_cgroups=None):
+        return self.balancer.set_resource_limit(
+            app_id, app_name, priority,
+            limit_overrides=limit_overrides,
+            target_cgroups=target_cgroups,
+        )
 
     def resource_limit_profile(self, app_id, app_name, priority):
         return self.balancer.get_resource_limit_profile(app_id, app_name, priority)
 
     def restore_resource(self, app_id):
         return self.balancer.set_restore_resource(app_id)
+
+    def get_limit_snapshot(self, app_id):
+        return self.balancer.get_limit_snapshot(app_id)
 
     def add_control(self, app_name):
         self.balancer.bpf_monitor.add_to_monitorlist(app_name)
@@ -153,6 +161,155 @@ def reset_app_status():
             logger.info(f"Reset {updated_count} app statuses to 'NA'")
     except Exception as e:
         logger.error(f"Failed to reset app statuses: {str(e)}")
+
+
+def _runtime_status_for_pid(pid: int) -> str:
+    try:
+        proc = psutil.Process(int(pid))
+        if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+            return "Stopped"
+        return "Running"
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, ValueError):
+        return "Stopped"
+
+
+def _process_name_for_pid(pid: int, fallback: str) -> str:
+    try:
+        return psutil.Process(int(pid)).name() or fallback
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, ValueError):
+        return fallback
+
+
+def _cmdline_for_pid(pid: int, fallback: str = "") -> str:
+    try:
+        parts = psutil.Process(int(pid)).cmdline()
+        return " ".join(parts).strip() or fallback
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, ValueError):
+        return fallback
+
+
+def _cgroup_for_pid(pid: int, fallback: str = "") -> str:
+    try:
+        path = get_cgroup_path_by_pid(int(pid))
+    except Exception:
+        path = None
+    if not path:
+        return fallback
+    # Show the leaf unit/scope (e.g. "app-...-.scope") which is what users recognise.
+    return os.path.basename(path.rstrip("/")) or path
+
+
+def _build_process_scope_snapshot(
+        app_id: str,
+        app_name: str,
+        process_names: list,
+        app_status: str,
+        limited_pid_snapshot: list,
+    limited_cgroup_snapshot: list,
+        app_cmdline: str = "",
+        limited_at: float = None,
+):
+    """Build per-instance status rows for a controlled app.
+
+    Identity is name-based: for every configured process name we look up the
+    live PIDs and group them by the cgroup they *currently* live in (discovered
+    at read time, never from stale config).  Each distinct cgroup becomes one
+    "instance" row, so two concurrent runs of the same program — even in fresh
+    ``tmux-spawn-*.scope`` cgroups after a restart — show up as two rows and
+    each carries its own limit status.  A name with nothing running yields a
+    single Stopped/Pending placeholder row.
+    """
+    configured_names = [str(x).strip() for x in (process_names or []) if str(x).strip()]
+    limited_pids = {int(pid) for pid in (limited_pid_snapshot or []) if str(pid).isdigit()}
+    limited_cgroups = {str(cg).strip() for cg in (limited_cgroup_snapshot or []) if str(cg).strip()}
+    app_status_l = (app_status or "").strip().lower()
+    app_cmdline = (app_cmdline or "").strip()
+    app_scope = (app_id or "").strip()
+
+    rows = []
+
+    def _emit_instance_rows(query_name: str, display_name: str) -> bool:
+        """Emit one row per live cgroup for *query_name*. Returns True if any
+        running instance was found."""
+        pids = sorted(set(get_app_processes_for_app(query_name, app_id=app_id, app_name=app_name)))
+        running_pids = [pid for pid in pids if _runtime_status_for_pid(pid) == "Running"]
+        if not running_pids:
+            return False
+
+        # Group running instances by their current cgroup so wrapper/child PIDs
+        # sharing a cgroup collapse into one row while genuinely separate runs
+        # (distinct cgroups) each get their own.
+        by_cgroup: dict[str, list[int]] = {}
+        for pid in running_pids:
+            cg = _cgroup_for_pid(pid, app_scope)
+            by_cgroup.setdefault(cg, []).append(pid)
+
+        for cgroup_id, cg_pids in sorted(by_cgroup.items()):
+            representative_pid = cg_pids[0]
+            if limited_pids:
+                is_limited = any(pid in limited_pids for pid in cg_pids)
+                note = "Applied" if is_limited else "Started after last limit"
+            elif limited_cgroups:
+                is_limited = cgroup_id in limited_cgroups
+                note = "Applied" if is_limited else "Started after last limit"
+            else:
+                is_limited = app_status_l in {"limited", "a_limited"}
+                note = "Applied" if is_limited else "-"
+            rows.append({
+                "key": f"{display_name}:{cgroup_id}",
+                "pid": representative_pid,
+                "process_name": display_name,
+                "cmdline": _cmdline_for_pid(representative_pid, app_cmdline),
+                "cgroup": cgroup_id,
+                "runtime_status": "Running",
+                "limit_status": "Limited" if is_limited else "Not Limited",
+                "applied_at": limited_at if is_limited else None,
+                "note": note,
+            })
+        return True
+
+    def _append_placeholder(display_name: str, key: str):
+        runtime_status = "Pending" if app_status_l == "pending" else "Stopped"
+        rows.append({
+            "key": key,
+            "pid": None,
+            "process_name": display_name,
+            "cmdline": app_cmdline,
+            "cgroup": app_scope,
+            "runtime_status": runtime_status,
+            "limit_status": "N/A",
+            "applied_at": None,
+            "note": "Awaiting relaunch" if runtime_status == "Pending" else "-",
+        })
+
+    if configured_names:
+        for proc_name in configured_names:
+            if not _emit_instance_rows(proc_name, proc_name):
+                _append_placeholder(proc_name, f"{proc_name}:na")
+    else:
+        found = _emit_instance_rows(app_name, app_name)
+        if not found and app_id:
+            found = _emit_instance_rows(os.path.basename(app_id), app_name)
+        if not found:
+            _append_placeholder(app_name or app_id, f"{app_id}:na")
+
+    running_rows = [r for r in rows if r.get("runtime_status") == "Running"]
+    limited_running = [r for r in running_rows if r.get("limit_status") == "Limited"]
+
+    if not running_rows:
+        app_summary_status = "No Running Process"
+        runtime_hint = "Pending" if app_status_l == "pending" else "Stopped"
+    else:
+        runtime_hint = "Running"
+        if len(limited_running) == len(running_rows):
+            app_summary_status = "Limited"
+        elif limited_running:
+            app_summary_status = "Partial Limited"
+        else:
+            app_summary_status = "Not Limited"
+
+    return rows, app_summary_status, runtime_hint
+
 
 
 @app.route('/app/get_apps', methods=['GET', 'POST'])
@@ -567,7 +724,7 @@ def new_controlled_app():
         #    crashes Balance.tsx and blanks the tab.
         priority_label = (priority or "low").lower() if isinstance(priority, str) else "low"
         try:
-            AIAppPriority.insert_record(
+            db_result = AIAppPriority.insert_record(
                 id=app_id,
                 app_id=app_id,
                 name=name,
@@ -579,8 +736,31 @@ def new_controlled_app():
                 status="NA",
                 last_update_time=datetime.now(),
             )
+
+            # insert_record() returns ALREADY_EXISTING when the id already
+            # exists (e.g. app previously added then uncontrolled). In that
+            # case we must re-enable control on the existing row so
+            # /app/get_controlled_app can see it immediately after wizard
+            # finish.
+            if db_result != DBStatus.SUCCESS:
+                update_result = AIAppPriority.update_record(
+                    id=app_id,
+                    app_id=app_id,
+                    name=name,
+                    priority=priority_label,
+                    controlled=True,
+                    cgroup='',
+                    remark=remark,
+                    cmdline=commandline,
+                    status="NA",
+                )
+                if update_result != DBStatus.SUCCESS:
+                    logger.warning(
+                        "new_controlled_app: DB upsert did not confirm success "
+                        f"(insert={db_result}, update={update_result}) for app_id={app_id}"
+                    )
         except Exception as db_exc:
-            logger.warning(f"new_controlled_app: DB insert failed (continuing): {db_exc}")
+            logger.warning(f"new_controlled_app: DB upsert failed (continuing): {db_exc}")
 
         # 3. Refresh the BPF match cache so this app is watched immediately.
         _service.add_control(name)
@@ -761,6 +941,27 @@ def get_controlled_app():
             # Prefer the DB name, or fall back to the config-derived human-readable name
             cfg_app = config_app_map.get(app.app_id, {})
             app_name = app.name if app.name and app.name.strip() else (cfg_app.get("app_name") or cfg_app.get("name") or "")
+            limit_snapshot = {}
+            get_snapshot = getattr(_service, "get_limit_snapshot", None)
+            if callable(get_snapshot):
+                try:
+                    snap = get_snapshot(app.app_id)
+                    if isinstance(snap, dict):
+                        limit_snapshot = snap
+                except Exception as e:
+                    logger.debug(f"get_limit_snapshot failed for {app.app_id}: {e}")
+
+            process_rows, app_summary_status, runtime_hint = _build_process_scope_snapshot(
+                app_id=app.app_id,
+                app_name=app_name,
+                process_names=cfg_app.get("process_names", []) or [],
+                app_status=app.status,
+                limited_pid_snapshot=limit_snapshot.get("pids", []),
+                limited_cgroup_snapshot=limit_snapshot.get("cgroups", []),
+                app_cmdline=app.cmdline or "",
+                limited_at=limit_snapshot.get("limited_at"),
+            )
+
             result_data.append({
                 "app_id": app.app_id,
                 "app_name": app_name,
@@ -771,7 +972,10 @@ def get_controlled_app():
                 "cgroup": app.cgroup,
                 "process_names": cfg_app.get("process_names", []) or [],
                 "remark": app.remark,
-                "status": app.status
+                "status": app.status,
+                "app_summary_status": app_summary_status,
+                "runtime_hint": runtime_hint,
+                "process_status_rows": process_rows,
             })
 
         return construct_response(
@@ -1004,6 +1208,7 @@ def app_resource_limit():
         app_name = data.get('app_name', "")
         priority = data.get('priority', "")
         limit_overrides = data.get('limit_overrides')
+        target_cgroups = data.get('target_cgroups') or None
 
         if not app_id and not app_name and not priority:
             return construct_response(
@@ -1012,7 +1217,11 @@ def app_resource_limit():
                 retmsg="app_id, app_name and priority must be provided"
             )
 
-        result = _service.resource_limit(app_id, app_name, priority, limit_overrides=limit_overrides)
+        result = _service.resource_limit(
+            app_id, app_name, priority,
+            limit_overrides=limit_overrides,
+            target_cgroups=target_cgroups,
+        )
 
         # set_resource_limit signals "intentionally skipped" with {"skipped": reason}.
         # That's a successful evaluation, not a failure — return 200 + the reason as

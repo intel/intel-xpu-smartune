@@ -381,18 +381,18 @@ Or query by name:
 | Type | Parameter | Required | Format | Description |
 |------|-----------|----------|--------|-------------|
 | Body | name | Yes | string | Display name |
-| Body | id | Yes | string | Unique identifier (DB primary key, systemd match) |
+| Body | id | Yes | string | Logical unique identifier (DB primary key). Use a stable `<slug>.id`, not an ephemeral `*.scope`/`*.service` unit |
 | Body | priority | No | string | `"low"` / `"medium"` / `"high"` / `"critical"` (default: `"low"`) |
 | Body | commandline | No | string | argv[0] of the main process |
-| Body | bpf_name | No | string[] | Executable names for BPF execve watch |
-| Body | process_names | No | string[] | Process names for explicit lookup |
+| Body | bpf_name | No | string[] | Executable names for BPF exec watch |
+| Body | process_names | No | string[] | Program names that make up this app (its identity) |
 | Body | remark | No | string | User-defined note |
 
 **Request Example:**
 ```json
 {
   "name": "heliconSearch",
-  "id": "heliconsearch.service",
+  "id": "heliconsearch.id",
   "priority": "high",
   "commandline": "/usr/local/heliconsearch/HeliconSearch_agent",
   "bpf_name": ["HeliconSearch_a", "VLMService"],
@@ -407,7 +407,7 @@ Or query by name:
   "retmsg": "Application 'heliconSearch' added",
   "data": {
     "name": "heliconSearch",
-    "id": "heliconsearch.service"
+    "id": "heliconsearch.id"
   }
 }
 ```
@@ -660,6 +660,7 @@ Or query by name:
 | Body | app_id | Yes | string | Application identifier |
 | Body | app_name | Yes | string | Application name |
 | Body | priority | Yes | string | Priority level |
+| Body | target_cgroups | No | string[] | Restrict limiting to selected running cgroup basenames; omitted means all running instances |
 | Body | limit_overrides | No | object | Custom limit overrides (key-value) |
 
 **Request Example:**
@@ -668,6 +669,7 @@ Or query by name:
   "app_id": "com.example.app",
   "app_name": "example",
   "priority": "3",
+  "target_cgroups": ["app-example.scope", "app-example-worker.scope"],
   "limit_overrides": {
     "cpu_quota": 50,
     "memory_max_mb": 2048

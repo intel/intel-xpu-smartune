@@ -14,6 +14,7 @@ tested with a normal ``python -m balancer.monitor.app_discovery``.
 """
 
 import os
+import re
 from dataclasses import dataclass, asdict
 from typing import Iterable, Optional
 
@@ -32,10 +33,9 @@ _DEFAULT_SHELL_TOOLS = frozenset({
     "mv", "cp", "rm", "ln", "mkdir", "rmdir", "touch", "chmod", "chown",
 })
 
-
 def _shell_tools() -> frozenset:
     """Resolve the shell-tool filter set from config, falling back to the
-    built-in default when `shell_tools` is unset/empty.  Read live so a config
+    built-in default when `shell_tools` is unset/empty. Read live so a config
     edit takes effect without a restart."""
     configured = getattr(b_config, "shell_tools", None)
     if configured:
@@ -43,11 +43,48 @@ def _shell_tools() -> frozenset:
     return _DEFAULT_SHELL_TOOLS
 
 
+# Language interpreters whose exe/argv0 is NOT the app identity — the real
+# program is the script/module carried in the cmdline (e.g. "python3 foo.py").
+# Treated like shells: their basename must never be written into
+# process_names/commandline, or pgrep -f would match every python/node/... on
+# the system.
+_INTERPRETERS = frozenset({
+    "python", "python2", "python3", "node", "nodejs",
+    "perl", "ruby", "java", "php", "lua", "rscript",
+})
+
+
+def _is_interpreter(name: str) -> bool:
+    """True for python / python3.12 / node / ... — version suffixes tolerated."""
+    n = (name or "").lower()
+    if n in _INTERPRETERS:
+        return True
+    # Strip a trailing version: "python3.12" -> "python", "ruby3.0" -> "ruby".
+    base = re.split(r"\d", n, 1)[0]
+    return bool(base) and base in _INTERPRETERS
+
+
+def _script_from_cmdline(tokens: list[str]) -> str:
+    """Basename of the first non-flag cmdline arg after argv0.
+
+    For interpreter/shell launches this is the real program identity:
+    ``python3 /usr/bin/unattended-upgrade`` -> ``unattended-upgrade``.
+    Returns "" when the cmdline is only flags (e.g. an interactive shell).
+    """
+    for tok in (tokens or [])[1:]:
+        t = (tok or "").strip()
+        if not t or t.startswith("-"):
+            continue
+        return os.path.basename(t)
+    return ""
+
+
 @dataclass
 class Candidate:
     """A single /proc entry that matched the user's keywords."""
     pid: int
     comm: str            # /proc/<pid>/comm — same 15-byte truncation BPF reports
+    process_name: str    # backend-derived user-facing program name
     exe: str             # readlink /proc/<pid>/exe (full path, may be empty)
     cmdline: str         # nul-joined cmdline, rendered with spaces
     cgroup_unit: str     # systemd unit/scope from /proc/<pid>/cgroup, or ""
@@ -60,6 +97,7 @@ class ExtractResult:
     bpf_name: list[str]
     process_names: list[str]
     commandline: list[str]
+    cgroup_ids: list[str]
     id_suggestion: str   # systemd unit if all PIDs share one, else ""
 
 
@@ -82,6 +120,7 @@ def _read_proc(pid: int) -> Optional[dict]:
     # /proc cmdline is nul-separated; argv[0] is everything up to the first nul.
     cmdline_argv0 = cmdline_raw.split("\x00", 1)[0] if cmdline_raw else ""
     cmdline_pretty = cmdline_raw.replace("\x00", " ").strip()
+    cmdline_tokens = [t for t in cmdline_raw.split("\x00") if t] if cmdline_raw else []
 
     try:
         exe = os.readlink(f"{base}/exe")
@@ -108,6 +147,7 @@ def _read_proc(pid: int) -> Optional[dict]:
         "exe": exe,
         "cmdline_argv0": cmdline_argv0,
         "cmdline_pretty": cmdline_pretty,
+        "cmdline_tokens": cmdline_tokens,
         "ppid": ppid,
         "cgroup_unit": cgroup_unit,
     }
@@ -193,6 +233,25 @@ def _score(info: dict) -> int:
     return score
 
 
+def _derive_process_name(info: dict) -> str:
+    """Derive the program identity from a /proc snapshot.
+
+    Uses the same rules as ``extract_fields`` so search-table display and the
+    later committed ``process_names`` stay consistent.
+    """
+    comm = (info.get("comm") or "").strip()
+    exe_base = os.path.basename(info.get("exe") or "")
+    argv0 = (info.get("cmdline_argv0") or "").strip()
+    argv0_base = os.path.basename(argv0) if argv0 else ""
+
+    launcher = exe_base or argv0_base
+    is_wrapped = launcher.lower() in _shell_tools() or _is_interpreter(launcher)
+    if is_wrapped:
+        return _script_from_cmdline(info.get("cmdline_tokens") or []) or comm
+
+    return exe_base or comm
+
+
 def search_processes(
     keywords: Iterable[str],
     *,
@@ -237,6 +296,7 @@ def search_processes(
         results.append(Candidate(
             pid=pid,
             comm=comm,
+            process_name=_derive_process_name(info),
             exe=info["exe"],
             cmdline=info["cmdline_pretty"],
             cgroup_unit=info["cgroup_unit"],
@@ -300,26 +360,34 @@ def extract_fields(pids: Iterable[int], name: str = "") -> ExtractResult:
             continue
 
         comm = info["comm"].strip()
-        if comm and comm not in seen_comm:
-            bpf_name.append(comm)
-            seen_comm.add(comm)
+        # bpf_name mirrors the kernel comm — but when comm is itself an
+        # interpreter/shell (python3, bash, node, ...) it is not the app
+        # identity, so reuse the interpreter branch's extraction: the script
+        # basename from the cmdline, falling back to comm when unavailable.
+        if comm and (comm.lower() in _shell_tools() or _is_interpreter(comm)):
+            bpf_candidate = _script_from_cmdline(info["cmdline_tokens"]) or comm
+        else:
+            bpf_candidate = comm
+        if bpf_candidate and bpf_candidate not in seen_comm:
+            bpf_name.append(bpf_candidate)
+            seen_comm.add(bpf_candidate)
 
-        exe_base = os.path.basename(info["exe"]) if info["exe"] else ""
-        # When the exe is a shell, the *real* program identity is in comm
-        # (the kernel renames comm to the script name on shebang launch).
-        # Using exe_base would write "bash" or "sh" into process_names, which
-        # later causes get_app_processes() to pgrep-match every shell on the
-        # system and break per-app resource aggregation and OOM scoring.
-        if exe_base.lower() in _shell_tools():
-            exe_base = comm
-        if exe_base and exe_base not in seen_proc:
-            process_names.append(exe_base)
-            seen_proc.add(exe_base)
-
+        proc_name = _derive_process_name(info)
         argv0 = info["cmdline_argv0"].strip()
-        if argv0 and argv0 not in seen_cmd:
-            commandline.append(argv0)
-            seen_cmd.add(argv0)
+
+        # Capture the full command line (with args) for every launch style, so
+        # pgrep -f can pin the specific invocation and instance matching has the
+        # arguments to distinguish same-program-different-args launches.  argv0
+        # is only a last-resort fallback when cmdline is unavailable.
+        cmd_value = info["cmdline_pretty"].strip() or argv0
+
+        if proc_name and proc_name not in seen_proc:
+            process_names.append(proc_name)
+            seen_proc.add(proc_name)
+
+        if cmd_value and cmd_value not in seen_cmd:
+            commandline.append(cmd_value)
+            seen_cmd.add(cmd_value)
 
         if info["cgroup_unit"]:
             units.add(info["cgroup_unit"])
@@ -339,6 +407,7 @@ def extract_fields(pids: Iterable[int], name: str = "") -> ExtractResult:
         bpf_name=sorted(bpf_name),
         process_names=sorted(process_names),
         commandline=sorted(commandline),
+        cgroup_ids=sorted(units),
         id_suggestion=id_suggestion,
     )
 

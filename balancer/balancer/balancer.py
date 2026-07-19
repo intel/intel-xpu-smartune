@@ -3,6 +3,7 @@
 
 import json
 import os, signal, subprocess, time
+import psutil
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Union
 
@@ -55,6 +56,7 @@ class LimitedApp:
     state: Optional[str] = None
     cgroups: list = field(default_factory=list)
     pids: set = field(default_factory=set)
+    limited_at: float = 0.0                   # epoch seconds when the limit was applied
 
 
 class LimitRegistry:
@@ -895,6 +897,7 @@ class DynamicBalancer:
                 state=None,
                 cgroups=[app_id] + list(extra_cgroup_ids),
                 pids=set(target.get('pids') or []),
+                limited_at=time.time(),
             )
 
             if is_controlled:
@@ -1213,6 +1216,7 @@ class DynamicBalancer:
                 state=None,  # None indicates fully limited
                 cgroups=[app_id] + list(extra_cgroup_ids),
                 pids=set(target_app.get('pids') or []),
+                limited_at=time.time(),
             )
 
             if is_controlled:
@@ -1496,11 +1500,19 @@ class DynamicBalancer:
             restore_success = False
 
         if notify and restore_success:
-            app_utils.update_app_status(entry.public_app_id, "running")
+            # Recompute runtime state instead of forcing "stopped": when one
+            # limited instance exits, other instances of the same app may
+            # still be running and should keep the Limit button available.
+            next_status = app_utils.check_app_running_status(
+                entry.public_app_id,
+                app_name,
+                "",
+            )
+            app_utils.update_app_status(entry.public_app_id, next_status)
             app_utils.callback_manager.send_callback_notification({
                 'app_id': entry.public_app_id,
                 'app_name': app_name,
-                'status': "running",
+                'status': next_status,
                 'purpose': "app"
             }, False)
             # Tell the UI the app closed and we lifted its (now-stale) limit.
@@ -1556,11 +1568,11 @@ class DynamicBalancer:
     _FATAL_PENDING_SIGNALS = frozenset({2, 9, 15})  # SIGINT, SIGKILL, SIGTERM
 
     def _pid_gone_or_dying(self, pid: int) -> bool:
-        """True if *pid* is dead, a zombie, or stuck in 'D' with a pending fatal
-        signal. The last case is a task that was asked to die but cannot receive
-        the signal because our own throttle is pinning it in uninterruptible
-        sleep; counting it as gone lets the reaper restore and unblock it. A
-        healthy busy app never carries a pending kill signal.
+        """True if *pid* is dead, a zombie, or has a pending fatal signal.
+
+        We treat a pending SIGINT/SIGTERM/SIGKILL as "dying" even before the
+        task falls into 'D': this lets the reaper lift manual limits quickly so
+        Ctrl+C exits are not delayed by strict throttles.
         """
         try:
             with open(f"/proc/{pid}/status") as f:
@@ -1576,22 +1588,23 @@ class DynamicBalancer:
                 key, _, value = line.partition(":")
                 fields[key] = value.strip()
 
+        pending = 0
+        for key in ("ShdPnd", "SigPnd"):
+            try:
+                pending |= int(fields.get(key, "0").split()[0], 16)
+            except (ValueError, IndexError):
+                pass
+
+        fatal_mask = 0
+        for sig in self._FATAL_PENDING_SIGNALS:
+            fatal_mask |= 1 << (sig - 1)
+
         state = (fields.get("State", "") or " ")[0]
         if state == 'Z':
             return True
-        if state == 'D':
-            pending = 0
-            for key in ("ShdPnd", "SigPnd"):
-                try:
-                    pending |= int(fields.get(key, "0").split()[0], 16)
-                except (ValueError, IndexError):
-                    pass
-            fatal_mask = 0
-            for sig in self._FATAL_PENDING_SIGNALS:
-                fatal_mask |= 1 << (sig - 1)
-            if pending & fatal_mask:
-                logger.info(f"PID {pid} stuck in 'D' with a pending fatal signal; treating as gone")
-                return True
+        if pending & fatal_mask:
+            logger.info(f"PID {pid} has a pending fatal signal; treating as gone")
+            return True
         return False
 
     def _is_app_closed(self, entry: "LimitedApp") -> bool:
@@ -1601,23 +1614,16 @@ class DynamicBalancer:
         share its cgroup with other processes that keep it non-empty.
 
           * All snapshot PIDs gone or dying-but-pinned -> the app closed.
-          * Multi-cgroup app where any limited cgroup no longer has a live
-            snapshot PID -> the app is broken; lift the limit.
+
+        For multi-cgroup apps, a subset of PIDs/cgroups can naturally exit
+        earlier than others. We should keep the app in limited/running state
+        while at least one tracked PID is still alive.
 
         Callers must have already filtered out entries with no PID snapshot.
         """
         alive = [pid for pid in entry.pids if not self._pid_gone_or_dying(pid)]
         if not alive:
             return True
-
-        if len(entry.cgroups) > 1:
-            live_cgroups = set()
-            for pid in alive:
-                cg = app_utils.get_cgroup_path_by_pid(pid)
-                if cg:
-                    live_cgroups.add(os.path.basename(cg))
-            if set(entry.cgroups) - live_cgroups:
-                return True
 
         return False
 
@@ -1776,6 +1782,25 @@ class DynamicBalancer:
         process_names = app_utils._get_app_process_names(app_id=app_id, app_name=app_name) or []
         cgroup_paths = usage.get("cgroup_paths") or ([usage.get("cgroup_path")] if usage.get("cgroup_path") else [])
         cgroup_ids = [os.path.basename(path) for path in cgroup_paths if path]
+        target_processes = []
+        seen_pids = set()
+        for pid in usage.get("pids", []) or []:
+            try:
+                pid_i = int(pid)
+            except (TypeError, ValueError):
+                continue
+            if pid_i in seen_pids:
+                continue
+            seen_pids.add(pid_i)
+            try:
+                pname = psutil.Process(pid_i).name()
+            except Exception:
+                pname = ""
+            target_processes.append({
+                "pid": pid_i,
+                "name": pname,
+            })
+        target_processes.sort(key=lambda x: x["pid"])
 
         disk_policy = (self.config.limit_policy or {}).get('disk_io', {}) if hasattr(self.config, 'limit_policy') else {}
         disk_rates_cfg = disk_policy.get('rate', {}) if isinstance(disk_policy, dict) else {}
@@ -1827,6 +1852,7 @@ class DynamicBalancer:
             },
             "process_names": process_names,
             "cgroup_ids": sorted(set(cgroup_ids)),
+            "target_processes": target_processes,
         }
 
     def get_limited_rates(
@@ -1907,9 +1933,15 @@ class DynamicBalancer:
             app_id: str,
             app_name: str,
             priority: str = None,
-            limit_overrides: Optional[Dict[str, Any]] = None
+            limit_overrides: Optional[Dict[str, Any]] = None,
+            target_cgroups: Optional[list[str]] = None,
     ) -> bool:
-        """Set resource limits for an application (balanced policy)."""
+        """Set resource limits for an application (balanced policy).
+
+        ``target_cgroups`` optionally restricts the limit to a subset of the
+        app's currently-running instances (by cgroup basename).  When omitted
+        or empty, every cgroup the app currently occupies is limited.
+        """
         priority = priority or "undefined"
         if isinstance(limit_overrides, dict):
             try:
@@ -1934,8 +1966,40 @@ class DynamicBalancer:
         if not effective_app_ids:
             logger.warning(f"Could not determine cgroup path for {app_name} (ID: {app_id})")
             return False
+
+        # Restrict to the user-selected instances (by cgroup basename) when
+        # provided. The dashboard defaults to "all instances", so target_cgroups
+        # is only a subset when the user unticked some rows.
+        if target_cgroups:
+            wanted = {os.path.basename(str(c)) for c in target_cgroups if str(c).strip()}
+            selected = [e for e in effective_app_ids if e in wanted]
+            if not selected:
+                reason = (
+                    f"None of the selected instances of {app_name} are still running; "
+                    "nothing to limit. Please refresh and try again."
+                )
+                logger.warning(reason)
+                return {"skipped": reason}
+            effective_app_ids = selected
+
         effective_app_id = effective_app_ids[0]   # primary (lexicographically smallest cgroup)
         extra_effective_ids = effective_app_ids[1:]
+
+        # Snapshot only PIDs that belong to the selected effective cgroups.
+        # This drives per-row limit-status rendering in the dashboard; if we
+        # keep all app PIDs here, unselected instances can be incorrectly
+        # shown as Limited.
+        selected_effective_set = set([effective_app_id] + list(extra_effective_ids))
+        selected_scope_pids: set[int] = set()
+        for raw_pid in (usage.get('pids') or []):
+            try:
+                pid_i = int(raw_pid)
+            except (TypeError, ValueError):
+                continue
+            cg_path = app_utils.get_cgroup_path_by_pid(pid_i)
+            cg_leaf = os.path.basename((cg_path or '').rstrip('/')) if cg_path else ''
+            if cg_leaf in selected_effective_set:
+                selected_scope_pids.add(pid_i)
 
         raw_cpu_percent = usage.get("cpu_percent", 0)
         mem_current = usage.get("mem_current", 0) + usage.get("mem_swap_current", 0)  # RSS + swap = true working set
@@ -2085,7 +2149,8 @@ class DynamicBalancer:
                     limit_parts={'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
                     state=None,
                     cgroups=[effective_app_id] + list(extra_effective_ids),
-                    pids=set(usage.get('pids') or []),
+                    pids=selected_scope_pids,
+                    limited_at=time.time(),
                 )
                 app_utils.update_app_status(app_id, "a_limited")
                 app_utils.callback_manager.send_callback_notification({
@@ -2174,6 +2239,33 @@ class DynamicBalancer:
         finally:
             time.sleep(self.config.regular_update_sys_pressure_time)
             self.control_manager.set_limited_app_dominant(False)
+
+    def get_limit_snapshot(self, app_id: str) -> dict:
+        """Return a lightweight runtime snapshot for a limited app.
+
+        The snapshot is used by the dashboard to infer per-process limit scope
+        without introducing a separate event-history subsystem.
+        """
+        with self.all_limits.lock:
+            found = self.all_limits.by_public_id(app_id)
+            if found is None:
+                return {
+                    "limited": False,
+                    "source": None,
+                    "pids": [],
+                    "cgroups": [],
+                }
+
+            effective_app_id, entry = found
+            return {
+                "limited": True,
+                "effective_app_id": effective_app_id,
+                "source": entry.source,
+                "pids": sorted(int(pid) for pid in entry.pids),
+                "cgroups": list(entry.cgroups),
+                "limit_parts": dict(entry.limit_parts or {}),
+                "limited_at": entry.limited_at or None,
+            }
 
     def shutdown(self):
         """

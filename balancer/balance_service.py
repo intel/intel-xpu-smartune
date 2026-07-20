@@ -4,7 +4,6 @@
 import json
 import logging
 import os
-import hashlib
 import queue as _queue
 import signal
 import ssl
@@ -24,7 +23,7 @@ from monitor.monitor_api import (
     stop_dynamic_info_collector,
 )
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
-from smartune_api import smartune_bp, set_balancer_available
+from smartune_api import auth_bp, smartune_bp, set_balancer_available
 from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, get_priority_value
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
@@ -32,6 +31,7 @@ from utils.logger import logger
 app = Flask(__name__)
 app.register_blueprint(monitor_bp)
 app.register_blueprint(smartune_bp)
+app.register_blueprint(auth_bp)
 set_balancer_available(True)
 _start_snapshot_cleanup_task()
 
@@ -54,17 +54,6 @@ class DynamicService:
         # both use the same instance (including is_limited_app_dominant state).
         register_system_pressure_monitor(self.balancer.control_manager.system_pressure_monitor)
         self.rebuild_controlled_map()
-        self.secret_hash = self._generate_secret_hash()  # Generate and store the hash
-        logger.info("Service secret hash generated.")
-
-    def _generate_secret_hash(self):
-        """Generate a random number and hash it using SHA256."""
-        random_number = os.urandom(16)  # Generate a secure random number
-        return hashlib.sha256(random_number).hexdigest()
-
-    def get_secret_hash(self):
-        """Return the stored hash."""
-        return self.secret_hash
 
     def start(self):
         self.balancer.start()
@@ -164,42 +153,6 @@ def reset_app_status():
             logger.info(f"Reset {updated_count} app statuses to 'NA'")
     except Exception as e:
         logger.error(f"Failed to reset app statuses: {str(e)}")
-
-
-@app.route('/auth/login', methods=['POST'])
-def login():
-    """Validate the user-provided token against the stored hash."""
-    try:
-        data = request.get_json()
-        token = data.get('pwd')
-
-        if not token:
-            return construct_response(
-                data={"authenticated": False},
-                retcode=RetCode.ARGUMENT_ERROR,
-                retmsg="Token is required"
-            )
-
-        # Hash the provided token and compare it with the stored hash
-        hashed_token = hashlib.sha256(token.encode()).hexdigest()
-        if hashed_token == _service.get_secret_hash():
-            return construct_response(
-                data={"authenticated": True},
-                retmsg="Authentication successful"
-            )
-        else:
-            return construct_response(
-                data={"authenticated": False},
-                retmsg="Invalid token"
-            )
-    except Exception as e:
-        logger.error(f"Login failed: {str(e)}")
-        return construct_response(
-            data={"authenticated": False},
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
-
 
 
 @app.route('/app/get_apps', methods=['GET', 'POST'])

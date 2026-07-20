@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect } from 'react'
-import { Tabs, Layout, Typography, Space, Badge, Alert } from 'antd'
+import { Tabs, Layout, Typography, Space, Badge, Alert, Button } from 'antd'
 import {
   DashboardOutlined,
   AppstoreOutlined,
@@ -7,6 +7,7 @@ import {
   ControlOutlined,
   LineChartOutlined,
   InfoCircleOutlined,
+  LogoutOutlined,
 } from '@ant-design/icons'
 import SystemOverview from './components/SystemOverview'
 import AppResources from './components/AppResources'
@@ -14,8 +15,9 @@ import Processes from './components/Processes'
 import Balance from './components/Balance'
 import HistoryDashboard from './components/HistoryDashboard'
 import About from './components/About'
+import LoginGate from './components/LoginGate'
 import { COLORS } from './styles/theme'
-import { api } from './api/client'
+import { api, getToken, clearToken, setUnauthorizedHandler } from './api/client'
 import { GlobalConfigNoticesProvider, useGlobalConfigNotices } from './hooks/useGlobalConfigNotices'
 
 const { Header, Content } = Layout
@@ -50,12 +52,27 @@ export default function App() {
   const [balancerEnabled, setBalancerEnabled] = useState(true)
   // Set from the Processes tab's "Add to balancer" action; consumed by the Balance tab.
   const [registerKeyword, setRegisterKeyword] = useState<string | null>(null)
+  // Gate the whole app behind a valid access token. A stored token is assumed
+  // valid until the server rejects a request with 401 (handled below).
+  const [authed, setAuthed] = useState(() => !!getToken())
+
+  // Any 401 (expired/revoked/invalid token) drops us back to the login gate.
+  useEffect(() => {
+    setUnauthorizedHandler(() => setAuthed(false))
+    return () => setUnauthorizedHandler(null)
+  }, [])
 
   useEffect(() => {
+    if (!authed) return
     api
       .getCapabilities()
       .then((c) => setBalancerEnabled(c.capabilities === 1))
       .catch(() => setBalancerEnabled(true))
+  }, [authed])
+
+  const handleLogout = useCallback(() => {
+    clearToken()
+    setAuthed(false)
   }, [])
 
   // Publish the combined height of the sticky header + sticky tab bar as a CSS
@@ -176,6 +193,10 @@ export default function App() {
     },
   ]
 
+  if (!authed) {
+    return <LoginGate onAuthenticated={() => setAuthed(true)} />
+  }
+
   return (
     <GlobalConfigNoticesProvider>
       <Layout style={{ minHeight: '100vh', background: COLORS.bg }}>
@@ -218,6 +239,15 @@ export default function App() {
             <Typography.Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
               Dynamic
             </Typography.Text>
+            <Button
+              type="text"
+              size="small"
+              icon={<LogoutOutlined />}
+              onClick={handleLogout}
+              style={{ color: COLORS.textMuted, marginLeft: 8 }}
+            >
+              Sign out
+            </Button>
           </div>
         </Header>
 

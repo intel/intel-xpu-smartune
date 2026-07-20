@@ -33,7 +33,7 @@ from monitor.monitor_api import (
     stop_dynamic_info_collector,
 )
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
-from smartune_api import smartune_bp
+from smartune_api import auth_bp, smartune_bp
 from utils.logger import logger
 
 app = Flask(__name__)
@@ -41,6 +41,9 @@ app.register_blueprint(monitor_bp)
 # smartune_bp reports capabilities. The balancer-available flag stays False here,
 # so /smartune/capabilities returns 0 (monitor only).
 app.register_blueprint(smartune_bp)
+# auth_bp enforces the access token app-wide (before_app_request) and serves
+# /auth/login, so the monitor-only deployment is protected too.
+app.register_blueprint(auth_bp)
 _start_snapshot_cleanup_task()
 
 _KEY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "key")

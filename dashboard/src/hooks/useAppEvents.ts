@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useEffect, useRef } from 'react'
+import { appEventsUrl } from '../api/client'
 
 export interface AppStatusEvent {
   app_id: string
@@ -33,7 +34,7 @@ export function useAppEvents(onEvent: EventCallback, enabled = true) {
 
     function connect() {
       if (closed) return
-      es = new EventSource('/api/app/events')
+      es = new EventSource(appEventsUrl())
 
       es.onmessage = (e) => {
         try {

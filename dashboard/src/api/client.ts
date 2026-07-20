@@ -40,6 +40,78 @@ const client = axios.create({
   headers: { 'Content-Type': 'application/json' },
 })
 
+// --- Access token ---------------------------------------------------------
+// The server (balancer + monitor) enforces an X-Auth-Token on every endpoint.
+// We keep the token the operator handed the user in localStorage, attach it to
+// every request, and expose helpers for the login gate and SSE stream.
+const TOKEN_STORAGE_KEY = 'smartune_api_token'
+const AUTH_HEADER = 'X-Auth-Token'
+
+export function getToken(): string | null {
+  return localStorage.getItem(TOKEN_STORAGE_KEY)
+}
+
+export function setToken(token: string): void {
+  localStorage.setItem(TOKEN_STORAGE_KEY, token)
+}
+
+export function clearToken(): void {
+  localStorage.removeItem(TOKEN_STORAGE_KEY)
+}
+
+// Registered by App so a 401 anywhere can bounce the user back to the login gate.
+let onUnauthorized: (() => void) | null = null
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  onUnauthorized = handler
+}
+
+// Attach the token to every outgoing request.
+client.interceptors.request.use((config) => {
+  const token = getToken()
+  if (token) {
+    config.headers = config.headers ?? {}
+    ;(config.headers as Record<string, string>)[AUTH_HEADER] = token
+  }
+  return config
+})
+
+// A 401 means the token is missing/invalid/revoked: drop it and prompt re-login.
+client.interceptors.response.use(
+  (res) => res,
+  (error) => {
+    if (error?.response?.status === 401) {
+      clearToken()
+      onUnauthorized?.()
+    }
+    return Promise.reject(error)
+  },
+)
+
+/**
+ * Validate a token against the server via /auth/login. On success the token is
+ * persisted so subsequent requests carry it. The login endpoint itself is
+ * exempt from the token gate, so this can run before any token is stored.
+ */
+export async function login(token: string): Promise<boolean> {
+  const res = await client.post<ApiResponse<{ authenticated: boolean }>>(
+    '/auth/login',
+    { pwd: token },
+    { headers: { [AUTH_HEADER]: token } },
+  )
+  const ok = res.data.retcode === 0 && res.data.data?.authenticated === true
+  if (ok) setToken(token)
+  return ok
+}
+
+/**
+ * URL for the SSE stream with the token in the query string. EventSource cannot
+ * set custom headers, so the server also accepts the token via ?token= for it.
+ */
+export function appEventsUrl(): string {
+  const token = getToken()
+  return token ? `/api/app/events?token=${encodeURIComponent(token)}` : '/api/app/events'
+}
+
 async function get<T>(url: string): Promise<T> {
   const res = await client.get<ApiResponse<T>>(url)
   if (res.data.retcode !== 0) throw new Error(res.data.retmsg)

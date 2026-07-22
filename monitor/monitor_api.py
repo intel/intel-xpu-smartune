@@ -310,7 +310,40 @@ _CONFIG_TS_KEYS = {
     "retention":                "retention_updated_at",
     "passive_resource_control": "passive_resource_control_updated_at",
     "monitored_sections":       "monitored_sections_updated_at",
+    "system_pressure":          "system_pressure_updated_at",
+    "disk_pressure":            "disk_pressure_updated_at",
+    "limit_policy":             "limit_policy_updated_at",
 }
+
+_CONFIG_CONFLICT_MSG = "Configuration was modified by another client; please reload."
+
+
+def _check_config_conflict(section: str, expected_raw: Any, build_current):
+    """Shared optimistic-concurrency gate for config POST handlers.
+
+    Returns a ready-to-send conflict/error Response, or ``None`` when the write
+    may proceed.  ``build_current`` is a zero-arg callable returning the payload
+    describing the current server state (embedded under ``current`` on conflict).
+    """
+    expected_ts = _coerce_expected_ts(expected_raw)
+    if expected_ts == -1:
+        return construct_response(
+            data={"success": False},
+            retcode=RetCode.ARGUMENT_ERROR,
+            retmsg="expected_updated_at must be an integer",
+        )
+    current_ts = _get_config_updated_at(section)
+    conflict = (expected_ts is None and current_ts != 0) or (
+        expected_ts is not None and expected_ts != current_ts
+    )
+    if conflict:
+        logger.info("%s conflict: expected=%s current=%d", section, expected_ts, current_ts)
+        return construct_response(
+            data={"success": False, "current": build_current()},
+            retcode=RetCode.CONFLICT,
+            retmsg=_CONFIG_CONFLICT_MSG,
+        )
+    return None
 
 
 _MONITORED_SECTIONS_SNAPSHOT_KEY = "monitored_sections_snapshot"
@@ -1420,7 +1453,7 @@ def update_weights_top():
         if not isinstance(data, dict):
             return construct_response(
                 data={"success": False},
-                retcode=RetCode.PARAM_ERROR,
+                retcode=RetCode.ARGUMENT_ERROR,
                 retmsg="Request body must be a JSON object"
             )
 
@@ -1434,20 +1467,20 @@ def update_weights_top():
                     if updates[key] < 0:
                         return construct_response(
                             data={"success": False},
-                            retcode=RetCode.PARAM_ERROR,
+                            retcode=RetCode.ARGUMENT_ERROR,
                             retmsg=f"Weight for {key} must be non-negative"
                         )
                 except (TypeError, ValueError):
                     return construct_response(
                         data={"success": False},
-                        retcode=RetCode.PARAM_ERROR,
+                        retcode=RetCode.ARGUMENT_ERROR,
                         retmsg=f"Invalid value for {key}, must be an integer"
                     )
 
         if not updates:
             return construct_response(
                 data={"success": False},
-                retcode=RetCode.PARAM_ERROR,
+                retcode=RetCode.ARGUMENT_ERROR,
                 retmsg="No valid weight updates provided"
             )
 
@@ -1575,6 +1608,131 @@ def get_monitored_sections_config():
         )
 
 
+@monitor_bp.route('/config/monitored_sections', methods=['POST'])
+def update_monitored_sections_config():
+    """Update the dynamic-info monitored sections with optimistic concurrency.
+
+    Body: ``{ "sections": [...], "expected_updated_at": <int> }``.  An empty
+    list is accepted and means "pure on-demand" (no background collector).
+    Unknown section names are rejected.  On success the effective set changes
+    and the change-driven updated_at advances.
+    """
+    try:
+        from config.config import b_config
+
+        data = request.get_json()
+        if not isinstance(data, dict):
+            return construct_response(
+                data={"success": False},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="Request body must be a JSON object"
+            )
+
+        raw_sections = data.get("sections")
+        if not isinstance(raw_sections, list):
+            return construct_response(
+                data={"success": False},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="sections must be a list"
+            )
+
+        valid = list(DYNAMIC_INFO_SECTIONS)
+        seen = set()
+        for item in raw_sections:
+            name = str(item).strip().lower()
+            if name not in valid:
+                return construct_response(
+                    data={"success": False},
+                    retcode=RetCode.ARGUMENT_ERROR,
+                    retmsg=f"Unknown section '{item}'. Valid sections: {', '.join(valid)}"
+                )
+            seen.add(name)
+        # Persist in canonical order regardless of the order the client sent.
+        normalized = [name for name in valid if name in seen]
+
+        client_addr = request.remote_addr
+        expected_ts = _coerce_expected_ts(data.get("expected_updated_at"))
+        if expected_ts == -1:
+            return construct_response(
+                data={"success": False},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="expected_updated_at must be an integer"
+            )
+        current_ts = _get_monitored_sections_updated_at()
+
+        def _conflict_payload() -> Dict[str, Any]:
+            raw = b_config.monitored_sections
+            return {
+                "success": False,
+                "current": {
+                    "sections": _get_monitored_sections(),
+                    "configured_sections": list(raw) if isinstance(raw, list) else None,
+                    "all_sections": valid,
+                    "updated_at": current_ts,
+                },
+            }
+
+        if expected_ts is None:
+            if current_ts != 0:
+                logger.info(
+                    "monitored_sections conflict (no expected_updated_at) from %s; current_ts=%d",
+                    client_addr, current_ts,
+                )
+                return construct_response(
+                    data=_conflict_payload(),
+                    retcode=RetCode.CONFLICT,
+                    retmsg="Configuration was modified by another client; please reload."
+                )
+        elif expected_ts != current_ts:
+            logger.info(
+                "monitored_sections conflict from %s: expected=%d current=%d",
+                client_addr, expected_ts, current_ts,
+            )
+            return construct_response(
+                data=_conflict_payload(),
+                retcode=RetCode.CONFLICT,
+                retmsg="Configuration was modified by another client; please reload."
+            )
+
+        logger.info("Updating monitored_sections from %s: %s (expected_ts=%s)",
+                    client_addr, normalized, expected_ts)
+        if not b_config.set_monitored_sections(normalized):
+            return construct_response(
+                data={"success": False},
+                retcode=RetCode.OPERATING_ERROR,
+                retmsg="Failed to persist monitored_sections (unsupported config layout?)"
+            )
+
+        # (Re)start the background collector if there is now something to
+        # monitor; idempotent and a no-op when the new set is empty.
+        _start_dynamic_info_auto_refresh()
+
+        new_ts = _get_monitored_sections_updated_at()
+        raw = b_config.monitored_sections
+        logger.info(
+            "monitored_sections accepted from %s: %s -> updated_at=%d",
+            client_addr, normalized, new_ts,
+        )
+        return construct_response(
+            data={
+                "success": True,
+                "sections": _get_monitored_sections(),
+                "configured_sections": list(raw) if isinstance(raw, list) else None,
+                "all_sections": valid,
+                "updated_at": new_ts,
+            },
+            retmsg="Successfully updated monitored_sections configuration"
+        )
+
+    except Exception as e:
+        logger.error(f"update_monitored_sections_config failed: {str(e)}")
+        return construct_response(
+            data={"success": False},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
 @monitor_bp.route('/config/passive_control', methods=['POST'])
 def update_passive_control():
     """Toggle the passive resource-control switch with optimistic concurrency."""
@@ -1585,14 +1743,14 @@ def update_passive_control():
         if not isinstance(data, dict):
             return construct_response(
                 data={"success": False},
-                retcode=RetCode.PARAM_ERROR,
+                retcode=RetCode.ARGUMENT_ERROR,
                 retmsg="Request body must be a JSON object"
             )
 
         if "enabled" not in data:
             return construct_response(
                 data={"success": False},
-                retcode=RetCode.PARAM_ERROR,
+                retcode=RetCode.ARGUMENT_ERROR,
                 retmsg="enabled is required"
             )
         # Accept native bools and the common string forms used by some clients.
@@ -1607,7 +1765,7 @@ def update_passive_control():
             except (TypeError, ValueError):
                 return construct_response(
                     data={"success": False},
-                    retcode=RetCode.PARAM_ERROR,
+                    retcode=RetCode.ARGUMENT_ERROR,
                     retmsg="enabled must be a boolean"
                 )
 
@@ -1678,3 +1836,267 @@ def update_passive_control():
             retcode=RetCode.EXCEPTION_ERROR,
             retmsg=str(e)
         )
+
+# ---------------------------------------------------------------------------
+# Generic auto-control config get/set.
+#
+# thresholds / weights / pressure_detection / collection / limit_policy are all
+# "read a config group, validate, persist" operations, so they share ONE
+# parametrized endpoint instead of five near-duplicate ones.  Each section
+# contributes a small spec (get / validate / write); the route handles the
+# common optimistic-concurrency check and response envelope.  The pre-existing
+# static routes (weights_top, passive_control, monitored_sections, retention)
+# keep their dedicated handlers and take priority over this dynamic route.
+# ---------------------------------------------------------------------------
+_LIMIT_POLICY_MODES = ("combined", "separated")
+_LIMIT_PRIORITIES = ("high", "medium", "low", "undefined")
+_DISK_RATE_FIELDS = ("write", "read", "write_iops", "read_iops")
+_THRESHOLD_KEYS = ("low", "medium", "high", "critical")
+_PSI_WEIGHT_KEYS = ("cpu", "memory", "io")
+
+
+def _cfg():
+    """Fetch the live global config (local import matches the rest of this module)."""
+    from config.config import b_config
+    return b_config
+
+
+# --- system_pressure: update interval + level cut-offs + weights + factor -----
+def _get_system_pressure():
+    cfg = _cfg()
+    return {
+        "regular_update_sys_pressure_time": getattr(cfg, "regular_update_sys_pressure_time", 5),
+        "thresholds": dict(cfg.thresholds or {}),
+        "weights": dict(cfg.weights or {}),
+        "dominant_app_reduce_factor": getattr(cfg, "dominant_app_reduce_factor", None),
+    }
+
+
+def _validate_system_pressure(body):
+    updates = {}
+
+    if body.get("regular_update_sys_pressure_time") is not None:
+        interval = float(body["regular_update_sys_pressure_time"])
+        if not (1 <= interval <= 3600):
+            raise ValueError("regular_update_sys_pressure_time must be within [1, 3600] seconds")
+        updates["regular_update_sys_pressure_time"] = interval
+
+    th_body = body.get("thresholds")
+    if isinstance(th_body, dict):
+        th = {}
+        for key in _THRESHOLD_KEYS:
+            if key in th_body and th_body[key] is not None:
+                val = float(th_body[key])
+                if not (0 < val <= 1):
+                    raise ValueError(f"threshold {key} must be within (0, 1]")
+                th[key] = val
+        if th:
+            merged = {**(_cfg().thresholds or {}), **th}
+            ordered = [merged[k] for k in _THRESHOLD_KEYS if merged.get(k) is not None]
+            if ordered != sorted(ordered):
+                raise ValueError("thresholds must be ordered low <= medium <= high <= critical")
+            updates["thresholds"] = th
+
+    w_body = body.get("weights")
+    if isinstance(w_body, dict):
+        w = {}
+        for key in _PSI_WEIGHT_KEYS:
+            if key in w_body and w_body[key] is not None:
+                val = int(w_body[key])
+                if val < 0:
+                    raise ValueError(f"{key} weight must be non-negative")
+                w[key] = val
+        if w:
+            updates["weights"] = w
+
+    if body.get("dominant_app_reduce_factor") is not None:
+        val = float(body["dominant_app_reduce_factor"])
+        if not (1 <= val <= 100):
+            raise ValueError("dominant_app_reduce_factor must be within [1, 100]")
+        updates["dominant_app_reduce_factor"] = val
+
+    if not updates:
+        raise ValueError("No valid system_pressure updates provided")
+    return updates
+
+
+def _write_system_pressure(updates):
+    cfg = _cfg()
+    if "thresholds" in updates:
+        cfg.update_config_section("thresholds", updates["thresholds"])
+    if "weights" in updates:
+        cfg.update_config_section("weights", updates["weights"])
+    scalars = {k: updates[k] for k in ("dominant_app_reduce_factor", "regular_update_sys_pressure_time") if k in updates}
+    if scalars:
+        cfg.update_top_level_scalars(scalars)
+    return True
+
+
+# --- disk_pressure: disk utilisation threshold -------------------------------
+# (iowait / throughput thresholds stay config-only; see is_disk_io_stressed)
+def _get_disk_pressure():
+    return {"disk_utilization_threshold": getattr(_cfg(), "disk_utilization_threshold", None)}
+
+
+def _validate_disk_pressure(body):
+    key = "disk_utilization_threshold"
+    if key not in body or body[key] is None:
+        raise ValueError(f"{key} is required")
+    val = float(body[key])
+    if not (0 <= val <= 100):
+        raise ValueError(f"{key} must be within [0, 100]")
+    return {key: val}
+
+
+# --- limit_policy: full nested policy + per-resource enable/rate --------------
+def _limit_policy_snapshot():
+    """Full limit_policy view (policy + per-resource enabled/rate)."""
+    lp = _cfg().limit_policy or {}
+
+    def _res(name):
+        cfg = lp.get(name) or {}
+        return {"enabled": bool(cfg.get("enabled", True)), "rate": dict(cfg.get("rate") or {})}
+
+    return {
+        "policy": lp.get("policy", "combined"),
+        "cpu": _res("cpu"),
+        "memory": _res("memory"),
+        "disk_io": _res("disk_io"),
+    }
+
+
+def _validate_limit_policy(body):
+    """Validate a (partial) nested limit_policy update from the UI."""
+    updates = {}
+
+    if "policy" in body:
+        policy = str(body["policy"]).strip().lower()
+        if policy not in _LIMIT_POLICY_MODES:
+            raise ValueError(f"policy must be one of {', '.join(_LIMIT_POLICY_MODES)}")
+        updates["policy"] = policy
+
+    for res in ("cpu", "memory"):
+        res_body = body.get(res)
+        if not isinstance(res_body, dict):
+            continue
+        res_upd = {}
+        if "enabled" in res_body:
+            res_upd["enabled"] = bool(res_body["enabled"])
+        if isinstance(res_body.get("rate"), dict):
+            rate = {}
+            for pri in _LIMIT_PRIORITIES:
+                if res_body["rate"].get(pri) is not None:
+                    val = float(res_body["rate"][pri])
+                    if not (0 < val <= 1):
+                        raise ValueError(f"{res} {pri} rate must be within (0, 1]")
+                    rate[pri] = val
+            if rate:
+                res_upd["rate"] = rate
+        if res_upd:
+            updates[res] = res_upd
+
+    disk_body = body.get("disk_io")
+    if isinstance(disk_body, dict):
+        disk_upd = {}
+        if "enabled" in disk_body:
+            disk_upd["enabled"] = bool(disk_body["enabled"])
+        if isinstance(disk_body.get("rate"), dict):
+            rate = {}
+            for pri in _LIMIT_PRIORITIES:
+                fields_body = disk_body["rate"].get(pri)
+                if not isinstance(fields_body, dict):
+                    continue
+                fields = {}
+                for key in _DISK_RATE_FIELDS:
+                    if fields_body.get(key) is not None:
+                        ival = int(float(fields_body[key]))
+                        if ival < 1:
+                            raise ValueError(f"disk_io {pri} {key} must be >= 1")
+                        fields[key] = ival
+                if fields:
+                    rate[pri] = fields
+            if rate:
+                disk_upd["rate"] = rate
+        if disk_upd:
+            updates["disk_io"] = disk_upd
+
+    if not updates:
+        raise ValueError("No valid limit_policy updates provided")
+    return updates
+
+
+# section -> {get: ()->dict, validate: (body)->updates, write: (updates)->bool}
+_CONFIG_SPECS = {
+    "system_pressure": {
+        "get": _get_system_pressure,
+        "validate": _validate_system_pressure,
+        "write": _write_system_pressure,
+    },
+    "disk_pressure": {
+        "get": _get_disk_pressure,
+        "validate": _validate_disk_pressure,
+        "write": lambda u: _cfg().update_top_level_scalars(u),
+    },
+    "limit_policy": {
+        "get": _limit_policy_snapshot,
+        "validate": _validate_limit_policy,
+        "write": lambda u: _cfg().set_limit_policy(u),
+    },
+}
+
+
+@monitor_bp.route('/config/<section>', methods=['GET'])
+def get_config_section(section):
+    """Get one auto-control config group (see _CONFIG_SPECS)."""
+    try:
+        spec = _CONFIG_SPECS.get(section)
+        if spec is None:
+            return construct_response(
+                data={}, retcode=RetCode.ARGUMENT_ERROR,
+                retmsg=f"Unknown config section '{section}'. Valid: {', '.join(_CONFIG_SPECS)}")
+        data = dict(spec["get"]())
+        data["updated_at"] = _get_config_updated_at(section)
+        return construct_response(data=data, retmsg=f"Successfully retrieved {section} configuration")
+    except Exception as e:
+        logger.error(f"get_config_section({section}) failed: {str(e)}")
+        return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
+
+
+@monitor_bp.route('/config/<section>', methods=['POST'])
+def update_config_generic(section):
+    """Update one auto-control config group with optimistic concurrency."""
+    try:
+        spec = _CONFIG_SPECS.get(section)
+        if spec is None:
+            return construct_response(
+                data={"success": False}, retcode=RetCode.ARGUMENT_ERROR,
+                retmsg=f"Unknown config section '{section}'. Valid: {', '.join(_CONFIG_SPECS)}")
+
+        body = request.get_json()
+        if not isinstance(body, dict):
+            return construct_response(data={"success": False}, retcode=RetCode.ARGUMENT_ERROR,
+                                      retmsg="Request body must be a JSON object")
+        try:
+            updates = spec["validate"](body)
+        except (ValueError, TypeError) as ve:
+            return construct_response(data={"success": False}, retcode=RetCode.ARGUMENT_ERROR, retmsg=str(ve))
+
+        def _current():
+            cur = dict(spec["get"]())
+            cur["updated_at"] = _get_config_updated_at(section)
+            return cur
+
+        conflict = _check_config_conflict(section, body.get("expected_updated_at"), _current)
+        if conflict:
+            return conflict
+
+        logger.info("Updating config '%s' from %s: %s", section, request.remote_addr, updates)
+        spec["write"](updates)
+        new_ts = _bump_config_updated_at(section)
+        data = dict(spec["get"]())
+        data["updated_at"] = new_ts
+        data["success"] = True
+        return construct_response(data=data, retmsg=f"Successfully updated {section} configuration")
+    except Exception as e:
+        logger.error(f"update_config_generic({section}) failed: {str(e)}")
+        return construct_response(data={"success": False}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))

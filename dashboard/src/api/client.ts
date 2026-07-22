@@ -298,10 +298,32 @@ export const api = {
 
   getPassiveControl: () => get<PassiveControlData>('/monitor/config/passive_control'),
   getMonitoredSections: () => get<MonitoredSectionsData>('/monitor/config/monitored_sections'),
+  updateMonitoredSections: (sections: string[], expectedUpdatedAt?: number) =>
+    postWithConflict<{
+      success: boolean
+      sections: string[]
+      configured_sections: string[] | null
+      all_sections: string[]
+      updated_at: number
+    }>('/monitor/config/monitored_sections', { sections, expected_updated_at: expectedUpdatedAt }),
   updatePassiveControl: (enabled: boolean, expectedUpdatedAt?: number) =>
     postWithConflict<{
       success: boolean
       enabled: boolean
       updated_at: number
     }>('/monitor/config/passive_control', { enabled, expected_updated_at: expectedUpdatedAt }),
+
+  // Generic auto-control config get/set (thresholds, weights, pressure_detection,
+  // collection, limit_policy).  These share one parametrized backend endpoint;
+  // the section-specific shapes are provided by the caller via the type param.
+  getConfig: <T>(section: string) => get<T>(`/monitor/config/${section}`),
+  updateConfig: <T extends { updated_at?: number }>(
+    section: string,
+    values: Record<string, unknown>,
+    expectedUpdatedAt?: number,
+  ) =>
+    postWithConflict<T & { success: boolean; updated_at: number }>(
+      `/monitor/config/${section}`,
+      { ...values, expected_updated_at: expectedUpdatedAt },
+    ),
 }

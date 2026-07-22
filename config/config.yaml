@@ -58,6 +58,18 @@ blacklist: [
   packagekit, ibus-, fcitx, at-spi-, pipewire, pulseaudio, wireplumber,
   networkmanager, modemmanager, wpa_supplicant, avahi, cron, rsyslog, logind,
 ]
+# Shells / tiny tools that are never the "app" a user wants to monitor. Used by
+# the Add-App wizard to skip these when scanning /proc and when deriving
+# process_names. Not exposed in the UI. If unset/empty a built-in default set is used.
+shell_tools: [
+  bash, sh, dash, zsh, fish, tcsh,
+  sudo, su, env, which, getent,
+  cat, head, tail, ls, find, xargs,
+  grep, sed, awk, cut, sort, uniq, wc, tr, tee,
+  ps, top, pgrep, pkill,
+  true, false, sleep, kill,
+  mv, cp, rm, ln, mkdir, rmdir, touch, chmod, chown,
+]
 cooldown_time: 15 # Cooldown period (seconds) to avoid frequent notifications
 regular_update_sys_pressure_time: 5
 monitor_idle_check_interval: 10  # Pressure check interval (seconds) when the balancer is idle

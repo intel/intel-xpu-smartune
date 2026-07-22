@@ -91,6 +91,8 @@ All endpoints return a standardized JSON structure:
 | Config | `/monitor/config/passive_control` | GET | Get passive control state | Enable/disable flag |
 | Config | `/monitor/config/passive_control` | POST | Toggle passive control | Optimistic concurrency |
 | Config | `/monitor/config/monitored_sections` | GET | Get monitored dynamic sections | Effective + configured + all |
+| Config | `/monitor/config/monitored_sections` | POST | Set monitored dynamic sections | Optimistic concurrency |
+| Config | `/monitor/config/<section>` | GET, POST | Auto-control config groups (system_pressure, disk_pressure, limit_policy) | One parametrized endpoint; optimistic concurrency |
 
 ---
 
@@ -1303,8 +1305,6 @@ data: {"app_id": "com.example.app", "app_name": "example", "status": "running", 
 - **list** (e.g. `["cpu","gpu"]`) → monitor only those; others are on-demand only
 - **empty (`[]`)** → nothing monitored; no background collector runs (pure on-demand)
 
-This is read-only via the API — the set is changed by editing the server config (`config.yaml`).
-
 **Response:**
 ```json
 {
@@ -1326,6 +1326,97 @@ This is read-only via the API — the set is changed by editing the server confi
 | configured_sections | string[] \| null | Raw config value; `null` means "all sections" |
 | all_sections | string[] | Full list of supported dynamic sections |
 | updated_at | int | Unix timestamp; advances only when the effective set changes |
+
+---
+
+#### POST /monitor/config/monitored_sections
+
+**Purpose:** Update the dynamic-info sections the background collector continuously monitors. Persists to `config.yaml`, updates the live config, and (re)starts the background collector when the new set is non-empty. Uses optimistic concurrency against the change-driven `updated_at` returned by the GET.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | sections | Yes | string[] | Sections to monitor; subset of `all_sections`. An empty list means "pure on-demand" (no background collector). Unknown names are rejected. |
+| Body | expected_updated_at | No | int | Unix timestamp from the prior GET (optimistic concurrency) |
+
+**Request Example:**
+```json
+{
+  "sections": ["cpu", "gpu"],
+  "expected_updated_at": 1718600000
+}
+```
+
+**Response (Success):**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Successfully updated monitored_sections configuration",
+  "data": {
+    "success": true,
+    "sections": ["cpu", "gpu"],
+    "configured_sections": ["cpu", "gpu"],
+    "all_sections": ["cpu", "memory", "pressure", "network", "disk", "gpu", "npu"],
+    "updated_at": 1718603800
+  }
+}
+```
+
+**Response (409 Conflict):**
+```json
+{
+  "retcode": 409,
+  "retmsg": "Configuration was modified by another client; please reload.",
+  "data": {
+    "success": false,
+    "current": {
+      "sections": ["cpu"],
+      "configured_sections": ["cpu"],
+      "all_sections": ["cpu", "memory", "pressure", "network", "disk", "gpu", "npu"],
+      "updated_at": 1718602500
+    }
+  }
+}
+```
+
+---
+
+### Auto-control tuning — `/monitor/config/<section>` (GET, POST)
+
+A single parametrized endpoint covering the auto-control config groups below. All values are hot-read by the balancer/monitor, so a save takes effect without a restart (exception: the monitor's pressure-cache TTL derived from `regular_update_sys_pressure_time` is re-read on restart).
+
+`GET /monitor/config/<section>` returns that group's current fields plus a change-tracking `updated_at`. `POST` accepts the group's fields plus `expected_updated_at` (optimistic concurrency: 409 `CONFLICT` on mismatch) and echoes the full group back with `success: true` and the new `updated_at`. Unknown sections and invalid values return 101 `ARGUMENT_ERROR`. The pre-existing dedicated routes (`weights_top`, `passive_control`, `monitored_sections`, `history/retention`) keep their own handlers and take priority over this dynamic route.
+
+**Valid sections:**
+
+Sections are grouped to match the Settings UI cards. Every field is optional in a `POST` (send any subset); at least one valid field is required.
+
+| Section | Fields | Constraints |
+|---------|--------|-------------|
+| `system_pressure` | `regular_update_sys_pressure_time`, `thresholds{low,medium,high,critical}`, `weights{cpu,memory,io}`, `dominant_app_reduce_factor` | interval seconds `1–3600`; thresholds in `(0,1]` and ordered `low ≤ medium ≤ high ≤ critical`; weights non-negative integers; factor `1–100` |
+| `disk_pressure` | `disk_utilization_threshold` | Percent, `0–100` (I/O-wait & throughput thresholds stay config-only) |
+| `limit_policy` | `policy` (`combined`/`separated`); `cpu`/`memory` = `{enabled, rate:{high,medium,low,undefined}}` (fractions `(0,1]`); `disk_io` = `{enabled, rate:{<priority>:{write,read,write_iops,read_iops}}}` (integers `≥ 1`) | Nested; any subset of leaves accepted |
+
+**Request Example (`POST /monitor/config/system_pressure`):**
+```json
+{ "thresholds": { "high": 0.75 }, "weights": { "memory": 6 }, "expected_updated_at": 1718600000 }
+```
+
+**Response (Success):**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Successfully updated system_pressure configuration",
+  "data": {
+    "thresholds": { "low": 0.4, "medium": 0.6, "high": 0.75, "critical": 1.0 },
+    "weights": { "cpu": 2, "memory": 6, "io": 1 },
+    "dominant_app_reduce_factor": 3.5,
+    "success": true,
+    "updated_at": 1718603800
+  }
+}
+```
 
 ---
 

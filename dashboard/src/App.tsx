@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect } from 'react'
-import { Tabs, Layout, Typography, Space, Badge, Alert, Button } from 'antd'
+import { Tabs, Layout, Typography, Space, Alert, Button } from 'antd'
 import {
   DashboardOutlined,
   AppstoreOutlined,
@@ -8,7 +8,9 @@ import {
   LineChartOutlined,
   InfoCircleOutlined,
   LogoutOutlined,
+  SettingOutlined,
 } from '@ant-design/icons'
+import SettingsModal from './components/SettingsModal'
 import SystemOverview from './components/SystemOverview'
 import AppResources from './components/AppResources'
 import Processes from './components/Processes'
@@ -55,6 +57,7 @@ export default function App() {
   // Gate the whole app behind a valid access token. A stored token is assumed
   // valid until the server rejects a request with 401 (handled below).
   const [authed, setAuthed] = useState(() => !!getToken())
+  const [settingsOpen, setSettingsOpen] = useState(false)
 
   // Any 401 (expired/revoked/invalid token) drops us back to the login gate.
   useEffect(() => {
@@ -235,16 +238,21 @@ export default function App() {
             </Typography.Title>
           </div>
           <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Badge status="processing" color={COLORS.green} />
-            <Typography.Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
-              Dynamic
-            </Typography.Text>
+            <Button
+              type="text"
+              size="small"
+              icon={<SettingOutlined />}
+              onClick={() => setSettingsOpen(true)}
+              style={{ color: COLORS.textMuted }}
+            >
+              Settings
+            </Button>
             <Button
               type="text"
               size="small"
               icon={<LogoutOutlined />}
               onClick={handleLogout}
-              style={{ color: COLORS.textMuted, marginLeft: 8 }}
+              style={{ color: COLORS.textMuted }}
             >
               Sign out
             </Button>
@@ -270,6 +278,11 @@ export default function App() {
             }}
           />
         </Content>
+        <SettingsModal
+          visible={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+          balancerEnabled={balancerEnabled}
+        />
       </Layout>
     </GlobalConfigNoticesProvider>
   )

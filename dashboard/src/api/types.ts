@@ -522,6 +522,49 @@ export interface MonitoredSectionsData {
   updated_at?: number
 }
 
+export interface CollectionData {
+  regular_update_sys_pressure_time: number
+  updated_at?: number
+}
+
+// System-pressure tuning grouped as one settings card: level cut-offs, resource
+// weights, and the dominant-app reduce factor.
+export interface SystemPressureData {
+  thresholds: { low: number; medium: number; high: number; critical: number }
+  weights: { cpu: number; memory: number; io: number }
+  dominant_app_reduce_factor: number
+  updated_at?: number
+}
+
+export interface DiskPressureData {
+  disk_utilization_threshold: number
+  updated_at?: number
+}
+
+export type LimitPriority = 'high' | 'medium' | 'low' | 'undefined'
+
+export interface LimitRates {
+  high?: number
+  medium?: number
+  low?: number
+  undefined?: number
+}
+
+export interface DiskIoRateFields {
+  write?: number
+  read?: number
+  write_iops?: number
+  read_iops?: number
+}
+
+export interface LimitPolicyData {
+  policy: string
+  cpu: { enabled: boolean; rate: LimitRates }
+  memory: { enabled: boolean; rate: LimitRates }
+  disk_io: { enabled: boolean; rate: Partial<Record<LimitPriority, DiskIoRateFields>> }
+  updated_at?: number
+}
+
 export type SaveResult<TOk> =
   | { status: 'ok'; data: TOk }
   | { status: 'conflict'; current: any; message: string }

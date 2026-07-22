@@ -6,14 +6,14 @@ from utils.logger import logger
 class PressureAnalyzer:
     def __init__(self, config):
         self.config = config
-        self.weights = config.weights
 
     def calculate_pressure_score(self, psi_data: dict, usage_data, is_limited_app_dominant) -> float:
         """Calculate weighted pressure score"""
 
         is_sys_busy = usage_data['cpu']['is_busy'] or usage_data['memory']['is_busy']
-        # 1. If the currently limited app is still dominant, reduce cpu/mem/io weights
-        weights = self.weights.copy()
+        # 1. If the currently limited app is still dominant, reduce cpu/mem/io weights.
+        # Read weights live each call so a config edit takes effect without a restart.
+        weights = dict(self.config.weights or {})
         reduce_factor = self.config.dominant_app_reduce_factor
         if is_limited_app_dominant and not is_sys_busy:
             weights['cpu'] = round(weights['cpu'] / reduce_factor)

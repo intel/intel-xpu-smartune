@@ -27,6 +27,9 @@ class Config:
     app_priority: dict = None
     limit_policy: dict = None
     blacklist: list = None
+    # Shells / tiny tools the Add-App wizard skips (see monitor/app_discovery.py).
+    # None/empty falls back to a built-in default set. Not exposed in the UI.
+    shell_tools: list = None
     cooldown_time: float = 15
     cpu_busy_threshold: float = 90
     memory_busy_threshold: float = 90
@@ -223,7 +226,8 @@ class Config:
                         disk_cfg["rate"][p] = disk_rate_cfg
 
             if modified:
-                logger.info(f"Configuration updated: {section} - {list(yaml_updates.keys())}")
+                from utils.logger import logger
+                logger.info(f"Configuration updated: limit_policy - {list(yaml_updates.keys())}")
                 self._patch_limit_policy_yaml(yaml_updates, self._config_path)
 
         return modified
@@ -461,6 +465,187 @@ class Config:
 
         logger.info(f"remove_from_list_section: removed {len(removed_ranges)} item(s) from '{section}'")
         return len(removed_ranges)
+
+    def set_monitored_sections(self, sections: list, path: Optional[str] = None) -> bool:
+        """Persist ``monitored_sections`` as a single-line YAML flow list.
+
+        Rewrites the top-level ``monitored_sections:`` line in place, preserving
+        any trailing inline comment, and updates the in-memory attribute.  Only
+        the single-line flow form (``monitored_sections: [a, b]``) is supported
+        — the shipped format; a multi-line block list is left untouched and
+        ``False`` is returned so the caller can surface the failure instead of
+        corrupting the YAML.  An empty list is written as ``[]`` (pure
+        on-demand, no background collector).
+        """
+        from utils.logger import logger
+
+        if not isinstance(sections, list):
+            return False
+
+        target = path or self._config_path
+        with self._persist_lock:
+            with open(target, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            idx = self._find_top_level_key(lines, "monitored_sections")
+            if idx == -1:
+                logger.warning("set_monitored_sections: 'monitored_sections:' not found")
+                return False
+
+            line = lines[idx].rstrip("\n")
+            after_key = line.split(":", 1)[1] if ":" in line else ""
+            # Reject the multi-line list form we cannot safely rewrite on one line.
+            if "[" in after_key and "]" not in after_key:
+                logger.warning("set_monitored_sections: multi-line list form unsupported")
+                return False
+
+            # Preserve any trailing inline comment (after the closing bracket).
+            rbracket = after_key.rfind("]")
+            tail = after_key[rbracket + 1:] if rbracket != -1 else after_key
+            hash_pos = tail.find("#")
+            comment = "  " + tail[hash_pos:].strip() if hash_pos != -1 else ""
+
+            value_str = "[" + ", ".join(str(s) for s in sections) + "]"
+            lines[idx] = f"monitored_sections: {value_str}{comment}\n"
+
+            with open(target, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+
+            self.monitored_sections = list(sections)
+
+        logger.info("set_monitored_sections: persisted %s", sections)
+        return True
+
+    def set_limit_policy(self, updates: dict[str, Any]) -> bool:
+        """Persist (a subset of) the nested ``limit_policy`` config.
+
+        ``updates`` mirrors the config shape, e.g.::
+
+            {
+              "policy": "combined",
+              "cpu":     {"enabled": True, "rate": {"high": 0.7, ...}},
+              "memory":  {"enabled": True, "rate": {"high": 0.3, ...}},
+              "disk_io": {"enabled": True,
+                          "rate": {"high": {"write": 50, "read": 60,
+                                            "write_iops": 2200, "read_iops": 20000}, ...}},
+            }
+
+        Only the leaves that actually change are rewritten (comments preserved).
+        The in-memory ``self.limit_policy`` is updated to match.  Returns True if
+        anything changed.
+        """
+        from utils.logger import logger
+
+        if not isinstance(updates, dict) or not updates:
+            return False
+
+        yaml_updates: dict[tuple[str, ...], Any] = {}
+
+        with self._persist_lock:
+            lp = self.limit_policy if isinstance(self.limit_policy, dict) else {}
+
+            if "policy" in updates:
+                val = str(updates["policy"])
+                if lp.get("policy") != val:
+                    lp["policy"] = val
+                    yaml_updates[("limit_policy", "policy")] = val
+
+            for res in ("cpu", "memory"):
+                res_upd = updates.get(res)
+                if not isinstance(res_upd, dict):
+                    continue
+                cfg = lp.setdefault(res, {})
+                if "enabled" in res_upd:
+                    enabled = bool(res_upd["enabled"])
+                    if cfg.get("enabled") != enabled:
+                        cfg["enabled"] = enabled
+                        yaml_updates[("limit_policy", res, "enabled")] = enabled
+                if isinstance(res_upd.get("rate"), dict):
+                    rate = cfg.setdefault("rate", {})
+                    for pri, raw in res_upd["rate"].items():
+                        try:
+                            fval = float(raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if rate.get(pri) != fval:
+                            rate[pri] = fval
+                            yaml_updates[("limit_policy", res, "rate", pri)] = fval
+
+            disk_upd = updates.get("disk_io")
+            if isinstance(disk_upd, dict):
+                cfg = lp.setdefault("disk_io", {})
+                if "enabled" in disk_upd:
+                    enabled = bool(disk_upd["enabled"])
+                    if cfg.get("enabled") != enabled:
+                        cfg["enabled"] = enabled
+                        yaml_updates[("limit_policy", "disk_io", "enabled")] = enabled
+                if isinstance(disk_upd.get("rate"), dict):
+                    rate = cfg.setdefault("rate", {})
+                    for pri, fields in disk_upd["rate"].items():
+                        if not isinstance(fields, dict):
+                            continue
+                        prio_cfg = rate.setdefault(pri, {})
+                        for key in ("write", "read", "write_iops", "read_iops"):
+                            if key not in fields:
+                                continue
+                            try:
+                                ival = max(1, int(float(fields[key])))
+                            except (TypeError, ValueError):
+                                continue
+                            if prio_cfg.get(key) != ival:
+                                prio_cfg[key] = ival
+                                yaml_updates[("limit_policy", "disk_io", "rate", pri, key)] = ival
+
+            self.limit_policy = lp
+            if yaml_updates:
+                logger.info(f"Configuration updated: limit_policy - {list(yaml_updates.keys())}")
+                self._patch_limit_policy_yaml(yaml_updates, self._config_path)
+
+        return bool(yaml_updates)
+
+    def update_top_level_scalars(self, updates: dict[str, Any]) -> bool:
+        """Persist one or more top-level *scalar* config keys (e.g.
+        ``cpu_busy_threshold``, ``dominant_app_reduce_factor``).
+
+        Each value is coerced to the current attribute's type when possible so
+        an int field stays an int on disk.  Comments on the line are preserved.
+        The in-memory attributes are updated to match.  Returns True if at least
+        one value changed.
+        """
+        from utils.logger import logger
+
+        if not isinstance(updates, dict) or not updates:
+            return False
+
+        modified = False
+        yaml_updates: dict[tuple[str, ...], Any] = {}
+
+        with self._persist_lock:
+            for key, value in updates.items():
+                current = getattr(self, key, None)
+                new_value = value
+                if isinstance(current, bool):
+                    new_value = bool(value)
+                elif isinstance(current, int) and not isinstance(current, bool):
+                    try:
+                        new_value = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                elif isinstance(current, float):
+                    try:
+                        new_value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                if current != new_value:
+                    setattr(self, key, new_value)
+                    yaml_updates[(key,)] = new_value
+                    modified = True
+
+            if modified:
+                logger.info(f"Configuration updated (scalars): {list(yaml_updates.keys())}")
+                self._patch_limit_policy_yaml(yaml_updates, self._config_path)
+
+        return modified
 
     def update_config_section(self, section: str, updates: dict[str, Any]) -> bool:
         """Generic method to update a config section (e.g., weights_top, thresholds, etc.).

@@ -21,7 +21,8 @@ from config.config import b_config
 
 
 # Shells / tiny tools — would never be the "app" the user wants to monitor.
-_SHELL_TOOLS = frozenset({
+# Built-in default used when config.yaml's `shell_tools` is unset/empty.
+_DEFAULT_SHELL_TOOLS = frozenset({
     "bash", "sh", "dash", "zsh", "fish", "tcsh",
     "sudo", "su", "env", "which", "getent",
     "cat", "head", "tail", "ls", "find", "xargs",
@@ -30,6 +31,16 @@ _SHELL_TOOLS = frozenset({
     "true", "false", "sleep", "kill",
     "mv", "cp", "rm", "ln", "mkdir", "rmdir", "touch", "chmod", "chown",
 })
+
+
+def _shell_tools() -> frozenset:
+    """Resolve the shell-tool filter set from config, falling back to the
+    built-in default when `shell_tools` is unset/empty.  Read live so a config
+    edit takes effect without a restart."""
+    configured = getattr(b_config, "shell_tools", None)
+    if configured:
+        return frozenset(str(name).strip().lower() for name in configured if str(name).strip())
+    return _DEFAULT_SHELL_TOOLS
 
 
 @dataclass
@@ -132,7 +143,7 @@ def _is_blacklisted(comm: str, exe_basename: str) -> bool:
     # /proc/<pid>/exe still points at /bin/bash.  Filtering on exe would
     # silently drop user-written launcher scripts that the wizard is
     # specifically meant to surface.
-    if comm_lower in _SHELL_TOOLS:
+    if comm_lower in _shell_tools():
         return True
     # Service / daemon noise checks both fields because some daemons spawn
     # short-lived helpers whose comm is benign but whose exe is the daemon.
@@ -299,7 +310,7 @@ def extract_fields(pids: Iterable[int], name: str = "") -> ExtractResult:
         # Using exe_base would write "bash" or "sh" into process_names, which
         # later causes get_app_processes() to pgrep-match every shell on the
         # system and break per-app resource aggregation and OOM scoring.
-        if exe_base.lower() in _SHELL_TOOLS:
+        if exe_base.lower() in _shell_tools():
             exe_base = comm
         if exe_base and exe_base not in seen_proc:
             process_names.append(exe_base)

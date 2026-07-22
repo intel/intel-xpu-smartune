@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import re
+import shlex
 import signal
 from multiprocessing import JoinableQueue
 from threading import Event, Timer
@@ -10,6 +12,7 @@ from typing import Any, List, Set, Union
 import psutil
 from bcc import BPF
 from controller.control_manager import ControlManager
+from db.DatabaseModel import AIAppPriority
 from utils import app_utils
 from utils.logger import logger
 
@@ -17,6 +20,29 @@ from utils.logger import logger
 # Constants matching those defined in the BPF C code
 COMM_LEN = 32
 PY_MAX_FILE_LEN = 64
+
+# Interpreter/shell executables whose real program identity lives in the cmdline
+# (e.g. "python train.py", "bash run.sh") rather than in comm/argv0.  When a
+# launch event's comm/filename is one of these, the effective program name is
+# resolved from the cmdline instead.
+#
+# Kept in sync with monitor.app_discovery so the wizard's bpf_name extraction and
+# this runtime resolution mirror each other exactly.
+INTERPRETERS = frozenset({
+    "python", "python2", "python3", "node", "nodejs",
+    "perl", "ruby", "java", "php", "lua", "rscript",
+    "bash", "sh", "dash", "zsh", "fish", "tcsh",
+})
+
+
+def _basename_is_interpreter(name: str) -> bool:
+    """True for python / python3.12 / node / ... — version suffixes tolerated."""
+    n = (name or "").lower()
+    if n in INTERPRETERS:
+        return True
+    # Strip a trailing version: "python3.12" -> "python", "ruby3.0" -> "ruby".
+    base = re.split(r"\d", n, 1)[0]
+    return bool(base) and base in INTERPRETERS
 
 
 class SingletonMeta(type):
@@ -51,6 +77,9 @@ class AppIntercept(metaclass=SingletonMeta):
         self._comm_to_app: dict = {}          # comm_lower -> app_name  (O(1) bpf_name exact match)
         self._filename_exe_to_app: dict = {}  # exe_lower  -> app_name  (filename path match)
         self._quick_filter: frozenset = frozenset()  # union of above for pre-filtering
+        # Per-app match policy cache.
+        # app_name_lower -> {"mode": "aggregate"|"instance", "match_cmdline": tuple[str, ...]}
+        self._app_match_cfg: dict = {}
 
         # Event-driven critical-mode flag.  Set by _on_critical_state_changed()
         # when the system pressure monitor transitions into "critical" state;
@@ -91,6 +120,22 @@ class AppIntercept(metaclass=SingletonMeta):
             if app.get("app_name") and app["app_name"].strip()
         }
 
+    @staticmethod
+    def _prefer_persisted_limited_status(app_id: str, fallback: str = "running") -> str:
+        """Keep limited/a_limited when startup scan finds a running app.
+
+        A page refresh triggers startup scan again. Without this guard, apps
+        already marked as limited can be overwritten to running.
+        """
+        try:
+            rec = AIAppPriority.query().where(AIAppPriority.app_id == app_id).first()
+            current = (getattr(rec, 'status', '') or '').lower()
+            if current in {"limited", "a_limited"}:
+                return current
+        except Exception:
+            pass
+        return fallback
+
     def _rebuild_match_cache(self) -> None:
         """Pre-build fast-lookup structures used by get_main_process.
 
@@ -113,15 +158,228 @@ class AppIntercept(metaclass=SingletonMeta):
                 comm_to_app[exe_lower] = app
                 filename_exe_to_app[exe_lower] = app
 
+        app_match_cfg = {}
+        for item in cnf_apps:
+            app_name = (item.get('name') or '').strip()
+            if not app_name:
+                continue
+
+            mode = str(item.get('match_mode', 'aggregate')).strip().lower() or 'aggregate'
+            if mode not in ('aggregate', 'instance'):
+                mode = 'aggregate'
+
+            raw_match_cmdline = item.get('match_cmdline', [])
+            if isinstance(raw_match_cmdline, str):
+                try:
+                    raw_tokens = shlex.split(raw_match_cmdline)
+                except ValueError:
+                    raw_tokens = raw_match_cmdline.split()
+            elif isinstance(raw_match_cmdline, list):
+                raw_tokens = [str(x) for x in raw_match_cmdline if str(x).strip()]
+            else:
+                raw_tokens = []
+
+            norm_tokens = self._normalize_cmdline(raw_tokens)
+            if mode == 'instance' and not norm_tokens:
+                logger.warning(
+                    "App '%s' configured with match_mode=instance but match_cmdline is empty; "
+                    "falling back to aggregate mode.",
+                    app_name,
+                )
+                mode = 'aggregate'
+
+            app_match_cfg[app_name.lower()] = {
+                'mode': mode,
+                'match_cmdline': norm_tokens,
+            }
+
         self._comm_to_app = comm_to_app
         self._filename_exe_to_app = filename_exe_to_app
+        self._app_match_cfg = app_match_cfg
         # Any string whose presence in comm or filename justifies a full match check
         self._quick_filter = frozenset(
             set(comm_to_app.keys()) | set(filename_exe_to_app.keys())
         )
 
+    def _read_proc_cmdline(self, pid: int) -> list[str]:
+        """Read full cmdline argv from /proc/<pid>/cmdline."""
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+            if not raw:
+                return []
+            return [x.decode('utf-8', 'ignore') for x in raw.split(b'\x00') if x]
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+            return []
+
+    def _normalize_cmdline(self, tokens: list[str]) -> tuple[str, ...]:
+        """Normalize argv tokens for stable instance matching."""
+        if not tokens:
+            return ()
+
+        normalized = []
+        for idx, token in enumerate(tokens):
+            t = (token or '').strip()
+            if not t:
+                continue
+            if idx == 0:
+                t = os.path.basename(t)
+            normalized.append(t.lower())
+        return tuple(normalized)
+
+    def _resolve_program_name(self, comm: str, filename: str, cmdline_tokens: list[str]) -> str:
+        """Resolve the effective program name for a launch event.
+
+        If comm/filename is a known interpreter (python, bash, ...), the real
+        program identity is the first non-flag cmdline argument (the script or
+        module).  Otherwise the executable basename itself is the program name.
+        """
+        base = os.path.basename((filename or comm or '').strip()).lower()
+        if not _basename_is_interpreter(base):
+            return base
+
+        # Interpreter launch: dig the real script/program out of the cmdline,
+        # skipping argv0 (the interpreter) and any leading flags (-u, -m, ...).
+        for tok in (cmdline_tokens or [])[1:]:
+            t = (tok or '').strip()
+            if not t or t.startswith('-'):
+                continue
+            return os.path.basename(t).lower()
+        return base
+
+    def _is_event_instance_match(self, pid: int, app_name: str, filename: str) -> tuple[bool, str]:
+        """Decide whether this launch event matches the app's configured match mode.
+
+        aggregate: always true once coarse bpf_name matching is satisfied.
+        instance: require full normalized /proc cmdline match; fallback to argv0-only
+                  when /proc cmdline is unavailable.
+        """
+        # App identity is name-based; a launch event is never rejected on the
+        # basis of which (ephemeral) cgroup the new process landed in.
+        cfg = self._app_match_cfg.get(app_name.lower(), {})
+        mode = cfg.get('mode', 'aggregate')
+        expected = tuple(cfg.get('match_cmdline', ()))
+
+        if mode != 'instance':
+            return True, "aggregate_mode"
+
+        observed_tokens = self._read_proc_cmdline(pid)
+        observed = self._normalize_cmdline(observed_tokens)
+        if observed:
+            if observed == expected:
+                return True, "instance_cmdline_exact"
+            logger.info(
+                "Instance mismatch for app '%s': expected=%s observed=%s pid=%s",
+                app_name, list(expected), list(observed), pid,
+            )
+            return False, "instance_cmdline_mismatch"
+
+        # Fallback strategy: when /proc cmdline is unavailable for short-lived
+        # processes, allow only an argv0-level check so we do not fully fail open.
+        fallback_argv0 = os.path.basename((filename or '').strip()).lower()
+        if expected and fallback_argv0 and expected[0] == fallback_argv0:
+            logger.warning(
+                "Instance fallback for app '%s': /proc cmdline unavailable, "
+                "using argv0-only check (expected argv0=%s, pid=%s)",
+                app_name, expected[0], pid,
+            )
+            return True, "instance_fallback_argv0"
+
+        logger.info(
+            "Instance mismatch for app '%s': /proc cmdline unavailable and "
+            "argv0 fallback failed (expected=%s, filename=%s, pid=%s)",
+            app_name, list(expected), filename, pid,
+        )
+        return False, "instance_cmdline_unavailable"
+
     def trace_print(self) -> None:
         self.bpf.trace_print()
+
+    def _resolve_main_process_for_exec_event(self, pid: int, comm: str, filename: str) -> tuple[bool, str]:
+        """Resolve app mapping on exec-complete events.
+
+        APP_EXEC events do not carry argv[0] in the BPF payload. Start with the
+        regular comm/filename lookup, then fall back to /proc cmdline token
+        basenames so interpreter-style launches (python foo.py, bash run.sh)
+        can still map to a configured bpf_name.
+        """
+        is_main_process, app_name = self.get_main_process(comm, filename)
+        if is_main_process:
+            return True, app_name
+
+        # Interpreter-style launches (python foo.py, bash run.sh) carry the
+        # interpreter as comm/filename; resolve the real program name from the
+        # cmdline and map that back to a configured bpf_name.
+        # This path mirrors app_discovery.extract_fields' bpf_name rule exactly:
+        # when comm is an interpreter, identity is the cmdline script basename
+        # (stored full, never truncated); when comm is the program, comm-exact
+        # above already handled it.  So no truncation here — the cmdline-derived
+        # full name matches the full bpf_name that extract stored.
+        tokens = self._read_proc_cmdline(pid)
+        program = self._resolve_program_name(comm, filename, tokens)
+        if program:
+            app = self._filename_exe_to_app.get(program) or self._comm_to_app.get(program)
+            if app:
+                return True, app
+
+        return False, ""
+
+    def _handle_launch_event(self, pid: int, comm: str, filename: str, app_name: str) -> None:
+        """Handle a launch after app mapping and instance checks succeed."""
+        app_data = self._app_map_index.get(app_name.lower())
+        if not app_data:
+            logger.warning(
+                "Matched app '%s' but no controlled-app DB entry found; skip pid=%s",
+                app_name, pid,
+            )
+            return
+
+        app_id = app_data.get('app_id', '')
+        app_priority = app_data.get('priority', 'low')
+        logger.debug(f"launch: app_id={app_id}, app_name={app_name}, comm={comm}, filename={filename}")
+        self.monitored_app_launched[pid] = (app_id, app_name, comm, filename)
+
+        # Track this PID under its app and decide whether we
+        # should emit a "running" notification.  Only the first
+        # live PID for an app emits one; subsequent execve
+        # events from sibling/child processes (shell wrapper
+        # -> daemon -> helper) just join the set silently.
+        live_pids = self.app_live_pids.setdefault(app_name, set())
+        is_first_live_pid = len(live_pids) == 0
+        live_pids.add(pid)
+
+        if app_priority.lower() == "critical":
+            app_utils.adjust_oom_priority(app_id, app_name, app_priority, app_data['cmdline'])
+            if is_first_live_pid:
+                app_utils.callback_manager.send_callback_notification({
+                    'app_id': app_id,
+                    'app_name': app_name,
+                    'status': "running",
+                    'purpose': "app"
+                }, True)
+        else:
+            # Only intercept (SIGSTOP) when the system is already in
+            # critical pressure state.  If the system is idle the app
+            # is allowed to start freely, avoiding the collateral
+            # "Stopped" visible to the user that the previous
+            # always-SIGSTOP pattern caused.
+            if self._system_critical.is_set():
+                try:
+                    os.kill(pid, signal.SIGSTOP)
+                except OSError as e:
+                    logger.debug(f"SIGSTOP failed for PID {pid}: {e}")
+                self.handle_monitored_app(pid, comm, filename, app_name, app_id)
+            else:
+                # System is not under critical pressure: let the app run.
+                logger.debug("System not critical, allowing '%s' (PID: %s) to run freely", app_name, pid)
+                if is_first_live_pid:
+                    app_utils.callback_manager.send_callback_notification({
+                        'app_id': app_id,
+                        'app_name': app_name,
+                        'status': "running",
+                        'purpose': "app"
+                    }, True)
+        self.mark_process_handled(pid)
 
     def get_main_process(self, comm: str, filename: str) -> tuple[bool, str]:
         """Check whether this execve event is the main process of a monitored app.
@@ -147,8 +405,14 @@ class AppIntercept(metaclass=SingletonMeta):
 
         # Exact filename-path match against bpf_name entries
         # (e.g. /usr/bin/llama-server with bpf_name=["llama-server"])
+        filename_base = os.path.basename(filename_lower)
         for exe, app in self._filename_exe_to_app.items():
-            if f"/{exe}" in filename_lower or filename_lower.endswith(f"/{exe}"):
+            if (
+                filename_lower == exe or
+                filename_base == exe or
+                f"/{exe}" in filename_lower or
+                filename_lower.endswith(f"/{exe}")
+            ):
                 return True, app
 
         return False, ""
@@ -168,6 +432,10 @@ class AppIntercept(metaclass=SingletonMeta):
             logger.debug(f"[Delay Check] PID={pid} still alive, not exiting normally.")
             return
 
+        # PID has exited for real; drop handled marker so future PID reuse
+        # does not get incorrectly filtered as "already handled".
+        self.handled_processes.discard(pid)
+
         # Per-app PID accounting: only emit "stopped" once the app has no
         # live PIDs left.  Intermediate exec-chain PIDs (shell wrapper that
         # exec'd into a daemon) come through this path and would otherwise
@@ -180,6 +448,25 @@ class AppIntercept(metaclass=SingletonMeta):
                 self.app_live_pids.pop(app_name, None)
         else:
             still_running = False
+
+        # Reconcile against current process reality. In some launcher/scope
+        # setups, the tracked PID set may keep helper PIDs that are no longer
+        # part of the app's effective process set, leaving UI stuck at running.
+        if still_running:
+            try:
+                app_data = self._app_map_index.get(app_name.lower()) or {}
+                cmdline = app_data.get('cmdline', '')
+                real_status = app_utils.check_app_running_status(app_id, app_name, cmdline)
+                if real_status != "running":
+                    logger.info(
+                        "Exit reconcile: app '%s' pid=%s has residual tracked pids=%s but "
+                        "check_app_running_status=%s; forcing stopped.",
+                        app_name, pid, sorted(live_pids), real_status,
+                    )
+                    still_running = False
+                    self.app_live_pids.pop(app_name, None)
+            except Exception as e:
+                logger.debug(f"Exit reconcile skipped for app '{app_name}': {e}")
 
         if still_running:
             logger.debug(
@@ -208,9 +495,7 @@ class AppIntercept(metaclass=SingletonMeta):
         pid = event.pid
         type = event.type
 
-        # logger.debug(f"*** Event: PID={pid}, type={type} COMM={comm}, FILENAME={filename} ***")
-
-        if type == 0:  # launch event
+        if type == 0:  # launch-enter event
             comm_lower = comm.lower()
             filename_lower = filename.lower()
             # Fast pre-filter: skip the vast majority of unrelated BPF exec events
@@ -220,60 +505,40 @@ class AppIntercept(metaclass=SingletonMeta):
                         for c in self._quick_filter)):
                 return
 
-            is_main_process, app_name = self.get_main_process(comm, filename)
-            # logger.debug(f"Is this filename main process? {is_main_process}, app_name={app_name}")
-            if is_main_process:
-                logger.debug(f"Is this filename main process? {is_main_process}, app_name={app_name}")
-                # Prevent processing the same process tree more than once
-                if not self.is_process_handled(pid):
-                    app_data = self._app_map_index.get(app_name.lower())
-                    app_id, app_priority = app_data['app_id'], app_data.get('priority', 'low') if app_data else ("", "low")
-                    logger.debug(f"launch: app_id={app_id}, app_name={app_name}, comm={comm}, filename={filename}")
-                    self.monitored_app_launched[pid] = (app_id, app_name, comm, filename)
+            # logger.debug(
+            #     "*** Event: PID=%s, type=%s COMM=%s, FILENAME=%s, phase=enter_exec ***",
+            #     pid, type, comm, filename,
+            # )
 
-                    # Track this PID under its app and decide whether we
-                    # should emit a "running" notification.  Only the first
-                    # live PID for an app emits one; subsequent execve
-                    # events from sibling/child processes (shell wrapper
-                    # → daemon → helper) just join the set silently.
-                    live_pids = self.app_live_pids.setdefault(app_name, set())
-                    is_first_live_pid = len(live_pids) == 0
-                    live_pids.add(pid)
+        elif type == 1:  # exec-complete event (launch decisions happen here)
+            cmdline_tokens = self._read_proc_cmdline(pid)
+            cmdline_pretty = " ".join(cmdline_tokens) if cmdline_tokens else "<unavailable>"
+            #logger.debug(
+            #    "*** Post-Exec Event: PID=%s, type=%s COMM=%s, FILENAME=%s, CMDLINE=%s ***",
+            #    pid, type, comm, filename, cmdline_pretty,
+            #)
 
-                    if app_priority.lower() == "critical":
-                        app_utils.adjust_oom_priority(app_id, app_name, app_priority, app_data['cmdline'])
-                        if is_first_live_pid:
-                            app_utils.callback_manager.send_callback_notification({
-                                'app_id': app_id,
-                                'app_name': app_name,
-                                'status': "running",
-                                'purpose': "app"
-                            }, True)
-                    else:
-                        # Only intercept (SIGSTOP) when the system is already in
-                        # critical pressure state.  If the system is idle the app
-                        # is allowed to start freely, avoiding the collateral
-                        # "Stopped" visible to the user that the previous
-                        # always-SIGSTOP pattern caused.
-                        if self._system_critical.is_set():
-                            try:
-                                os.kill(pid, signal.SIGSTOP)
-                            except OSError as e:
-                                logger.debug(f"SIGSTOP failed for PID {pid}: {e}")
-                            self.handle_monitored_app(pid, comm, filename, app_name, app_id)
-                        else:
-                            # System is not under critical pressure: let the app run.
-                            logger.debug("System not critical, allowing '%s' (PID: %s) to run freely", app_name, pid)
-                            if is_first_live_pid:
-                                app_utils.callback_manager.send_callback_notification({
-                                    'app_id': app_id,
-                                    'app_name': app_name,
-                                    'status': "running",
-                                    'purpose': "app"
-                                }, True)
-                    self.mark_process_handled(pid)
+            # Prevent processing the same process tree more than once
+            if self.is_process_handled(pid):
+                return
 
-        elif type == 1:  # exit event
+            is_main_process, app_name = self._resolve_main_process_for_exec_event(pid, comm, filename)
+            if not is_main_process:
+                return
+
+            logger.debug(f"Is this filename main process? {is_main_process}, app_name={app_name}")
+
+            matched, reason = self._is_event_instance_match(pid, app_name, filename)
+            if not matched:
+                logger.debug(
+                    "Skip launch event: app='%s' pid=%s comm=%s filename=%s reason=%s",
+                    app_name, pid, comm, filename, reason,
+                )
+                return
+
+            self._handle_launch_event(pid, comm, filename, app_name)
+
+        elif type == 2:  # exit event
             if pid not in self.monitored_app_launched:
                 return
 
@@ -417,14 +682,14 @@ class AppIntercept(metaclass=SingletonMeta):
         if process_names:
             for pname in process_names:
                 try:
-                    pids.update(app_utils.get_app_processes(pname))
+                    pids.update(app_utils.get_app_processes_for_app(pname, app_id=app_id, app_name=app_name))
                 except Exception:
                     continue
         elif cmdline:
             try:
                 exe = app_utils._get_executable_name(app_name, cmdline)
                 if exe:
-                    pids.update(app_utils.get_app_processes(exe))
+                    pids.update(app_utils.get_app_processes_for_app(exe, app_id=app_id, app_name=app_name))
             except Exception:
                 pass
 
@@ -514,10 +779,11 @@ class AppIntercept(metaclass=SingletonMeta):
                         live_pids.add(pid)
 
                         if is_first_live_pid:
+                            startup_status = self._prefer_persisted_limited_status(app_id, "running")
                             app_utils.callback_manager.send_callback_notification({
                                 'app_id': app_id,
                                 'app_name': app_name,
-                                'status': "running",
+                                'status': startup_status,
                                 'purpose': "app"
                             }, True)
                         detected.append({"app_id": app_id, "app_name": app_name, "pid": pid})
@@ -543,6 +809,8 @@ class AppIntercept(metaclass=SingletonMeta):
                     continue  # handled by pass 1 (or not monitored at all)
 
                 status = app_utils.check_app_running_status(app_id, app_name, cmdline)
+                if status == "running":
+                    status = self._prefer_persisted_limited_status(app_id, status)
                 logger.info(
                     f"[startup scan] Multi-process app '{app_name}' "
                     f"(process_names={process_names}): status={status}"
@@ -553,7 +821,7 @@ class AppIntercept(metaclass=SingletonMeta):
                     'status': status,
                     'purpose': "app"
                 }, True)
-                if status == "running":
+                if status in {"running", "limited", "a_limited"}:
                     detected.append({"app_id": app_id, "app_name": app_name, "pid": None})
         except Exception as e:
             logger.error(f"scan_already_running_apps (pass 2) failed: {e}")

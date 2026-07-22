@@ -60,6 +60,21 @@ export interface AppInfo {
   process_names?: string[]
   is_running?: boolean
   is_pending?: boolean
+  app_summary_status?: 'Limited' | 'Partial Limited' | 'Not Limited' | 'No Running Process'
+  runtime_hint?: 'Running' | 'Stopped' | 'Pending'
+  process_status_rows?: ProcessStatusRow[]
+}
+
+export interface ProcessStatusRow {
+  key: string
+  pid?: number | null
+  process_name: string
+  cmdline?: string
+  cgroup?: string
+  runtime_status: 'Running' | 'Stopped' | 'Pending'
+  limit_status: 'Limited' | 'Not Limited' | 'N/A'
+  applied_at?: number | null
+  note?: string
 }
 
 export interface AppResourceEntry {
@@ -179,6 +194,7 @@ export interface SetPriorityPayload {
 export interface DiscoverCandidate {
   pid: number
   comm: string         // /proc/<pid>/comm — same 15-byte truncation BPF reports
+  process_name?: string
   exe: string          // readlink /proc/<pid>/exe (full path, may be empty)
   cmdline: string      // nul-joined cmdline rendered with spaces
   cgroup_unit: string  // systemd unit/scope (or "")
@@ -195,6 +211,7 @@ export interface DiscoverExtractData {
   bpf_name: string[]
   process_names: string[]
   commandline: string[]
+  cgroup_ids?: string[]
   id_suggestion: string
 }
 
@@ -217,7 +234,7 @@ export interface ResourceLimitPayload {
   app_id: string
   app_name: string
   priority: string
-  cgroup_id?: string
+  target_cgroups?: string[]
   limit_overrides?: {
     cpu?: {
       enabled: boolean
@@ -264,6 +281,7 @@ export interface ResourceLimitProfileData {
   }
   process_names?: string[]
   cgroup_ids?: string[]
+  target_processes?: Array<{ pid: number; name?: string }>
 }
 
 export interface PackageInfo {

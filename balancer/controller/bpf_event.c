@@ -13,6 +13,7 @@
 
 enum event_type {
     APP_START,
+    APP_EXEC,
     APP_EXIT
 };
 
@@ -65,6 +66,22 @@ TRACEPOINT_PROBE(sched, sched_process_exit) {
     bpf_probe_read_kernel_str(&event.comm, sizeof(event.comm), comm);
     // For exit events, reuse comm as filename
     bpf_probe_read_kernel_str(&event.filename, sizeof(event.filename), comm);
+
+    events.perf_submit(args, &event, sizeof(event));
+
+    return 0;
+}
+
+// Trace process exec completion (after execve has committed).
+TRACEPOINT_PROBE(sched, sched_process_exec) {
+    struct event_t event = {};
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    event.pid = pid_tgid >> 32;
+    event.type = APP_EXEC;
+    bpf_get_current_comm(&event.comm, sizeof(event.comm));
+    // Keep filename as comm for APP_EXEC; userspace will enrich with /proc cmdline.
+    bpf_probe_read_kernel_str(&event.filename, sizeof(event.filename), event.comm);
 
     events.perf_submit(args, &event, sizeof(event));
 

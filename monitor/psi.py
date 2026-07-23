@@ -31,6 +31,9 @@ class PSIMonitor:
             # Initialise resources only on first instantiation
             cls._instance._fds = {}
             cls._instance._last_total = {}
+            # History for the self-inflicted-fraction path (system + per-cgroup),
+            # kept separate from the trigger-driven window above.
+            cls._instance._frac_last = {}
             cls._instance._pressure_history = defaultdict(list)
             cls._instance._last_pressure = {'cpu': 0.0, 'memory': 0.0, 'io': 0.0}
             cls._instance._window_sec = 5
@@ -130,6 +133,78 @@ class PSIMonitor:
             'memory': round(self._get_window_average('memory'), 2),
             'io': round(self._get_window_average('io'), 2)
         }
+
+    _CGROUP_MOUNT = "/sys/fs/cgroup"
+
+    @staticmethod
+    def _parse_some_total(path: str) -> Optional[int]:
+        """Return the cumulative ``some total`` stall time (µs) from a PSI file, or None."""
+        try:
+            with open(path) as f:
+                for line in f:
+                    if line.startswith("some"):
+                        return int(line.split("total=")[-1])
+        except (OSError, ValueError):
+            return None
+        return None
+
+    def _some_total_delta_rate(self, key, path: str) -> Optional[float]:
+        """Instantaneous ``some`` pressure in [0, 1] from cumulative ``total`` deltas,
+        using the same total-delta method as system PSI (see _get_resource_pressure).
+
+        ``key`` scopes the history so system and cgroup readings taken in the same call
+        share one consistent interval. Returns None on the first read (no interval yet)
+        or when the file is unavailable.
+        """
+        now = time.time()
+        total = self._parse_some_total(path)
+        if total is None:
+            return None
+        last = self._frac_last.get(key)
+        self._frac_last[key] = (now, total)
+        if last is None:
+            return None
+        time_delta = now - last[0]
+        if time_delta <= 0:
+            return None
+        rate = (total - last[1]) / 1_000_000 / time_delta  # µs → s
+        return max(0.0, min(rate, 1.0))
+
+    def get_self_inflicted_fraction(self, cgroup_rel_paths) -> Dict[str, float]:
+        """Estimate how much of each resource's system pressure is self-inflicted by the
+        set of currently rate-limited cgroups, as a fraction in [0, 1] per resource.
+
+        For each resource: ``min(1, (Σ cgroup_rate) / system_rate)`` summed over the given
+        cgroups, all using the file's total-delta method (unit-independent ratio, so it
+        composes with any pressure magnitude). When the already-limited apps are the sole
+        source of a resource's stalls the fraction approaches 1; when other (unlimited)
+        tasks also stall it drops, leaving their (real) pressure intact. Aggregating over
+        all limited cgroups means that once every top consumer is already limited, their
+        combined pressure is discounted -- so the score stops over-reporting and restore
+        can proceed. Returns all-zero (no discount) when unavailable.
+
+        Accepts a single path or a list of paths.
+        """
+        fraction = {'cpu': 0.0, 'memory': 0.0, 'io': 0.0}
+        if not cgroup_rel_paths:
+            return fraction
+        if isinstance(cgroup_rel_paths, str):
+            cgroup_rel_paths = [cgroup_rel_paths]
+        for res in ('cpu', 'memory', 'io'):
+            sys_rate = self._some_total_delta_rate(('sys', res), self._PRESSURE_FILES[res])
+            if not sys_rate:
+                continue
+            cg_sum, have_cg = 0.0, False
+            for path in cgroup_rel_paths:
+                cg_rate = self._some_total_delta_rate(
+                    (path, res),
+                    os.path.join(self._CGROUP_MOUNT, path.lstrip('/'), f"{res}.pressure"))
+                if cg_rate is not None:
+                    cg_sum += cg_rate
+                    have_cg = True
+            if have_cg:
+                fraction[res] = min(1.0, cg_sum / sys_rate)
+        return fraction
 
     def cleanup(self):
         """Release resources: close all PSI file descriptors (call on program exit)."""

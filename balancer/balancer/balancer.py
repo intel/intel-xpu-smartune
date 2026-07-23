@@ -436,6 +436,12 @@ class DynamicBalancer:
                 _prc = self.config.passive_resource_control or {}
                 passive_enabled = bool(_prc.get('enabled', True))
 
+                # With auto-limiting off, nothing we did is inflating PSI, so drop any
+                # stale dominant state to fall back to raw (undiscounted) pressure.
+                if not passive_enabled and self.all_limits.is_limited_app_dominant:
+                    self.all_limits.is_limited_app_dominant = False
+                    self.control_manager.set_limited_app_dominant(False)
+
                 if not self.app_priority_queue.empty() or (state.current_time - state.last_check_time) >= state.idle_check_interval:
                     # Use consume_peak_pressure_level() instead of get_current_pressure_level()
                     # so that transient "critical" spikes that occurred while the
@@ -576,6 +582,12 @@ class DynamicBalancer:
         ``self.all_limits.is_limited_app_dominant`` and pushes the flag down
         into the control manager so PSI baselines compensate correctly.
         """
+        # Collect the cgroups of ALL already-auto-limited apps among the top consumers
+        # (not just the first). Discounting every already-limited app's self-inflicted PSI
+        # -- rather than a single one -- means that once all top hogs are limited, their
+        # combined pressure is attributed correctly and the score stops over-reporting.
+        dominant_cgroups = []
+        is_dominant = False
         for app_info in state.top_consume_apps:
             # Match by cgroup membership, not just the top-consumer id: a
             # controlled multi-cgroup app is keyed in the registry by its
@@ -597,14 +609,20 @@ class DynamicBalancer:
                         entry = cand
                         break
 
-            if entry is not None and entry.source == "auto":
-                self.all_limits.is_limited_app_dominant = (entry.state != "partially_restored")
-                break
-            else:
-                self.all_limits.is_limited_app_dominant = False
+            if entry is not None and entry.source == "auto" and entry.state != "partially_restored":
+                is_dominant = True
+                # Full cgroup path of this limited consumer (resolved from its PID),
+                # used to discount its self-inflicted PSI when scoring system pressure.
+                pid = (app_info.get('process') or {}).get('pid') or \
+                    next(iter(app_info.get('pids') or []), None)
+                cg = app_utils.get_cgroup_path_by_pid(pid) if pid else None
+                if cg and cg not in dominant_cgroups:
+                    dominant_cgroups.append(cg)
 
+        self.all_limits.is_limited_app_dominant = is_dominant
         logger.debug(f"Balance- was the process limited before? {self.all_limits.is_limited_app_dominant}")
-        self.control_manager.set_limited_app_dominant(self.all_limits.is_limited_app_dominant)
+        self.control_manager.set_limited_app_dominant(
+            self.all_limits.is_limited_app_dominant, dominant_cgroups)
 
     def _tick_separated_policy(
         self,

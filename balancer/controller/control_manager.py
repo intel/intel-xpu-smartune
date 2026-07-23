@@ -34,9 +34,9 @@ class ControlManager:
         """
         self.system_pressure_monitor.register_critical_state_listener(callback)
 
-    def set_limited_app_dominant(self, is_dominant: bool):
-        """ Set whether the limited app is dominant. """
-        self.system_pressure_monitor.set_limited_app_dominant(is_dominant)
+    def set_limited_app_dominant(self, is_dominant: bool, dominant_cgroup: str = None):
+        """ Set whether the limited app is dominant, and its cgroup path for PSI discounting. """
+        self.system_pressure_monitor.set_limited_app_dominant(is_dominant, dominant_cgroup)
 
     def get_current_pressure_level(self) -> tuple:
         """ Get system pressure level, score, disk pressure status, and PSI data. """

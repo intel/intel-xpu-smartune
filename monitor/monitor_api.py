@@ -564,6 +564,10 @@ class SystemPressureMonitor:
         _MAX_PRESSURE_UPDATE = 60.0  # seconds
         self._CACHE_TTL = max(_MIN_PRESSURE_UPDATE, min(_MAX_PRESSURE_UPDATE, config.regular_update_sys_pressure_time))
         self._is_limited_app_dominant = False
+        # Cgroup paths (relative to the cgroup mount) of the auto-limited apps that are
+        # currently among the top consumers, used to discount their self-inflicted PSI.
+        # Empty when no auto-limited app is dominant.
+        self._dominant_cgroups = []
         self._update_lock = threading.Lock()
 
         # Peak-latch fields: track the highest pressure seen since the balancer
@@ -589,10 +593,16 @@ class SystemPressureMonitor:
         """
         self._critical_state_listeners.append(callback)
 
-    def set_limited_app_dominant(self, is_dominant: bool):
-        """Set whether the rate-limited app is currently dominant."""
-        if self._is_limited_app_dominant != is_dominant:
-            self._is_limited_app_dominant = is_dominant
+    def set_limited_app_dominant(self, is_dominant: bool, dominant_cgroups=None):
+        """Set whether any rate-limited app is currently dominant, and (when so) the cgroup
+        paths used to discount their self-inflicted PSI. Accepts a single path or a list."""
+        self._is_limited_app_dominant = is_dominant
+        if not is_dominant or not dominant_cgroups:
+            self._dominant_cgroups = []
+        elif isinstance(dominant_cgroups, str):
+            self._dominant_cgroups = [dominant_cgroups]
+        else:
+            self._dominant_cgroups = list(dominant_cgroups)
 
     def _start_auto_refresh(self):
         """Start the background thread that periodically refreshes system pressure state."""
@@ -640,10 +650,14 @@ class SystemPressureMonitor:
             psi_data = self.psi.get_current_pressure()
             usage_data = self.res.get_resource_usage()
             disk_io = self.res.is_disk_io_stressed()
+            self_fraction = None
+            if self._is_limited_app_dominant and self._dominant_cgroups:
+                self_fraction = self.psi.get_self_inflicted_fraction(self._dominant_cgroups)
             score = self.analyzer.calculate_pressure_score(
                 psi_data,
                 usage_data,
-                self._is_limited_app_dominant
+                self._is_limited_app_dominant,
+                self_fraction
             )
             logger.debug(f"disk_io={disk_io}")
             level = self.analyzer.get_pressure_level(score, self.config.thresholds)

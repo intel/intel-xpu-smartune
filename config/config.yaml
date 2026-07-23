@@ -9,10 +9,10 @@ thresholds:
   high: 0.8
   critical: 1.0
 weights:
-  cpu: 2
-  memory: 7
+  cpu: 1
+  memory: 8
   io: 1
-dominant_app_reduce_factor: 3.5  # When a limited app is dominant and system is not busy, divide both weights and resource_adjust_factor by this value
+dominant_app_reduce_factor: 3.5
 cpu_busy_threshold: 90
 memory_busy_threshold: 90
 disk_utilization_threshold: 95

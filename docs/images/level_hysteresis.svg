@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="440" viewBox="0 0 880 440" font-family="Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="880" height="440" fill="white"/>
+<text x="70" y="24" font-size="16" font-weight="600" fill="#334155">Level hysteresis — enter medium at 0.60, drop to low only below 0.55</text>
+<line x1="70.0" y1="40" x2="70.0" y2="385" stroke="#e2e8f0"/>
+<text x="70.0" y="403" font-size="11" text-anchor="middle" fill="#334155">0</text>
+<line x1="116.7" y1="40" x2="116.7" y2="385" stroke="#e2e8f0"/>
+<text x="116.7" y="403" font-size="11" text-anchor="middle" fill="#334155">1</text>
+<line x1="163.3" y1="40" x2="163.3" y2="385" stroke="#e2e8f0"/>
+<text x="163.3" y="403" font-size="11" text-anchor="middle" fill="#334155">2</text>
+<line x1="210.0" y1="40" x2="210.0" y2="385" stroke="#e2e8f0"/>
+<text x="210.0" y="403" font-size="11" text-anchor="middle" fill="#334155">3</text>
+<line x1="256.7" y1="40" x2="256.7" y2="385" stroke="#e2e8f0"/>
+<text x="256.7" y="403" font-size="11" text-anchor="middle" fill="#334155">4</text>
+<line x1="303.3" y1="40" x2="303.3" y2="385" stroke="#e2e8f0"/>
+<text x="303.3" y="403" font-size="11" text-anchor="middle" fill="#334155">5</text>
+<line x1="350.0" y1="40" x2="350.0" y2="385" stroke="#e2e8f0"/>
+<text x="350.0" y="403" font-size="11" text-anchor="middle" fill="#334155">6</text>
+<line x1="396.7" y1="40" x2="396.7" y2="385" stroke="#e2e8f0"/>
+<text x="396.7" y="403" font-size="11" text-anchor="middle" fill="#334155">7</text>
+<line x1="443.3" y1="40" x2="443.3" y2="385" stroke="#e2e8f0"/>
+<text x="443.3" y="403" font-size="11" text-anchor="middle" fill="#334155">8</text>
+<line x1="490.0" y1="40" x2="490.0" y2="385" stroke="#e2e8f0"/>
+<text x="490.0" y="403" font-size="11" text-anchor="middle" fill="#334155">9</text>
+<line x1="536.7" y1="40" x2="536.7" y2="385" stroke="#e2e8f0"/>
+<text x="536.7" y="403" font-size="11" text-anchor="middle" fill="#334155">10</text>
+<line x1="583.3" y1="40" x2="583.3" y2="385" stroke="#e2e8f0"/>
+<text x="583.3" y="403" font-size="11" text-anchor="middle" fill="#334155">11</text>
+<line x1="630.0" y1="40" x2="630.0" y2="385" stroke="#e2e8f0"/>
+<text x="630.0" y="403" font-size="11" text-anchor="middle" fill="#334155">12</text>
+<line x1="70" y1="308.3" x2="630" y2="308.3" stroke="#e2e8f0"/>
+<text x="62" y="312.3" font-size="11" text-anchor="end" fill="#334155">0.4</text>
+<line x1="70" y1="193.3" x2="630" y2="193.3" stroke="#e2e8f0"/>
+<text x="62" y="197.3" font-size="11" text-anchor="end" fill="#334155">0.55</text>
+<line x1="70" y1="155.0" x2="630" y2="155.0" stroke="#e2e8f0"/>
+<text x="62" y="159.0" font-size="11" text-anchor="end" fill="#334155">0.6</text>
+<line x1="70" y1="40.0" x2="630" y2="40.0" stroke="#e2e8f0"/>
+<text x="62" y="44.0" font-size="11" text-anchor="end" fill="#334155">0.75</text>
+<line x1="70" y1="385" x2="630" y2="385" stroke="#64748b" stroke-width="1.5"/>
+<line x1="70" y1="40" x2="70" y2="385" stroke="#64748b" stroke-width="1.5"/>
+<text x="350" y="426" font-size="13" text-anchor="middle" fill="#334155">tick</text>
+<text x="18" y="212" font-size="13" text-anchor="middle" fill="#334155" transform="rotate(-90 18 212)">smoothed score</text>
+<path d="M70.0 231.7 L116.7 139.7 L163.3 170.3 L210.0 132.0 L256.7 178.0 L303.3 147.3 L350.0 185.7 L396.7 162.7 L443.3 201.0 L490.0 231.7 L536.7 277.7 L583.3 231.7 L630.0 139.7" fill="none" stroke="#2563eb" stroke-width="2.4"/>
+<line x1="648" y1="46" x2="670" y2="46" stroke="#2563eb" stroke-width="3"/>
+<text x="676" y="50" font-size="12" fill="#334155">smoothed score</text>
+<text x="648" y="84" font-size="10.5" fill="#64748b">up threshold = 0.60 (enter medium)</text>
+<text x="648" y="100" font-size="10.5" fill="#64748b">down threshold = 0.55 (0.60 - 0.05)</text>
+<text x="648" y="116" font-size="10.5" fill="#64748b">in [0.55, 0.60): keep prior level</text>
+<text x="648" y="132" font-size="10.5" fill="#64748b">=> no chatter at the boundary</text>
+<line x1="70" y1="155.0" x2="630" y2="155.0" stroke="#e11d48" stroke-width="1.3" stroke-dasharray="6 4"/>
+<text x="76" y="151.0" font-size="11" fill="#e11d48">medium entry 0.60</text>
+<line x1="70" y1="193.3" x2="630" y2="193.3" stroke="#059669" stroke-width="1.3" stroke-dasharray="6 4"/>
+<text x="76" y="189.3" font-size="11" fill="#059669">exit 0.55</text>
+</svg>

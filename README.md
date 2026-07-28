@@ -147,6 +147,7 @@ Real-time collection of CPU, memory, and I/O pressure data based on Linux PSI (P
 - PSI-based pressure monitoring (CPU/memory/I/O) with four levels: low/medium/high/critical
 - eBPF (via BCC) execve interception for real-time app launch/exit detection
 - Disk I/O stress detection and top disk consumer throttling
+- 📖 Deep dive: [System Pressure Model](docs/pressure_model.md) — the scoring formulas, sigmoid/EWMA curves, and how each tuning parameter affects behavior
 
 ### 3. Priority Queue
 When system pressure reaches critical level or disk I/O is busy, new app launch requests are suspended and inserted into a max-priority queue. Once resources recover, queued apps are automatically launched in priority order, with support for manual cancellation of queued launches.
@@ -218,7 +219,7 @@ intel-xpu-smartune/
 ├── my_database.db              # Peewee SQLite DB (generated at runtime)
 ├── key/                        # Generated TLS certificate/key (b_server.crt / .key)
 ├── logs/                       # Runtime logs
-├── docs/                       # API documentation (API_ENDPOINTS.md)
+├── docs/                       # Docs: API_ENDPOINTS.md, pressure_model.md (+ images/)
 ├── config/                     # config.yaml (thresholds, weights, app list) and config loader
 ├── utils/                      # Shared utilities: logger, app_utils, http_utils
 ├── db/                         # Peewee ORM database model for controlled app records

@@ -3258,6 +3258,11 @@ export default function SystemOverview({ active }: Props) {
                 <PressurePointerGauge
                   title="System Pressure"
                   valuePct={systemPressurePct}
+                  // Use the backend level as the single source of truth for the label; deriving
+                  // it from the score here can disagree with the backend (it applies hysteresis
+                  // and latches critical off the raw score), which read as "high" while the
+                  // system was already acting on "critical".
+                  levelLabel={pressureLevel ? pressureLevel.toUpperCase() : undefined}
                   subtitle={pressureLevel
                     ? `Level: ${pressureLevel.toUpperCase()} | Score: ${isNumber(pressureScore) ? (pressureScore / 100).toFixed(2) : 'N/A'}`
                     : undefined}

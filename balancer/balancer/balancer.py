@@ -143,7 +143,9 @@ class _MonitorLoopState:
     pressure_start_time: Optional[float] = None   # timestamp when pressure entered medium/low
     current_pressure: Optional[str] = None        # current pressure level; used to detect stability
     disk_io_not_stressed_start_time: Optional[float] = None  # timestamp when disk IO pressure was relieved
-    sustained_critical_iters: int = 0
+    prev_critical: bool = False                   # critical seen on the previous loop iteration (rising-edge detection)
+    critical_since: Optional[float] = None        # timestamp critical was first entered (sustained-recheck timer)
+    last_sustained_recheck_time: float = 0.0      # last time a sustained-critical background recheck fired
     prev_pressure: Optional[str] = None
     current_time: float = 0.0
 
@@ -201,7 +203,8 @@ class TopConsumerPrefetcher:
 
     CACHE_TTL = 5.0                       # rising-edge / listener debounce window (s)
     CRITICAL_WAIT = 0.35                  # max wait for an in-flight prefetch on cold-start (s)
-    SUSTAINED_CRITICAL_REFRESH_ITERS = 5  # iters of sustained critical before background recheck
+    SUSTAINED_CRITICAL_REFRESH_SEC = 45.0  # seconds of sustained critical before background recheck
+                                           # (wall-clock, independent of the loop's tick cadence)
 
     def __init__(self, fetch_top_consumers):
         """
@@ -442,7 +445,19 @@ class DynamicBalancer:
                     self.all_limits.is_limited_app_dominant = False
                     self.control_manager.set_limited_app_dominant(False)
 
-                if not self.app_priority_queue.empty() or (state.current_time - state.last_check_time) >= state.idle_check_interval:
+                # A RISING EDGE into critical bypasses the idle_check_interval gate. This loop
+                # wakes every ~1s (see time.sleep below), so a fresh critical level -- e.g.
+                # memory racing toward OOM -- gets a limit applied within ~1s instead of
+                # waiting up to idle_check_interval. Edge- (not level-) triggered on purpose:
+                # while critical persists, the tick reverts to the normal idle_check cadence,
+                # so we don't re-run the apply pipeline every second. Uses the non-consuming
+                # current level (does NOT reset the peak latch consumed below).
+                critical_now = self.control_manager.current_level == "critical"
+                critical_edge = critical_now and not state.prev_critical
+                state.prev_critical = critical_now
+                if (not self.app_priority_queue.empty()
+                        or critical_edge
+                        or (state.current_time - state.last_check_time) >= state.idle_check_interval):
                     # Use consume_peak_pressure_level() instead of get_current_pressure_level()
                     # so that transient "critical" spikes that occurred while the
                     # idle_check_interval gate was closed are never silently dropped.
@@ -527,7 +542,7 @@ class DynamicBalancer:
         disabled (the multi-second sampling has no consumer in that case).
         """
         if not passive_enabled:
-            state.sustained_critical_iters = 0
+            state.critical_since = None
             return
 
         # Edge trigger: prefetch whenever pressure enters the high band from
@@ -541,21 +556,25 @@ class DynamicBalancer:
             )
             self.top_prefetcher.start("entering_high")
 
-        # Sustained-critical recheck: if critical persists for N iters, the
-        # original top1 has had ample time to settle under its limit. Refresh
-        # top in background to catch a new dominant app that may have taken
-        # over. Counter resets whenever pressure drops out of critical.
+        # Sustained-critical recheck: if critical persists for SUSTAINED_CRITICAL_REFRESH_SEC,
+        # the original top1 has had ample time to settle under its limit. Refresh top in
+        # background to catch a new dominant app that may have taken over. Timed on wall-clock
+        # (not iteration count) so the cadence is independent of how often this tick runs.
+        # Timer resets whenever pressure drops out of critical.
         if pressure == "critical":
-            state.sustained_critical_iters += 1
-            if state.sustained_critical_iters >= TopConsumerPrefetcher.SUSTAINED_CRITICAL_REFRESH_ITERS:
+            now = state.current_time
+            if state.critical_since is None:
+                state.critical_since = now
+                state.last_sustained_recheck_time = now
+            elif now - state.last_sustained_recheck_time >= TopConsumerPrefetcher.SUSTAINED_CRITICAL_REFRESH_SEC:
                 logger.debug(
-                    f"Sustained critical for {state.sustained_critical_iters} iters: "
+                    f"Sustained critical for {round(now - state.critical_since, 1)}s: "
                     f"triggering background top-consumer recheck"
                 )
                 self.top_prefetcher.start("sustained_critical_recheck")
-                state.sustained_critical_iters = 0
+                state.last_sustained_recheck_time = now
         else:
-            state.sustained_critical_iters = 0
+            state.critical_since = None
 
     def _drain_pending_app_queue(self, state: "_MonitorLoopState") -> None:
         """Pop one pending app off ``app_priority_queue`` and resume it:

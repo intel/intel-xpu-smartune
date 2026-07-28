@@ -9,12 +9,12 @@ thresholds:
   high: 0.8
   critical: 1.0
 weights:
-  cpu: 1
-  memory: 8
+  cpu: 4
+  memory: 5
   io: 1
-dominant_app_reduce_factor: 3.5
 cpu_busy_threshold: 90
-memory_busy_threshold: 90
+memory_busy_threshold: 80
+mem_gate_steepness: 16  #Steepness of the memory scarcity sigmoid gate (larger = sharper transition around the memory busy point)
 disk_utilization_threshold: 95
 disk_iowait_threshold: 10
 disk_io_throughput_threshold_kb: 102400  # KB/s, i.e. 100 MB/s

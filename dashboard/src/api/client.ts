@@ -75,13 +75,43 @@ client.interceptors.request.use((config) => {
   return config
 })
 
+// --- Backend reachability tracking ---------------------------------------
+// Count consecutive "server unreachable" failures. Two shapes mean the backend
+// is down: (a) a network-level error with no HTTP response (ECONNREFUSED,
+// timeout, ...) — this is what the browser sees in production; (b) a gateway
+// error (502/503/504) — this is what the Vite dev proxy synthesizes when it
+// cannot reach the upstream (see vite.config.ts), so a dead backend arrives as
+// an HTTP response rather than a network error. Any other response — even a 401
+// or 500 from the real backend — means the server is reachable and resets the
+// count. Pollers (see usePolling) consult isBackendUnreachable() to back off
+// instead of hammering a dead backend.
+const MAX_CONSECUTIVE_ERRORS = 3
+const GATEWAY_ERROR_STATUSES = new Set([502, 503, 504])
+let consecutiveNetworkErrors = 0
+
+export function isBackendUnreachable(): boolean {
+  return consecutiveNetworkErrors >= MAX_CONSECUTIVE_ERRORS
+}
+
 // A 401 means the token is missing/invalid/revoked: drop it and prompt re-login.
 client.interceptors.response.use(
-  (res) => res,
+  (res) => {
+    consecutiveNetworkErrors = 0
+    return res
+  },
   (error) => {
-    if (error?.response?.status === 401) {
-      clearToken()
-      onUnauthorized?.()
+    const status = error?.response?.status
+    if (status === undefined || GATEWAY_ERROR_STATUSES.has(status)) {
+      // No response (network-level failure) or a gateway error from the dev
+      // proxy → the backend is down / unreachable.
+      consecutiveNetworkErrors += 1
+    } else {
+      // Got a real HTTP response from the backend → server is reachable.
+      consecutiveNetworkErrors = 0
+      if (status === 401) {
+        clearToken()
+        onUnauthorized?.()
+      }
     }
     return Promise.reject(error)
   },

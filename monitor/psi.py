@@ -34,6 +34,9 @@ class PSIMonitor:
             # History for the self-inflicted-fraction path (system + per-cgroup),
             # kept separate from the trigger-driven window above.
             cls._instance._frac_last = {}
+            # EWMA state for the smoothed self-inflicted fraction, per resource
+            # (see get_self_inflicted_fraction for why smoothing is needed).
+            cls._instance._frac_smoothed = {}
             cls._instance._pressure_history = defaultdict(list)
             cls._instance._last_pressure = {'cpu': 0.0, 'memory': 0.0, 'io': 0.0}
             cls._instance._window_sec = 5
@@ -135,6 +138,12 @@ class PSIMonitor:
         }
 
     _CGROUP_MOUNT = "/sys/fs/cgroup"
+    # EWMA smoothing factor for the self-inflicted fraction, in (0, 1]. The raw
+    # fraction is a single-interval ratio (Σ cgroup_rate / system_rate) and is
+    # therefore noisy tick-to-tick; smoothing across ticks damps the swing before it
+    # feeds the discount. Smaller = smoother but slower to react; ~0.3 keeps roughly a
+    # 3-4 sample memory at a ~5s cadence.
+    _FRAC_EWMA_ALPHA = 0.3
 
     @staticmethod
     def _parse_some_total(path: str) -> Optional[int]:
@@ -174,26 +183,37 @@ class PSIMonitor:
         """Estimate how much of each resource's system pressure is self-inflicted by the
         set of currently rate-limited cgroups, as a fraction in [0, 1] per resource.
 
-        For each resource: ``min(1, (Σ cgroup_rate) / system_rate)`` summed over the given
-        cgroups, all using the file's total-delta method (unit-independent ratio, so it
-        composes with any pressure magnitude). When the already-limited apps are the sole
-        source of a resource's stalls the fraction approaches 1; when other (unlimited)
-        tasks also stall it drops, leaving their (real) pressure intact. Aggregating over
-        all limited cgroups means that once every top consumer is already limited, their
-        combined pressure is discounted -- so the score stops over-reporting and restore
-        can proceed. Returns all-zero (no discount) when unavailable.
+        For each resource: ``min(1, (Σ cgroup_rate) / system_rate)`` over the given cgroups,
+        both taken from the ``some``-pressure total-delta method on the cgroup's
+        ``<res>.pressure`` file vs the system PSI file (unit-independent ratio). Attribution
+        is pressure-based on purpose: a throughput/usage share was tried and was worse for
+        stall-driven loads (e.g. ``stress --io`` generates IO-wait via ``sync()`` while
+        moving almost no bytes, so a byte share collapsed to ~0 and under-discounted). When
+        the already-limited apps are the sole source of a resource's stalls the fraction
+        approaches 1; when other (unlimited) tasks also stall it drops, leaving their (real)
+        pressure intact. Aggregating over all limited cgroups means once every top consumer
+        is limited their combined pressure is discounted, so the score stops over-reporting
+        and restore can proceed. Returns all-zero (no discount) when unavailable.
+
+        The per-interval ratio is noisy, so each resource's fraction is EWMA-smoothed across
+        calls (see ``_FRAC_EWMA_ALPHA``). A resource with no fresh measurement this call
+        carries forward its last smoothed value rather than collapsing to 0, so a momentary
+        sampling gap does not briefly drop the discount and spike the score. The scorer only
+        consumes the CPU/IO fractions (hard-limited resources); memory is governed instead by
+        the availability-driven scarcity gate (PressureAnalyzer._mem_scarcity_gate).
 
         Accepts a single path or a list of paths.
         """
-        fraction = {'cpu': 0.0, 'memory': 0.0, 'io': 0.0}
         if not cgroup_rel_paths:
-            return fraction
+            return {'cpu': 0.0, 'memory': 0.0, 'io': 0.0}
         if isinstance(cgroup_rel_paths, str):
             cgroup_rel_paths = [cgroup_rel_paths]
-        for res in ('cpu', 'memory', 'io'):
+
+        # Raw single-interval fraction per resource; only populated when a valid
+        # system rate and at least one cgroup rate are available this call.
+        raw = {}
+        for res in ('cpu', 'io'):
             sys_rate = self._some_total_delta_rate(('sys', res), self._PRESSURE_FILES[res])
-            if not sys_rate:
-                continue
             cg_sum, have_cg = 0.0, False
             for path in cgroup_rel_paths:
                 cg_rate = self._some_total_delta_rate(
@@ -202,8 +222,20 @@ class PSIMonitor:
                 if cg_rate is not None:
                     cg_sum += cg_rate
                     have_cg = True
-            if have_cg:
-                fraction[res] = min(1.0, cg_sum / sys_rate)
+            if sys_rate and have_cg:
+                raw[res] = min(1.0, cg_sum / sys_rate)
+
+        alpha = self._FRAC_EWMA_ALPHA
+        fraction = {'cpu': 0.0, 'memory': 0.0, 'io': 0.0}
+        for res in ('cpu', 'memory', 'io'):
+            if res in raw:
+                prev = self._frac_smoothed.get(res)
+                cur = raw[res] if prev is None else alpha * raw[res] + (1.0 - alpha) * prev
+                self._frac_smoothed[res] = cur
+                fraction[res] = cur
+            else:
+                # No fresh sample: hold the last smoothed value (0.0 if never measured).
+                fraction[res] = self._frac_smoothed.get(res, 0.0)
         return fraction
 
     def cleanup(self):

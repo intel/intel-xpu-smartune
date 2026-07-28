@@ -546,11 +546,13 @@ export interface CollectionData {
 }
 
 // System-pressure tuning grouped as one settings card: level cut-offs, resource
-// weights, and the dominant-app reduce factor.
+// weights, and the memory-discount gate steepness.
 export interface SystemPressureData {
   thresholds: { low: number; medium: number; high: number; critical: number }
   weights: { cpu: number; memory: number; io: number }
-  dominant_app_reduce_factor: number
+  mem_gate_steepness: number
+  memory_busy_threshold: number
+  cpu_busy_threshold: number
   updated_at?: number
 }
 

@@ -545,6 +545,15 @@ _LEVEL_ORDER: Dict[str, int] = {
     "critical":  3,
 }
 
+# Adaptive pressure-refresh cadence: while free RAM is ample the normal interval
+# (regular_update_sys_pressure_time) is used, but once memory climbs into the pre-OOM band
+# the refresh tightens to _FAST_PRESSURE_UPDATE so a run toward critical is caught within a
+# couple of seconds instead of up to a full normal interval. The band entry tracks
+# memory_busy_threshold (so it moves with that knob): fast mode engages at
+# (memory_busy_threshold - _FAST_ZONE_MEM_MARGIN)% used.
+_FAST_PRESSURE_UPDATE = 2.0    # seconds
+_FAST_ZONE_MEM_MARGIN = 20.0   # percentage points below the busy threshold
+
 
 class SystemPressureMonitor:
     """ Manages overall system pressure state based on PSI and resource usage,
@@ -563,6 +572,9 @@ class SystemPressureMonitor:
         _MIN_PRESSURE_UPDATE = 1.0   # seconds
         _MAX_PRESSURE_UPDATE = 60.0  # seconds
         self._CACHE_TTL = max(_MIN_PRESSURE_UPDATE, min(_MAX_PRESSURE_UPDATE, config.regular_update_sys_pressure_time))
+        # Next refresh interval, recomputed each cycle by _update_pressure_level: normal
+        # (_CACHE_TTL) when RAM is ample, _FAST_PRESSURE_UPDATE when memory is in the pre-OOM band.
+        self._next_interval = self._CACHE_TTL
         self._is_limited_app_dominant = False
         # Cgroup paths (relative to the cgroup mount) of the auto-limited apps that are
         # currently among the top consumers, used to discount their self-inflicted PSI.
@@ -608,7 +620,7 @@ class SystemPressureMonitor:
         """Start the background thread that periodically refreshes system pressure state."""
         def refresh_loop():
             while True:
-                time.sleep(self._CACHE_TTL * 0.9)
+                time.sleep(self._next_interval * 0.9)
                 self._safe_update()
 
         threading.Thread(target=refresh_loop, daemon=True).start()
@@ -653,20 +665,36 @@ class SystemPressureMonitor:
             self_fraction = None
             if self._is_limited_app_dominant and self._dominant_cgroups:
                 self_fraction = self.psi.get_self_inflicted_fraction(self._dominant_cgroups)
-            score = self.analyzer.calculate_pressure_score(
+            raw_score = self.analyzer.calculate_pressure_score(
                 psi_data,
                 usage_data,
                 self._is_limited_app_dominant,
                 self_fraction
             )
             logger.debug(f"disk_io={disk_io}")
-            level = self.analyzer.get_pressure_level(score, self.config.thresholds)
+            # Smooth + hysteresis for the level/restore decision; critical stays instantaneous.
+            # `score` is the smoothed value so the reported score matches the emitted level.
+            level, score = self.analyzer.classify_level(raw_score, self.config.thresholds)
             self._last_update_time = time.time()
+            # Tighten the refresh cadence while memory is in the pre-OOM band so a fast climb
+            # toward critical is caught promptly; relax back to normal once RAM is ample.
+            mem_usage = usage_data.get('memory', {}).get('usage', 0.0)
+            busy = getattr(self.config, 'memory_busy_threshold', 90)
+            in_fast_zone = mem_usage >= (busy - _FAST_ZONE_MEM_MARGIN)
+            self._next_interval = min(_FAST_PRESSURE_UPDATE, self._CACHE_TTL) if in_fast_zone else self._CACHE_TTL
             return level, score, disk_io.get("is_stressed", False), disk_io
         except Exception as e:
             logger.error("Failed to update pressure level: %s", str(e))
             return "unknown", 0.0, False, {}
 
+
+    @property
+    def current_level(self) -> str:
+        """Cached pressure level string with NO logging -- safe for hot-path polling
+        (the balancer's per-second critical pre-check). Use this instead of
+        get_current_pressure_level() when you only need the level and must not spam the log.
+        """
+        return self._current_level
 
     def get_current_pressure_level(self) -> tuple:
         """Return the current pressure level as (level, score, is_disk_io_stressed)."""
@@ -1882,7 +1910,9 @@ def _get_system_pressure():
         "regular_update_sys_pressure_time": getattr(cfg, "regular_update_sys_pressure_time", 5),
         "thresholds": dict(cfg.thresholds or {}),
         "weights": dict(cfg.weights or {}),
-        "dominant_app_reduce_factor": getattr(cfg, "dominant_app_reduce_factor", None),
+        "mem_gate_steepness": getattr(cfg, "mem_gate_steepness", None),
+        "memory_busy_threshold": getattr(cfg, "memory_busy_threshold", None),
+        "cpu_busy_threshold": getattr(cfg, "cpu_busy_threshold", None),
     }
 
 
@@ -1923,11 +1953,23 @@ def _validate_system_pressure(body):
         if w:
             updates["weights"] = w
 
-    if body.get("dominant_app_reduce_factor") is not None:
-        val = float(body["dominant_app_reduce_factor"])
-        if not (1 <= val <= 100):
-            raise ValueError("dominant_app_reduce_factor must be within [1, 100]")
-        updates["dominant_app_reduce_factor"] = val
+    if body.get("mem_gate_steepness") is not None:
+        val = float(body["mem_gate_steepness"])
+        if not (1 <= val <= 50):
+            raise ValueError("mem_gate_steepness must be within [1, 50]")
+        updates["mem_gate_steepness"] = val
+
+    if body.get("memory_busy_threshold") is not None:
+        val = float(body["memory_busy_threshold"])
+        if not (0 <= val <= 100):
+            raise ValueError("memory_busy_threshold must be within [0, 100]")
+        updates["memory_busy_threshold"] = val
+
+    if body.get("cpu_busy_threshold") is not None:
+        val = float(body["cpu_busy_threshold"])
+        if not (0 <= val <= 100):
+            raise ValueError("cpu_busy_threshold must be within [0, 100]")
+        updates["cpu_busy_threshold"] = val
 
     if not updates:
         raise ValueError("No valid system_pressure updates provided")
@@ -1940,7 +1982,16 @@ def _write_system_pressure(updates):
         cfg.update_config_section("thresholds", updates["thresholds"])
     if "weights" in updates:
         cfg.update_config_section("weights", updates["weights"])
-    scalars = {k: updates[k] for k in ("dominant_app_reduce_factor", "regular_update_sys_pressure_time") if k in updates}
+    scalars = {
+        k: updates[k]
+        for k in (
+            "mem_gate_steepness",
+            "memory_busy_threshold",
+            "cpu_busy_threshold",
+            "regular_update_sys_pressure_time",
+        )
+        if k in updates
+    }
     if scalars:
         cfg.update_top_level_scalars(scalars)
     return True

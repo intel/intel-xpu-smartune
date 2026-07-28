@@ -3,6 +3,14 @@
 
 import { useEffect, useRef } from 'react'
 
+import { isBackendUnreachable } from '../api/client'
+
+// Once the backend is unreachable (see client.ts), stop hammering it at the
+// normal cadence and probe at this slow interval instead. A single successful
+// request resets the reachability flag, so polling returns to intervalMs on the
+// very next tick after the server comes back.
+const RECONNECT_INTERVAL_MS = 30000
+
 export function usePolling(callback: () => void | Promise<void>, intervalMs: number, enabled = true) {
   const savedCallback = useRef(callback)
 
@@ -23,7 +31,8 @@ export function usePolling(callback: () => void | Promise<void>, intervalMs: num
         // Errors are expected to be handled by the callback itself
       }
       if (!cancelled) {
-        timeoutId = setTimeout(run, intervalMs)
+        const delay = isBackendUnreachable() ? RECONNECT_INTERVAL_MS : intervalMs
+        timeoutId = setTimeout(run, delay)
       }
     }
 

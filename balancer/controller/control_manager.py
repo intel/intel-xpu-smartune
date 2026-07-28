@@ -38,6 +38,11 @@ class ControlManager:
         """ Set whether the limited app is dominant, and its cgroup path for PSI discounting. """
         self.system_pressure_monitor.set_limited_app_dominant(is_dominant, dominant_cgroup)
 
+    @property
+    def current_level(self) -> str:
+        """ Cached system pressure level string, no logging (hot-path safe). """
+        return self.system_pressure_monitor.current_level
+
     def get_current_pressure_level(self) -> tuple:
         """ Get system pressure level, score, disk pressure status, and PSI data. """
         return self.system_pressure_monitor.get_current_pressure_level()

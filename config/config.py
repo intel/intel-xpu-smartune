@@ -22,7 +22,6 @@ class Config:
     weights: dict = None
     weights_top: dict = None
     passive_resource_control: dict = None
-    dominant_app_reduce_factor: float = 3.0
     workloads: dict = None
     app_priority: dict = None
     limit_policy: dict = None
@@ -33,6 +32,10 @@ class Config:
     cooldown_time: float = 15
     cpu_busy_threshold: float = 90
     memory_busy_threshold: float = 90
+    # Steepness of the sigmoid (logistic) memory scarcity gate in pressure.py
+    # (larger = sharper transition around the memory "busy" point). See
+    # PressureAnalyzer._mem_scarcity_gate.
+    mem_gate_steepness: float = 8.0
     disk_utilization_threshold: float = 95
     disk_iowait_threshold: float = 10
     disk_io_throughput_threshold_kb: float = 102400  # KB/s, i.e. 100 MB/s
@@ -605,7 +608,7 @@ class Config:
 
     def update_top_level_scalars(self, updates: dict[str, Any]) -> bool:
         """Persist one or more top-level *scalar* config keys (e.g.
-        ``cpu_busy_threshold``, ``dominant_app_reduce_factor``).
+        ``cpu_busy_threshold``, ``mem_gate_steepness``).
 
         Each value is coerced to the current attribute's type when possible so
         an int field stays an int on disk.  Comments on the line are preserved.
@@ -642,7 +645,8 @@ class Config:
                     modified = True
 
             if modified:
-                logger.info(f"Configuration updated (scalars): {list(yaml_updates.keys())}")
+                logger.info("Configuration updated (scalars): %s",
+                            {path[-1]: val for path, val in yaml_updates.items()})
                 self._patch_limit_policy_yaml(yaml_updates, self._config_path)
 
         return modified

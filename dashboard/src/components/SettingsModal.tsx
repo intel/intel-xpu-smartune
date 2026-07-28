@@ -350,7 +350,9 @@ function MonitorPanel() {
             regular_update_sys_pressure_time: number
             thresholds: Record<string, number>
             weights: Record<string, number>
-            dominant_app_reduce_factor: number
+            mem_gate_steepness: number
+            memory_busy_threshold: number
+            cpu_busy_threshold: number
             updated_at?: number
           }>('system_pressure')
           return {
@@ -358,7 +360,9 @@ function MonitorPanel() {
               regular_update_sys_pressure_time: d.regular_update_sys_pressure_time,
               thresholds: d.thresholds,
               weights: d.weights,
-              dominant_app_reduce_factor: d.dominant_app_reduce_factor,
+              mem_gate_steepness: d.mem_gate_steepness,
+              memory_busy_threshold: d.memory_busy_threshold,
+              cpu_busy_threshold: d.cpu_busy_threshold,
             },
             updatedAt: d.updated_at,
           }
@@ -368,7 +372,9 @@ function MonitorPanel() {
           regular_update_sys_pressure_time: c.regular_update_sys_pressure_time,
           thresholds: c.thresholds,
           weights: c.weights,
-          dominant_app_reduce_factor: c.dominant_app_reduce_factor,
+          mem_gate_steepness: c.mem_gate_steepness,
+          memory_busy_threshold: c.memory_busy_threshold,
+          cpu_busy_threshold: c.cpu_busy_threshold,
         })}
       >
         <Row gutter={16}>
@@ -431,12 +437,32 @@ function MonitorPanel() {
         <Row gutter={16}>
           <Col span={8}>
             <Form.Item
-              label="Dominant-app factor"
-              name="dominant_app_reduce_factor"
-              tooltip="Damps the score when a throttled app dominates while the system is otherwise idle."
-              rules={[{ required: true, type: 'number', min: 1, max: 100 }]}
+              label="Memory gate steepness"
+              name="mem_gate_steepness"
+              tooltip="Steepness of the memory-discount sigmoid gate: larger makes the transition around the memory busy point sharper."
+              rules={[{ required: true, type: 'number', min: 1, max: 50 }]}
             >
-              <InputNumber style={{ width: '100%' }} min={1} max={100} step={0.5} />
+              <InputNumber style={{ width: '100%' }} min={1} max={50} step={0.5} />
+            </Form.Item>
+          </Col>
+          <Col span={8}>
+            <Form.Item
+              label="Memory busy threshold (%)"
+              name="memory_busy_threshold"
+              tooltip="Memory usage percentage where memory pressure starts to be treated as busy."
+              rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
+            >
+              <InputNumber style={{ width: '100%' }} min={0} max={100} step={1} />
+            </Form.Item>
+          </Col>
+          <Col span={8}>
+            <Form.Item
+              label="CPU busy threshold (%)"
+              name="cpu_busy_threshold"
+              tooltip="CPU usage percentage where CPU pressure starts to be treated as busy."
+              rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
+            >
+              <InputNumber style={{ width: '100%' }} min={0} max={100} step={1} />
             </Form.Item>
           </Col>
         </Row>

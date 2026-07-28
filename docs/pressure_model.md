@@ -62,9 +62,11 @@ rest of the machine has headroom. We remove only the portion of the stall that t
 limited app itself caused.
 
 $$
-\text{psi\_eff}_{r} = \text{psi}_{r}\;\bigl(1 - \text{self\_fraction}_{r}\cdot \text{gate}\bigr)
+p^{\mathrm{eff}}_{r} = p_{r}\;\bigl(1 - f_{r}g\bigr)
 \qquad r \in \{\text{cpu}, \text{io}\}
 $$
+
+where $p^{\mathrm{eff}}_{r}\equiv$ `psi_eff.r`, $p_r\equiv$ `psi.r`, $f_r\equiv$ `self_fraction.r`, and $g\equiv$ `gate`.
 
 - `gate` = `_CPU_IO_SELF_GATE` (default **0.7**).
 - `self_fraction` is only non-zero when a limited app is dominant; otherwise no discount.
@@ -72,8 +74,10 @@ $$
 **`self_fraction` itself** (`PSIMonitor.get_self_inflicted_fraction`):
 
 $$
-\text{self\_fraction}_{r} = \min\!\Bigl(1,\ \frac{\sum_{\text{limited cg}} \text{stall\_rate}_{cg,r}}{\text{stall\_rate}_{\text{system},r}}\Bigr)
+f_{r} = \min\!\Bigl(1,\ \frac{\sum_{\mathrm{limited\ cg}} q_{cg,r}}{q_{\mathrm{sys},r}}\Bigr)
 $$
+
+where $q_{cg,r}$ and $q_{\mathrm{sys},r}$ are cgroup/system stall-rate deltas for resource $r$.
 
 computed from the `some total` delta of each cgroup's `*.pressure` file vs the system
 PSI file, then **EWMA-smoothed** (§5). It is attribution by *pressure*, not throughput —
@@ -102,12 +106,14 @@ near-OOM before thrashing starts (under-report). Instead memory pressure is deri
 **directly from the free-RAM ratio** with a logistic (sigmoid) gate:
 
 $$
-\text{mem\_scarcity} = \frac{1}{1 + e^{x}},
+m = \frac{1}{1 + e^{x}},
 \qquad
-x = \frac{\text{available\_ratio} - c}{c}\cdot k,
+x = \frac{a - c}{c}\cdot k,
 \qquad
-c = 1 - \frac{\text{memory\_busy\_threshold}}{100}
+c = 1 - \frac{T_{\mathrm{mem}}}{100}
 $$
+
+where $m\equiv$ `mem_scarcity`, $a\equiv$ `available_ratio`, and $T_{\mathrm{mem}}\equiv$ `memory_busy_threshold`.
 
 - `c` = **center** = free-RAM ratio at the "busy" point (default busy 80 % → `c = 0.2`).
 - `k` = `mem_gate_steepness` (default **8**).
@@ -139,12 +145,14 @@ applied (memory scarcity is *never* discounted — that preserves OOM safety, si
 ## 5. Aggregation — normalized average + independent memory channel
 
 $$
-\text{load} = \frac{w_{\text{cpu}}\cdot\text{psi\_eff}_{\text{cpu}} + w_{\text{mem}}\cdot\text{mem\_scarcity} + w_{\text{io}}\cdot\text{psi\_eff}_{\text{io}}}{w_{\text{cpu}} + w_{\text{mem}} + w_{\text{io}}}
+L = \frac{w_{\mathrm{cpu}}\,p^{\mathrm{eff}}_{\mathrm{cpu}} + w_{\mathrm{mem}}\,m + w_{\mathrm{io}}\,p^{\mathrm{eff}}_{\mathrm{io}}}{w_{\mathrm{cpu}} + w_{\mathrm{mem}} + w_{\mathrm{io}}}
 $$
 
 $$
-\boxed{\ \text{score} = \min\bigl(\max(\text{load},\ \text{mem\_scarcity}),\ 1\bigr)\ }
+\boxed{\ S = \min\bigl(\max(L,\ m),\ 1\bigr)\ }
 $$
+
+where $L\equiv$ `load` and $S\equiv$ final `score`.
 
 Two design decisions live in this one line:
 
@@ -198,8 +206,10 @@ raw scores into a **stable level** plus the smoothed score that is reported to t
 **(a) EWMA smoothing** of the sub-critical score:
 
 $$
-s_t = \alpha\,x_t + (1-\alpha)\,s_{t-1},\qquad \alpha = \text{\_SCORE\_EWMA\_ALPHA} = 0.3
+s_t = \alpha\,x_t + (1-\alpha)\,s_{t-1},\qquad \alpha = 0.3
 $$
+
+where `alpha` is configured by `_SCORE_EWMA_ALPHA` in `pressure.py`.
 
 A first-order IIR low-pass filter. Weight on the sample `k` ticks ago is `α(1−α)^k`
 (geometric decay); effective memory ≈ `1/α ≈ 3.3` ticks (~15 s at a 5 s cadence).

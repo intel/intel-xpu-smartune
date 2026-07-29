@@ -1094,38 +1094,10 @@ class DynamicBalancer:
         """Network sampling + handling. Runs every iteration (regardless
         of ``idle_check_interval``) so traffic pressure stays current.
         """
-        if self.network_controller.enable_network_control:
-            self.network_controller.update_app_network_control()
-            self.network_controller.network.get_tc_class_stats(self.network_controller.IFB_DEV,
-                                                               self.network_controller.handle_id + 1,
-                                                               classids=self.network_controller.ingress_classids,
-                                                               direction="ingress")
-            self.network_controller.network.get_tc_class_stats(self.network_controller.dev,
-                                                               self.network_controller.handle_id,
-                                                               classids=self.network_controller.egress_classids,
-                                                               direction="egress")
-        self.network_controller.network.sample_network_pressure()
-        if state.current_time - state.last_network_sample_time >= state.network_sample_interval:
+        do_pressure_eval = (state.current_time - state.last_network_sample_time) >= state.network_sample_interval
+        if do_pressure_eval:
             state.last_network_sample_time = state.current_time
-            network_data = self.network_controller.network.get_current_pressure()
-            tx_pressure, rx_pressure, *_ = self.control_manager.update_network_pressure_level(network_data)
-            tx_total_bw = self.network_controller.total_bw * network_data['tx']
-            rx_total_bw = self.network_controller.total_bw * network_data['rx']
-            logger.debug(
-                f"NetworkMonitor {self.network_controller.dev} TX level: {tx_pressure} (pressure: {network_data['tx']:.2f}),"
-                f" RX level: {rx_pressure} (pressure: {network_data['rx']:.2f})")
-            if self.network_controller.enable_network_control:
-                ingress_rates = self.network_controller.network.get_tc_class_stats_rate_ingress()
-                egress_rates = self.network_controller.network.get_tc_class_stats_rate_egress()
-                rates = self.network_controller.get_rates(self.network_controller.handle_id, egress_rates,
-                                                          ingress_rates)
-                logger.debug(
-                    f"NetworkMonitor {self.network_controller.dev} TX_total_BW={tx_total_bw:,.2f}kbit/s (App Class BW: System - {rates['egress_system']:,.2f},"
-                    f" Critical - {rates['egress_critical']:,.2f} , High - {rates['egress_high']:,.2f}, Low - {rates['egress_low']:,.2f}),"
-                    f" RX_total_BW={rx_total_bw:,.2f}kbit/s (App Class BW: System - {rates['ingress_system']:,.2f},"
-                    f" Critical - {rates['ingress_critical']:,.2f} , High - {rates['ingress_high']:,.2f}, Low - {rates['ingress_low']:,.2f})")
-                self.network_controller.handle_network_pressure(tx_pressure, rx_pressure, ingress_rates,
-                                                                egress_rates, network_data)
+        self.network_controller.process_network_cycle(self.control_manager, do_pressure_eval)
 
     def _run_handle_loop(self):
         logger.info("Resource handle service is wait for processing")

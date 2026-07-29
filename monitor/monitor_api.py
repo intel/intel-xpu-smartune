@@ -29,6 +29,7 @@ monitor_bp = Blueprint('monitor', __name__, url_prefix='/monitor')
 
 _resource_monitor = None
 _system_pressure_monitor = None
+_network_config_reload_notifier: Optional[Callable[[], None]] = None
 
 # ---------------------------------------------------------------------------
 # Background auto-refresh cache for /dynamic_info
@@ -265,6 +266,17 @@ def register_system_pressure_monitor(spm) -> None:
     _system_pressure_monitor = spm
 
 
+def register_network_config_reload_notifier(callback: Optional[Callable[[], None]]) -> None:
+    """Register a callback to apply network-control config changes live.
+
+    The balancer wires this to ``NetworkController.request_reload`` so updates
+    made via /monitor/config/network_control are applied on the next monitor
+    cycle without a service restart.
+    """
+    global _network_config_reload_notifier
+    _network_config_reload_notifier = callback
+
+
 # ---------------------------------------------------------------------------
 # Snapshot retention settings and background cleanup
 # ---------------------------------------------------------------------------
@@ -312,6 +324,8 @@ _CONFIG_TS_KEYS = {
     "monitored_sections":       "monitored_sections_updated_at",
     "system_pressure":          "system_pressure_updated_at",
     "disk_pressure":            "disk_pressure_updated_at",
+    "network_pressure":         "network_pressure_updated_at",
+    "network_control":          "network_control_updated_at",
     "limit_policy":             "limit_policy_updated_at",
 }
 
@@ -1895,6 +1909,7 @@ _LIMIT_PRIORITIES = ("high", "medium", "low", "undefined")
 _DISK_RATE_FIELDS = ("write", "read", "write_iops", "read_iops")
 _THRESHOLD_KEYS = ("low", "medium", "high", "critical")
 _PSI_WEIGHT_KEYS = ("cpu", "memory", "io")
+_NETWORK_PRIORITIES = ("system", "critical", "high", "low")
 
 
 def _cfg():
@@ -2013,6 +2028,35 @@ def _validate_disk_pressure(body):
     return {key: val}
 
 
+# --- network_pressure: network utilisation level cut-offs --------------------
+def _get_network_pressure():
+    return {"network_thresholds": dict(_cfg().network_thresholds or {})}
+
+
+def _validate_network_pressure(body):
+    thresholds_body = body.get("network_thresholds")
+    if not isinstance(thresholds_body, dict):
+        raise ValueError("network_thresholds must be an object")
+
+    thresholds = {}
+    for key in _THRESHOLD_KEYS:
+        if key in thresholds_body and thresholds_body[key] is not None:
+            value = float(thresholds_body[key])
+            if not (0 < value <= 1):
+                raise ValueError(f"network threshold {key} must be within (0, 1]")
+            thresholds[key] = value
+
+    merged = {**(_cfg().network_thresholds or {}), **thresholds}
+    ordered = [merged[key] for key in _THRESHOLD_KEYS if merged.get(key) is not None]
+    if len(ordered) != len(_THRESHOLD_KEYS) or ordered != sorted(ordered):
+        raise ValueError("network_thresholds must be ordered low <= medium <= high <= critical")
+    return {"network_thresholds": thresholds}
+
+
+def _write_network_pressure(updates):
+    return _cfg().update_config_section("network_thresholds", updates["network_thresholds"])
+
+
 # --- limit_policy: full nested policy + per-resource enable/rate --------------
 def _limit_policy_snapshot():
     """Full limit_policy view (policy + per-resource enabled/rate)."""
@@ -2090,6 +2134,166 @@ def _validate_limit_policy(body):
     return updates
 
 
+# --- network_control: class bandwidth ratios + network switch ----------------
+def _get_network_control():
+    cfg = _cfg()
+    from monitor.system_info import _get_network_static_info
+
+    available_nics = _get_network_static_info().get("valid_nics", [])
+    configured_nics = getattr(cfg, "network_interfaces", None)
+    if configured_nics is None:
+        selected_nics = [nic.get("name") for nic in available_nics if isinstance(nic, dict) and nic.get("name")]
+    else:
+        selected_nics = [
+            entry.get("name") for entry in configured_nics
+            if isinstance(entry, dict) and entry.get("enabled", True) and entry.get("name")
+        ]
+    bw = dict(cfg.config_network_bw or {})
+    raw_ports = getattr(cfg, "network_system_ports", [])
+    ports = []
+    if isinstance(raw_ports, (list, tuple)):
+        for p in raw_ports:
+            try:
+                val = int(p)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= val <= 65535:
+                ports.append(val)
+    # Normalise to the currently supported class set and keep deterministic order.
+    class_bw = {
+        key: {
+            "min": float((bw.get(key) or {}).get("min", 0.0)),
+            "max": float((bw.get(key) or {}).get("max", 0.0)),
+        }
+        for key in _NETWORK_PRIORITIES
+    }
+    return {
+        "enable_network_control": bool(getattr(cfg, "enable_network_control", False)),
+        "enable_network_pressure_shaping": bool(getattr(cfg, "enable_network_pressure_shaping", True)),
+        "available_network_interfaces": available_nics,
+        "selected_network_interfaces": selected_nics,
+        "config_network_bw": class_bw,
+        "network_system_ports": sorted(set(ports)),
+    }
+
+
+def _validate_network_control(body):
+    updates: dict[str, Any] = {}
+
+    if "enable_network_control" in body:
+        updates["enable_network_control"] = bool(body.get("enable_network_control"))
+
+    enabling_network_control = (
+        "enable_network_control" in updates and updates["enable_network_control"] is True
+    )
+    disabling_network_control = (
+        "enable_network_control" in updates and updates["enable_network_control"] is False
+    )
+
+    if "enable_network_pressure_shaping" in body:
+        updates["enable_network_pressure_shaping"] = bool(body.get("enable_network_pressure_shaping"))
+
+    if "selected_network_interfaces" in body and not disabling_network_control:
+        from monitor.system_info import _get_network_static_info
+
+        selected = body.get("selected_network_interfaces")
+        if not isinstance(selected, list):
+            raise ValueError("selected_network_interfaces must be a list")
+        available = {
+            nic.get("name") for nic in _get_network_static_info().get("valid_nics", [])
+            if isinstance(nic, dict) and nic.get("name")
+        }
+        names = list(dict.fromkeys(str(name) for name in selected if name))
+        unknown = [name for name in names if name not in available]
+        if unknown:
+            raise ValueError(f"Unknown or unavailable network interfaces: {', '.join(unknown)}")
+        if body.get("enable_network_control", getattr(_cfg(), "enable_network_control", False)) and not names:
+            raise ValueError("At least one network interface must be selected while network control is enabled")
+        updates["network_interfaces"] = [{"name": name, "enabled": True} for name in names]
+
+    if enabling_network_control and "selected_network_interfaces" not in body:
+        configured_nics = getattr(_cfg(), "network_interfaces", None)
+        has_configured_enabled_nic = isinstance(configured_nics, list) and any(
+            isinstance(entry, dict) and entry.get("enabled", True) and entry.get("name")
+            for entry in configured_nics
+        )
+        if not has_configured_enabled_nic:
+            from monitor.system_info import _get_network_static_info
+
+            available_names = [
+                nic.get("name")
+                for nic in _get_network_static_info().get("valid_nics", [])
+                if isinstance(nic, dict) and nic.get("name")
+            ]
+            if not available_names:
+                raise ValueError("At least one network interface must be available while network control is enabled")
+            updates["network_interfaces"] = [
+                {"name": name, "enabled": True}
+                for name in available_names
+            ]
+
+    # Product behavior: when the global network-control switch is turned off,
+    # clear persisted interface selection so future enable can repopulate defaults.
+    if disabling_network_control:
+        updates["network_interfaces"] = []
+
+    bw_body = body.get("config_network_bw")
+    if isinstance(bw_body, dict):
+        if "system" in bw_body:
+            raise ValueError("config_network_bw.system is reserved and cannot be modified")
+        bw_updates = {}
+        for pri in _NETWORK_PRIORITIES:
+            if pri == "system":
+                continue
+            pri_body = bw_body.get(pri)
+            if not isinstance(pri_body, dict):
+                continue
+            pri_upd = {}
+            for key in ("min", "max"):
+                if key in pri_body and pri_body[key] is not None:
+                    val = float(pri_body[key])
+                    if not (0 <= val <= 1):
+                        raise ValueError(f"config_network_bw.{pri}.{key} must be within [0, 1]")
+                    pri_upd[key] = val
+            if pri_upd:
+                current = _cfg().config_network_bw.get(pri, {}) if isinstance(_cfg().config_network_bw, dict) else {}
+                merged = {**(current if isinstance(current, dict) else {}), **pri_upd}
+                min_v = merged.get("min")
+                max_v = merged.get("max")
+                if min_v is None or max_v is None:
+                    raise ValueError(f"config_network_bw.{pri} must include both min and max")
+                if min_v > max_v:
+                    raise ValueError(f"config_network_bw.{pri}: min must be <= max")
+                bw_updates[pri] = pri_upd
+        if bw_updates:
+            current_bw = _cfg().config_network_bw if isinstance(_cfg().config_network_bw, dict) else {}
+            merged_bw = {
+                pri: dict(current_bw.get(pri) or {})
+                for pri in _NETWORK_PRIORITIES
+            }
+            for pri, pri_upd in bw_updates.items():
+                merged_bw[pri].update(pri_upd)
+            min_total = sum(float(merged_bw[pri].get("min", 0)) for pri in _NETWORK_PRIORITIES)
+            if min_total > 1.0 + 1e-9:
+                raise ValueError("config_network_bw minimum ratios, including reserved system, cannot exceed 1.0")
+            updates["config_network_bw"] = bw_updates
+
+    if "network_system_ports" in body:
+        raise ValueError("network_system_ports are reserved and cannot be modified")
+
+    if not updates:
+        raise ValueError("No valid network_control updates provided")
+    return updates
+
+
+def _write_network_control(updates):
+    interface_updates = updates.pop("network_interfaces", None)
+    modified = _cfg().set_network_control_policy(updates) if updates else False
+    if interface_updates is not None:
+        modified = _cfg().set_list_section("network_interfaces", interface_updates) or modified
+    return modified
+
+
 # section -> {get: ()->dict, validate: (body)->updates, write: (updates)->bool}
 _CONFIG_SPECS = {
     "system_pressure": {
@@ -2101,6 +2305,16 @@ _CONFIG_SPECS = {
         "get": _get_disk_pressure,
         "validate": _validate_disk_pressure,
         "write": lambda u: _cfg().update_top_level_scalars(u),
+    },
+    "network_pressure": {
+        "get": _get_network_pressure,
+        "validate": _validate_network_pressure,
+        "write": _write_network_pressure,
+    },
+    "network_control": {
+        "get": _get_network_control,
+        "validate": _validate_network_control,
+        "write": _write_network_control,
     },
     "limit_policy": {
         "get": _limit_policy_snapshot,
@@ -2157,6 +2371,11 @@ def update_config_generic(section):
 
         logger.info("Updating config '%s' from %s: %s", section, request.remote_addr, updates)
         spec["write"](updates)
+        if section == "network_control" and callable(_network_config_reload_notifier):
+            try:
+                _network_config_reload_notifier()
+            except Exception as exc:
+                logger.warning("network_control reload notification failed: %s", exc)
         new_ts = _bump_config_updated_at(section)
         data = dict(spec["get"]())
         data["updated_at"] = new_ts

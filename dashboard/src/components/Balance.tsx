@@ -15,6 +15,7 @@ import {
   Modal,
   message,
   Switch,
+  Checkbox,
   InputNumber,
 } from 'antd'
 import {
@@ -29,8 +30,8 @@ import {
   ReloadOutlined,
   QuestionCircleOutlined,
   SearchOutlined,
-  DownOutlined,
   RightOutlined,
+  DownOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
@@ -70,6 +71,8 @@ interface LimitDialogState {
 }
 
 interface LimitFormValues {
+  applyResourceLimit: boolean
+  networkPriority: string
   cpuEnabled: boolean
   cpuPercent: number
   cpuMin: number
@@ -102,6 +105,57 @@ const PRIORITY_OPTIONS = [
   { value: 'critical', label: 'Critical', color: COLORS.red },
 ]
 
+const NETWORK_PRIORITY_COLORS: Record<'low' | 'high' | 'critical', string> = {
+  low: COLORS.green,
+  high: COLORS.orange,
+  critical: COLORS.red,
+}
+
+const NETWORK_PRIORITY_OPTIONS = [
+  { value: 'low', label: 'Low', color: NETWORK_PRIORITY_COLORS.low },
+  { value: 'high', label: 'High', color: NETWORK_PRIORITY_COLORS.high },
+  { value: 'critical', label: 'Critical', color: NETWORK_PRIORITY_COLORS.critical },
+]
+
+type NetworkClassKey = 'critical' | 'high' | 'low' | 'system'
+
+const NETWORK_CLASS_ORDER: NetworkClassKey[] = ['critical', 'high', 'low', 'system']
+
+const DEFAULT_NETWORK_BW_RANGES: Record<NetworkClassKey, { min: number; max: number }> = {
+  critical: { min: 0.6, max: 0.9 },
+  high: { min: 0.3, max: 0.8 },
+  low: { min: 0.1, max: 0.3 },
+  system: { min: 0.05, max: 0.1 },
+}
+
+function normalizeNetworkPriority(value?: string): string {
+  const normalized = (value ?? '').toLowerCase()
+  if (normalized === 'medium') return 'low'
+  const allowed = new Set(NETWORK_PRIORITY_OPTIONS.map((opt) => opt.value))
+  return allowed.has(normalized) ? normalized : 'low'
+}
+
+function sanitizeNetworkBandwidthRanges(
+  raw?: Record<string, { min?: number; max?: number }>
+): Record<NetworkClassKey, { min: number; max: number }> {
+  const next = { ...DEFAULT_NETWORK_BW_RANGES }
+  if (!raw) return next
+
+  for (const key of NETWORK_CLASS_ORDER) {
+    const item = raw[key]
+    if (!item) continue
+    const min = Number(item.min)
+    const max = Number(item.max)
+    if (Number.isFinite(min) && min >= 0) next[key].min = min
+    if (Number.isFinite(max) && max >= 0) next[key].max = max
+  }
+  return next
+}
+
+function formatPercentNumber(value: number): string {
+  return (value * 100).toFixed(0)
+}
+
 function priorityColor(p?: string): string {
   switch (p?.toLowerCase()) {
     case 'low': return COLORS.green
@@ -110,6 +164,11 @@ function priorityColor(p?: string): string {
     case 'critical': return COLORS.red
     default: return COLORS.textMuted
   }
+}
+
+function networkPriorityColor(p?: string): string {
+  const key = (p ?? '').toLowerCase() as 'low' | 'high' | 'critical'
+  return NETWORK_PRIORITY_COLORS[key] ?? COLORS.textMuted
 }
 
 function normalizePercentOptions(options: number[] | undefined, fallback: number): number[] {
@@ -137,21 +196,6 @@ function PriorityTag({ priority }: { priority?: string }) {
   )
 }
 
-function appSummaryTag(summary?: string) {
-  switch (summary) {
-    case 'Limited':
-      return <Tag color="warning" style={{ marginInlineEnd: 0 }}>Limited</Tag>
-    case 'Partial Limited':
-      return <Tag color="gold" style={{ marginInlineEnd: 0 }}>Partial Limited</Tag>
-    case 'Not Limited':
-      return <Tag color="success" style={{ marginInlineEnd: 0 }}>Not Limited</Tag>
-    case 'No Running Process':
-      return <Tag color="default" style={{ marginInlineEnd: 0 }}>No Running Process</Tag>
-    default:
-      return <Tag color="default" style={{ marginInlineEnd: 0 }}>N/A</Tag>
-  }
-}
-
 function runtimeHintTag(runtime?: string) {
   switch (runtime) {
     case 'Running':
@@ -162,6 +206,47 @@ function runtimeHintTag(runtime?: string) {
       return <Tag color="default" style={{ marginInlineEnd: 0 }}>Stopped</Tag>
     default:
       return <Tag color="default" style={{ marginInlineEnd: 0 }}>-</Tag>
+  }
+}
+
+function deriveCombinedStatus(record: AppInfo): {
+  runtime: 'Running' | 'Stopped' | 'Pending'
+  limitSummary: 'Limited' | 'Partial Limited' | 'Not Limited' | 'N/A'
+} {
+  const isPending = record.status === APP_STATUS.PENDING || record.runtime_hint === 'Pending'
+  if (isPending) {
+    return { runtime: 'Pending', limitSummary: 'N/A' }
+  }
+
+  const summary = record.app_summary_status
+    ?? ((record.status === APP_STATUS.LIMITED || record.status === APP_STATUS.A_LIMITED)
+      ? 'Limited'
+      : record.status === APP_STATUS.RUNNING
+        ? 'Not Limited'
+        : 'No Running Process')
+
+  if (summary === 'No Running Process') {
+    return { runtime: 'Stopped', limitSummary: 'N/A' }
+  }
+
+  return {
+    runtime: 'Running',
+    limitSummary: summary === 'Limited' || summary === 'Partial Limited' || summary === 'Not Limited'
+      ? summary
+      : 'N/A',
+  }
+}
+
+function limitSummaryTag(summary: 'Limited' | 'Partial Limited' | 'Not Limited' | 'N/A') {
+  switch (summary) {
+    case 'Limited':
+      return <Tag color="warning" style={{ marginInlineEnd: 0 }}>Limited</Tag>
+    case 'Partial Limited':
+      return <Tag color="gold" style={{ marginInlineEnd: 0 }}>Partial Limited</Tag>
+    case 'Not Limited':
+      return <Tag color="success" style={{ marginInlineEnd: 0 }}>Not Limited</Tag>
+    default:
+      return <Tag color="default" style={{ marginInlineEnd: 0 }}>N/A</Tag>
   }
 }
 
@@ -193,6 +278,11 @@ function deriveDisplayProcessName(row: ProcessStatusRow): string {
 
 interface PassiveControlPanelProps {
   active: boolean
+}
+
+interface NetworkControlPanelProps {
+  active: boolean
+  networkControlEnabled: boolean
 }
 
 // Compact card with a single Switch that gates the balancer's pressure-driven
@@ -299,7 +389,7 @@ function PassiveControlPanel({ active }: PassiveControlPanelProps) {
         <Col flex="auto">
           <Space size={8} align="center">
             <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
-              Passive Resource Control
+              Auto System Control
             </Text>
             <Tooltip title="When ON, the balancer monitors system pressure and automatically limits/restores the top resource consumers. When OFF, network shaping and manual per-app limits still work, but the pressure-driven auto-limit loop is paused.">
               <QuestionCircleOutlined style={{ color: COLORS.textMuted }} />
@@ -327,6 +417,160 @@ function PassiveControlPanel({ active }: PassiveControlPanelProps) {
     </Card>
   )
 }
+
+// Quick runtime toggle for pressure-driven auto network shaping.
+function NetworkControlPanel({ active, networkControlEnabled }: NetworkControlPanelProps) {
+  const { publishNotice } = useGlobalConfigNotices()
+  const [enabled, setEnabled] = useState<boolean | null>(null)
+  const [updatedAt, setUpdatedAt] = useState<number | undefined>(undefined)
+  const [loading, setLoading] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const disabledByMaster = !networkControlEnabled
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const data = await api.getConfig<{
+        enable_network_pressure_shaping: boolean
+        updated_at?: number
+      }>('network_control')
+      const nextEnabled = Boolean(data.enable_network_pressure_shaping)
+      setEnabled(nextEnabled)
+      setUpdatedAt(data.updated_at)
+    } catch (e) {
+      console.error('[Balance] load auto network control failed:', e)
+      message.error('Failed to load auto network control state')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (active) load()
+  }, [active, load])
+
+  const handleToggle = async (checked: boolean) => {
+    if (disabledByMaster) {
+      message.warning('Network control is disabled. Enable it in Settings / Control Policy first.')
+      return
+    }
+
+    setSaving(true)
+    try {
+      const result = await api.updateConfig<{
+        enable_network_pressure_shaping?: boolean
+        updated_at: number
+      }>(
+        'network_control',
+        { enable_network_pressure_shaping: checked },
+        updatedAt,
+      )
+
+      if (result.status === 'conflict') {
+        const current = (result.current ?? {}) as {
+          enable_network_pressure_shaping?: boolean
+          updated_at?: number
+        }
+        const latestEnabled = Boolean(current.enable_network_pressure_shaping)
+        const latestTs = current.updated_at
+        const tsLabel = formatPassiveControlTimestamp(latestTs)
+        Modal.confirm({
+          title: 'Setting changed by another client',
+          content: (
+            <div>
+              <p>
+                Auto network control was updated to{' '}
+                <b>{latestEnabled ? 'enabled' : 'disabled'}</b> at <b>{tsLabel}</b>.
+                Reload to pick up the latest value before changing it again.
+              </p>
+            </div>
+          ),
+          okText: 'Reload latest value',
+          cancelText: 'Cancel',
+          onOk: () => {
+            setEnabled(latestEnabled)
+            setUpdatedAt(latestTs)
+            publishNotice({
+              title: 'Auto network control updated',
+              description: `Another client changed auto network control to ${latestEnabled ? 'enabled' : 'disabled'} at ${tsLabel}.`,
+              scope: 'network_control',
+              updatedAt: latestTs,
+            })
+          },
+        })
+        return
+      }
+
+      const response = result.data
+      if (response.success) {
+        const nextEnabled = Boolean(response.enable_network_pressure_shaping ?? checked)
+        setEnabled(nextEnabled)
+        setUpdatedAt(response.updated_at)
+        publishNotice({
+          title: 'Auto network control updated',
+          description: nextEnabled
+            ? 'Auto network control is now enabled.'
+            : 'Auto network control is now disabled.',
+          scope: 'network_control',
+          updatedAt: response.updated_at,
+        })
+        message.success(nextEnabled ? 'Auto network control enabled' : 'Auto network control disabled')
+      } else {
+        message.error('Failed to update auto network control state')
+      }
+    } catch (e) {
+      console.error('[Balance] update auto network control failed:', e)
+      message.error('Failed to update auto network control state')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Card
+      style={{
+        background: COLORS.panelBg,
+        border: `1px solid ${COLORS.border}`,
+        borderRadius: 6,
+        marginBottom: 12,
+      }}
+      bodyStyle={{ padding: '12px 16px' }}
+    >
+      <Row gutter={[12, 8]} align="middle" justify="space-between">
+        <Col flex="auto">
+          <Space size={8} align="center">
+            <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
+              Auto Network Control
+            </Text>
+            <Tooltip title="Pressure-driven automatic network shaping. Network control master switch remains in Settings / Control Policy.">
+              <QuestionCircleOutlined style={{ color: COLORS.textMuted }} />
+            </Tooltip>
+          </Space>
+          <div style={{ marginTop: 2 }}>
+            <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>
+              {updatedAt
+                ? `Last changed: ${formatPassiveControlTimestamp(updatedAt)}`
+                : 'Never changed via dashboard'}
+            </Text>
+          </div>
+        </Col>
+        <Col>
+          <Tooltip title={disabledByMaster ? 'Enable Network control in Settings / Control Policy first' : ''}>
+            <Switch
+              checked={Boolean(enabled)}
+              disabled={disabledByMaster || loading || saving || enabled === null}
+              loading={saving}
+              onChange={handleToggle}
+              checkedChildren="On"
+              unCheckedChildren="Off"
+            />
+          </Tooltip>
+        </Col>
+      </Row>
+    </Card>
+  )
+}
+
 
 export default function Balance({
   active,
@@ -357,6 +601,10 @@ export default function Balance({
 
   // Per-row priority edit state
   const [rowPriorities, setRowPriorities] = useState<Record<string, string>>({})
+  const [networkControlEnabled, setNetworkControlEnabled] = useState(true)
+  const [networkBandwidthRanges, setNetworkBandwidthRanges] = useState<Record<NetworkClassKey, { min: number; max: number }>>(
+    DEFAULT_NETWORK_BW_RANGES
+  )
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({})
   const [limitDialog, setLimitDialog] = useState<LimitDialogState>({
     app: null,
@@ -364,7 +612,11 @@ export default function Balance({
     submitting: false,
     loadingProfile: false,
   })
+  const [resourceSectionExpanded, setResourceSectionExpanded] = useState(false)
+  const [networkSectionExpanded, setNetworkSectionExpanded] = useState(false)
   const [limitForm, setLimitForm] = useState<LimitFormValues>({
+    applyResourceLimit: true,
+    networkPriority: 'low',
     cpuEnabled: true,
     cpuPercent: 30,
     cpuMin: 1,
@@ -392,10 +644,14 @@ export default function Balance({
 
   const fetchData = useCallback(async () => {
     try {
-      const [apps, controlled, pending] = await Promise.allSettled([
+      const [apps, controlled, pending, networkControl] = await Promise.allSettled([
         api.getApps(),
         api.getControlledApps(),
         api.getPendingApps(),
+        api.getConfig<{
+          enable_network_control: boolean
+          config_network_bw?: Record<string, { min?: number; max?: number }>
+        }>('network_control'),
       ])
 
       if (apps.status === 'fulfilled') setAllApps(apps.value ?? [])
@@ -412,6 +668,10 @@ export default function Balance({
         setRowPriorities((prev) => ({ ...prev, ...priorities }))
       }
       if (pending.status === 'fulfilled') setPendingApps(pending.value ?? [])
+      if (networkControl.status === 'fulfilled') {
+        setNetworkControlEnabled(Boolean(networkControl.value.enable_network_control))
+        setNetworkBandwidthRanges(sanitizeNetworkBandwidthRanges(networkControl.value.config_network_bw))
+      }
 
       setError(null)
     } catch (e: unknown) {
@@ -558,6 +818,8 @@ export default function Balance({
       try {
         await fn()
         await fetchData()
+      } catch (e: unknown) {
+        messageApi.error(e instanceof Error ? e.message : 'Operation failed')
       } finally {
         setActionLoading((prev) => ({ ...prev, [key]: false }))
       }
@@ -578,6 +840,7 @@ export default function Balance({
         app_id: app.app_id,
         app_name: app.app_name,
         priority: addPriority,
+        network_priority: addPriority,
         controlled: true,
         remark,
         cmdline: app.cmdline ?? '',
@@ -613,12 +876,14 @@ export default function Balance({
       messageApi.success(`Priority updated for ${app.app_name}`)
     })()
 
-  function applyLimitProfile(profile: ResourceLimitProfileData) {
+  function applyLimitProfile(profile: ResourceLimitProfileData, defaultNetworkPriority: string) {
     const cpuOptions = normalizePercentOptions(profile.cpu.options, profile.cpu.value)
     const memOptions = normalizePercentOptions(profile.memory.options, profile.memory.value)
     const cgIds = profile.cgroup_ids ?? []
 
     const baseForm: LimitFormValues = {
+      applyResourceLimit: true,
+      networkPriority: normalizeNetworkPriority(defaultNetworkPriority),
       cpuEnabled: profile.cpu.enabled,
       cpuPercent: Number(profile.cpu.value),
       cpuMin: profile.cpu.min,
@@ -653,14 +918,17 @@ export default function Balance({
 
   const handleResourceLimit = async (app: AppInfo) => {
     setLimitDialog({ app, open: true, loadingProfile: true, submitting: false })
+    setResourceSectionExpanded(true)
+    setNetworkSectionExpanded(true)
     try {
       const priority = rowPriorities[app.app_id] ?? app.priority ?? 'medium'
+      const defaultNetworkPriority = normalizeNetworkPriority(app.network_priority ?? app.priority ?? priority)
       const profile = await api.getResourceLimitProfile({
         app_id: app.app_id,
         app_name: app.app_name,
         priority,
       })
-      applyLimitProfile(profile)
+      applyLimitProfile(profile, defaultNetworkPriority)
     } catch (e: unknown) {
       setLimitDialog({ app: null, open: false, loadingProfile: false, submitting: false })
       messageApi.error(e instanceof Error ? e.message : 'Failed to load limit profile')
@@ -675,44 +943,73 @@ export default function Balance({
     setLimitDialog((prev) => ({ ...prev, submitting: true }))
     try {
       const priority = rowPriorities[limitDialog.app.app_id] ?? limitDialog.app.priority ?? 'medium'
+      const networkPriority = normalizeNetworkPriority(limitForm.networkPriority)
+      const shouldApplyResourceLimit = Boolean(limitForm.applyResourceLimit)
+      const shouldUpdateNetworkPriority = networkControlEnabled
+      if (!shouldApplyResourceLimit && !shouldUpdateNetworkPriority) {
+        messageApi.warning('Please select at least one action to apply.')
+        setLimitDialog((prev) => ({ ...prev, submitting: false }))
+        return
+      }
+
       const targetCgroups = selectedDialogCgroups
-      if (targetCgroups.length === 0) {
+      if (shouldApplyResourceLimit && targetCgroups.length === 0) {
         messageApi.warning('No running process selected. Expand the app row and tick at least one process scope first.')
         setLimitDialog((prev) => ({ ...prev, submitting: false }))
         return
       }
       const isMultiTarget = targetCgroups.length > 1
+      let resourceApplied = false
+      let resourceSkippedMessage: string | null = null
 
-      const res = await api.resourceLimit({
-        app_id: limitDialog.app.app_id,
-        app_name: limitDialog.app.app_name,
-        priority,
-        target_cgroups: targetCgroups,
-        limit_overrides: {
-          cpu: { enabled: limitForm.cpuEnabled, rate: limitForm.cpuPercent / 100 },
-          memory: { enabled: limitForm.memEnabled, rate: limitForm.memPercent / 100 },
-          disk_io: {
-            enabled: limitForm.diskEnabled,
-            rate: {
-              write: limitForm.writeMbps,
-              read: limitForm.readMbps,
-              write_iops: limitForm.writeIops,
-              read_iops: limitForm.readIops,
+      if (shouldUpdateNetworkPriority) {
+        await api.setNetworkPriority({
+          app_id: limitDialog.app.app_id,
+          network_priority: networkPriority,
+        })
+        messageApi.success(`Network priority updated for ${limitDialog.app.app_name}`)
+      }
+
+      if (shouldApplyResourceLimit) {
+        const res = await api.resourceLimit({
+          app_id: limitDialog.app.app_id,
+          app_name: limitDialog.app.app_name,
+          priority,
+          target_cgroups: targetCgroups,
+          limit_overrides: {
+            cpu: { enabled: limitForm.cpuEnabled, rate: limitForm.cpuPercent / 100 },
+            memory: { enabled: limitForm.memEnabled, rate: limitForm.memPercent / 100 },
+            disk_io: {
+              enabled: limitForm.diskEnabled,
+              rate: {
+                write: limitForm.writeMbps,
+                read: limitForm.readMbps,
+                write_iops: limitForm.writeIops,
+                read_iops: limitForm.readIops,
+              },
             },
           },
-        },
-      })
-      if (res.skipped) {
-        // Server intentionally skipped the limit (negligible usage / undetectable
-        // process). Surface the server-provided reason and close the dialog.
-        messageApi.warning(res.message)
-      } else {
+        })
+        if (res.skipped) {
+          // Server intentionally skipped the limit (negligible usage / undetectable
+          // process). Surface the server-provided reason and still close the dialog.
+          resourceSkippedMessage = res.message
+        } else {
+          resourceApplied = true
+        }
+      }
+
+      if (resourceSkippedMessage) {
+        messageApi.warning(resourceSkippedMessage)
+      }
+      if (resourceApplied) {
         messageApi.success(
           isMultiTarget
             ? `Unified resource limit applied to ${limitDialog.app.app_name} across ${targetCgroups.length} cgroups`
             : `Resource limit applied to ${limitDialog.app.app_name}`
         )
       }
+
       setLimitDialog({ app: null, open: false, loadingProfile: false, submitting: false })
       await fetchData()
     } catch (e: unknown) {
@@ -749,30 +1046,11 @@ export default function Balance({
       render: (name: string, record) => {
         const displayName = name || record.app_id
         const tooltipContent = record.remark ? `${displayName} — ${record.remark}` : displayName
-        const procCount = record.process_status_rows?.length ?? 0
-        const expanded = expandedProcessRows.includes(record.app_id)
         return (
           <Space direction="vertical" size={2} style={{ lineHeight: 1.25 }}>
             <Tooltip title={tooltipContent}>
               <div style={{ color: COLORS.accent, fontWeight: 500 }}>{displayName}</div>
             </Tooltip>
-            {procCount > 0 && (
-              <Button
-                size="small"
-                type="link"
-                icon={expanded ? <DownOutlined /> : <RightOutlined />}
-                style={{ padding: 0, height: 'auto', textAlign: 'left', fontSize: 12 }}
-                onClick={() => {
-                  setExpandedProcessRows((prev) => (
-                    prev.includes(record.app_id)
-                      ? prev.filter((k) => k !== record.app_id)
-                      : [...prev, record.app_id]
-                  ))
-                }}
-              >
-                {expanded ? 'Hide Processes' : `View Processes (${procCount})`}
-              </Button>
-            )}
           </Space>
         )
       },
@@ -788,7 +1066,7 @@ export default function Balance({
             onChange={(v) => setRowPriorities((prev) => ({ ...prev, [record.app_id]: v }))}
             size="small"
             style={{ width: 120 }}
-            dropdownStyle={{ background: COLORS.panelBg }}
+            styles={{ popup: { root: { background: COLORS.panelBg } } }}
           >
             {PRIORITY_OPTIONS.map((opt) => (
               <Option key={opt.value} value={opt.value}>
@@ -800,7 +1078,6 @@ export default function Balance({
             <Button
               size="small"
               icon={<SaveOutlined />}
-              loading={actionLoading[`priority-${record.app_id}`]}
               onClick={() => handleUpdatePriority(record)}
               style={{ borderColor: COLORS.accent, color: COLORS.accent }}
             />
@@ -809,27 +1086,17 @@ export default function Balance({
       ),
     },
     {
-      title: 'Runtime Status',
-      key: 'runtime_status',
-      width: 160,
+      title: 'Status',
+      key: 'status',
+      width: 230,
       render: (_: unknown, record: AppInfo) => {
-        const summary = record.app_summary_status
-          ?? ((record.status === APP_STATUS.LIMITED || record.status === APP_STATUS.A_LIMITED)
-            ? 'Limited'
-            : record.status === APP_STATUS.RUNNING
-              ? 'Not Limited'
-              : 'No Running Process')
-        const isPending = record.status === APP_STATUS.PENDING || record.runtime_hint === 'Pending'
-        const runtimeTag = isPending
-          ? runtimeHintTag('Pending')
-          : summary === 'No Running Process'
-            ? runtimeHintTag('Stopped')
-            : runtimeHintTag('Running')
+        const combined = deriveCombinedStatus(record)
 
         return (
-          <Space size={6}>
-            {runtimeTag}
-            {record.status === APP_STATUS.PENDING && (
+          <Space size={6} wrap>
+            {runtimeHintTag(combined.runtime)}
+            {limitSummaryTag(combined.limitSummary)}
+            {combined.runtime === 'Pending' && (
               <Tooltip title="Cancel Relaunch">
                 <Button
                   size="small"
@@ -842,20 +1109,6 @@ export default function Balance({
             )}
           </Space>
         )
-      },
-    },
-    {
-      title: 'Limit Status',
-      key: 'limit_status',
-      width: 150,
-      render: (_: unknown, record: AppInfo) => {
-        const summary = record.app_summary_status
-          ?? ((record.status === APP_STATUS.LIMITED || record.status === APP_STATUS.A_LIMITED)
-            ? 'Limited'
-            : record.status === APP_STATUS.RUNNING
-              ? 'Not Limited'
-              : 'No Running Process')
-        return appSummaryTag(summary)
       },
     },
     {
@@ -1043,21 +1296,22 @@ export default function Balance({
       },
     },
     {
-      title: 'Runtime Status',
-      dataIndex: 'runtime_status',
-      key: 'runtime_status',
-      width: 130,
-      render: (status: string) => runtimeHintTag(status),
-    },
-    {
-      title: 'Limit Status',
-      dataIndex: 'limit_status',
-      key: 'limit_status',
-      width: 130,
-      render: (status: string) => {
-        if (status === 'Limited') return <Tag color="warning" style={{ marginInlineEnd: 0 }}>Limited</Tag>
-        if (status === 'Not Limited') return <Tag color="default" style={{ marginInlineEnd: 0 }}>Not Limited</Tag>
-        return <Tag color="default" style={{ marginInlineEnd: 0 }}>N/A</Tag>
+      title: 'Status',
+      key: 'status',
+      width: 190,
+      render: (_: unknown, row: ProcessStatusRow) => {
+        const limitTag = row.limit_status === 'Limited'
+          ? <Tag color="warning" style={{ marginInlineEnd: 0 }}>Limited</Tag>
+          : row.limit_status === 'Not Limited'
+            ? <Tag color="default" style={{ marginInlineEnd: 0 }}>Not Limited</Tag>
+            : <Tag color="default" style={{ marginInlineEnd: 0 }}>N/A</Tag>
+
+        return (
+          <Space size={6} wrap>
+            {runtimeHintTag(row.runtime_status)}
+            {limitTag}
+          </Space>
+        )
       },
     },
     {
@@ -1079,6 +1333,11 @@ export default function Balance({
   const limitDialogPriority = limitDialog.app
     ? (rowPriorities[limitDialog.app.app_id] ?? limitDialog.app.priority ?? 'medium').toLowerCase()
     : 'medium'
+  const currentNetworkPriority = normalizeNetworkPriority(
+    limitDialog.app?.network_priority ?? limitDialog.app?.priority ?? limitDialogPriority
+  )
+  const selectedNetworkPriority = normalizeNetworkPriority(limitForm.networkPriority || currentNetworkPriority)
+  const currentNetworkRange = networkBandwidthRanges[currentNetworkPriority as NetworkClassKey] ?? DEFAULT_NETWORK_BW_RANGES.low
   const limitDialogPriorityColor = priorityColor(limitDialogPriority)
   const limitDialogTitle = limitDialog.app
     ? (
@@ -1140,9 +1399,42 @@ export default function Balance({
   ) => (
     <>
       <div>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <Space size={8} align="center">
+          <Button
+            size="small"
+            type="text"
+            onClick={() => setResourceSectionExpanded((prev) => !prev)}
+            icon={resourceSectionExpanded
+              ? <DownOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />
+              : <RightOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />}
+            aria-label="Toggle resource limit settings"
+          />
+          <Checkbox
+            checked={form.applyResourceLimit}
+            onChange={(e) => {
+              const checked = e.target.checked
+              updateForm((prev) => ({ ...prev, applyResourceLimit: checked }))
+              if (checked) setResourceSectionExpanded(true)
+            }}
+          >
+            <Text strong>Apply Resource Limit (CPU/Memory/Disk)</Text>
+          </Checkbox>
+        </Space>
+      </div>
+
+      {resourceSectionExpanded && <div style={{ marginLeft: 14, paddingLeft: 12, borderLeft: `2px solid ${COLORS.border}` }}>
+        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+          Resource limit settings
+        </Text>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <Space size={4}>
-            <Text strong>CPU Limit</Text>
+            <Checkbox
+              checked={form.cpuEnabled}
+              disabled={!form.applyResourceLimit}
+              onChange={(e) => updateForm((prev) => ({ ...prev, cpuEnabled: e.target.checked }))}
+            >
+              <Text strong>CPU Limit (%)</Text>
+            </Checkbox>
             <Tooltip title="Controls how much CPU this app can consume.">
               <Button
                 size="small"
@@ -1153,29 +1445,28 @@ export default function Balance({
               />
             </Tooltip>
           </Space>
-          <Switch
-            checked={form.cpuEnabled}
-            onChange={(checked) => updateForm((prev) => ({ ...prev, cpuEnabled: checked }))}
-          />
-        </div>
-        <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
           <InputNumber
-            style={{ width: '100%' }}
-            disabled={!form.cpuEnabled}
+            style={{ width: 220, maxWidth: '45%' }}
+            disabled={!form.applyResourceLimit || !form.cpuEnabled}
             value={form.cpuPercent}
             controls
             min={form.cpuMin}
             max={form.cpuMax}
             onChange={(v) => updateForm((prev) => ({ ...prev, cpuPercent: Number(v ?? prev.cpuPercent) }))}
           />
-          <Text type="secondary">%</Text>
         </div>
-      </div>
+      </div>}
 
-      <div>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+      {resourceSectionExpanded && <div style={{ marginLeft: 14, paddingLeft: 12, borderLeft: `2px solid ${COLORS.border}` }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <Space size={4}>
-            <Text strong>Memory Limit</Text>
+            <Checkbox
+              checked={form.memEnabled}
+              disabled={!form.applyResourceLimit}
+              onChange={(e) => updateForm((prev) => ({ ...prev, memEnabled: e.target.checked }))}
+            >
+              <Text strong>Memory Limit (%)</Text>
+            </Checkbox>
             <Tooltip title="Controls the memory pressure boundary for this app.">
               <Button
                 size="small"
@@ -1186,29 +1477,28 @@ export default function Balance({
               />
             </Tooltip>
           </Space>
-          <Switch
-            checked={form.memEnabled}
-            onChange={(checked) => updateForm((prev) => ({ ...prev, memEnabled: checked }))}
-          />
-        </div>
-        <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
           <InputNumber
-            style={{ width: '100%' }}
-            disabled={!form.memEnabled}
+            style={{ width: 220, maxWidth: '45%' }}
+            disabled={!form.applyResourceLimit || !form.memEnabled}
             value={form.memPercent}
             controls
             min={form.memMin}
             max={form.memMax}
             onChange={(v) => updateForm((prev) => ({ ...prev, memPercent: Number(v ?? prev.memPercent) }))}
           />
-          <Text type="secondary">%</Text>
         </div>
-      </div>
+      </div>}
 
-      <div>
+      {resourceSectionExpanded && <div style={{ marginLeft: 14, paddingLeft: 12, borderLeft: `2px solid ${COLORS.border}` }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <Space size={4}>
-            <Text strong>Disk IO Limit</Text>
+            <Checkbox
+              checked={form.diskEnabled}
+              disabled={!form.applyResourceLimit}
+              onChange={(e) => updateForm((prev) => ({ ...prev, diskEnabled: e.target.checked }))}
+            >
+              <Text strong>Disk IO Limit</Text>
+            </Checkbox>
             <Tooltip title="Controls disk throughput and IOPS caps for this app.">
               <Button
                 size="small"
@@ -1219,10 +1509,6 @@ export default function Balance({
               />
             </Tooltip>
           </Space>
-          <Switch
-            checked={form.diskEnabled}
-            onChange={(checked) => updateForm((prev) => ({ ...prev, diskEnabled: checked }))}
-          />
         </div>
         <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 6 }}>
           {form.diskDetected
@@ -1236,7 +1522,7 @@ export default function Balance({
               addonBefore="Write"
               addonAfter="MB/s"
               controls
-              disabled={!form.diskEnabled}
+              disabled={!form.applyResourceLimit || !form.diskEnabled}
               min={1}
               value={form.writeMbps}
               onChange={(v) => updateForm((prev) => ({ ...prev, writeMbps: Number(v ?? prev.writeMbps) }))}
@@ -1248,7 +1534,7 @@ export default function Balance({
               addonBefore="Read"
               addonAfter="MB/s"
               controls
-              disabled={!form.diskEnabled}
+              disabled={!form.applyResourceLimit || !form.diskEnabled}
               min={1}
               value={form.readMbps}
               onChange={(v) => updateForm((prev) => ({ ...prev, readMbps: Number(v ?? prev.readMbps) }))}
@@ -1259,7 +1545,7 @@ export default function Balance({
               style={{ width: '100%' }}
               addonBefore="Write IOPS"
               controls
-              disabled={!form.diskEnabled}
+              disabled={!form.applyResourceLimit || !form.diskEnabled}
               min={1}
               value={form.writeIops}
               onChange={(v) => updateForm((prev) => ({ ...prev, writeIops: Number(v ?? prev.writeIops) }))}
@@ -1270,17 +1556,133 @@ export default function Balance({
               style={{ width: '100%' }}
               addonBefore="Read IOPS"
               controls
-              disabled={!form.diskEnabled}
+              disabled={!form.applyResourceLimit || !form.diskEnabled}
               min={1}
               value={form.readIops}
               onChange={(v) => updateForm((prev) => ({ ...prev, readIops: Number(v ?? prev.readIops) }))}
             />
           </Col>
         </Row>
+      </div>}
+
+      <div>
+        <Space size={8} align="center">
+          <Button
+            size="small"
+            type="text"
+            onClick={() => setNetworkSectionExpanded((prev) => !prev)}
+            icon={networkSectionExpanded
+              ? <DownOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />
+              : <RightOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />}
+            aria-label="Toggle network priority settings"
+          />
+          <Space size={4}>
+            <Text strong>Update Network Priority</Text>
+            <Tooltip title={networkControlEnabled
+              ? 'Expand this section to review or adjust the app network priority.'
+              : 'Enable Network control in Settings > Control Policy > Network Control first.'}
+            >
+              <Button
+                size="small"
+                type="text"
+                icon={<QuestionCircleOutlined />}
+                aria-label="Help: Update Network Priority"
+                style={{ color: COLORS.textMuted }}
+              />
+            </Tooltip>
+          </Space>
+        </Space>
+        {networkSectionExpanded && <div style={{
+          marginTop: 8,
+          marginLeft: 14,
+          paddingLeft: 12,
+          borderLeft: `2px solid ${COLORS.border}`,
+          opacity: networkControlEnabled ? 1 : 0.6,
+        }}>
+          {!networkControlEnabled && (
+            <Text type="warning" style={{ display: 'block', marginBottom: 6 }}>
+              Network Control is OFF. Network priority policy is currently not applied.
+            </Text>
+          )}
+          <Text style={{ display: 'block', marginBottom: 10 }}>
+            <Text strong>Current Network Priority:</Text>{' '}
+            <Text style={{ color: networkPriorityColor(currentNetworkPriority) }}>
+              {currentNetworkPriority.toUpperCase()}
+            </Text>
+            <Text type="secondary"> | </Text>
+            <Text type="secondary">
+              <Text strong>Bandwidth Range:</Text> {formatPercentNumber(currentNetworkRange.min)}% - {formatPercentNumber(currentNetworkRange.max)}%
+            </Text>
+          </Text>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 2 }}>
+            <Text strong>Adjust Network Priority</Text>
+            <Tooltip title={networkControlEnabled
+              ? 'Higher priority levels allow higher bandwidth ranges, while lower levels limit speed to save resources.'
+              : 'Enable Network control in Settings > Control Policy > Network Control first.'}
+            >
+              <QuestionCircleOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />
+            </Tooltip>
+            <Tooltip title={networkControlEnabled ? 'Select the app network priority to apply.' : 'Enable Network control in Settings > Control Policy > Network Control first.'}>
+              <Select
+                value={selectedNetworkPriority}
+                onChange={(v) => updateForm((prev) => ({ ...prev, networkPriority: v }))}
+                style={{ width: 220 }}
+                styles={{ popup: { root: { background: COLORS.panelBg } } }}
+                disabled={!networkControlEnabled}
+              >
+                {NETWORK_PRIORITY_OPTIONS.map((opt) => (
+                  <Option key={opt.value} value={opt.value}>
+                    <span style={{ color: opt.color }}>{opt.label}</span>
+                  </Option>
+                ))}
+              </Select>
+            </Tooltip>
+          </div>
+          <div style={{ marginTop: 10, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '8px 10px' }}>
+            <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+              Global bandwidth ranges (read-only in this dialog)
+            </Text>
+            <Row gutter={8} style={{ marginBottom: 6 }}>
+              <Col flex="150px">
+                <Text style={{ fontSize: 12, color: COLORS.textMuted, fontWeight: 600, whiteSpace: 'nowrap' }}>Network Priority</Text>
+              </Col>
+              <Col flex="auto">
+                <Space size={4} align="center">
+                  <Text style={{ fontSize: 12, color: COLORS.textMuted, fontWeight: 600 }}>
+                    Bandwidth Range (%)
+                  </Text>
+                  <Tooltip title="Network bandwidth range is calculated as a percentage of each NIC's link speed.">
+                    <QuestionCircleOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />
+                  </Tooltip>
+                </Space>
+              </Col>
+            </Row>
+            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+              {NETWORK_CLASS_ORDER.filter((level) => level !== 'system').map((level) => {
+                const range = networkBandwidthRanges[level]
+                const isSelected = level === selectedNetworkPriority
+                return (
+                  <Row key={`network-class-${level}`} gutter={8} align="middle">
+                    <Col flex="150px">
+                      <Tag color={isSelected ? 'processing' : 'default'} style={{ marginInlineEnd: 0 }}>
+                        {level.toUpperCase()}
+                      </Tag>
+                    </Col>
+                    <Col flex="auto">
+                      <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
+                        {formatPercentNumber(range.min)} - {formatPercentNumber(range.max)}
+                      </Text>
+                    </Col>
+                  </Row>
+                )
+              })}
+            </Space>
+            <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
+              For advanced rule changes, please go to Settings &gt; Control Policy &gt; Network Control.
+            </Text>
+          </div>
+        </div>}
       </div>
-      <Text type="secondary" style={{ fontSize: 12 }}>
-        Note: In rare cases, excessively strict limit settings may prevent certain specialized applications from obtaining even their minimum required resources.
-      </Text>
     </>
   )
 
@@ -1310,8 +1712,6 @@ export default function Balance({
           style={{ marginBottom: 12 }}
         />
       )}
-
-      <PassiveControlPanel active={active} />
 
       {/* Add App Section — two paths:
             (1) Discover new: open the wizard, scan /proc, auto-fill bpf_name
@@ -1411,7 +1811,7 @@ export default function Balance({
                     filterOption={(input, option) =>
                       String(option?.children ?? '').toLowerCase().includes(input.toLowerCase())
                     }
-                    dropdownStyle={{ background: COLORS.panelBg }}
+                    styles={{ popup: { root: { background: COLORS.panelBg } } }}
                     notFoundContent={
                       <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
                         No new apps to add — register one via &ldquo;Find new application&rdquo;.
@@ -1434,7 +1834,7 @@ export default function Balance({
                     value={addPriority}
                     onChange={setAddPriority}
                     style={{ width: '100%' }}
-                    dropdownStyle={{ background: COLORS.panelBg }}
+                    styles={{ popup: { root: { background: COLORS.panelBg } } }}
                   >
                     {PRIORITY_OPTIONS.map((opt) => (
                       <Option key={opt.value} value={opt.value}>
@@ -1533,13 +1933,6 @@ export default function Balance({
         headStyle={{ borderBottom: `1px solid ${COLORS.border}`, padding: '8px 16px', minHeight: 40 }}
         bodyStyle={{ padding: '0' }}
       >
-        <div style={{ padding: '8px 16px', borderBottom: `1px solid ${COLORS.border}55` }}>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            Scope note: each app is identified by its program name(s). Every running process with a
-            matching name — in any terminal, including instances started later — belongs to the app and
-            is limited when you apply a limit. Expand an app to see its current instances.
-          </Text>
-        </div>
         <Table
           columns={controlledColumns}
           dataSource={controlledApps.map((a) => ({ ...a, key: a.app_id }))}
@@ -1549,7 +1942,6 @@ export default function Balance({
           scroll={{ x: 'max-content' }}
           rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
           expandable={{
-            showExpandColumn: false,
             expandedRowKeys: expandedProcessRows,
             onExpandedRowsChange: (keys) => setExpandedProcessRows([...keys]),
             expandedRowRender: (record) => {
@@ -1561,35 +1953,35 @@ export default function Balance({
                 .map((row) => row.key)
 
               return (
-                <div style={{ padding: '4px 8px 8px 8px' }}>
-                  <div style={{ marginBottom: 8 }}>
-                    <Text type="secondary" style={{ fontSize: 12 }}>
-                      Tick running process scopes to choose where the Limit action applies. Default: all running scopes selected.
-                    </Text>
-                  </div>
-                  <Table
-                    columns={processStatusColumns}
-                    dataSource={rows}
-                    size="small"
-                    pagination={false}
-                    rowKey={(row) => row.key}
-                    rowSelection={{
-                      selectedRowKeys,
-                      onChange: (_keys, selectedRows) => {
-                        const nextCgroups = Array.from(new Set(
-                          selectedRows
-                            .filter((row) => row.runtime_status === 'Running')
-                            .map((row) => (row.cgroup || '').trim())
-                            .filter(Boolean)
-                        ))
-                        setSelectedTargetCgroups((prev) => ({ ...prev, [record.app_id]: nextCgroups }))
-                      },
-                      getCheckboxProps: (row) => ({
-                        disabled: row.runtime_status !== 'Running' || !(row.cgroup || '').trim(),
-                      }),
-                    }}
-                  />
-                </div>
+                <Table
+                  columns={processStatusColumns}
+                  dataSource={rows}
+                  size="small"
+                  pagination={false}
+                  rowKey={(row) => row.key}
+                  rowSelection={{
+                    selectedRowKeys,
+                    onChange: (_keys, selectedRows) => {
+                      const nextCgroups = Array.from(new Set(
+                        selectedRows
+                          .filter((row) => row.runtime_status === 'Running')
+                          .map((row) => (row.cgroup || '').trim())
+                          .filter(Boolean)
+                      ))
+                      setSelectedTargetCgroups((prev) => ({ ...prev, [record.app_id]: nextCgroups }))
+                    },
+                    getCheckboxProps: (row) => ({
+                      disabled: row.runtime_status !== 'Running' || !(row.cgroup || '').trim(),
+                    }),
+                  }}
+                  locale={{
+                    emptyText: (
+                      <div style={{ padding: 12, color: COLORS.textMuted, textAlign: 'center', fontSize: 12 }}>
+                        No live process details for this app
+                      </div>
+                    ),
+                  }}
+                />
               )
             },
             rowExpandable: (record) => (record.process_status_rows?.length ?? 0) > 0,
@@ -1664,9 +2056,11 @@ export default function Balance({
         open={limitDialog.open}
         onCancel={() => {
           setLimitDialog({ app: null, open: false, loadingProfile: false, submitting: false })
+          setResourceSectionExpanded(false)
+          setNetworkSectionExpanded(false)
         }}
         onOk={submitResourceLimit}
-        okText="Apply Limit"
+        okText="Apply Changes"
         confirmLoading={limitDialog.submitting}
         maskClosable={false}
         width={760}

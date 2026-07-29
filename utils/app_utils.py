@@ -135,6 +135,7 @@ def get_controlled_apps_config(apps_dict=None):
             app_name = app.get("app_name")
             app_id = app.get("app_cgroup")
             priority = app.get("priority")
+            network_priority = app.get("network_priority") or priority
             try:
                 for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                     if app_name and app_name.lower() in proc.name().lower():
@@ -145,9 +146,19 @@ def get_controlled_apps_config(apps_dict=None):
                                     "app_name": app_name,
                                     "app_id": app_id,
                                     "priority": priority,
+                                    "network_priority": network_priority,
                                     "pid": proc.pid,
                                     "cgroup_path": cg_path,
+                                    "cgroup_paths": [cg_path],
                                 }
+                            else:
+                                existing = apps_dict[app_id]
+                                paths = set(existing.get("cgroup_paths") or [])
+                                paths.add(cg_path)
+                                existing["cgroup_paths"] = sorted(paths)
+                                # Keep a representative legacy field for callers
+                                # that still read a single cgroup path.
+                                existing["cgroup_path"] = existing["cgroup_paths"][0]
                             break
             except Exception as e:
                 logger.error(f"Error processing app {app_name}: {str(e)}", exc_info=True)
@@ -203,21 +214,30 @@ def get_controlled_apps_net():
             app_name = getattr(app, "name", None)
             app_id = getattr(app, "app_id", None)
             priority = getattr(app, "priority", None)
-            cmdline = getattr(app, "cmdline", None)
-            pid = None
-            cgroup_path = None
+            network_priority = getattr(app, "network_priority", None) or priority
+            # cmdline kept for possible future matching refinements.
+            _cmdline = getattr(app, "cmdline", None)
+            matched_pid = None
+            matched_paths = set()
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                 if app_name and app_name.lower() in proc.name().lower():
                     cg_path = get_cgroup_path_by_pid(proc.pid)
                     if cg_path and app_id in cg_path:
-                        apps_dict[app_id] = {
-                            "app_name": app_name,
-                            "app_id": app_id,
-                            "priority": priority,
-                            "pid": proc.pid,
-                            "cgroup_path": cg_path,
-                        }
-                        break
+                        if matched_pid is None:
+                            matched_pid = proc.pid
+                        matched_paths.add(cg_path)
+
+            if matched_paths:
+                paths_sorted = sorted(matched_paths)
+                apps_dict[app_id] = {
+                    "app_name": app_name,
+                    "app_id": app_id,
+                    "priority": priority,
+                    "network_priority": network_priority,
+                    "pid": matched_pid,
+                    "cgroup_path": paths_sorted[0],
+                    "cgroup_paths": paths_sorted,
+                }
     except Exception as e:
         logger.error(f"Database query failed: {str(e)}", exc_info=True)
 
@@ -237,6 +257,7 @@ def get_controlled_apps(priority: str = None):
             "app_id": app.app_id,
             "controlled": app.controlled,
             "priority": app.priority,
+            "network_priority": getattr(app, "network_priority", None) or app.priority,
             "cmdline": app.cmdline,
         } for app in controlled_apps] if controlled_apps else None
 

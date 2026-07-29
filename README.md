@@ -100,7 +100,7 @@ Each component of the Edge Infrastructure external is licensed under [Apache 2.0
     1. server:
         Option A) Run manually:
             # Adjust config/config.yaml first if needed:
-            #   enable_network_control: true  -> default enabled, disable with false
+            #   enable_network_control: false -> disabled by default; enable explicitly when needed
             #   vendor: "generic"             -> use "admin" if running with admin permission
             ./start_smartune.sh            # -a (default): balancer + monitor (single process, port 9001)
             ./start_smartune.sh -m         # monitor only (standalone telemetry, port 9001)

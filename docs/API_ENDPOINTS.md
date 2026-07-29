@@ -92,7 +92,7 @@ All endpoints return a standardized JSON structure:
 | Config | `/monitor/config/passive_control` | POST | Toggle passive control | Optimistic concurrency |
 | Config | `/monitor/config/monitored_sections` | GET | Get monitored dynamic sections | Effective + configured + all |
 | Config | `/monitor/config/monitored_sections` | POST | Set monitored dynamic sections | Optimistic concurrency |
-| Config | `/monitor/config/<section>` | GET, POST | Auto-control config groups (system_pressure, disk_pressure, limit_policy) | One parametrized endpoint; optimistic concurrency |
+| Config | `/monitor/config/<section>` | GET, POST | Auto-control config groups (system_pressure, disk_pressure, network_pressure, network_control, limit_policy) | One parametrized endpoint; optimistic concurrency |
 
 ---
 
@@ -1292,6 +1292,106 @@ data: {"app_id": "com.example.app", "app_name": "example", "status": "running", 
     "success": false,
     "current": {
       "enabled": true,
+      "updated_at": 1718602500
+    }
+  }
+}
+```
+
+---
+
+#### GET /monitor/config/network_control
+
+**Purpose:** Get network-control policy including the global switch and per-class bandwidth ratio ranges. This is the class-level policy shared by all apps with the same network priority.
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Successfully retrieved network_control configuration",
+  "data": {
+    "enable_network_control": true,
+    "enable_network_pressure_shaping": true,
+    "config_network_bw": {
+      "system": { "min": 0.05, "max": 0.10 },
+      "critical": { "min": 0.55, "max": 0.90 },
+      "high": { "min": 0.30, "max": 0.80 },
+      "low": { "min": 0.10, "max": 0.30 }
+    },
+    "updated_at": 1718600000
+  }
+}
+```
+
+---
+
+#### POST /monitor/config/network_control
+
+**Purpose:** Update network control behavior with optimistic concurrency.
+
+- Passive/global network shaping switch: `enable_network_control`
+- Pressure-driven dynamic shaping switch: `enable_network_pressure_shaping`
+- Class-level ratio policy shared by all apps: `config_network_bw`
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | enable_network_control | No | boolean | Enable/disable global network shaping |
+| Body | enable_network_pressure_shaping | No | boolean | Enable/disable pressure-driven dynamic throttle/recovery |
+| Body | config_network_bw | No | object | Per-class `min`/`max` ratio updates |
+| Body | expected_updated_at | No | int | Unix timestamp from prior GET |
+
+**Request Example:**
+```json
+{
+  "enable_network_control": true,
+  "enable_network_pressure_shaping": true,
+  "config_network_bw": {
+    "critical": { "min": 0.55, "max": 0.90 },
+    "high": { "min": 0.30, "max": 0.80 },
+    "low": { "min": 0.10, "max": 0.30 }
+  },
+  "expected_updated_at": 1718600000
+}
+```
+
+**Response (Success):**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Successfully updated network_control configuration",
+  "data": {
+    "success": true,
+    "enable_network_control": true,
+    "enable_network_pressure_shaping": true,
+    "config_network_bw": {
+      "system": { "min": 0.05, "max": 0.10 },
+      "critical": { "min": 0.55, "max": 0.90 },
+      "high": { "min": 0.30, "max": 0.80 },
+      "low": { "min": 0.10, "max": 0.30 }
+    },
+    "updated_at": 1718603900
+  }
+}
+```
+
+**Response (409 Conflict):**
+```json
+{
+  "retcode": 409,
+  "retmsg": "Configuration was modified by another client; please reload.",
+  "data": {
+    "success": false,
+    "current": {
+      "enable_network_control": false,
+      "enable_network_pressure_shaping": true,
+      "config_network_bw": {
+        "system": { "min": 0.05, "max": 0.10 },
+        "critical": { "min": 0.55, "max": 0.90 },
+        "high": { "min": 0.30, "max": 0.80 },
+        "low": { "min": 0.10, "max": 0.30 }
+      },
       "updated_at": 1718602500
     }
   }

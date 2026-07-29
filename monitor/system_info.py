@@ -446,6 +446,56 @@ def _compute_network_pressure(network_bw: Dict[str, Any], net_static: Dict[str, 
     }
 
 
+def _is_physical_nic_candidate(name: str) -> bool:
+    """True for interfaces that can be a real shaping target.
+
+    Excludes loopback and common virtual/bridge/container interfaces so they
+    never get auto-selected as the primary NIC or pollute peak-speed detection.
+    """
+    lower = name.lower()
+    if lower == "lo" or lower.startswith("docker") or lower.startswith("veth"):
+        return False
+    if lower.startswith("br-") or lower.startswith("virbr") or lower.startswith("lxc"):
+        return False
+    return True
+
+
+def detect_primary_nic() -> Tuple[Optional[str], int]:
+    """Auto-detect the most likely primary NIC and its link speed (Mbps).
+
+    Returns ``(name, speed_mbps)`` for the best candidate — preferring up
+    interfaces, then higher link speed, then more cumulative traffic — or
+    ``(None, 0)`` when nothing usable is found. ``speed_mbps`` may be 0 when the
+    driver does not report a link speed (common on WiFi / virtual NICs); callers
+    must treat 0 as "unknown" and fall back to a configured/default value.
+    """
+    try:
+        stats = psutil.net_if_stats()
+        io_stats = psutil.net_io_counters(pernic=True)
+    except Exception:
+        return None, 0
+
+    best_name: Optional[str] = None
+    best_speed = 0
+    best_score: Optional[Tuple[int, int, int]] = None
+    for name, nic in stats.items():
+        if not _is_physical_nic_candidate(name):
+            continue
+        try:
+            speed = int(getattr(nic, "speed", 0) or 0)
+        except (TypeError, ValueError):
+            speed = 0
+        is_up = bool(getattr(nic, "isup", False))
+        counters = io_stats.get(name)
+        total_bytes = int((getattr(counters, "bytes_recv", 0) or 0) + (getattr(counters, "bytes_sent", 0) or 0))
+        score = (1 if is_up else 0, speed, total_bytes)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_name = name
+            best_speed = speed
+    return best_name, best_speed
+
+
 def _get_network_static_info() -> Dict[str, Any]:
     stats = psutil.net_if_stats()
     io_stats = psutil.net_io_counters(pernic=True)

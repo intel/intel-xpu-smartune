@@ -18,6 +18,7 @@ import type {
   SetControlPayload,
   AppIdPayload,
   SetPriorityPayload,
+  SetNetworkPriorityPayload,
   ResourceLimitPayload,
   ResourceLimitProfileData,
   WeightsTopData,
@@ -252,6 +253,8 @@ export const api = {
     post<void>('/app/remove_from_control', payload),
   setPriority: (payload: SetPriorityPayload) =>
     post<void>('/app/set_priority', payload),
+  setNetworkPriority: (payload: SetNetworkPriorityPayload) =>
+    post<void>('/app/set_network_priority', payload),
   setOomScore: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<void>('/app/set_oom_score', payload),
   killProcess: (pid: number, force = false) =>

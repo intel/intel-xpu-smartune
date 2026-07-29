@@ -52,6 +52,7 @@ export interface AppInfo {
   io_read_rate: number
   score?: number
   priority?: string
+  network_priority?: string
   status?: string
   controlled?: boolean
   remark?: string
@@ -171,6 +172,7 @@ export interface SetControlPayload {
   app_id: string
   app_name: string
   priority: string
+  network_priority?: string
   controlled: boolean
   remark: string
   cmdline: string
@@ -185,6 +187,11 @@ export interface AppIdPayload {
 export interface SetPriorityPayload {
   app_id: string
   priority: string
+}
+
+export interface SetNetworkPriorityPayload {
+  app_id: string
+  network_priority: string
 }
 
 // "Add Application" wizard ------------------------------------------------

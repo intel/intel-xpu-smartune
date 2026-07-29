@@ -46,9 +46,9 @@ class Config:
     # monitor_idle_check_interval so detection latency stays short.
     limit_reap_interval: float = 2
     network_thresholds: dict = None
-    network_interface: dict = None
-    network_bandwidth_kbit: int = 1000000 #kbit/s
-    enable_network_control: bool = True
+    network_interfaces: list = None
+    enable_network_control: bool = False
+    enable_network_pressure_shaping: bool = True
     config_network_bw: dict = None
     testing_network_app: list = None
     network_burst_map: dict = None
@@ -387,6 +387,68 @@ class Config:
         logger.info(f"append_to_list_section: appended to '{section}'")
         return True
 
+    def set_list_section(self, section: str, entries: list[Any], path: Optional[str] = None) -> bool:
+        """Replace or create a top-level YAML list and update its in-memory value."""
+        from utils.logger import logger
+
+        if not isinstance(entries, list):
+            return False
+
+        target = path or self._config_path
+        with self._persist_lock:
+            with open(target, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            header_idx = self._find_top_level_key(lines, section)
+            if getattr(self, section, None) == entries:
+                if entries:
+                    return False
+                if header_idx != -1:
+                    end_idx = self._find_block_end(lines, header_idx)
+                    after_colon = lines[header_idx].partition(":")[2]
+                    inline_value = after_colon.split("#", 1)[0].strip()
+                    has_block_items = any(
+                        line.strip() and not line.lstrip().startswith("#")
+                        for line in lines[header_idx + 1:end_idx]
+                    )
+                    if inline_value == "[]" and not has_block_items:
+                        return False
+
+            header_comment = ""
+            if header_idx == -1:
+                if lines and lines[-1].strip():
+                    lines.append("\n")
+                header_idx = len(lines)
+                lines.append(f"{section}: []\n" if not entries else f"{section}:\n")
+                end_idx = len(lines)
+                dash_indent, subkey_indent = 2, 4
+            else:
+                existing_header = lines[header_idx].rstrip("\n")
+                _, _, after_colon = existing_header.partition(":")
+                hash_pos = after_colon.find("#")
+                if hash_pos != -1:
+                    header_comment = "  " + after_colon[hash_pos:].strip()
+                end_idx = self._find_block_end(lines, header_idx)
+                dash_indent, subkey_indent = self._detect_list_item_indent(lines, header_idx, end_idx)
+                del lines[header_idx + 1:end_idx]
+                lines[header_idx] = (
+                    f"{section}: []{header_comment}\n"
+                    if not entries
+                    else f"{section}:{header_comment}\n"
+                )
+
+            rendered = []
+            for entry in entries:
+                rendered.extend(self._render_list_item(entry, dash_indent, subkey_indent))
+            lines[header_idx + 1:header_idx + 1] = rendered
+
+            with open(target, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            setattr(self, section, entries)
+
+        logger.info("Configuration updated: %s", section)
+        return True
+
     def remove_from_list_section(
         self,
         section: str,
@@ -605,6 +667,70 @@ class Config:
                 self._patch_limit_policy_yaml(yaml_updates, self._config_path)
 
         return bool(yaml_updates)
+
+    def set_network_control_policy(self, updates: dict[str, Any]) -> bool:
+        """Persist network-control policy updates.
+
+        Supported updates:
+          * enable_network_control: bool
+          * enable_network_pressure_shaping: bool
+          * config_network_bw: {priority: {min: ratio, max: ratio}}
+
+        Ratios are expected in [0, 1]. Only changed leaves are patched in YAML.
+        """
+        from utils.logger import logger
+
+        if not isinstance(updates, dict) or not updates:
+            return False
+
+        modified = False
+        yaml_updates: dict[tuple[str, ...], Any] = {}
+
+        with self._persist_lock:
+            if "enable_network_control" in updates:
+                enabled = bool(updates["enable_network_control"])
+                if getattr(self, "enable_network_control", False) != enabled:
+                    self.enable_network_control = enabled
+                    yaml_updates[("enable_network_control",)] = enabled
+                    modified = True
+
+            if "enable_network_pressure_shaping" in updates:
+                shaping_enabled = bool(updates["enable_network_pressure_shaping"])
+                if getattr(self, "enable_network_pressure_shaping", True) != shaping_enabled:
+                    self.enable_network_pressure_shaping = shaping_enabled
+                    yaml_updates[("enable_network_pressure_shaping",)] = shaping_enabled
+                    modified = True
+
+            bw_updates = updates.get("config_network_bw")
+            if isinstance(bw_updates, dict):
+                current_bw = self.config_network_bw if isinstance(self.config_network_bw, dict) else {}
+                for pri, bounds in bw_updates.items():
+                    if not isinstance(bounds, dict):
+                        continue
+                    pri_cfg = current_bw.get(pri)
+                    if not isinstance(pri_cfg, dict):
+                        pri_cfg = {}
+                        current_bw[pri] = pri_cfg
+
+                    for key in ("min", "max"):
+                        if key not in bounds:
+                            continue
+                        try:
+                            val = float(bounds[key])
+                        except (TypeError, ValueError):
+                            continue
+                        if pri_cfg.get(key) != val:
+                            pri_cfg[key] = val
+                            yaml_updates[("config_network_bw", pri, key)] = val
+                            modified = True
+
+                self.config_network_bw = current_bw
+
+            if modified:
+                logger.info(f"Configuration updated: network_control - {list(yaml_updates.keys())}")
+                self._patch_limit_policy_yaml(yaml_updates, self._config_path)
+
+        return modified
 
     def update_top_level_scalars(self, updates: dict[str, Any]) -> bool:
         """Persist one or more top-level *scalar* config keys (e.g.

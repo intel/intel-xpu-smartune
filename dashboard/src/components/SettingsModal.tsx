@@ -17,6 +17,7 @@ import {
   Col,
   Divider,
   Tooltip,
+  Tag,
   message,
 } from 'antd'
 import {
@@ -25,8 +26,9 @@ import {
   ReloadOutlined,
   MonitorOutlined,
   ControlOutlined,
-  GlobalOutlined,
   QuestionCircleOutlined,
+  RightOutlined,
+  DownOutlined,
 } from '@ant-design/icons'
 import { api } from '../api/client'
 import type {
@@ -44,7 +46,7 @@ interface Props {
   visible: boolean
   onClose: () => void
   // In monitor-only deployments (started with `-m`) the balancer is not running,
-  // so the Auto Control and Network tabs are hidden — only Monitor applies.
+  // so control settings tabs are hidden — only Monitor applies.
   balancerEnabled: boolean
 }
 
@@ -337,6 +339,11 @@ function MonitoredSectionsCard() {
 // Monitor tab: sections + collection cadence + pressure detection params.
 // ---------------------------------------------------------------------------
 function MonitorPanel() {
+  const toPercentageThresholds = (thresholds: Record<string, number>) =>
+    Object.fromEntries(Object.entries(thresholds).map(([level, value]) => [level, Math.round(value * 100)]))
+  const toRatioThresholds = (thresholds: Record<string, number>) =>
+    Object.fromEntries(Object.entries(thresholds).map(([level, value]) => [level, value / 100]))
+
   return (
     <>
       <MonitoredSectionsCard />
@@ -358,7 +365,7 @@ function MonitorPanel() {
           return {
             values: {
               regular_update_sys_pressure_time: d.regular_update_sys_pressure_time,
-              thresholds: d.thresholds,
+              thresholds: toPercentageThresholds(d.thresholds),
               weights: d.weights,
               mem_gate_steepness: d.mem_gate_steepness,
               memory_busy_threshold: d.memory_busy_threshold,
@@ -367,10 +374,13 @@ function MonitorPanel() {
             updatedAt: d.updated_at,
           }
         }}
-        save={(values, ts) => api.updateConfig('system_pressure', values, ts)}
+        save={(values, ts) => api.updateConfig('system_pressure', {
+          ...values,
+          thresholds: toRatioThresholds(values.thresholds as Record<string, number>),
+        }, ts)}
         currentToValues={(c) => ({
           regular_update_sys_pressure_time: c.regular_update_sys_pressure_time,
-          thresholds: c.thresholds,
+          thresholds: toPercentageThresholds(c.thresholds as Record<string, number>),
           weights: c.weights,
           mem_gate_steepness: c.mem_gate_steepness,
           memory_busy_threshold: c.memory_busy_threshold,
@@ -393,8 +403,8 @@ function MonitorPanel() {
         <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
           <SectionLabel
             required
-            text="Level thresholds (0–1, ordered)"
-            tip="Maps the 0–1 pressure score to a level. Each threshold is the lower bound of that level and they must increase in order (low < medium < high < critical)."
+            text="Level thresholds (%, ordered)"
+            tip="Maps the system pressure score to a level. Each threshold is the lower bound of that level and they must increase in order (low < medium < high < critical)."
           />
         </Divider>
         <Row gutter={16}>
@@ -404,9 +414,9 @@ function MonitorPanel() {
                 label={k[0].toUpperCase() + k.slice(1)}
                 name={['thresholds', k]}
                 required={false}
-                rules={[{ required: true, type: 'number', min: 0.01, max: 1 }]}
+                rules={[{ required: true, type: 'number', min: 1, max: 100 }]}
               >
-                <InputNumber style={{ width: '100%' }} min={0.01} max={1} step={0.05} />
+                <InputNumber style={{ width: '100%' }} min={1} max={100} step={1} addonAfter="%" />
               </Form.Item>
             </Col>
           ))}
@@ -494,18 +504,47 @@ function MonitorPanel() {
         </Row>
       </FormCard>
 
-      <Alert
-        type="info"
-        showIcon
-        message="Network I/O pressure — coming soon"
-        description="Network pressure thresholds will be configurable here alongside the network control settings."
-      />
+      <FormCard
+        title="Network I/O pressure"
+        scope="network_pressure"
+        load={async () => {
+          const d = await api.getConfig<{ network_thresholds: Record<string, number>; updated_at?: number }>('network_pressure')
+          return { values: { network_thresholds: toPercentageThresholds(d.network_thresholds) }, updatedAt: d.updated_at }
+        }}
+        save={(values, ts) => api.updateConfig('network_pressure', {
+          network_thresholds: toRatioThresholds(values.network_thresholds as Record<string, number>),
+        }, ts)}
+        currentToValues={(c) => ({
+          network_thresholds: toPercentageThresholds(c.network_thresholds as Record<string, number>),
+        })}
+      >
+        <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
+          <SectionLabel
+            required
+            text="Utilisation thresholds (%, ordered)"
+            tip="Maps overall network utilisation to low, medium, high, and critical. Thresholds must increase in that order."
+          />
+        </Divider>
+        <Row gutter={16}>
+          {(['low', 'medium', 'high', 'critical'] as const).map((level) => (
+            <Col span={6} key={level}>
+              <Form.Item
+                label={level[0].toUpperCase() + level.slice(1)}
+                name={['network_thresholds', level]}
+                rules={[{ required: true, type: 'number', min: 1, max: 100 }]}
+              >
+                <InputNumber style={{ width: '100%' }} min={1} max={100} step={1} addonAfter="%" />
+              </Form.Item>
+            </Col>
+          ))}
+        </Row>
+      </FormCard>
     </>
   )
 }
 
 // ---------------------------------------------------------------------------
-// Auto Control tab: auto resource control + full limit policy.
+// Control Policy tab content: system control + network control.
 // ---------------------------------------------------------------------------
 function LimitRateRow({ resource, disabled }: { resource: 'cpu' | 'memory'; disabled?: boolean }) {
   const form = Form.useFormInstance()
@@ -521,8 +560,8 @@ function LimitRateRow({ resource, disabled }: { resource: 'cpu' | 'memory'; disa
       </Col>
       {PRIORITIES.map((p) => (
         <Col span={5} key={p.key}>
-          <Form.Item label={p.label} name={[resource, 'rate', p.key]} rules={[{ type: 'number', min: 0.01, max: 1 }]}>
-            <InputNumber style={{ width: '100%' }} min={0.01} max={1} step={0.05} disabled={ratesDisabled} />
+          <Form.Item label={p.label} name={[resource, 'rate', p.key]} rules={[{ type: 'number', min: 1, max: 100 }]}>
+            <InputNumber style={{ width: '100%' }} min={1} max={100} step={1} addonAfter="%" disabled={ratesDisabled} />
           </Form.Item>
         </Col>
       ))}
@@ -572,18 +611,27 @@ function DiskRateMatrix({ disabled }: { disabled?: boolean }) {
   )
 }
 
-// Auto Control is a single card with one Save: the master "Auto resource
+// System Control is a single card with one Save: the master "system control
 // control" switch gates (grays out) the limit-policy settings below, which are
-// meaningless while auto control is off.  One save persists both the switch
+// meaningless while system control is off.  One save persists both the switch
 // (passive_control section) and the limit policy (limit_policy section).
 function AutoControlPanel() {
   const [form] = Form.useForm()
   const { publishNotice } = useGlobalConfigNotices()
+  const [policyExpanded, setPolicyExpanded] = useState(false)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [enabledTs, setEnabledTs] = useState<number | undefined>(undefined)
   const [limitTs, setLimitTs] = useState<number | undefined>(undefined)
-  const autoEnabled = (Form.useWatch('enabled', form) ?? true) as boolean
+  const autoEnabled = (Form.useWatch('enabled', form) ?? false) as boolean
+  const toPercentageRates = (resource: LimitPolicyData['cpu']) => ({
+    ...resource,
+    rate: Object.fromEntries(Object.entries(resource.rate).map(([priority, rate]) => [priority, Math.round(Number(rate) * 100)])),
+  })
+  const toRatioRates = (resource: LimitPolicyData['cpu']) => ({
+    ...resource,
+    rate: Object.fromEntries(Object.entries(resource.rate).map(([priority, rate]) => [priority, Number(rate) / 100])),
+  })
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -595,14 +643,15 @@ function AutoControlPanel() {
       form.setFieldsValue({
         enabled: pc.enabled,
         policy: lp.policy,
-        cpu: lp.cpu,
-        memory: lp.memory,
+        cpu: toPercentageRates(lp.cpu),
+        memory: toPercentageRates(lp.memory),
         disk_io: lp.disk_io,
       })
+      setPolicyExpanded(Boolean(pc.enabled))
       setEnabledTs(pc.updated_at)
       setLimitTs(lp.updated_at)
     } catch (error) {
-      message.error('Failed to load auto control settings')
+      message.error('Failed to load system control settings')
       console.error(error)
     } finally {
       setLoading(false)
@@ -622,11 +671,17 @@ function AutoControlPanel() {
     }
     setSaving(true)
     try {
+      const policyValues = values as unknown as LimitPolicyData
       const [r1, r2] = await Promise.all([
         api.updatePassiveControl(Boolean(values.enabled), enabledTs),
         api.updateConfig<LimitPolicyData>(
           'limit_policy',
-          { policy: values.policy, cpu: values.cpu, memory: values.memory, disk_io: values.disk_io },
+          {
+            policy: policyValues.policy,
+            cpu: toRatioRates(policyValues.cpu),
+            memory: toRatioRates(policyValues.memory),
+            disk_io: policyValues.disk_io,
+          },
           limitTs,
         ),
       ])
@@ -640,15 +695,15 @@ function AutoControlPanel() {
         Modal.confirm({
           title: 'Settings changed by another client',
           content: (
-            <p>Auto control settings were changed elsewhere while you were editing. Reload the latest values?</p>
+            <p>System control settings were changed elsewhere while you were editing. Reload the latest values?</p>
           ),
           okText: 'Reload latest values',
           cancelText: 'Cancel',
           onOk: () => {
             void load()
             publishNotice({
-              title: 'Auto control updated',
-              description: 'Another client changed auto control settings. Your form has been reloaded.',
+              title: 'System control updated',
+              description: 'Another client changed system control settings. Your form has been reloaded.',
               scope: 'auto_control',
             })
           },
@@ -657,12 +712,12 @@ function AutoControlPanel() {
       }
 
       if (r1.data.success && r2.data.success) {
-        message.success('Auto control settings saved')
+        message.success('System control settings saved')
       } else {
-        message.error('Failed to update auto control settings')
+        message.error('Failed to update system control settings')
       }
     } catch (error) {
-      message.error('Failed to save auto control settings')
+      message.error('Failed to save system control settings')
       console.error(error)
     } finally {
       setSaving(false)
@@ -670,55 +725,73 @@ function AutoControlPanel() {
   }
 
   return (
-    <Card size="small" title="Auto Control" style={{ marginBottom: 16 }}>
+    <Card size="small" title="System Control (CPU/Memory/Disk I/O)" style={{ marginBottom: 16 }}>
       <Spin spinning={loading}>
         <Form form={form} layout="vertical">
           <Form.Item
-            label="Auto resource control"
+            label={
+              <Space size={4}>
+                <Button
+                  size="small"
+                  type="text"
+                  onClick={() => setPolicyExpanded((expanded) => !expanded)}
+                  disabled={!autoEnabled}
+                  icon={policyExpanded
+                    ? <DownOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />
+                    : <RightOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />}
+                  aria-label="Toggle system policy details"
+                />
+                <span>Auto system control</span>
+              </Space>
+            }
             name="enabled"
             valuePropName="checked"
             tooltip="When enabled, the balancer automatically throttles top apps under critical system pressure. When disabled, only manual per-app limits active in Balancer tab."
             style={{ marginBottom: 4 }}
           >
-            <Switch />
+            <Switch checkedChildren="On" unCheckedChildren="Off" onChange={setPolicyExpanded} />
           </Form.Item>
-          <Text type="secondary">
-            The limit policy below only applies while auto resource control is enabled.
-          </Text>
+          {policyExpanded && (
+            <>
+              <Text type="secondary">
+                The limit policy below only applies while system control is enabled.
+              </Text>
 
-          <Divider orientation="left" orientationMargin={0} plain style={{ margin: '12px 0 8px' }}>
-            <SectionLabel
-              text="Policy mode"
-              tip="Combined applies one shared limit across all matched processes of an app; Separated applies the limit to each process individually."
-            />
-          </Divider>
-          <Form.Item name="policy" rules={[{ required: true }]}>
-            <Radio.Group disabled={!autoEnabled}>
-              <Radio.Button value="combined">Combined</Radio.Button>
-              <Radio.Button value="separated">Separated</Radio.Button>
-            </Radio.Group>
-          </Form.Item>
+              <Divider orientation="left" orientationMargin={0} plain style={{ margin: '12px 0 8px' }}>
+                <SectionLabel
+                  text="Policy mode"
+                  tip="Combined applies one shared limit across all matched processes of an app; Separated applies the limit to each process individually."
+                />
+              </Divider>
+              <Form.Item name="policy" rules={[{ required: true }]}>
+                <Radio.Group disabled={!autoEnabled}>
+                  <Radio.Button value="combined">Combined</Radio.Button>
+                  <Radio.Button value="separated">Separated</Radio.Button>
+                </Radio.Group>
+              </Form.Item>
 
-          <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 8px' }}>
-            <SectionLabel
-              text="System rate (fraction of total)"
-              tip="Per-priority cap on CPU / memory, as a fraction of total system capacity (0–1). A throttled app in that priority is held at or below this share. Toggle a resource off to leave it uncapped."
-            />
-          </Divider>
-          <LimitRateRow resource="cpu" disabled={!autoEnabled} />
-          <LimitRateRow resource="memory" disabled={!autoEnabled} />
+              <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 8px' }}>
+                <SectionLabel
+                  text="System rate (%)"
+                  tip="Per-priority CPU and memory cap as a percentage of total system capacity. A throttled app in that priority is held at or below this share. Toggle a resource off to leave it uncapped."
+                />
+              </Divider>
+              <LimitRateRow resource="cpu" disabled={!autoEnabled} />
+              <LimitRateRow resource="memory" disabled={!autoEnabled} />
 
-          <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 8px' }}>
-            <SectionLabel
-              text="Disk I/O rate"
-              tip="Per-priority absolute disk limits (MB/s and IOPS, read and write). Toggle off to leave disk I/O uncapped."
-            />
-            &nbsp;
-            <Form.Item name={['disk_io', 'enabled']} valuePropName="checked" noStyle>
-              <Switch size="small" checkedChildren="On" unCheckedChildren="Off" disabled={!autoEnabled} />
-            </Form.Item>
-          </Divider>
-          <DiskRateMatrix disabled={!autoEnabled} />
+              <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 8px' }}>
+                <SectionLabel
+                  text="Disk I/O rate"
+                  tip="Per-priority absolute disk limits (MB/s and IOPS, read and write). Toggle off to leave disk I/O uncapped."
+                />
+                &nbsp;
+                <Form.Item name={['disk_io', 'enabled']} valuePropName="checked" noStyle>
+                  <Switch size="small" checkedChildren="On" unCheckedChildren="Off" disabled={!autoEnabled} />
+                </Form.Item>
+              </Divider>
+              <DiskRateMatrix disabled={!autoEnabled} />
+            </>
+          )}
         </Form>
 
         <Text type="secondary" style={{ fontSize: 12 }}>
@@ -739,6 +812,307 @@ function AutoControlPanel() {
   )
 }
 
+function NetworkPanel() {
+  const [policyExpanded, setPolicyExpanded] = useState(false)
+  const toPercentage = (ratio: number) => Math.round(ratio * 100)
+  const toPercentages = (bandwidth: Record<string, { min: number; max: number }> | undefined) =>
+    Object.fromEntries(Object.entries(bandwidth ?? {}).map(([priority, bounds]) => [
+      priority,
+      { min: toPercentage(bounds.min), max: toPercentage(bounds.max) },
+    ]))
+
+  return (
+    <FormCard
+      title="Network Control"
+      scope="network_control"
+      load={async () => {
+        const d = await api.getConfig<{
+          enable_network_control: boolean
+          enable_network_pressure_shaping: boolean
+          available_network_interfaces: Array<{ name: string; speed_mbps: number }>
+          selected_network_interfaces: string[]
+          config_network_bw: Record<string, { min: number; max: number }>
+          network_system_ports?: number[]
+          updated_at?: number
+        }>('network_control')
+        setPolicyExpanded(Boolean(d.enable_network_control))
+        return {
+          values: {
+            enable_network_control: Boolean(d.enable_network_control),
+            enable_network_pressure_shaping: Boolean(d.enable_network_pressure_shaping ?? true),
+            available_network_interfaces: d.available_network_interfaces ?? [],
+            selected_network_interfaces: d.selected_network_interfaces ?? [],
+            config_network_bw: toPercentages(d.config_network_bw),
+            network_system_ports: Array.isArray(d.network_system_ports) ? d.network_system_ports : [],
+          },
+          updatedAt: d.updated_at,
+        }
+      }}
+      save={(values, ts) =>
+        api.updateConfig('network_control', {
+          enable_network_control: Boolean(values.enable_network_control),
+          enable_network_pressure_shaping: Boolean(values.enable_network_pressure_shaping),
+          ...(Boolean(values.enable_network_control)
+            ? { selected_network_interfaces: values.selected_network_interfaces }
+            : {}),
+          config_network_bw: Object.fromEntries(
+            ['critical', 'high', 'low'].map((priority) => [
+              priority,
+              Object.fromEntries(Object.entries(
+                (values.config_network_bw as Record<string, Record<string, number>> | undefined)?.[priority] ?? {},
+              ).map(([bound, value]) => [bound, value / 100])),
+            ]),
+          ),
+        }, ts)
+      }
+      currentToValues={(c) => ({
+        enable_network_control: Boolean(c.enable_network_control),
+        enable_network_pressure_shaping: Boolean(c.enable_network_pressure_shaping ?? true),
+        available_network_interfaces: c.available_network_interfaces,
+        selected_network_interfaces: c.selected_network_interfaces,
+        config_network_bw: toPercentages(c.config_network_bw as Record<string, { min: number; max: number }> | undefined),
+        network_system_ports: c.network_system_ports,
+      })}
+    >
+      <Form.Item noStyle shouldUpdate>
+        {({ getFieldValue, setFieldsValue }) => {
+          const networkControlEnabled = Boolean(getFieldValue('enable_network_control'))
+          const availableNetworkInterfaces = (
+            getFieldValue('available_network_interfaces') as Array<{ name: string; speed_mbps: number }> | undefined
+          ) ?? []
+          const systemPorts = (getFieldValue('network_system_ports') as number[] | undefined) ?? []
+          const reservedBandwidth = (
+            getFieldValue('config_network_bw') as Record<string, { min?: number; max?: number }> | undefined
+          )?.system
+          const bandwidth = getFieldValue('config_network_bw') as Record<string, { min?: number }> | undefined
+          const reservedMinimumRatio = Math.round(Number(reservedBandwidth?.min ?? 0))
+          const applicationMinimumRatioTotal = ['critical', 'high', 'low'].reduce(
+            (sum, priority) => sum + Number(
+              bandwidth?.[priority]?.min ?? 0,
+            ),
+            0,
+          )
+          const displayedApplicationMinimumRatioTotal = Math.round(applicationMinimumRatioTotal)
+          const applicationMinimumRatioLimit = 100 - reservedMinimumRatio
+          const minimumRatioExceeded = displayedApplicationMinimumRatioTotal > applicationMinimumRatioLimit
+          return (
+            <>
+              <Space size={8} align="center" style={{ marginTop: 6 }}>
+                <Button
+                  size="small"
+                  type="text"
+                  onClick={() => setPolicyExpanded((expanded) => !expanded)}
+                  disabled={!networkControlEnabled}
+                  icon={policyExpanded
+                    ? <DownOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />
+                    : <RightOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />}
+                  aria-label="Toggle network policy details"
+                />
+                <Text strong>Network control</Text>
+                <Tooltip title="When enabled, network shaping is applied to controlled apps. When disabled, all network shaping is paused.">
+                  <QuestionCircleOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />
+                </Tooltip>
+                <Form.Item name="enable_network_control" valuePropName="checked" noStyle>
+                  <Switch
+                    checkedChildren="On"
+                    unCheckedChildren="Off"
+                    onChange={(checked) => {
+                      setPolicyExpanded(checked)
+                      if (!checked) {
+                        setFieldsValue({ selected_network_interfaces: [] })
+                        return
+                      }
+                      const currentSelected = (
+                        getFieldValue('selected_network_interfaces') as string[] | undefined
+                      ) ?? []
+                      if (currentSelected.length === 0) {
+                        setFieldsValue({
+                          selected_network_interfaces: availableNetworkInterfaces.map((nic) => nic.name),
+                        })
+                      }
+                    }}
+                  />
+                </Form.Item>
+              </Space>
+
+              {policyExpanded && (
+                <div style={{ marginTop: 8, marginLeft: 14, paddingLeft: 12, borderLeft: `2px solid ${COLORS.border}` }}>
+                  <Text type="secondary" style={{ display: 'block', marginBottom: 10 }}>
+                    The network policy below only applies while network control is enabled.
+                  </Text>
+                  <Row gutter={16}>
+                    <Col span={10}>
+                      <Form.Item
+                        label="Auto network control"
+                        name="enable_network_pressure_shaping"
+                        valuePropName="checked"
+                        tooltip="When enabled, bandwidth ceilings are adjusted automatically based on network pressure. When disabled, only the static class policy is applied."
+                      >
+                        <Switch
+                          checkedChildren="On"
+                          unCheckedChildren="Off"
+                          disabled={!networkControlEnabled}
+                        />
+                      </Form.Item>
+                    </Col>
+                  </Row>
+
+                  <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
+                    <SectionLabel
+                      required
+                      text="Controlled network interfaces"
+                      tip="Select the automatically detected physical interfaces to control. Link bandwidth is detected by the operating system."
+                    />
+                  </Divider>
+                  <Form.Item
+                    name="selected_network_interfaces"
+                    rules={[{
+                      validator: (_, value: string[]) => !networkControlEnabled || value?.length > 0
+                        ? Promise.resolve()
+                        : Promise.reject(new Error('Select at least one network interface')),
+                    }]}
+                  >
+                    <Checkbox.Group disabled={!networkControlEnabled}>
+                      <Space direction="vertical" size={6}>
+                        {availableNetworkInterfaces.map((nic) => (
+                          <Checkbox key={nic.name} value={nic.name}>
+                            {nic.name} ({nic.speed_mbps.toLocaleString()} Mbps)
+                          </Checkbox>
+                        ))}
+                      </Space>
+                    </Checkbox.Group>
+                  </Form.Item>
+                  {availableNetworkInterfaces.length === 0 && (
+                    <Alert type="warning" showIcon message="No controllable physical network interfaces detected" />
+                  )}
+
+                  <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
+                    <SectionLabel
+                      text="Reserved network bandwidth range"
+                      tip="Reserved capacity and its controlled ports are managed by the system and cannot be changed here."
+                    />
+                  </Divider>
+
+                  <Text style={{ display: 'block', marginBottom: 10 }}>
+                    Reserved network bandwidth for system ports:{' '}
+                    {reservedBandwidth?.min != null && reservedBandwidth?.max != null
+                      ? `${Math.round(reservedBandwidth.min)}% - ${Math.round(reservedBandwidth.max)}%`
+                      : 'Not configured'}
+                  </Text>
+
+                  <div style={{ marginTop: 10 }}>
+                    <Text type="secondary" style={{ display: 'block', marginBottom: 4 }}>
+                      Controlled system ports
+                    </Text>
+                    {systemPorts.length > 0 ? (
+                      <Space size={[4, 4]} wrap>
+                        {systemPorts.map((port) => (
+                          <Tag key={port}>{({ 22: '22 - SSH', 53: '53 - DNS', 80: '80 - HTTP', 123: '123 - NTP', 443: '443 - HTTPS' }[port] ?? port)}</Tag>
+                        ))}
+                      </Space>
+                    ) : (
+                      <Text>None</Text>
+                    )}
+                  </div>
+
+                  <Divider orientation="left" orientationMargin={0} plain style={{ margin: '16px 0 12px' }}>
+                    <SectionLabel
+                      required
+                      text="Network bandwidth ranges"
+                      tip="Set the minimum and maximum ratio of NIC link bandwidth for each application priority. The application minimum total cannot exceed the capacity remaining after the system reservation."
+                    />
+                  </Divider>
+
+                  <Row gutter={12} align="middle" style={{ marginBottom: 6 }}>
+                    <Col span={6}><Text type="secondary" style={{ whiteSpace: 'nowrap' }}>Network priority</Text></Col>
+                    <Col span={5}><Text type="secondary">Min (%)</Text></Col>
+                    <Col span={5}><Text type="secondary">Max (%)</Text></Col>
+                  </Row>
+
+                  {(['critical', 'high', 'low'] as const).map((pri) => (
+                    <Row gutter={12} align="middle" key={pri} style={{ marginBottom: 8 }}>
+                      <Col span={6}>
+                        <Text>{pri[0].toUpperCase() + pri.slice(1)}</Text>
+                      </Col>
+                      <Col span={5}>
+                        <Form.Item
+                          name={['config_network_bw', pri, 'min']}
+                          rules={[
+                            { required: true, type: 'number', min: 0, max: 100 },
+                            ({ getFieldValue }) => ({
+                              validator() {
+                                const bandwidth = getFieldValue('config_network_bw') as Record<string, { min?: number }> | undefined
+                                const total = ['system', 'critical', 'high', 'low'].reduce(
+                                  (sum, priority) => sum + Number(bandwidth?.[priority]?.min ?? 0),
+                                  0,
+                                )
+                                if (total > 100) {
+                                  const reserved = Math.round(Number(bandwidth?.system?.min ?? 0))
+                                  return Promise.reject(new Error(`Application minimum ratios cannot exceed ${100 - reserved}% (${reserved}% is reserved for system ports)`))
+                                }
+                                return Promise.resolve()
+                              },
+                            }),
+                          ]}
+                          noStyle
+                        >
+                          <InputNumber
+                            style={{ width: '100%' }}
+                            min={0}
+                            max={100}
+                            step={1}
+                            addonAfter="%"
+                            disabled={!networkControlEnabled}
+                          />
+                        </Form.Item>
+                      </Col>
+                      <Col span={5}>
+                        <Form.Item
+                          name={['config_network_bw', pri, 'max']}
+                          rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
+                          noStyle
+                        >
+                          <InputNumber
+                            style={{ width: '100%' }}
+                            min={0}
+                            max={100}
+                            step={1}
+                            addonAfter="%"
+                            disabled={!networkControlEnabled}
+                          />
+                        </Form.Item>
+                      </Col>
+                    </Row>
+                  ))}
+
+                  <Text type={minimumRatioExceeded ? 'danger' : 'secondary'} style={{ display: 'block', marginTop: 4 }}>
+                    Application minimum allocation: {displayedApplicationMinimumRatioTotal}% / {applicationMinimumRatioLimit}% ({reservedMinimumRatio}% reserved for system ports)
+                  </Text>
+                  {!minimumRatioExceeded && displayedApplicationMinimumRatioTotal < applicationMinimumRatioLimit && (
+                    <Text type="secondary" style={{ display: 'block', marginTop: 2 }}>
+                      Remaining application minimum capacity: {applicationMinimumRatioLimit - displayedApplicationMinimumRatioTotal}%
+                    </Text>
+                  )}
+                  {minimumRatioExceeded && (
+                    <Alert
+                      type="error"
+                      showIcon
+                      message={`Application minimum allocation exceeds ${applicationMinimumRatioLimit}%`}
+                      description={`${reservedMinimumRatio}% is reserved for system ports. Reduce the Critical, High, or Low minimum ratio before saving.`}
+                      style={{ marginTop: 8 }}
+                    />
+                  )}
+
+                </div>
+              )}
+            </>
+          )
+        }}
+      </Form.Item>
+    </FormCard>
+  )
+}
+
 function ReservedPanel({ title, description }: { title: string; description: string }) {
   return <Alert type="info" showIcon message={title} description={description} style={{ marginTop: 8 }} />
 }
@@ -755,7 +1129,7 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
       ),
       children: <MonitorPanel />,
     },
-    // Auto Control and Network configure the balancer; in monitor-only mode the
+    // Control Policy configures the balancer; in monitor-only mode the
     // balancer is not running, so these tabs are omitted entirely (matching how
     // the main Balancer tab is hidden in App.tsx).
     ...(balancerEnabled
@@ -765,24 +1139,14 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
             label: (
               <Space>
                 <ControlOutlined />
-                Auto Control
-              </Space>
-            ),
-            children: <AutoControlPanel />,
-          },
-          {
-            key: 'network',
-            label: (
-              <Space>
-                <GlobalOutlined />
-                Network
+                Control Policy
               </Space>
             ),
             children: (
-              <ReservedPanel
-                title="Network control settings — coming soon"
-                description="Network traffic control (interface, bandwidth, per-priority limits) will be configurable here."
-              />
+              <>
+                <AutoControlPanel />
+                <NetworkPanel />
+              </>
             ),
           },
         ]
@@ -799,6 +1163,7 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
       }
       open={visible}
       onCancel={onClose}
+      destroyOnClose
       footer={[
         <Button key="close" onClick={onClose}>
           Close

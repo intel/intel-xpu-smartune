@@ -19,6 +19,7 @@ from db.DatabaseModel import AIAppPriority, DBStatus, init_database
 from monitor.monitor_api import (
     monitor_bp,
     register_system_pressure_monitor,
+    register_network_config_reload_notifier,
     _start_snapshot_cleanup_task,
     _start_dynamic_info_auto_refresh,
     stop_dynamic_info_collector,
@@ -54,6 +55,7 @@ class DynamicService:
         # Share the controller's SystemPressureMonitor with the monitor API so that
         # both use the same instance (including is_limited_app_dominant state).
         register_system_pressure_monitor(self.balancer.control_manager.system_pressure_monitor)
+        register_network_config_reload_notifier(self.balancer.network_controller.request_reload)
         self.rebuild_controlled_map()
 
     def start(self):
@@ -161,6 +163,33 @@ def reset_app_status():
             logger.info(f"Reset {updated_count} app statuses to 'NA'")
     except Exception as e:
         logger.error(f"Failed to reset app statuses: {str(e)}")
+
+
+def normalize_priority(raw, default="medium"):
+    """Return a canonical application priority label."""
+    labels = {"low", "medium", "high", "critical"}
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        return value if value in labels else default
+    if isinstance(raw, bool):
+        return default
+    if isinstance(raw, (int, float)):
+        if raw >= 90:
+            return "critical"
+        if raw >= 65:
+            return "high"
+        if raw >= 35:
+            return "medium"
+        return "low"
+    return default
+
+
+def normalize_network_priority(raw):
+    """Return a canonical network priority label for class-based QoS."""
+    if isinstance(raw, str) and raw.strip().lower() == "system":
+        return "system"
+    value = normalize_priority(raw, default="low")
+    return value if value != "medium" else "low"
 
 
 def _runtime_status_for_pid(pid: int) -> str:
@@ -360,14 +389,16 @@ def set_priority():
     try:
         data = request.get_json()
         app_id = data.get('app_id')
-        priority = data.get('priority')
+        raw_priority = data.get('priority')
 
-        if not all([app_id, priority]):
+        if not app_id or raw_priority is None or raw_priority == "":
             return construct_response(
                 data={},
                 retcode=RetCode.ARGUMENT_ERROR,
                 retmsg="Missing required parameters"
             )
+
+        priority = normalize_priority(raw_priority)
 
         result = AIAppPriority.update_record(
             id=app_id,
@@ -394,6 +425,50 @@ def set_priority():
         return construct_response(
             data={},
             retmsg="Priority updated successfully"
+        )
+    except Exception as e:
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/set_network_priority', methods=['POST'])
+def set_network_priority():
+    """Set the network priority used for class-based network QoS."""
+    try:
+        data = request.get_json()
+        app_id = data.get('app_id')
+        raw_network_priority = data.get('network_priority')
+
+        if not app_id or raw_network_priority is None or raw_network_priority == "":
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="Missing required parameters"
+            )
+
+        network_priority = normalize_network_priority(raw_network_priority)
+
+        result = AIAppPriority.update_record(
+            id=app_id,
+            network_priority=network_priority,
+            up_time=datetime.now()
+        )
+
+        logger.info(f"Set network priority result for app_id={app_id}: {result}")
+
+        if result == DBStatus.NOT_FOUND:
+            return construct_response(
+                data={},
+                retcode=RetCode.NOT_EXISTING,
+                retmsg="Application record not found in database"
+            )
+
+        return construct_response(
+            data={},
+            retmsg="Network priority updated successfully"
         )
     except Exception as e:
         return construct_response(
@@ -451,6 +526,7 @@ def get_priority_data():
             "app_id": record.app_id,
             "name": record.name,
             "priority": record.priority,
+            "network_priority": getattr(record, "network_priority", None) or record.priority,
             "cgroup": record.cgroup,
             "remark": record.remark,
             "cmdline": record.cmdline,
@@ -480,6 +556,8 @@ def set_to_control():
         controlled = data.get('controlled', True)
         cgroup = data.get('cgroup', '')
         priority = data.get('priority', 0)
+        priority = normalize_priority(priority)
+        network_priority = normalize_network_priority(data.get('network_priority') or priority)
         remark = data.get('remark', '')
         cmdline = data.get('cmdline', '')
 
@@ -489,6 +567,7 @@ def set_to_control():
         update_fields = dict(
             controlled=controlled,
             priority=priority,
+            network_priority=network_priority,
             cgroup=cgroup,
             remark=remark,
         )
@@ -503,6 +582,7 @@ def set_to_control():
                 app_id=app_id,
                 name=app_name,
                 priority=priority,
+                network_priority=network_priority,
                 controlled=controlled,
                 cgroup=cgroup,
                 remark=remark,
@@ -722,13 +802,15 @@ def new_controlled_app():
         #    /app/set_to_control writes — because the dashboard front-end
         #    calls ``.toLowerCase()`` on it during render.  Passing an int
         #    crashes Balance.tsx and blanks the tab.
-        priority_label = (priority or "low").lower() if isinstance(priority, str) else "low"
+        priority_label = normalize_priority(priority, default="low")
+        network_priority_label = normalize_network_priority(priority_label)
         try:
             db_result = AIAppPriority.insert_record(
                 id=app_id,
                 app_id=app_id,
                 name=name,
                 priority=priority_label,
+                network_priority=network_priority_label,
                 controlled=True,
                 cgroup='',
                 remark=remark,
@@ -748,6 +830,7 @@ def new_controlled_app():
                     app_id=app_id,
                     name=name,
                     priority=priority_label,
+                    network_priority=network_priority_label,
                     controlled=True,
                     cgroup='',
                     remark=remark,
@@ -967,6 +1050,7 @@ def get_controlled_app():
                 "app_name": app_name,
                 "controlled": app.controlled,
                 "priority": app.priority,
+                "network_priority": getattr(app, "network_priority", None) or app.priority,
                 "oom_score": app.oom_score,
                 "cmdline": app.cmdline,
                 "cgroup": app.cgroup,

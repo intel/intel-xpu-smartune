@@ -118,27 +118,26 @@ limit_policy: # Default resource limit ratios for apps at different priority lev
         read: 20
         write_iops: 1000
         read_iops: 8000
-enable_network_control: true # Whether to enable network traffic control
+enable_network_control: false  #Whether to enable network traffic control
+enable_network_pressure_shaping: false  # Whether to enable pressure-driven dynamic throttle/recover within network classes
 network_thresholds:
   low: 0.3
   medium: 0.5
   high: 0.7
   critical: 0.9
-network_interface: "enp2s0" # Change this to your actual network interface name
-network_bandwidth_kbit: 1000000   # unit: kbit/s
-config_network_bw:  # kbit/s, bandwidth range per priority level
+config_network_bw:  # ratio [0, 1] of NIC link bandwidth per network class
   system:
-    min: 50000
-    max: 100000
+    min: 0.05
+    max: 0.10
   critical:
-    min: 500000
-    max: 900000
+    min: 0.55
+    max: 0.90
   high:
-    min: 300000
-    max: 800000
+    min: 0.30
+    max: 0.80
   low:
-    min: 100000
-    max: 800000
+    min: 0.10
+    max: 0.80
 network_burst_map:
   critical: "64k"
   high: "32k"
@@ -150,7 +149,5 @@ network_system_ports:
   - 80
   - 443
   - 123
-testing_network_app:
-  - app_name: "iperf"
-    app_cgroup: "session-1879.scope"
-    priority: "critical"
+
+network_interfaces: []

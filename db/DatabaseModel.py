@@ -158,6 +158,7 @@ class AIAppPriority(DataBaseModel):
     app_id = CharField(max_length=32, null=False, index=True)
     name = CharField(max_length=128, null=False, help_text="app name", index=True)
     priority = IntegerField(default=0, help_text="app priority", index=True)
+    network_priority = CharField(max_length=32, null=True, help_text="network QoS priority", index=True)
     oom_score = IntegerField(default=0, help_text="set app oom_score_adj", index=True)
     controlled = BooleanField(default=False, help_text="whether this app is controlled", index=True)
     cgroup = CharField(max_length=255, null=True, help_text=" where does it manage in cgroup", index=True)
@@ -242,6 +243,7 @@ def _apply_migrations():
     """Apply incremental schema migrations for existing databases."""
     migrations = [
         "ALTER TABLE aiapppriority ADD COLUMN limit_overrides_json TEXT",
+        "ALTER TABLE aiapppriority ADD COLUMN network_priority VARCHAR(32)",
     ]
     for sql in migrations:
         try:

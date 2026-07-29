@@ -118,7 +118,7 @@ limit_policy: # Default resource limit ratios for apps at different priority lev
         read: 20
         write_iops: 1000
         read_iops: 8000
-enable_network_control: false  #Whether to enable network traffic control
+enable_network_control: false  # Whether to enable network traffic control
 enable_network_pressure_shaping: false  # Whether to enable pressure-driven dynamic throttle/recover within network classes
 network_thresholds:
   low: 0.3

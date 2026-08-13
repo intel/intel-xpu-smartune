@@ -52,6 +52,11 @@ class ControlManager:
         Used by the balancer loop to avoid missing transient critical spikes. """
         return self.system_pressure_monitor.consume_peak_pressure_level()
 
+    def get_disk_io_stress(self) -> dict:
+        """ Cached disk-IO stress details from the last pressure tick, incl. `stressed_disks`.
+        The balancer uses it to scope an io.max write to the disks actually under pressure. """
+        return self.system_pressure_monitor.get_disk_io_stress()
+
     def update_network_pressure_level(self, network_data):
         """ Get network pressure level based on network data. """
         return self.system_pressure_monitor.update_network_pressure_level(network_data)

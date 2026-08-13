@@ -37,6 +37,9 @@ class PSIMonitor:
             # EWMA state for the smoothed self-inflicted fraction, per resource
             # (see get_self_inflicted_fraction for why smoothing is needed).
             cls._instance._frac_smoothed = {}
+            # Last (time, total) for the io 'full' delta rate (see get_io_full_pressure).
+            # Isolated from the 'some'/self-fraction state above.
+            cls._instance._io_full_last = None
             cls._instance._pressure_history = defaultdict(list)
             cls._instance._last_pressure = {'cpu': 0.0, 'memory': 0.0, 'io': 0.0}
             cls._instance._window_sec = 5
@@ -237,6 +240,46 @@ class PSIMonitor:
                 # No fresh sample: hold the last smoothed value (0.0 if never measured).
                 fraction[res] = self._frac_smoothed.get(res, 0.0)
         return fraction
+
+    @staticmethod
+    def _parse_full_total(path: str) -> Optional[int]:
+        """Return the cumulative ``full total`` stall time (µs) from a PSI file, or None.
+
+        ``full`` means every non-idle task is stalled on the resource -- i.e. the
+        system as a whole cannot make progress. Separate from the ``some`` parser so
+        the existing 'some'/self-fraction path stays untouched.
+        """
+        try:
+            with open(path) as f:
+                for line in f:
+                    if line.startswith("full"):
+                        return int(line.split("total=")[-1])
+        except (OSError, ValueError):
+            return None
+        return None
+
+    def get_io_full_pressure(self) -> float:
+        """Instantaneous io ``full`` pressure in [0, 1] from cumulative-total deltas.
+
+        This is the system-wide-blocking signal the disk-pressure gate uses to detect
+        the critical band (all non-idle tasks stalled on IO). Kept fully independent of
+        the ``some`` window-average path and the self-inflicted-fraction state: its own
+        ``_io_full_last`` timestamp, its own fresh read of /proc/pressure/io. Returns 0.0
+        on the first read (no interval yet) or when the file is unavailable.
+        """
+        now = time.time()
+        total = self._parse_full_total(self._PRESSURE_FILES['io'])
+        if total is None:
+            return 0.0
+        last = self._io_full_last
+        self._io_full_last = (now, total)
+        if last is None:
+            return 0.0
+        time_delta = now - last[0]
+        if time_delta <= 0:
+            return 0.0
+        rate = (total - last[1]) / 1_000_000 / time_delta  # µs → s
+        return max(0.0, min(rate, 1.0))
 
     def cleanup(self):
         """Release resources: close all PSI file descriptors (call on program exit)."""

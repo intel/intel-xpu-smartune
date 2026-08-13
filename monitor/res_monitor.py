@@ -13,11 +13,17 @@ from time import sleep
 
 import psutil
 from config.config import b_config
-from utils.app_utils import fetch_all_apps, get_cgroup_path_by_pid, get_pids_in_cgroup
+from utils.app_utils import (
+    derived_process_identity,
+    fetch_all_apps,
+    get_cgroup_path_by_pid,
+    get_pids_in_cgroup,
+)
 from utils.logger import logger
 
 from monitor import PSIMonitor
 from monitor.app_discovery import is_noise_process
+from monitor.disk_pressure import DiskIOMonitor
 from utils.self_ident import is_own_process
 
 _GPU_DRM_DRIVERS = frozenset({'i915', 'xe'})
@@ -252,13 +258,25 @@ def _peak_engine_util(engine_delta, elapsed_ns):
 
 
 
+def _identity_keys(name: str) -> tuple:
+    """The forms a configured name can legitimately appear in as a process name.
+
+    Just the name itself, plus its 15-character prefix when it is longer than that:
+    the kernel truncates ``comm`` to 15 characters, so a longer program is only ever
+    *seen* in the truncated form.
+    """
+    n = (name or '').strip().lower()
+    if not n:
+        return ()
+    return (n,) if len(n) <= 15 else (n, n[:15])
+
+
 class ResourceMonitor:
     def __init__(self):
         """Initialise the resource monitor."""
         self.config = b_config
         self.cpu_cores = os.cpu_count() or 16
-        self.prev_io = psutil.disk_io_counters(perdisk=True)
-        self.prev_time = time.time()
+        self._disk_io = DiskIOMonitor(self.config)
         self._prev_pid_io = {}  # pid -> (read_bytes, write_bytes, ts) for per-pid IO rates
         # Desktop application metadata
         try:
@@ -276,6 +294,26 @@ class ResourceMonitor:
         self._multiprocess_apps: dict[str, dict] = {}
         self._load_multiprocess_config()
 
+        # Registered apps indexed by the exact identities a process can present.
+        self._desktop_name_to_app: dict[str, str] = {}
+        self._desktop_exe_to_app: dict[str, str] = {}
+        self._build_desktop_identity_index()
+
+        # The balancer must never rank itself as a limit candidate: it reads /proc for
+        # every process on every tick, and psutil's read_count / write_count are syscall
+        # counts, not block-device operations, so those reads look like a huge IOPS load
+        # at almost no bandwidth. Excluding the whole cgroup rather than just our PID,
+        # because a limit is a property of a cgroup: any helper we spawn is inside it and
+        # every cap written there reaches us. The limit-path counterpart of
+        # :func:`is_own_process`. Resolved once -- our own cgroup does not change.
+        self._self_cgroup = ''
+        try:
+            own = get_cgroup_path_by_pid(os.getpid())
+            self._self_cgroup = own if own and own != '/' else ''
+            logger.info(f"Self cgroup (never limited): {self._self_cgroup or 'unknown'}")
+        except Exception as e:
+            logger.warning(f"Could not resolve own cgroup, self-exclusion is off: {e}")
+
     def _load_multiprocess_config(self) -> None:
         """Populate multi-process app lookup maps from controlled_apps config."""
         apps = getattr(self.config, 'controlled_apps', None) or []
@@ -291,7 +329,84 @@ class ResourceMonitor:
                 'process_names_lower': pnames_lower,
             }
             for p in pnames_lower:
-                self._proc_name_to_app[p] = app_id
+                if p:
+                    self._proc_name_to_app[p] = app_id
+
+    def _build_desktop_identity_index(self) -> None:
+        """Index every registered app by the exact names its processes can present.
+
+        Replaces a substring test -- "does the app's name appear anywhere inside the
+        process name" -- under which an app claimed every process whose name merely began
+        with or contained it. Two apps whose names share a prefix are then indistinguishable,
+        and the traffic of one is reported against the other, so the limit is written to the
+        wrong app. (Seen with the disk-IO test workload, whose three binaries are named as
+        prefixes of one another; the same holds for any `foo` / `foo-worker` pair.)
+
+        The substring form was covering two differences that are real, and both are handled
+        exactly here instead:
+
+        * ``comm`` is truncated to 15 characters by the kernel, so a longer program name is
+          only ever observed in that form -- see :func:`_identity_keys`;
+        * an app is usually registered under a display name while its processes show the
+          executable from ``commandline``. That executable is resolved with the wizard's own
+          derivation rule, so an interpreter or shell launch indexes as the script rather
+          than as the interpreter -- indexing it as the interpreter would hand the app every
+          process on the machine that shares it, which is the same over-match in a new place.
+
+        First writer wins: when two apps claim one identity the earlier registration keeps
+        it, instead of the limit silently moving to whichever was configured last.
+        """
+        for app_id, app in self.desktop_apps.items():
+            try:
+                tokens = (app.get('cmdline') or '').split()
+                exe_token = tokens[0] if tokens else ''
+                derived = derived_process_identity(
+                    {'name': '', 'exe': exe_token, 'cmdline': tokens}) if exe_token else ''
+                for name in (app.get('name') or '', derived, *(app.get('process_names') or [])):
+                    for key in _identity_keys(name):
+                        self._desktop_name_to_app.setdefault(key, app_id)
+                # Only when the executable IS the program: for a wrapper launch the
+                # derivation resolved past it, and indexing the wrapper path would match
+                # every process started through the same interpreter or shell.
+                if exe_token and derived.lower() == os.path.basename(exe_token).lower():
+                    self._desktop_exe_to_app.setdefault(exe_token.lower(), app_id)
+            except Exception as e:
+                logger.warning(f"Could not index registered app {app_id}: {e}")
+
+    def _app_id_for_process(self, info: dict) -> str:
+        """Which configured multi-process app a running process belongs to, or ''.
+
+        Every test here is an exact comparison against a configured process name. Asking
+        instead whether a configured name appears *anywhere* in the command line turns
+        every launcher into a match for the app it launches: `sudo systemd-run --scope
+        --unit=lo-io.scope /tmp/fio_lo` was reported as the app "fio_lo" while living in
+        the terminal's own scope, so that scope was merged into the app and then received
+        the app's io.max.
+
+        argv[0], comm and exe are all consulted because none is reliable alone: comm is
+        truncated to 15 characters by the kernel, exe is unreadable for other users'
+        processes, and argv[0] can be rewritten by the process itself. The derived
+        identity covers the apps the wizard recorded by script name rather than by
+        executable name, whose three exec fields all read "python3" or "bash".
+        """
+        cmdline = info.get('cmdline') or []
+        for name in (
+            os.path.basename((cmdline[0] or '').strip()).lower() if cmdline else '',
+            (info.get('name') or '').strip().lower(),
+            os.path.basename((info.get('exe') or '').strip()).lower(),
+        ):
+            app_id = self._proc_name_to_app.get(name) if name else None
+            if app_id:
+                return app_id
+
+        # A derived identity that differs from the three fields above is always the
+        # basename of one of the arguments, so screening on those keeps the derivation --
+        # which re-reads config on every call -- off a loop over every process on the box.
+        args = {os.path.basename((t or '').strip()).lower() for t in cmdline[1:]}
+        if not (args & self._proc_name_to_app.keys()):
+            return ''
+        return self._proc_name_to_app.get(
+            derived_process_identity(info).strip().lower(), '')
 
     def _get_top_processes(self, n=1, samples=3, interval=1.0, mode='default'):
         """Return the top resource-consuming applications, aggregated per cgroup.
@@ -301,24 +416,35 @@ class ResourceMonitor:
         :param mode: scoring mode — 'default' ranks by combined CPU+memory score; 'io' ranks by IO throughput
         """
         # Step 1: Sample candidate processes (weighted, per-process-group)
-        psi_data = PSIMonitor().get_current_pressure()
-        dynamic_weights = self._adjust_weights_by_pressure(psi_data)
-
-        candidate_procs = self._get_candidate_processes(
-            num=max(n * 3, 9),  # candidate count; ensures enough candidates to cover at least n distinct cgroups
-            samples=samples,
-            interval=interval,
-            dynamic_weights=dynamic_weights
-        )
+        num_candidates = max(n * 3, 9)  # ensures enough candidates to cover at least n distinct cgroups
+        if mode == 'io':
+            # Rank candidates by actual disk IO, not CPU+memory: a low-CPU, high-IO process
+            # (a large sequential writer, a database flushing) never enters a CPU-weighted
+            # candidate set, which would make the whole disk-IO throttle path silently
+            # no-op for exactly the apps it exists to control. The PSI-derived CPU/memory
+            # weights below are irrelevant here, so they are not computed on this path.
+            candidate_procs = self._get_disk_io_candidate_processes(num=num_candidates)
+        else:
+            psi_data = PSIMonitor().get_current_pressure()
+            dynamic_weights = self._adjust_weights_by_pressure(psi_data)
+            candidate_procs = self._get_candidate_processes(
+                num=num_candidates,
+                samples=samples,
+                interval=interval,
+                dynamic_weights=dynamic_weights
+            )
 
         # logger.debug(f"Candidate processes for cgroup aggregation: {candidate_procs}")
         # Step 2: Collect unique cgroup paths
         # Exclude '/' (root cgroup): its pids span the entire system process tree, which
         # would create a spurious "super group" with an artificially high aggregate score.
+        # Our own cgroup is dropped here rather than in each candidate collector: this is
+        # the one place every mode passes through, and it is the set that decides which
+        # cgroups can receive a limit (see _self_cgroup).
         cgroup_paths = set()
         for proc in candidate_procs:
             cgroup_path = get_cgroup_path_by_pid(proc['pid'])
-            if cgroup_path and cgroup_path != '/':
+            if cgroup_path and cgroup_path != '/' and cgroup_path != self._self_cgroup:
                 cgroup_paths.add(cgroup_path)
 
         # Step 2b: For apps with explicit process_names, scan ALL their running
@@ -328,28 +454,15 @@ class ResourceMonitor:
         multiapp_cgroup_to_app: dict[str, str] = {}
         if self._multiprocess_apps:
             try:
-                for proc in psutil.process_iter(['pid', 'name']):
+                for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
                     try:
-                        pname_lower = (proc.info.get('name') or '').lower()
-                        if pname_lower not in self._proc_name_to_app:
-                            # Fallback: Linux comm is capped at 15 chars; long process names
-                            # (e.g. "HeliconSearch_agent") get truncated.  Check the full
-                            # cmdline to catch these cases.
-                            try:
-                                cmdline_str = ' '.join(proc.cmdline()).lower()
-                            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                                continue
-                            matched = next(
-                                (k for k in self._proc_name_to_app if k in cmdline_str),
-                                None,
-                            )
-                            if not matched:
-                                continue
-                            pname_lower = matched
+                        app_id = self._app_id_for_process(proc.info)
+                        if not app_id:
+                            continue
                         cg = get_cgroup_path_by_pid(proc.info['pid'])
-                        if cg and cg != '/':
+                        if cg and cg != '/' and cg != self._self_cgroup:
                             cgroup_paths.add(cg)
-                            multiapp_cgroup_to_app[cg] = self._proc_name_to_app[pname_lower]
+                            multiapp_cgroup_to_app[cg] = app_id
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         continue
             except Exception as e:
@@ -639,6 +752,79 @@ class ResourceMonitor:
 
         return [{'pid': p['pid'], 'name': p['name']} for p in candidates]
 
+    def _get_disk_io_candidate_processes(self, num, interval=0.5):
+        """Return the ``num`` processes doing the most disk IO, as [{'pid', 'name'}].
+
+        Deliberately separate from :meth:`_get_candidate_processes` (which ranks by a
+        CPU+memory weighted score) rather than a mode flag on it: the two select on
+        unrelated signals and share no useful logic beyond the blacklist and the
+        per-cgroup diversity cap.
+
+        Ranking is on the read+write byte delta from ``/proc/<pid>/io`` across a single
+        ``interval`` window — the same quantity the caller re-measures precisely for the
+        surviving cgroups, so the candidate set can never exclude a genuine top consumer.
+        A process that only appears in the second snapshot has no baseline and is skipped
+        (it would otherwise show its whole lifetime's IO as one interval's worth).
+
+        :param num: number of candidates to return.
+        :param interval: seconds between the two ``/proc/<pid>/io`` snapshots.
+        """
+        blacklist = tuple(self.config.blacklist or ())
+
+        def _snapshot():
+            """{pid: (read_bytes + write_bytes, name)} for all readable, non-blacklisted procs."""
+            snap = {}
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    name = proc.info.get('name') or ''
+                    if any(b in name.lower() for b in blacklist):
+                        continue
+                    io = proc.io_counters()
+                    snap[proc.info['pid']] = (io.read_bytes + io.write_bytes, name)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess,
+                        AttributeError, OSError):
+                    continue
+            return snap
+
+        t0 = _snapshot()
+        time.sleep(interval)
+        t1 = _snapshot()
+
+        scored = []
+        for pid, (total_end, name) in t1.items():
+            start = t0.get(pid)
+            if start is None:
+                continue  # no baseline this window
+            delta = total_end - start[0]
+            if delta > 0:
+                scored.append({'pid': pid, 'name': name, 'io_delta': delta})
+
+        scored.sort(key=lambda p: -p['io_delta'])
+
+        # Same per-cgroup diversity cap as the default path: without it a high-concurrency
+        # writer (fio --numjobs=8) fills every slot with its own workers and the caller is
+        # left with a single distinct cgroup instead of the n it asked for.
+        max_per_cgroup = 2
+        selected = []
+        cgroup_count: dict = {}
+        for proc in scored:
+            cgroup = get_cgroup_path_by_pid(proc['pid']) or str(proc['pid'])
+            cnt = cgroup_count.get(cgroup, 0)
+            if cnt >= max_per_cgroup:
+                continue
+            selected.append(proc)
+            cgroup_count[cgroup] = cnt + 1
+            if len(selected) >= num:
+                break
+
+        logger.info(
+            "[disk-io] candidates (%.1fs window, top %d of %d active): %s",
+            interval, len(selected), len(scored),
+            ", ".join(f"{p['name']}({p['pid']})={p['io_delta'] / (1024 ** 2):.1f}MB"
+                      for p in selected) or "none",
+        )
+        return [{'pid': p['pid'], 'name': p['name']} for p in selected]
+
     def _adjust_weights_by_pressure(self, psi_data):
         """Dynamically adjust weights based on PSI pressure."""
         base_weights = self.config.weights_top
@@ -781,7 +967,7 @@ class ResourceMonitor:
 
         # 1. Try to match a registered desktop app by process name or exe path
         if self.desktop_apps:
-            exe = process_info.get('exe', '')
+            exe = (process_info.get('exe') or '').strip()
             # Support both aggregated format (names: set/list) and single-process format (name: str)
             names = process_info.get('names')
             if names is None:
@@ -797,27 +983,27 @@ class ResourceMonitor:
             dominant_name = process_info.get('dominant_name', '')
             match_names = [dominant_name] if dominant_name else names
 
-            for app_id, app in self.desktop_apps.items():
-                try:
-                    app_cmd = app.get("cmdline", "")
-                    if exe and app_cmd and exe in app_cmd:
-                        return {
-                            'type': 'desktop',
-                            'id': app_id,
-                            'name': app["display_name"]
-                        }
-
-                    app_name_lower = app.get("name", "").lower()
-                    for proc_name in match_names:
-                        if app_name_lower and proc_name and app_name_lower in proc_name.lower():
-                            return {
-                                'type': 'desktop',
-                                'id': app_id,
-                                'name': app["display_name"]
-                            }
-                except Exception as e:
-                    logger.warning(f"Catch error: {e}")
-                    continue
+            # Exe first -- it is the one field a process cannot rewrite -- then the process
+            # name in both its full and its kernel-truncated form. All exact: whatever
+            # matches here decides which app a cgroup's usage is reported under, and so
+            # which app's limit that cgroup ends up receiving.
+            # 'id' stays the configured app id, which need not name a cgroup; the caller
+            # resolves a controlled app to its real cgroup set before writing any limit.
+            app_id = self._desktop_exe_to_app.get(exe.lower()) if exe else None
+            if not app_id and exe:
+                app_id = self._desktop_name_to_app.get(os.path.basename(exe).lower())
+            if not app_id:
+                for proc_name in match_names:
+                    app_id = self._desktop_name_to_app.get((proc_name or '').strip().lower())
+                    if app_id:
+                        break
+            if app_id:
+                app = self.desktop_apps.get(app_id) or {}
+                return {
+                    'type': 'desktop',
+                    'id': app_id,
+                    'name': app.get('display_name') or app_id,
+                }
 
         # 2. Fallback: extract a readable name from the cgroup path
         if cgroup:
@@ -939,15 +1125,26 @@ class ResourceMonitor:
 
         return results, reach_threshold
 
-    def get_top_disk_io_consumers(self):
-        """Return the single process with the highest disk IO and its application metadata."""
+    def get_top_disk_io_consumers(self, n=1):
+        """Return the top ``n`` processes by disk IO and their application metadata.
+
+        ``n`` defaults to 1 (single top consumer).  Callers that must skip
+        non-throttleable apps (e.g. a Critical app that happens to be the #1 disk
+        user) pass ``n > 1`` so the next candidates are available.  The candidate
+        sampling floor in ``_get_top_processes`` (``max(n*3, 9)``) means small ``n``
+        values cost the same as ``n=1``.
+        """
         results = []
-        processes = self._get_top_processes(n=1, mode="io")
+        processes = self._get_top_processes(n=n, mode="io")
         logger.debug(f"Top processes(disk io): {processes}")
 
         for process in processes:
-            process_name = next(iter(process['names']), "unknown")
-            process_cmdline = next(iter(process['cmdlines']), "unknown")
+            # Prefer the dominant (highest-IO) process of the cgroup over an arbitrary
+            # member of the name/cmdline sets: a shared scope holds many processes, and the
+            # name picked here is what get_app_control_info() matches a priority against —
+            # an unrelated one silently resolves to the wrong priority (or to none at all).
+            process_name = process.get('dominant_name') or next(iter(process['names']), "unknown")
+            process_cmdline = process.get('dominant_cmdline') or next(iter(process['cmdlines']), "unknown")
 
             app_info = self.try_match_app(process)
             results.append({
@@ -956,8 +1153,13 @@ class ResourceMonitor:
                     'name': process_name,
                     'cmdline': process_cmdline,
                     'score': round(process['score'], 3),
-                    'io_read_rate': process['io_read_rate'],
-                    'io_write_rate': process['io_write_rate']
+                    'io_read_rate': process['io_read_rate'],      # MB/s
+                    'io_write_rate': process['io_write_rate'],    # MB/s
+                    # IOPS is surfaced alongside MB/s because a 4k random workload is
+                    # bandwidth-light but IOPS-heavy: the throttle decision needs both to
+                    # tell "worth capping" from "capping this cannot relieve the device".
+                    'io_read_iops': process['io_read_iops'],
+                    'io_write_iops': process['io_write_iops'],
                 },
                 'app': app_info,
                 # Full PID list (see get_top_resource_consumers) for close-detection.
@@ -969,6 +1171,15 @@ class ResourceMonitor:
                 'per_cgroup_cpu': process.get('per_cgroup_cpu', {}),
             })
 
+        logger.info(
+            "[disk-io] top-%d consumers: %s", n,
+            " | ".join(
+                f"#{i} {r['process']['name']} app={(r['app'] or {}).get('id')!r} "
+                f"rd={r['process']['io_read_rate']:.1f} wr={r['process']['io_write_rate']:.1f} MB/s "
+                f"riops={r['process']['io_read_iops']:.0f} wiops={r['process']['io_write_iops']:.0f}"
+                for i, r in enumerate(results, 1)
+            ) or "none",
+        )
         return results
 
     def _get_gpu_stats_for_pids(self, pids, sample_interval=0.3):
@@ -1281,20 +1492,7 @@ class ResourceMonitor:
 
     def get_physical_disks(self):
         """Return a list of all physical disk device names."""
-        cmd = ["lsblk", "-d", "-o", "NAME,TYPE", "-n"]
-        try:
-            output = subprocess.check_output(cmd, text=True).strip()
-
-            disks = []
-            for line in output.splitlines():
-                parts = line.split()
-                if len(parts) >= 2 and parts[1] == "disk":
-                    disks.append(parts[0])
-
-            return disks
-
-        except subprocess.CalledProcessError:
-            return []
+        return self._disk_io.get_physical_disks()
 
     def get_resource_usage(self) -> dict:
         """Return overall system resource utilisation and available capacity."""
@@ -1324,132 +1522,9 @@ class ResourceMonitor:
             }
         }
 
-    def _collect_disk_io_stats(self) -> dict:
-        """
-        Collect raw disk IO statistics (utilisation, read/write speed, IOPS) for all disks.
-        For internal use only; is_busy determination is handled by is_disk_io_stressed.
-        :return:
-        {
-            "disk_io": {
-                "nvme0n1": {
-                    "utilization": 45.2,
-                    "read_kb_per_sec": 1024.0,
-                    "write_kb_per_sec": 512.0,
-                    "read_iops": 128.0,
-                    "write_iops": 64.0,
-                },
-                ...
-            }
-        }
-        """
-        disks = self.get_physical_disks()
-        curr_io = psutil.disk_io_counters(perdisk=True)
-        curr_time = time.time()
-
-        prev_io = self.prev_io if isinstance(self.prev_io, dict) else {}
-        time_elapsed = curr_time - self.prev_time
-
-        merged_result = {}
-        for disk in disks:
-            curr = curr_io.get(disk)
-            prev = prev_io.get(disk)
-            if not curr or not prev or time_elapsed <= 0:
-                merged_result[disk] = {
-                    'utilization': 0.0,
-                    'read_kb_per_sec': 0.0,
-                    'write_kb_per_sec': 0.0,
-                    'read_iops': 0.0,
-                    'write_iops': 0.0,
-                }
-                continue
-
-            read_kb = (curr.read_bytes - prev.read_bytes) / 1024
-            write_kb = (curr.write_bytes - prev.write_bytes) / 1024
-            read_kb_per_sec = max(0.0, read_kb / time_elapsed)
-            write_kb_per_sec = max(0.0, write_kb / time_elapsed)
-            read_iops = max(0.0, (curr.read_count - prev.read_count) / time_elapsed)
-            write_iops = max(0.0, (curr.write_count - prev.write_count) / time_elapsed)
-
-            # Prefer device busy_time/io_time if available; fallback to read+write time.
-            prev_busy = getattr(prev, 'busy_time', None)
-            curr_busy = getattr(curr, 'busy_time', None)
-            if prev_busy is None or curr_busy is None:
-                prev_busy = getattr(prev, 'io_time', None)
-                curr_busy = getattr(curr, 'io_time', None)
-
-            if prev_busy is not None and curr_busy is not None:
-                busy_delta_ms = curr_busy - prev_busy
-            else:
-                busy_delta_ms = (curr.read_time - prev.read_time) + (curr.write_time - prev.write_time)
-
-            utilization = min(100.0, max(0.0, 100.0 * busy_delta_ms / (time_elapsed * 1000.0)))
-
-            merged_result[disk] = {
-                'utilization': round(utilization, 2),
-                'read_kb_per_sec': round(read_kb_per_sec, 2),
-                'write_kb_per_sec': round(write_kb_per_sec, 2),
-                'read_iops': round(read_iops, 2),
-                'write_iops': round(write_iops, 2),
-            }
-
-        self.prev_io = curr_io
-        self.prev_time = curr_time
-        return {'disk_io': merged_result}
-
     def is_disk_io_stressed(self, device: str = None, threshold: float = None) -> dict:
-        """
-        Determine whether disk I/O is under stress.
-        :param device: specific disk to check (e.g. 'nvme0n1'); checks all disks if None
-        :param threshold: custom utilisation threshold; falls back to the config value if None
-
-        Decision logic:
-          - disk busy (is_busy): utilisation exceeds disk_utilization_threshold AND
-            throughput exceeds disk_io_throughput_threshold_kb
-          - overall stressed (is_stressed): at least one disk is busy AND
-            CPU iowait exceeds disk_iowait_threshold (both conditions must hold to avoid false positives)
-
-        :return:
-            {
-                "is_stressed": bool,
-                "stressed_disks": list[str],
-                "iowait": float,
-                "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec, read_iops, write_iops, is_busy}}
-            }
-        """
-        disk_stats = self._collect_disk_io_stats()["disk_io"]
-
-        # CPU iowait
-        iowait = psutil.cpu_times_percent().iowait
-
-        busy_threshold = threshold or self.config.disk_utilization_threshold
-        speed_threshold = self.config.disk_io_throughput_threshold_kb
-        iowait_threshold = self.config.disk_iowait_threshold
-
-        stressed_disks = []
-        details = {}
-        for disk, stats in disk_stats.items():
-            # Only check the specified device if provided
-            if device and disk != device:
-                continue
-
-            # Both high utilisation AND high throughput required to classify a disk as busy
-            is_busy = (
-                stats["utilization"] > busy_threshold and
-                (stats["read_kb_per_sec"] + stats["write_kb_per_sec"]) > speed_threshold
-            )
-            details[disk] = {**stats, "is_busy": is_busy}
-            if is_busy:
-                stressed_disks.append(disk)
-
-        # Both a busy disk AND high iowait are required to classify IO as stressed
-        is_stressed = bool(stressed_disks) and iowait > iowait_threshold
-
-        return {
-            "is_stressed": is_stressed,
-            "stressed_disks": stressed_disks,
-            "iowait": iowait,
-            "details": details,
-        }
+        """Determine whether disk I/O is under stress (see DiskIOMonitor.is_disk_io_stressed)."""
+        return self._disk_io.is_disk_io_stressed(device, threshold)
 
 def main():
     """Debug entry point."""

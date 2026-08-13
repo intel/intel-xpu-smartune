@@ -44,6 +44,10 @@ class LimitedApp:
             after a partial restore (auto only).
       * cgroups       — [primary, *extras]; multi-cgroup apps fan restores
             out across every entry.
+      * limit_disks   — disk names the io.max cap was written to, empty for
+            "every disk".  Restores must target exactly this set: a partial
+            restore writes a real (2x) cap, so replaying it against every disk
+            puts a limit on disks that were never throttled.
       * pids          — snapshot of the app's PIDs at limit time, used by
             the reaper to detect that the app has closed (see
             DynamicBalancer._is_app_closed).
@@ -55,6 +59,7 @@ class LimitedApp:
     limit_parts: dict
     state: Optional[str] = None
     cgroups: list = field(default_factory=list)
+    limit_disks: list = field(default_factory=list)
     pids: set = field(default_factory=set)
     limited_at: float = 0.0                   # epoch seconds when the limit was applied
 
@@ -147,6 +152,12 @@ class _MonitorLoopState:
     critical_since: Optional[float] = None        # timestamp critical was first entered (sustained-recheck timer)
     last_sustained_recheck_time: float = 0.0      # last time a sustained-critical background recheck fired
     prev_pressure: Optional[str] = None
+    # Disk-IO top-consumer prefetch state (separated policy only), mirroring the
+    # pressure fields above but tracked independently so the two channels never
+    # perturb each other's rising-edge / sustained-recheck timers.
+    prev_disk_level: Optional[str] = None         # disk level on the previous iteration (rising-edge detection)
+    disk_high_since: Optional[float] = None        # timestamp disk entered high/critical (sustained-recheck timer)
+    disk_last_recheck_time: float = 0.0            # last time a sustained disk background recheck fired
     current_time: float = 0.0
 
     # Stability thresholds, kept on the state object so the tick methods
@@ -186,10 +197,16 @@ class TopConsumerPrefetcher:
       2. Sustained-critical recheck      — ``reason="sustained_critical_recheck"``
       3. Critical-state listener entry   — ``reason="critical_listener"``
 
-    Debounce (NOT a validity TTL): ``CACHE_TTL`` only suppresses repeat
-    ``start()`` calls fired within seconds of one another (e.g. rising-edge
-    followed by listener). ``resolve_for_critical()`` will happily return
-    cached data of any age — refresh is event-driven, not time-driven.
+    Two independent time constants, easy to confuse:
+      * ``CACHE_TTL`` is a *debounce*: it suppresses repeat ``start()`` calls
+        fired within seconds of one another (e.g. rising-edge followed by
+        listener). It says nothing about whether the data is still valid.
+      * ``MAX_CACHE_AGE`` is the *validity* bound used by
+        ``resolve_for_critical()``. Past it the cached answer is still returned
+        (acting on slightly stale data beats stalling the critical path for a
+        multi-second resample) but a background refresh is kicked off, so the
+        next tick acts on fresh data. Without this the event-driven refresh
+        alone could hand back a minutes-old top list.
 
     Cold-start fallback: ``resolve_for_critical()`` first returns cached
     data; if empty, waits up to ``CRITICAL_WAIT`` for an in-flight
@@ -202,6 +219,7 @@ class TopConsumerPrefetcher:
     """
 
     CACHE_TTL = 5.0                       # rising-edge / listener debounce window (s)
+    MAX_CACHE_AGE = 30.0                  # past this the cached top list is refreshed in background (s)
     CRITICAL_WAIT = 0.35                  # max wait for an in-flight prefetch on cold-start (s)
     SUSTAINED_CRITICAL_REFRESH_SEC = 45.0  # seconds of sustained critical before background recheck
                                            # (wall-clock, independent of the loop's tick cadence)
@@ -255,11 +273,26 @@ class TopConsumerPrefetcher:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def is_stale(self) -> bool:
+        """True when the cache is empty or older than ``MAX_CACHE_AGE``.
+
+        Lets a caller that holds on to a previously-resolved list (e.g. the disk
+        channel while it sits at "high" without throttling) know when to pull a
+        fresh one instead of reusing an answer indefinitely.
+        """
+        with self._lock:
+            if not self._cache["apps"]:
+                return True
+            return (time.time() - self._cache["fetched_at"]) > self.MAX_CACHE_AGE
+
     def resolve_for_critical(self):
         """Return ``(apps, reach_threshold)`` for the critical-path lookup.
 
         Order of operations:
-          1. Return cached data immediately when present (any age).
+          1. Return cached data immediately when present. Past ``MAX_CACHE_AGE``
+             it is still returned — blocking the critical path on a multi-second
+             resample is worse than acting on a slightly old top list — but a
+             background refresh is started so the next call is fresh.
           2. Otherwise wait up to ``CRITICAL_WAIT`` for an in-flight
              prefetch and return its result.
           3. As a last resort, run a synchronous fetch — pays the full
@@ -271,7 +304,14 @@ class TopConsumerPrefetcher:
             threshold = bool(self._cache["reach_threshold"])
             age = time.time() - self._cache["fetched_at"]
         if apps:
-            logger.debug(f"Critical resolve: using cached top (age={age:.2f}s, apps={len(apps)})")
+            if age > self.MAX_CACHE_AGE:
+                logger.info(
+                    f"Critical resolve: cached top is stale (age={age:.1f}s > "
+                    f"{self.MAX_CACHE_AGE}s); using it now, refreshing in background"
+                )
+                self.start("stale_refresh")
+            else:
+                logger.debug(f"Critical resolve: using cached top (age={age:.2f}s, apps={len(apps)})")
             return apps, threshold
 
         if self._inflight.is_set():
@@ -370,6 +410,19 @@ def _split_proportionally(total_budget, all_ids: list, per_cg_usage: dict) -> di
 
 
 class DynamicBalancer:
+    # How many top disk-IO consumers to fetch so the throttle decision can skip
+    # non-throttleable candidates (Critical / already-limited) and fall through to the
+    # next heavy user.  Kept small: the candidate-sampling floor in _get_top_processes
+    # (max(n*3, 9)) means values up to 3 cost the same as fetching just #1.
+    _DISK_IO_TOP_N = 3
+    # Minimum disk IO a candidate must itself be doing before capping it is worthwhile --
+    # throttling a light user cannot relieve the device. EITHER floor qualifies: bandwidth
+    # alone would miss small-block random workloads, which move few MB but saturate the
+    # device on IOPS. The IOPS floor sits above the highest per-priority IOPS cap in
+    # limit_policy, so a candidate only qualifies when a cap would really slow it down.
+    _DISK_IO_LIMIT_MIN_MB = 50.0
+    _DISK_IO_LIMIT_MIN_IOPS = 2500.0
+
     def __init__(self):
         self.bpf_monitor = AppIntercept("controller/bpf_event.c")
         self.config = b_config
@@ -393,7 +446,27 @@ class DynamicBalancer:
             self.resource_monitor.get_top_resource_consumers
         )
 
+        # Separate cache for the disk-IO top consumers.  Same rationale as
+        # top_prefetcher, but keyed off the disk-IO level: warmed on the rising
+        # edge into disk "high" so the eventual critical-path throttle finds the
+        # answer ready instead of re-sampling the multi-second IO pipeline every
+        # tick while disk pressure persists.
+        self.disk_top_prefetcher = TopConsumerPrefetcher(
+            self._fetch_top_disk_consumers
+        )
+
         self.network_controller = NetworkController()
+
+    def _fetch_top_disk_consumers(self):
+        """Adapter so ``TopConsumerPrefetcher`` can warm the disk-IO top list.
+
+        Fetches the top ``_DISK_IO_TOP_N`` consumers (not just #1) so the throttle
+        decision can skip non-throttleable candidates (Critical / already-limited)
+        and move on to the next heavy disk user.  ``get_top_disk_io_consumers``
+        returns just the app list; the prefetcher expects ``(apps, reach_threshold)``,
+        and any disk-IO stress counts as threshold-crossing, so it is always True.
+        """
+        return self.resource_monitor.get_top_disk_io_consumers(n=self._DISK_IO_TOP_N), True
 
     def start(self):
         """
@@ -461,23 +534,24 @@ class DynamicBalancer:
                     # Use consume_peak_pressure_level() instead of get_current_pressure_level()
                     # so that transient "critical" spikes that occurred while the
                     # idle_check_interval gate was closed are never silently dropped.
+                    disk_level = "low"
                     if policy == "separated":
-                        pressure, _, is_disk_io_stressed = self.control_manager.consume_peak_pressure_level()
+                        pressure, _, disk_level = self.control_manager.consume_peak_pressure_level()
                     else:  # policy == "combined"
                         pressure, *_ = self.control_manager.consume_peak_pressure_level()
-                        is_disk_io_stressed = False
 
                     state.last_check_time = state.current_time
                     # Top-consumer prefetch / recheck only exist to warm the cache for the
                     # auto-limit path.  When passive control is off we are not going to
                     # apply any auto-limit, so skip the multi-second sampling pipeline.
-                    self._maybe_trigger_prefetch(state, pressure, passive_enabled)
+                    self._maybe_trigger_prefetch(state, pressure, disk_level, passive_enabled)
 
                     if policy == "separated":
-                        self._tick_separated_policy(state, pressure, is_disk_io_stressed, passive_enabled)
+                        self._tick_separated_policy(state, pressure, disk_level, passive_enabled)
                     elif policy == "combined":
                         self._tick_combined_policy(state, pressure, passive_enabled)
                     state.prev_pressure = pressure
+                    state.prev_disk_level = disk_level
                 self._run_network_tick(state)
 
                 # Reaper: restore limits for apps that have since closed. Runs
@@ -536,13 +610,20 @@ class DynamicBalancer:
         logger.debug("Critical-state listener fired: triggering top-consumer prefetch")
         self.top_prefetcher.start("critical_listener")
 
-    def _maybe_trigger_prefetch(self, state: "_MonitorLoopState", pressure: str, passive_enabled: bool) -> None:
+    def _maybe_trigger_prefetch(self, state: "_MonitorLoopState", pressure: str,
+                                disk_level: str, passive_enabled: bool) -> None:
         """Edge-trigger and sustained-critical recheck for the
         top-consumer prefetch. No-op when passive_resource_control is
         disabled (the multi-second sampling has no consumer in that case).
+
+        Handles the pressure channel (CPU/mem) and, in separated policy, the
+        independent disk-IO channel: both warm their own cache on the rising
+        edge into "high" so the critical-path throttle never pays the sampling
+        cost inline.
         """
         if not passive_enabled:
             state.critical_since = None
+            state.disk_high_since = None
             return
 
         # Edge trigger: prefetch whenever pressure enters the high band from
@@ -575,6 +656,32 @@ class DynamicBalancer:
                 state.last_sustained_recheck_time = now
         else:
             state.critical_since = None
+
+        # Warm the disk cache at "high" so the throttle at "critical" finds it ready
+        # (see disk_top_prefetcher). A sustained window triggers a background recheck,
+        # so a new dominant IO app is still picked up while the stress persists.
+        disk_stressed = disk_level in ("high", "critical")
+        if disk_stressed and state.prev_disk_level not in ("high", "critical"):
+            logger.debug(
+                f"Disk level edge {state.prev_disk_level}→{disk_level}: "
+                f"triggering disk top-consumer prefetch"
+            )
+            self.disk_top_prefetcher.start("entering_disk_high")
+
+        if disk_stressed:
+            now = state.current_time
+            if state.disk_high_since is None:
+                state.disk_high_since = now
+                state.disk_last_recheck_time = now
+            elif now - state.disk_last_recheck_time >= TopConsumerPrefetcher.SUSTAINED_CRITICAL_REFRESH_SEC:
+                logger.debug(
+                    f"Sustained disk stress for {round(now - state.disk_high_since, 1)}s: "
+                    f"triggering background disk top-consumer recheck"
+                )
+                self.disk_top_prefetcher.start("sustained_disk_recheck")
+                state.disk_last_recheck_time = now
+        else:
+            state.disk_high_since = None
 
     def _drain_pending_app_queue(self, state: "_MonitorLoopState") -> None:
         """Pop one pending app off ``app_priority_queue`` and resume it:
@@ -647,7 +754,7 @@ class DynamicBalancer:
         self,
         state: "_MonitorLoopState",
         pressure: str,
-        is_disk_io_stressed: bool,
+        disk_level: str,
         passive_enabled: bool,
     ) -> None:
         """One iteration of the separated-policy state machine.
@@ -656,7 +763,21 @@ class DynamicBalancer:
           * critical pressure or disk-IO stress — apply or refresh limits
           * pending app launches with no critical pressure — drain queue
           * medium/low pressure with limited apps — staged restore
+
+        Disk IO is handled in two stages off ``disk_level``: ``>= high`` engages the arm
+        and identifies the top consumer, but the actual throttle is applied only at
+        ``critical`` — a saturated disk that has not yet blocked the system is observed,
+        not throttled.
         """
+        is_disk_io_stressed = disk_level in ("high", "critical")
+        if is_disk_io_stressed or state.prev_disk_level in ("high", "critical"):
+            logger.info(
+                "[disk-io] tick: disk_level=%s (prev=%s) pressure=%s passive=%s "
+                "candidates_held=%d limited=%s",
+                disk_level, state.prev_disk_level, pressure, passive_enabled,
+                len(state.top_consume_apps or []),
+                [k for k, v in self.all_limits.apps.items() if v.limit_parts.get('io_limited')],
+            )
         if passive_enabled and (pressure == "critical" or is_disk_io_stressed):
             state.restore_pending = False
 
@@ -666,7 +787,11 @@ class DynamicBalancer:
                     state.top_consume_apps, state.reach_threshold = self.top_prefetcher.resolve_for_critical()
             else:
                 state.disk_io_not_stressed_start_time = None
-                state.top_consume_apps = self.resource_monitor.get_top_disk_io_consumers()
+                # Serve from the prefetch cache instead of re-sampling every tick. The
+                # staleness check matters at "high", where the batch is never consumed:
+                # without it we keep acting on the list captured when the disk got busy.
+                if not state.top_consume_apps or self.disk_top_prefetcher.is_stale():
+                    state.top_consume_apps, _ = self.disk_top_prefetcher.resolve_for_critical()
                 state.reach_threshold = True  # IO pressure always counts as threshold-crossing
             if state.top_consume_apps:
                 self._update_dominant_flag_from_top(state)
@@ -674,20 +799,52 @@ class DynamicBalancer:
                 if not is_disk_io_stressed:
                     should_adjust, is_controlled, app_id, limit_rates = self._handle_critical_pressure(
                         state.top_consume_apps, state.reach_threshold)
+                    # CPU/mem critical acts on the #1 top consumer; don't re-limit when the
+                    # dominant top app is already limited.
+                    target_app = state.top_consume_apps[0]
+                    can_apply = (not self.all_limits.is_limited_app_dominant
+                                 and state.reach_threshold and should_adjust and app_id)
+                    consumed_idx = 0
                 else:
-                    should_adjust, is_controlled, app_id, limit_rates = self._handle_disk_io_stressed(
-                        state.top_consume_apps)
+                    should_adjust, is_controlled, app_id, limit_rates, target_app, consumed_idx = \
+                        self._handle_disk_io_stressed(state.top_consume_apps)
+                    # Disk: throttle only at "critical" (at "high" we just prefetch/identify).
+                    # _handle_disk_io_stressed already excludes Critical and already-limited
+                    # targets, so the is_limited_app_dominant gate is intentionally NOT applied
+                    # here -- successive critical ticks move on to the next heavy consumer.
+                    can_apply = (disk_level == "critical"
+                                 and state.reach_threshold and should_adjust and app_id)
 
-                if not self.all_limits.is_limited_app_dominant and state.reach_threshold and should_adjust and app_id:
+                if can_apply and target_app:
                     self._apply_resource_limits(
-                        state.top_consume_apps[0],
+                        target_app,
                         app_id,
                         limit_rates,
                         is_controlled,
                         is_disk_io_stressed=is_disk_io_stressed
                     )
 
-                state.top_consume_apps.pop(0)
+                if is_disk_io_stressed and disk_level != "critical":
+                    # "high" is the armed state: identify the target but keep the prefetched
+                    # list intact, or the critical tick it was warmed for finds it empty.
+                    logger.debug(
+                        "[disk-io] level=high: holding %d prefetched candidate(s), no throttle",
+                        len(state.top_consume_apps),
+                    )
+                elif consumed_idx is not None:
+                    # Drop the candidate we actually acted on, not blindly the head: the head
+                    # is often a Critical app we deliberately skipped, and popping it would
+                    # discard a valid future target while keeping the one just limited.
+                    state.top_consume_apps.pop(consumed_idx)
+                else:
+                    # Critical, but the whole batch was unthrottleable. Popping one entry per
+                    # tick would re-walk the same dead list for several ticks; drop it so the
+                    # next tick resolves a fresh one and can react to a new heavy consumer.
+                    logger.info(
+                        "[disk-io] critical but no throttleable candidate in this batch; "
+                        "discarding it to force a fresh top-consumer list next tick"
+                    )
+                    state.top_consume_apps = []
             else:
                 state.reset()
 
@@ -1025,9 +1182,19 @@ class DynamicBalancer:
                             "riops": io_limits['read_iops'] * 2
                         }
                     }
+                    # Same disks the cap was written to, never "all": a relaxed cap is
+                    # still a cap, so an unfiltered replay throttles disks the limit
+                    # never touched. Empty means it was applied to all.
+                    disks = entry.limit_disks or None
+                    logger.info(
+                        f"[disk-io] partial restore for {app_name!r} (app_id={app_id!r}): "
+                        f"relaxing io.max to 2x rd={io_limits['read']*2}MB/s wr={io_limits['write']*2}MB/s "
+                        f"on disks={entry.limit_disks or 'ALL'} (extra_cgroups={extra_ids})"
+                    )
                     io_limited = self.io_ctl.set_disk_io_throttle(
                         app_id,
-                        limits=limits
+                        limits=limits,
+                        disk_filter=disks,
                     )
 
                     if not io_limited:
@@ -1035,7 +1202,8 @@ class DynamicBalancer:
                             f"Failed to partially restore disk IO for {app_name}")
                         io_restored = False
                     for extra_id in extra_ids:
-                        self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
+                        self.io_ctl.set_disk_io_throttle(
+                            extra_id, limits=limits, disk_filter=disks)
 
                     if not io_restored:
                         restore_success = False
@@ -1067,11 +1235,17 @@ class DynamicBalancer:
             if limit_parts.get('io_limited', False) and self.is_running:
                 io_restored = True
 
-                if not self.io_ctl.restore_disk_io_throttle(app_id):
+                disks = entry.limit_disks or None
+                logger.info(
+                    f"[disk-io] full restore for {app_name!r} (app_id={app_id!r}): "
+                    f"removing io.max cap on disks={entry.limit_disks or 'ALL'} "
+                    f"(extra_cgroups={extra_ids})"
+                )
+                if not self.io_ctl.restore_disk_io_throttle(app_id, disk_filter=disks):
                     logger.error(f"Failed to remove IO limits for {app_name}")
                     io_restored = False
                 for extra_id in extra_ids:
-                    self.io_ctl.restore_disk_io_throttle(extra_id)
+                    self.io_ctl.restore_disk_io_throttle(extra_id, disk_filter=disks)
 
                 if not io_restored:
                     restore_success = False
@@ -1147,6 +1321,20 @@ class DynamicBalancer:
                 time.sleep(3)
                 break
 
+    def _stressed_disks(self) -> list:
+        """Names of the disks currently in the busy band, from the last pressure tick.
+
+        Used to scope an ``io.max`` write to the disks that are actually under pressure.
+        Returns an empty list when the information is unavailable, which callers must read
+        as "unknown" (cap every disk) rather than "no disk is busy" (cap nothing).
+        """
+        try:
+            stress = self.control_manager.get_disk_io_stress() or {}
+            return list(stress.get('stressed_disks') or [])
+        except Exception as e:
+            logger.warning(f"[disk-io] could not read stressed disks: {e}")
+            return []
+
     def _apply_resource_limits(self, target_app, app_id, limit_rates, is_controlled, is_disk_io_stressed=False):
         """Apply resource limits (common logic)."""
         app_name = target_app.get('process', {}).get('name') or ''
@@ -1159,6 +1347,7 @@ class DynamicBalancer:
 
         resource_limited = False
         io_limited = False
+        limited_disks: list = []
 
         if not is_disk_io_stressed:
             cpu_rate = int(100 * limit_rates["cpu_rate"]) if limit_rates.get("cpu_rate") else None
@@ -1209,11 +1398,26 @@ class DynamicBalancer:
                         "riops": io_limits['read_iops']
                     }
                 }
-                io_limited = self.io_ctl.set_disk_io_throttle(app_id, limits=limits)
+                # Cap only the disks that are actually saturated. Without a filter the same
+                # io.max is written to every physical disk, so an app is throttled on disks
+                # that have nothing to do with the pressure. None/empty means "could not
+                # tell" -- fall back to all disks rather than silently skipping the limit.
+                stressed_disks = self._stressed_disks()
+                limited_disks = list(stressed_disks)
+                logger.info(
+                    f"[disk-io] applying io.max to {app_name!r} (app_id={app_id!r}): "
+                    f"rd={io_limits['read']}MB/s wr={io_limits['write']}MB/s "
+                    f"riops={io_limits['read_iops']} wiops={io_limits['write_iops']} "
+                    f"disks={stressed_disks or 'ALL (no stressed-disk info)'} "
+                    f"extra_cgroups={extra_cgroup_ids}"
+                )
+                io_limited = self.io_ctl.set_disk_io_throttle(
+                    app_id, limits=limits, disk_filter=stressed_disks or None)
                 if not io_limited:
                     logger.error(f"Failed to set IO limit for {app_name}")
                 for extra_id in extra_cgroup_ids:
-                    self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
+                    self.io_ctl.set_disk_io_throttle(
+                        extra_id, limits=limits, disk_filter=stressed_disks or None)
 
         if resource_limited or io_limited:
             self.all_limits.apps[app_id] = LimitedApp(
@@ -1224,6 +1428,7 @@ class DynamicBalancer:
                 limit_parts={'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
                 state=None,  # None indicates fully limited
                 cgroups=[app_id] + list(extra_cgroup_ids),
+                limit_disks=limited_disks,
                 pids=set(target_app.get('pids') or []),
                 limited_at=time.time(),
             )
@@ -1280,6 +1485,8 @@ class DynamicBalancer:
                     for extra_id in extra_ids:
                         self.control_manager.adjust_resources(extra_id, "low")
             if limit_parts.get('io_limited', False):
+                # Only the disks the cap was written to -- a partial restore is still a cap.
+                disks = (entry.limit_disks or None) if entry is not None else None
                 if restore_type == "partial" and "disk_io_rate" in limit_rates:
                     io_limits = limit_rates["disk_io_rate"]
                     limits = {
@@ -1290,13 +1497,25 @@ class DynamicBalancer:
                             "riops": io_limits['read_iops'] * 2
                         }
                     }
-                    if not self.io_ctl.set_disk_io_throttle(app_id, limits=limits):
+                    logger.info(
+                        f"[disk-io] partial restore for {app_name!r} (app_id={app_id!r}): "
+                        f"relaxing io.max to 2x rd={io_limits['read']*2}MB/s wr={io_limits['write']*2}MB/s "
+                        f"on disks={disks or 'ALL'} (extra_cgroups={extra_ids})"
+                    )
+                    if not self.io_ctl.set_disk_io_throttle(
+                            app_id, limits=limits, disk_filter=disks):
                         logger.error(f"Failed to partially restore disk IO for {app_name}")
                         restore_success = False
                     for extra_id in extra_ids:
-                        self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
+                        self.io_ctl.set_disk_io_throttle(
+                            extra_id, limits=limits, disk_filter=disks)
                 elif restore_type == "full":
-                    if not self.io_ctl.restore_disk_io_throttle(app_id):
+                    logger.info(
+                        f"[disk-io] full restore for {app_name!r} (app_id={app_id!r}): "
+                        f"removing io.max cap on disks={disks or 'ALL'} "
+                        f"(extra_cgroups={extra_ids})"
+                    )
+                    if not self.io_ctl.restore_disk_io_throttle(app_id, disk_filter=disks):
                         logger.error(f"Failed to fully restore disk IO for {app_name}")
                         restore_success = False
                     elif entry is not None:
@@ -1305,52 +1524,97 @@ class DynamicBalancer:
                             'io_limited': False,
                         }
                     for extra_id in extra_ids:
-                        self.io_ctl.restore_disk_io_throttle(extra_id)
+                        self.io_ctl.restore_disk_io_throttle(extra_id, disk_filter=disks)
 
         return restore_success
 
     def _handle_disk_io_stressed(self, top_consumers):
+        """Pick the first *throttleable* disk-IO consumer among the top-N and the rates
+        to cap it at.
+
+        Walks the candidates in descending-IO order and selects the first that is:
+          1. not a Critical app -- Critical apps are never throttled for disk IO, so a
+             Critical #1 consumer is skipped and the next candidate is considered;
+          2. not already under an auto disk-IO limit -- so successive critical ticks move
+             on to the *next* heavy consumer (limit the 2nd, then the 3rd, ...) instead of
+             re-limiting the same app;
+          3. itself doing enough disk IO for a cap to matter -- either
+             >= ``_DISK_IO_LIMIT_MIN_MB`` MB/s or >= ``_DISK_IO_LIMIT_MIN_IOPS`` ops/s.
+             Bandwidth alone is not a sufficient test: a 4k random workload is
+             bandwidth-light but IOPS-heavy, and capping it *does* relieve the device.
+
+        Controlled non-critical apps are capped at their own priority's rates; uncontrolled
+        apps count as ``undefined`` (lowest tier), i.e. a heavy unmanaged writer is
+        throttled harder than a managed Low app.  The candidate's own sampled IO rate is
+        used as the gate (no extra per-app sampling).
+
+        A controlled app's cgroup set is resolved the same way the CPU/memory critical path
+        does it (:meth:`_resolve_controlled_target`): the top-consumer sample keys an app by
+        a single cgroup, and for ``process_names`` apps by a public app id that need not be
+        a systemd unit at all -- without resolving, ``set_disk_io_throttle`` cannot find an
+        ``io.max`` to write and the limit silently never lands.
+
+        :return: ``(should_adjust, is_controlled, app_id, limit_rates, target_app, index)``
+            where ``index`` is the candidate's position in *top_consumers* so the caller can
+            drop exactly the entry that was acted on.  When nothing is worth limiting --
+            every candidate is Critical, already limited, or below threshold -- returns
+            ``(False, False, None, None, None, None)`` even under critical pressure: there
+            is simply no useful throttle left to apply.
         """
-            Disk IO pressure handling strategy.
-            Disk IO control differs from CPU/memory control:
-            1. Unmanaged apps: when their disk IO causes high pressure, intervene only if a managed app is running and consuming significant IO.
-            2. Managed apps: only check the status of critical apps when IO pressure is high.
-            3. Critical apps: never throttled for disk IO.
-        """
-        app_info = top_consumers[0] if top_consumers else None
-        if not app_info:
-            return False, False, None, None
+        for idx, app_info in enumerate(top_consumers or []):
+            app_id = app_info['app'].get('id') if app_info.get('app') else None
+            if not app_id:
+                continue
+            proc = app_info.get('process', {})
+            app_name = (proc.get('name') or '').lower()
+            cand_mb = (proc.get('io_read_rate') or 0.0) + (proc.get('io_write_rate') or 0.0)
+            cand_iops = (proc.get('io_read_iops') or 0.0) + (proc.get('io_write_iops') or 0.0)
 
-        app_id = app_info['app'].get('id') if app_info.get('app') else None
-        app_name = (app_info.get('process', {}).get('name') or '').lower()
+            is_controlled, controlled_data = app_utils.get_app_control_info(app_id, app_name)
+            priority = controlled_data.get('priority') if controlled_data else None
+            # Built once and reused by every outcome below, so a candidate costs one log line
+            # whether it is skipped or selected.
+            cand = (f"#{idx} {app_id!r} name={app_name!r} io={cand_mb:.1f}MB/s "
+                    f"{cand_iops:.0f}iops priority={priority!r}")
 
-        is_controlled, controlled_data = app_utils.get_app_control_info(app_id, app_name)
-        priority = controlled_data.get('priority') if controlled_data else None
+            # 1) Critical apps are never throttled -- skip to the next candidate.
+            if is_controlled and str(priority).lower() == 'critical':
+                logger.info(f"[disk-io] skip {cand}: Critical app, never throttled")
+                continue
+            # 2) Already io-limited (auto) -- skip so we advance to the next heavy user.
+            existing = self.all_limits.by_public_id(app_id, source="auto")
+            if existing and existing[1].limit_parts.get('io_limited'):
+                logger.info(f"[disk-io] skip {cand}: already io-limited")
+                continue
+            # 3) Only limit a genuinely heavy disk user -- below both floors a cap won't help.
+            if cand_mb < self._DISK_IO_LIMIT_MIN_MB and cand_iops < self._DISK_IO_LIMIT_MIN_IOPS:
+                logger.info(
+                    f"[disk-io] skip {cand}: too light (floors "
+                    f"{self._DISK_IO_LIMIT_MIN_MB}MB/s / {self._DISK_IO_LIMIT_MIN_IOPS}iops)"
+                )
+                continue
 
-        if not is_controlled:
-            controlled_apps = app_utils.get_controlled_apps() or []
-            for controlled_app in controlled_apps:
-                running_pids = app_utils.get_app_processes(controlled_app['app_name'])
-                logger.debug(f"Disk IO stressed - controlled app {controlled_app['app_name']} running PIDs: {running_pids}")
-                if running_pids:
-                    is_high_io, msg = app_utils.check_pids_disk_io_usage(running_pids, threshold_mb=100)
+            # Resolve a controlled app to its real cgroup set before we try to write io.max.
+            if is_controlled and controlled_data:
+                resolved_id = self._resolve_controlled_target(app_info, controlled_data)
+                if resolved_id:
+                    app_id = resolved_id
 
-                    if is_high_io:
-                        return True, False, app_id, self.get_limited_rates("undefined")
-                    else:
-                        logger.info(f"Disk IO stressed - No controlled app with high IO usage found.")
-            return False, False, None, None
+            rates = self.get_limited_rates(priority or "undefined")
+            io_rates = (rates or {}).get('disk_io_rate') or {}
+            logger.info(
+                f"[disk-io] SELECTED {cand} -> cap {app_id!r} at "
+                f"'{priority or 'undefined'}' rates rd={io_rates.get('read')} "
+                f"wr={io_rates.get('write')} MB/s riops={io_rates.get('read_iops')} "
+                f"wiops={io_rates.get('write_iops')} extra_cgroups={app_info.get('extra_cgroups')}"
+            )
+            return True, is_controlled, app_id, rates, app_info, idx
 
-        elif priority != 'critical':
-            critical_apps = app_utils.get_controlled_apps(priority="Critical") or []
-            for critical_app in critical_apps:
-                running_pids = app_utils.get_app_processes(critical_app['app_name'])
-                if running_pids:
-                    is_high_io = app_utils.check_pids_disk_io_usage([running_pids], threshold_mb=100)
-                    if is_high_io:
-                        return True, True, app_id, self.get_limited_rates(priority or "undefined")
-
-        return False, False, None, None
+        logger.info(
+            "[disk-io] no throttleable disk consumer among %d candidates "
+            "(all Critical / already-limited / below threshold)", len(top_consumers or [])
+        )
+        return False, False, None, None, None, None
 
     def _resolve_controlled_target(self, app_info: dict, controlled_data: dict) -> Optional[str]:
         """Resolve a controlled app's real cgroups and rewrite ``app_info`` so
@@ -1399,7 +1663,35 @@ class DynamicBalancer:
         logger.info(
             f"Controlled app '{name}' resolved to cgroups {effective_ids}; "
             f"primary={primary}, extras={extras}")
+        self._warn_on_shared_cgroups(name, cgroup_paths, usage.get('pids') or [])
         return primary
+
+    def _warn_on_shared_cgroups(self, app_name: str, cgroup_paths: list, app_pids: list) -> None:
+        """Log the cgroups where the limit will also hit processes outside the app.
+
+        A limit is a property of a cgroup, not of a process, so an app that never got a
+        cgroup of its own -- launched straight from a shell, so it lives in that terminal's
+        ``vte-spawn-*.scope`` -- can only be limited by limiting everything in there with
+        it. That is unavoidable and still the correct action, but it must not be silent:
+        it is also exactly what an over-matched process name looks like, and the two are
+        indistinguishable from the limit log alone.
+        """
+        mount = getattr(self.config, 'cgroup_mount', '/sys/fs/cgroup') or '/sys/fs/cgroup'
+        mine = {int(p) for p in app_pids}
+        if not mine:
+            return
+        for cg in cgroup_paths:
+            try:
+                with open(os.path.join(mount, str(cg).lstrip('/'), 'cgroup.procs')) as f:
+                    resident = {int(line) for line in f if line.strip()}
+            except (OSError, ValueError):
+                continue
+            others = resident - mine
+            if others:
+                logger.warning(
+                    f"[limit-scope] cgroup {os.path.basename(str(cg))} for app {app_name!r} also holds "
+                    f"{len(others)} process(es) not belonging to it (e.g. {sorted(others)[:5]}); "
+                    f"the limit applies to them too")
 
     def _handle_critical_pressure(self, top_consumers, reach_threshold):
         """Handle resource pressure (processes one app per invocation)."""
@@ -1496,7 +1788,8 @@ class DynamicBalancer:
                         logger.error(f"Failed to restore CPU/Memory for {source} limited app {cg}")
                         restore_success = False
                 if entry.limit_parts.get('io_limited', False):
-                    if not self.io_ctl.restore_disk_io_throttle(cg) and is_primary:
+                    if not self.io_ctl.restore_disk_io_throttle(
+                            cg, disk_filter=entry.limit_disks or None) and is_primary:
                         logger.error(f"Failed to remove IO limits for {source} limited app {cg}")
                         restore_success = False
 

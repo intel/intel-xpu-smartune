@@ -12,11 +12,18 @@ import threading
 from datetime import datetime
 
 from utils.logger import logger
-from db.DatabaseModel import AIAppPriority, DBStatus
+from db.DatabaseModel import AIAppPriority, DBStatus, get_write_epoch
 from typing import List, Dict, Any, Optional
 from config.config import b_config
 
 _original_oom_scores: dict[str, str] = {}
+
+# Snapshot of the controlled-apps table, kept in sync via the model's write
+# epoch.  See get_controlled_apps().  The epoch starts below zero so the first
+# read always populates the snapshot.
+_controlled_apps_lock = threading.Lock()
+_controlled_apps_snapshot: Optional[List[Dict[str, Any]]] = None
+_controlled_apps_epoch: int = -1
 
 
 def build_sudo_cmd(base_cmd: List[str]) -> List[str]:
@@ -246,12 +253,15 @@ def get_controlled_apps_net():
     return list(apps_dict.values()) if apps_dict else None
 
 
-def get_controlled_apps(priority: str = None):
-    """ Get the list of all controlled apps with basic info (without dynamic data like pid/cgroup) """
+def _fetch_controlled_apps() -> Optional[List[Dict[str, Any]]]:
+    """Read every controlled app straight from the database.
+
+    Returns the rows (possibly an empty list) on success, or ``None`` if the
+    query failed, so the caller can tell an empty table from an unusable
+    database and keep serving its last good snapshot.
+    """
     try:
         controlled_apps = AIAppPriority.query().filter(AIAppPriority.controlled == True)
-        if priority is not None:
-            controlled_apps = controlled_apps.filter(AIAppPriority.priority == priority)
         return [{
             "app_name": app.name,
             "app_id": app.app_id,
@@ -259,11 +269,43 @@ def get_controlled_apps(priority: str = None):
             "priority": app.priority,
             "network_priority": getattr(app, "network_priority", None) or app.priority,
             "cmdline": app.cmdline,
-        } for app in controlled_apps] if controlled_apps else None
+        } for app in controlled_apps]
 
     except Exception as e:
         logger.error(f"Database query failed: {str(e)}", exc_info=True)
         return None
+
+
+def get_controlled_apps(priority: str = None):
+    """ Get the list of all controlled apps with basic info (without dynamic data like pid/cgroup)
+
+    Served from an in-memory snapshot that is refreshed only when the table has
+    actually been written to (tracked by the model's write epoch).  This keeps
+    the throttle decision path off the database: it calls
+    :func:`get_app_control_info` once per candidate, every database access takes
+    a process-wide lock shared with the monitor's snapshot writer, and under a
+    saturated disk that lock has been observed held for minutes -- long enough
+    for the balancer to stop applying the limits that would have relieved it.
+    """
+    global _controlled_apps_snapshot, _controlled_apps_epoch
+
+    epoch = get_write_epoch(AIAppPriority)
+    with _controlled_apps_lock:
+        if _controlled_apps_epoch != epoch:
+            fetched = _fetch_controlled_apps()
+            # On a failed read keep the previous snapshot and leave the epoch
+            # behind, so the next call retries instead of caching the failure.
+            if fetched is not None:
+                _controlled_apps_snapshot = fetched
+                _controlled_apps_epoch = epoch
+        apps = _controlled_apps_snapshot
+
+    if not apps:
+        return None
+    if priority is not None:
+        apps = [app for app in apps if app.get("priority") == priority]
+    # Copy: callers treat the result as their own and some mutate the entries.
+    return [dict(app) for app in apps] or None
 
 
 def get_app_control_info(app_id: str = None, app_name: str = None):
@@ -379,63 +421,149 @@ def get_app_processes_for_app(process_query: str, app_id: str = None, app_name: 
     return sorted({int(pid) for pid in get_app_processes(process_query)})
 
 
+_DERIVE_PROCESS_NAME = None
+
+
+def derived_process_identity(info: dict) -> str:
+    """Program identity of one process, using the wizard's own derivation rule.
+
+    ``monitor.app_discovery._derive_process_name`` is what wrote ``process_names`` into
+    config.yaml in the first place, so reusing it here makes matching symmetric with
+    writing: an interpreter/shell launch resolves to the script on both sides, and
+    ``python3 /opt/app/server.py`` -- configured as "server.py" -- stays findable even
+    though its argv0, comm and exe all read "python3".
+
+    Imported lazily on purpose: ``monitor/__init__`` pulls in ``res_monitor``, which
+    imports this module, so a top-level import would re-enter app_utils while it is still
+    half-initialised.
+    """
+    global _DERIVE_PROCESS_NAME
+    if _DERIVE_PROCESS_NAME is None:
+        from monitor.app_discovery import _derive_process_name
+        _DERIVE_PROCESS_NAME = _derive_process_name
+
+    cmdline = info.get('cmdline') or []
+    return _DERIVE_PROCESS_NAME({
+        'comm': (info.get('name') or '').strip(),
+        'exe': (info.get('exe') or '').strip(),
+        'cmdline_argv0': (cmdline[0] or '').strip() if cmdline else '',
+        'cmdline_tokens': list(cmdline),
+    })
+
+
+def get_app_processes_by_exact_name(process_name: str) -> List[int]:
+    """Find the PIDs of ``process_name`` without matching anything else.
+
+    Deliberately NOT a drop-in replacement for :func:`get_app_processes_for_app`. That one
+    is fuzzy (``pgrep -fi``, substring against the whole command line), which is the right
+    trade for "is this app running" -- there a miss is worse than an over-match. This
+    function is for the one place where the trade inverts: resolving which cgroups get a
+    resource limit written to them, where an over-match writes io.max into somebody else's
+    cgroup. Measured on the testing_io.sh workload, "fio_lo" under ``pgrep -fi`` reached 35
+    PIDs across 5 cgroups -- the app itself, plus ``fio_lo2`` (the app the test requires to
+    stay *unmanaged*), ``fio_lo3``, the terminal scope holding six ``sudo systemd-run``
+    launchers, and the session scope of an unrelated shell that merely had the string
+    "fio_lo" somewhere in its command line.
+
+    Two independent exact tests, either of which is enough:
+
+    * the configured name equals argv[0]'s basename, ``comm``, or the exe basename. All
+      three are checked because none alone is reliable: ``comm`` is truncated to 15
+      characters by the kernel, ``exe`` is unreadable for other users' processes, and
+      argv[0] can be rewritten by the process itself.
+    * the configured name equals the process's derived identity (see
+      :func:`derived_process_identity`) -- this is what finds wrapped and interpreted
+      apps, whose configured name is a script rather than an executable.
+
+    Neither test looks at the command line as a substring, so the union of the two cannot
+    over-match; it is only ever harder to miss than either test alone.
+
+    When both come up empty it reports what the fuzzy lookup *would* have found and still
+    returns nothing. Falling back to that result was the original plan, until the fallback
+    was measured: it can only fire when the app has no matching process, i.e. when it is
+    not running -- and then ``pgrep -fi`` returns whatever else happens to carry the name,
+    which in the measured case was the diagnostic shell command that mentioned it. Writing
+    a limit into that process's cgroup is worse than writing none, so the log line is the
+    deliverable here: it names the app whose ``process_names`` needs fixing.
+    """
+    q = (process_name or '').strip().lower()
+    if not q:
+        return []
+
+    matched: set[int] = set()
+    for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
+        try:
+            info = proc.info
+            cmdline = info.get('cmdline') or []
+            names = {
+                os.path.basename((cmdline[0] or '').strip()).lower() if cmdline else '',
+                (info.get('name') or '').strip().lower(),
+                os.path.basename((info.get('exe') or '').strip()).lower(),
+            }
+            if q in names:
+                matched.add(int(info['pid']))
+                continue
+
+            # A derived identity that differs from the three fields above is always the
+            # basename of some argument -- the script the wrapper runs. Screening on that
+            # first keeps the derivation itself off the hot path: it re-reads config on
+            # every call, and this loop walks every process on the machine.
+            if q not in {os.path.basename((t or '').strip()).lower() for t in cmdline[1:]}:
+                continue
+            if derived_process_identity(info).strip().lower() == q:
+                matched.add(int(info['pid']))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    if matched:
+        return sorted(matched)
+
+    loose = sorted({int(pid) for pid in get_app_processes(process_name)})
+    if loose:
+        logger.warning(
+            f"[app-identity] no process matches {process_name!r} exactly, though fuzzy "
+            f"matching finds {len(loose)} pid(s) {loose[:8]} -- not limiting them. Either the "
+            f"app is not running and these merely mention its name, or process_names is wrong.")
+    return []
+
+
 def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.0) -> tuple[bool, str]:
     """
     Check whether the aggregate disk IO of a set of PIDs exceeds a threshold.
+
+    Measures actual block-layer bytes from each process's IO counters
+    (``/proc/<pid>/io`` read_bytes/write_bytes) over a short interval. No external tool
+    (previously ``iotop``) and no privileges beyond what smartune already runs with, so it
+    also works on hosts where iotop / kernel taskstats are unavailable.
     :param running_pids: PIDs belonging to a single app
     :param threshold_mb: disk IO threshold in MB/s
     :return:
         tuple(bool, str): (is_busy, error_message)
     """
     try:
-        sample_times, sample_interval = 3, 0.2
+        interval = 0.5
 
-        iotop_base = ["iotop", "-b", "-o", "-k", "-n", str(sample_times), "-d", str(sample_interval)]
-        iotop_cmd = build_sudo_cmd(iotop_base)
-        for pid in running_pids:
-            iotop_cmd.extend(["-p", str(pid)])
+        def _sample() -> Dict[int, int]:
+            # {pid: read_bytes + write_bytes}; skip pids that vanished or are unreadable.
+            totals: Dict[int, int] = {}
+            for pid in running_pids:
+                try:
+                    io = psutil.Process(pid).io_counters()
+                    totals[pid] = io.read_bytes + io.write_bytes
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            return totals
 
-        result = subprocess.run(
-            iotop_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            text=True,
-            encoding="utf-8",
-            errors="ignore"
-        )
+        t0 = _sample()
+        time.sleep(interval)
+        t1 = _sample()
 
-        # Handle command execution errors
-        if result.returncode != 0:
-            error_msg = result.stderr.strip()
-            if "no such file or directory" in error_msg.lower():
-                raise Exception("iotop is not installed; please install it first")
-            elif "permission denied" in error_msg.lower():
-                raise Exception("Insufficient sudo permissions")
-            else:
-                raise Exception(f"iotop execution failed: {error_msg}")
-
-        # Parse iotop output
-        io_pattern = re.compile(r"(?P<pid>\d+)\s+.+?(?P<read_kb>\d+\.\d+)\s+K/s\s+(?P<write_kb>\d+\.\d+)\s+K/s")
-        pid_io_data = {pid: {"read": [], "write": []} for pid in running_pids}
-
-        for line in result.stdout.strip().split("\n"):
-            line = line.strip()
-            if not line or "PID" in line or "DISK READ" in line:
-                continue
-            match = io_pattern.search(line)
-            if match:
-                pid = int(match.group("pid"))
-                if pid in pid_io_data:
-                    pid_io_data[pid]["read"].append(float(match.group("read_kb")))
-                    pid_io_data[pid]["write"].append(float(match.group("write_kb")))
-
-        # Calculate total IO rate
-        total_io_mb = 0.0
-        for io_data in pid_io_data.values():
-            avg_read = sum(io_data["read"]) / len(io_data["read"]) if io_data["read"] else 0.0
-            avg_write = sum(io_data["write"]) / len(io_data["write"]) if io_data["write"] else 0.0
-            total_io_mb += (avg_read + avg_write) / 1024.0
+        total_bytes = 0
+        for pid, end in t1.items():
+            start = t0.get(pid)
+            if start is not None and end >= start:  # ignore pids that restarted mid-sample
+                total_bytes += end - start
+        total_io_mb = total_bytes / (1024.0 * 1024.0) / interval
 
         logger.debug(f"Total Disk IO for PIDs {running_pids}: {total_io_mb:.2f} MB/s (Threshold: {threshold_mb} MB/s)")
         # Return result; error_msg is empty string when there are no errors
@@ -992,10 +1120,12 @@ def _get_multi_process_app_resource_usage(app_id: str, app_name: str, process_na
     # --- Discover PIDs and cgroups ---
     all_pids: list[int] = []
     cgroup_paths: set[str] = set()
-    # get_app_processes_for_app already scope-filters the PIDs, so every cgroup
-    # discovered below is guaranteed to be within the app's configured scope.
+    # Exact name matching, not the fuzzy pgrep: the cgroup set discovered here is what
+    # gets a resource limit written to it, so one over-matched process silently drags a
+    # whole unrelated cgroup (another app's scope, or the launching terminal's) into the
+    # limit. See get_app_processes_by_exact_name.
     for proc_name in process_names:
-        pids = get_app_processes_for_app(proc_name, app_id=app_id, app_name=app_name)
+        pids = get_app_processes_by_exact_name(proc_name)
         logger.debug(f"[multi_process_resource] app='{app_name}' proc_name='{proc_name}' -> pids: {pids}")
         all_pids.extend(pids)
         for pid in pids:

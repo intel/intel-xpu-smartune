@@ -3,11 +3,17 @@
 
 # System Pressure Model
 
-How SmarTune turns raw kernel signals into a single **pressure score** and a
+How SmarTune turns raw kernel signals into a **pressure score** and a
 **pressure level** (`low / medium / high / critical`) that drives auto-throttling
 and staged restore.
 
-- Score math: [`monitor/pressure.py`](../monitor/pressure.py) (`PressureAnalyzer`)
+There are **two independent channels**, each with its own score, bands and level state:
+the **system** channel (§1–§7), driven mostly by memory, and the **disk-IO** channel (§8),
+which decides `io.max` throttling on its own. They share the smoothing machinery and the
+self-inflicted discount, nothing else.
+
+- Score math, both channels: [`monitor/pressure.py`](../monitor/pressure.py) (`PressureAnalyzer`)
+- Per-disk USE model: [`monitor/disk_pressure.py`](../monitor/disk_pressure.py) (`DiskIOMonitor`)
 - Signal collection & attribution: [`monitor/psi.py`](../monitor/psi.py) (`PSIMonitor`)
 - Orchestration / refresh cadence: [`monitor/monitor_api.py`](../monitor/monitor_api.py) (`SystemPressureMonitor`)
 
@@ -35,6 +41,9 @@ Every ~5 s (tightening to ~2 s near OOM — see §7) the monitor samples the sig
 computes a **raw score**, then smooths it into a **level**. The raw score reacts
 instantly; the level is deliberately stabilized so the balancer's restore timer can
 converge.
+
+The same tick also evaluates the disk-IO channel, which has its own inputs, bands and
+level — see §8.
 
 ---
 
@@ -80,7 +89,7 @@ $$
 where $q_{cg,r}$ and $q_{\mathrm{sys},r}$ are cgroup/system stall-rate deltas for resource $r$.
 
 computed from the `some total` delta of each cgroup's `*.pressure` file vs the system
-PSI file, then **EWMA-smoothed** (§5). It is attribution by *pressure*, not throughput —
+PSI file, then **EWMA-smoothed** (§7). It is attribution by *pressure*, not throughput —
 a byte/CPU-time share was tried and was worse for stall-driven loads (e.g. `stress --io`
 generates IO-wait via `sync()` while moving ~no bytes, collapsing a byte-share to zero).
 
@@ -257,7 +266,237 @@ default), so a run toward OOM is caught within a couple of seconds.
 
 ---
 
-## 8. Parameter reference
+## 8. Disk-IO pressure — an independent channel
+
+Disk IO cannot ride on the system score. With `weights.io = 1` out of `Σweights`, the io
+term contributes at most `1/Σweights` (§5) — a disk can be completely saturated and the
+system score still reads `low`. That is correct for the system channel (a busy disk is not
+an emergency) but useless for deciding `io.max` caps, which need their own trigger.
+
+So the disk channel is a parallel pipeline: its own saturation model, its own bands
+(`disk_thresholds`, never the system `thresholds`), and its own EWMA + hysteresis state.
+Its output is a `disk_level`, and `critical` on that level is what makes the balancer
+write `io.max` (`_handle_disk_io_stressed`).
+
+```mermaid
+flowchart TD
+    A["/proc/diskstats + sysfs<br/>util, await, aqu per disk"] --> B
+    B["P_disk = USE model<br/>media-normalised sigmoids"] --> C
+    C["disk_combined<br/>noisy-OR(mean, worst)"] --> E
+    C --> D["sat = ramp over low..high"]
+    F["/proc/pressure/io<br/>some + full"] --> G["stall severity"]
+    H["self_fraction.io"] -.discount.-> G
+    G --> E
+    D --> E
+    E["raw = C + (1−C)·stall·sat"] --> L["EWMA + hysteresis<br/>+ critical fast-attack"]
+    L --> O["disk_level<br/>critical ⇒ write io.max by priority"]
+```
+
+The shape of the whole thing is one sentence: **`disk_combined` says how saturated the
+disk is, the io PSI says whether that saturation is actually stalling work, and only the
+product of the two reaches `critical`.**
+
+### 8.1 Per-disk pressure — the USE model
+
+Each disk gets a pressure in `[0, 1]` from three sub-signals (utilisation, saturation,
+latency — the USE method), each squashed by a logistic:
+
+$$
+P_{\mathrm{disk}} = A\bigl(w_{\mathrm{lat}}\,\sigma(\text{await}) + w_{q}\,\sigma(\text{aqu})\bigr) + w_{\mathrm{util}}\,\sigma(\text{util})
+$$
+
+$$
+\sigma(x) = \frac{1}{1 + e^{-k\left(\frac{x}{x_{1/2}} - 1\right)}},
+\qquad
+A = \min\!\left(1,\ \frac{\text{util}}{\text{util}_{\mathrm{act}}}\right)
+$$
+
+| Term | Source | Default weight |
+|---|---|---|
+| `await` (ms) | Δ`io_time` ÷ Δ`ops` — mean per-IO latency | `latency: 0.55` |
+| `aqu` | Δ(diskstats field 14) ÷ Δt — mean queue depth (Little's law) | `queue: 0.35` |
+| `util` (%) | Δ`io_ticks` ÷ Δt — time with ≥1 IO in flight | `util: 0.10` |
+
+- **Latency dominates** because it is what users feel.
+- **`util` is only a tie-breaker.** It measures "time with ≥1 IO in flight", which says
+  nothing about remaining concurrency: an NVMe sits at 100 % util with one request
+  outstanding and enormous headroom. Treat a high util alone as "active", never as "full".
+- **`A` is the activity gate.** On an NVMe (await half-point 1 ms) a couple of background
+  ops on an otherwise idle disk would pin the latency term at 1.0; scaling latency and
+  queue by util (relative to `activity_util_pct`, default 20 %) makes an idle disk read ~0
+  regardless of per-op latency.
+
+#### Media-aware half-points
+
+Every `_half` is the metric value that reads as **0.5**, and every one of them is per
+**media class** — that is where "busy" is made relative to what the hardware can sustain:
+
+| media | `await_half_ms` | `queue_half` | `util_half_pct` |
+|---|---|---|---|
+| `nvme` | 1.0 | 32 | 95 |
+| `sata_ssd` | 5.0 | 16 | 85 |
+| `hdd` | 20.0 | 3 | 80 |
+| `usb` | 30.0 | 1 | 80 |
+
+![Media-aware half-points](images/disk_media_sigmoid.svg)
+
+A 20 ms await is routine for an HDD and catastrophic for an NVMe — same curve, different
+pain point. Two consequences worth knowing:
+
+- Because `P_disk` comes out **media-normalised**, the thresholds applied to it are
+  deliberately media-agnostic. Per-media bands *and* per-media half-points would apply the
+  correction twice.
+- Media is detected from sysfs facts, and USB is checked **before** the rotational flag:
+  USB mass storage reports `rotational=0` and would otherwise be judged by SSD latency —
+  the single worst misclassification available, since the two differ by an order of
+  magnitude in what counts as slow.
+- `queue_half` is the only half-point a device can lower for itself: a disk advertising
+  `device/queue_depth` below the class default (USB bridges report 1) uses its own value.
+  Probing never *raises* it above the class pain point, because the advertised depth is
+  capacity, not the depth at which latency starts to hurt.
+
+### 8.2 Aggregation — noisy-OR of the mean and the worst disk
+
+$$
+C = 1 - (1 - \bar{P})\,(1 - P_{\max} w_{\max})
+$$
+
+where $C\equiv$ `disk_combined`, $\bar P\equiv$ `avg_p` over all physical disks,
+$P_{\max}\equiv$ `max_p`, and $w_{\max}\equiv$ `max_p_weight` (default **0.8**).
+
+![Noisy-OR aggregation](images/disk_noisy_or.svg)
+
+A plain mean would average one hammered disk away behind idle ones; taking only the worst
+would ignore breadth. The noisy-OR keeps both: the mean carries "how much of the storage
+subsystem is busy", the max term guarantees a single saturated disk still lands high.
+
+On a box with three physical disks where only one is loaded, a `P_disk` of **0.91** yields
+`C ≈ 0.81` — the two idle disks cost about 0.1 of aggregate pressure. That is the intended
+dilution, but it also means `C` sits close to the `high` band edge on such a box; if one
+saturated disk out of N should count for more, raise `max_p_weight`.
+
+### 8.3 The PSI gate — saturation × stall
+
+`disk_combined` alone would throttle any app that merely keeps a disk busy. The io PSI is
+what turns "the disk is working hard" into "the disk is hurting the system".
+
+$$
+\text{stall} = \min\bigl(1,\ w_{s}\,p^{\mathrm{io}}_{\mathrm{some}} + w_{f}\,p^{\mathrm{io}}_{\mathrm{full}}\bigr)
+$$
+
+![Stall severity from the io PSI](images/disk_psi_stall.svg)
+
+- `full` = *every* non-idle task is blocked on IO. Strongest signal, but on a multi-core
+  box one CPU-bound thread drives it to 0, so it is rare — hence weight **3.0**.
+- `some` = at least one task blocked. Common under any real disk load, so weight **0.5**:
+  since `some ≤ 1`, that term alone tops out at 0.5 and can never saturate the stall.
+- Net effect: **`critical` effectively requires `io.full ≳ 1/3`.** If a workload keeps a
+  disk pinned but never blocks a task (async O_DIRECT that always finds a free tag), the
+  level correctly stops at `high`.
+
+Then saturation is turned into a ramp, and the PSI is allowed to fill only the headroom
+`disk_combined` has left:
+
+$$
+\text{sat} = \operatorname{clamp}\!\left(\frac{C - T_{\text{low}}}{T_{\text{high}} - T_{\text{low}}},\ 0,\ 1\right)
+\qquad
+\boxed{\ \text{raw} = C + (1 - C)\cdot\text{stall}\cdot\text{sat}\ }
+$$
+
+![Disk gate](images/disk_gate.svg)
+
+Monotone and continuous in **both** signals, which is what keeps the level from jumping
+straight from `medium` to `critical`:
+
+| | no task stall | system-wide IO stall |
+|---|---|---|
+| disk not saturated (`C < low`) | `low` | `low` — `sat = 0`, so the stall is not blamed on the local disk (a network fs, a stuck USB device) |
+| disk saturated (`C ≥ high`) | **`high`** — armed: the top consumer is identified and logged, nothing is throttled | **`critical`** — throttle |
+
+Note the corollary in the figure: with `C ≈ 0.81` (the 3-disk box above), `raw` reaches
+1.00 only when `stall` is essentially 1.0. The saturation side of this gate has enormous
+headroom on a deep-queue workload — `σ` is long since saturated — so in practice **it is
+the PSI that decides the level**, and `disk_combined` just decides whether the PSI is
+allowed to count.
+
+### 8.4 Self-inflicted discount
+
+The same `_CPU_IO_SELF_GATE` (§3) applies here, logged as `io_self_disc`: once an app has
+been capped, its tasks stall against their *own* `io.max`, and that stall must not be read
+as fresh system-wide pressure — otherwise the first cap guarantees a second one.
+
+$$
+p^{\mathrm{io}}_{\{\mathrm{some},\,\mathrm{full}\}} \mathrel{{\times}{=}} \bigl(1 - f_{\mathrm{io}}\,g\bigr)
+$$
+
+### 8.5 Level classification
+
+Identical machinery to §7 — EWMA (`_SCORE_EWMA_ALPHA`), per-level hysteresis
+(`_LEVEL_HYSTERESIS`), and critical fast-attack off the **raw** score — but on separate
+state (`_disk_score_smoothed`, `_disk_last_level`), so a disk transition never disturbs the
+system level or vice versa.
+
+### 8.6 What the level drives
+
+| `disk_level` | balancer behaviour |
+|---|---|
+| `low` / `medium` | nothing; `medium` marks a disk `is_busy` for the UI breadth report |
+| `high` | **armed**: the top disk-IO consumers are resolved and logged (`[disk-io]`), no cap is written |
+| `critical` | cap the top throttleable consumer with `io.max` at its priority's rates, scoped to `stressed_disks`; `Critical`-priority and already-capped apps are skipped |
+
+Restore is driven by the *system* level, not this one (partial at `medium`, full at `low`,
+each after a stable period), plus a reaper that lifts the cap as soon as the app exits.
+
+---
+
+## 9. Reading the log
+
+Each channel prints **one line per tick**, tagged `[sys-level]` and `[disk-level]`. Both are
+INFO once the channel is out of `low` and DEBUG while it is quiet. A third tag, `[disk-io]`,
+appears only when the balancer acts (candidate list, why each was skipped, the cap applied).
+
+```
+[sys-level] level=low score=0.18 raw=0.18 | load=0.182 = w-avg(cpu 0.350, mem 0.000, io 0.420)
+            w=4:5:1 | mem_scarcity=0.000 (free 29%) | cpu 78% mem 71%
+```
+
+| Field | Meaning |
+|---|---|
+| `level` | the emitted band, after EWMA + hysteresis (§7) — what the balancer acts on |
+| `score` | the smoothed score behind `level`; this is what the UI gauge shows |
+| `raw` | this tick's unsmoothed score. `raw` alone latches `critical`; a gap between the two is the EWMA still catching up |
+| `load` | the normalized weighted average of the three inputs — the `w-avg(...)` right after it is those inputs, already self-discounted (§3) |
+| `w=4:5:1` | the live `cpu:memory:io` weights, re-read from `config.yaml` every tick |
+| `mem_scarcity` | the memory gate (§4): ~0 while RAM is ample, →1 as free RAM runs out. It is both the `mem` term in the average **and** a floor under `score` |
+| `free N%` | free-RAM ratio — the only input `mem_scarcity` has |
+| `cpu N% mem N%` | plain utilisation, for context only; nothing is computed from them |
+| `self_disc …` | only printed when a limited app is dominant: the fraction of CPU/IO stall attributed to it and discounted (§3) |
+
+```
+[disk-level] level=high score=0.93 raw=0.93 | combined=0.830 sat=1.00 stall=0.59
+             (io some=0.350 full=0.140 self_disc=1.00) | nvme0n1(nvme) p=0.936 util=88%
+             await=159.2ms aqu=5814 rd=0 wr=147 MB/s | for critical: stall>=1.00 (io.full>=0.275)
+```
+
+`level` / `score` / `raw` mean exactly what they do above, on the disk channel's own state.
+
+| Field | Meaning |
+|---|---|
+| `combined` | how saturated the disk subsystem is, 0–1, from the USE model + noisy-OR (§8.1, §8.2). Media-normalised, so 0.83 means the same on an HDD and an NVMe |
+| `sat` | how much of the stall we are willing to **blame on the disk**: 0 below the `low` band, 1 at/above `high`. A stalling but unsaturated disk has `sat=0` and cannot lift the score |
+| `stall` | how badly IO is actually blocking work, from the io PSI: `0.5·some + 3·full`, capped at 1 |
+| `some` / `full` | the raw io PSI inputs. `some` = at least one task blocked, `full` = *every* runnable task blocked. `full` is weighted 6× because only it means the machine as a whole is stuck |
+| `self_disc` | 1.00 = no discount. Below 1, part of the PSI was attributed to an already-limited app stalling on its own cap and removed (§8.4) |
+| per-disk block | the busy disks, busiest first: `p` = that disk's pressure, then the raw sub-signals — `util` %, `await` mean per-IO latency, `aqu` mean queue depth, and throughput. `(nvme)` is the detected media class, which picks the half-points |
+| `for critical: …` | printed only at `high` (armed, not throttling): the `stall` — and the `io.full` behind it — still needed to cross `critical` at this saturation |
+
+The score itself is `raw = combined + (1 − combined)·stall·sat` (§8.3): saturation sets the
+level, PSI lifts it within the remaining headroom, and `sat` decides whether that lift is
+allowed at all.
+
+---
+
+## 10. Parameter reference
 
 | Parameter | Where | Default | Increase it → | Decrease it → |
 |---|---|---|---|---|
@@ -271,6 +510,18 @@ default), so a run toward OOM is caught within a couple of seconds.
 | `_FRAC_EWMA_ALPHA` | `psi.py` | `0.3` | faster / noisier discount | smoother / laggier |
 | `regular_update_sys_pressure_time` | `config.yaml` | `5` s | slower sampling | faster sampling |
 
+Disk channel (§8) — all under `config.yaml`, re-read every tick, no restart needed:
+
+| Parameter | Default | Increase it → | Decrease it → |
+|---|---|---|---|
+| `disk_thresholds.{low,medium,high,critical}` | `0.4/0.6/0.8/1.0` | disk levels harder to reach | easier |
+| `disk_psi_weights.{some,full}` | `0.5 / 3.0` | less task stall needed for `critical` | more stall needed |
+| `disk_pressure_model.sub_weights.{latency,queue,util}` | `0.55/0.35/0.10` | that sub-signal dominates `P_disk` | it matters less |
+| `disk_pressure_model.sigmoid_k` | `8.0` | sharper, more switch-like at the half-point | gentler ramp |
+| `disk_pressure_model.{await_half_ms,queue_half,util_half_pct}` | per media class | the same hardware state reads as **less** pressure | as more pressure |
+| `disk_pressure_model.activity_util_pct` | `20` % | more util required before await/queue count | idle-disk noise counts sooner |
+| `disk_pressure_model.max_p_weight` | `0.8` | the single worst disk dominates the aggregate | the mean dominates |
+
 ### Tuning cheat-sheet
 
 - **"CPU-heavy jobs shouldn't trigger throttling"** — already handled by the normalized
@@ -281,17 +532,33 @@ default), so a run toward OOM is caught within a couple of seconds.
   `_SCORE_EWMA_ALPHA`.
 - **"App keeps getting re-limited after a limit"** — raise `_CPU_IO_SELF_GATE` (discount
   more of its self-inflicted stall).
+- **"The disk is clearly saturated but never reaches critical"** — read `stall` in the
+  `[disk-level]` log line. A workload that keeps the queue full without ever blocking a task
+  produces `io.full ≈ 0`; that is the gate working, not a bug. Raise
+  `disk_psi_weights.some` only if measurements show `full` staying low while `some` is high.
+- **"One hammered disk out of several doesn't register"** — that is the mean diluting it
+  (§8.2); raise `disk_pressure_model.max_p_weight`.
+- **"A USB disk / an HDD reads as permanently saturated"** — check `disk_type` in the
+  `[disk-level]` line first (misdetected media applies the wrong half-points), then the
+  half-points for that class.
 
 ---
 
-## 9. Why memory is special (summary)
+## 11. Why memory is special (summary)
 
 | Resource | Limit type | Signal | Discounted when limited? | Can reach critical alone? |
 |---|---|---|---|---|
 | CPU | `cpu.max` (hard) | system PSI | yes (`_CPU_IO_SELF_GATE`) | no (normalized to a small share) |
-| IO | `io.max` (hard) | system PSI | yes (`_CPU_IO_SELF_GATE`) | no |
+| IO (system channel) | `io.max` (hard) | system PSI | yes (`_CPU_IO_SELF_GATE`) | no |
 | Memory | `MemoryHigh` (soft) | availability sigmoid | **no** (OOM safety) | **yes** (`max(load, mem_scarcity)`) |
+| Disk IO (own channel, §8) | `io.max` (hard) | USE model **×** io PSI | yes (`_CPU_IO_SELF_GATE`) | **yes** — via `disk_thresholds`, not the system score |
 
 CPU/IO are hard-capped, so a limited app can't drive the machine to catastrophe — its
 self-inflicted stall is safe to discount. Memory's soft cap can still be exceeded, so its
 scarcity is never discounted and retains an independent path to `critical`.
+
+Memory and disk IO both need a path to `critical` that the weighted average cannot give
+them, and they get it in different ways for different reasons: memory floors the system
+score (`max(load, mem_scarcity)`) because an OOM kill is a system-wide event; disk IO gets
+a whole separate channel because a saturated disk is *not* a system-wide emergency and must
+not lift the system score at all — it only needs to authorize an `io.max` cap.

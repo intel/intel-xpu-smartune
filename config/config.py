@@ -19,6 +19,17 @@ class Config:
     cgroup_mount: str = "/sys/fs/cgroup"
     vendor: str = "generic"
     thresholds: dict = None
+    # Disk-IO pressure bands. Deliberately NOT defaulted to `thresholds`: the two channels
+    # are tuned independently, and silently borrowing the system bands would make a
+    # disk-side change look like it had no effect. Expected to be present in config.yaml,
+    # same as `thresholds`.
+    disk_thresholds: dict = None
+    # io PSI -> stall-severity weights for the disk gate. Unlike the thresholds these do
+    # have in-code defaults (PressureAnalyzer._PSI_IO_*_W), so the block is optional.
+    disk_psi_weights: dict = None
+    # Calibration knobs for the per-disk USE model (DiskIOMonitor._model). Optional and
+    # partially overridable -- anything absent uses the module default in disk_pressure.py.
+    disk_pressure_model: dict = None
     weights: dict = None
     weights_top: dict = None
     passive_resource_control: dict = None
@@ -36,9 +47,6 @@ class Config:
     # (larger = sharper transition around the memory "busy" point). See
     # PressureAnalyzer._mem_scarcity_gate.
     mem_gate_steepness: float = 8.0
-    disk_utilization_threshold: float = 95
-    disk_iowait_threshold: float = 10
-    disk_io_throughput_threshold_kb: float = 102400  # KB/s, i.e. 100 MB/s
     regular_update_sys_pressure_time: float = 5
     monitor_idle_check_interval: float = 10
     # How often (seconds) the reaper checks whether a limited app has closed
@@ -592,7 +600,7 @@ class Config:
               "memory":  {"enabled": True, "rate": {"high": 0.3, ...}},
               "disk_io": {"enabled": True,
                           "rate": {"high": {"write": 50, "read": 60,
-                                            "write_iops": 2200, "read_iops": 20000}, ...}},
+                                            "write_iops": 15000, "read_iops": 18000}, ...}},
             }
 
         Only the leaves that actually change are rewritten (comments preserved).

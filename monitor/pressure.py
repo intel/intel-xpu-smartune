@@ -29,12 +29,44 @@ class PressureAnalyzer:
     # Ascending severity order, used only for hysteresis comparisons.
     _LEVEL_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
+    # --- Disk-IO pressure gate ------------------------------------------------
+    # How the io PSI (some/full, fractions in [0, 1]) maps to the stall severity that gates
+    # disk_combined -- see classify_disk_pressure for the gate itself. io.full dominates
+    # because it means every non-idle task is blocked, not just some. Defaults only:
+    # ``config.disk_psi_weights`` overrides them live, so a weight can be re-calibrated
+    # from measured io PSI without a code change.
+    _PSI_IO_FULL_W = 3.0   # io.full weight: full ~= 0.33 alone saturates the stall severity
+    _PSI_IO_SOME_W = 0.5   # io.some weight: partial waiting contributes, but secondary to full
+
+    def _psi_io_weights(self) -> tuple:
+        """``(some_w, full_w)`` read live from config, falling back to the class defaults.
+
+        Note these are *weights*, not thresholds: unlike ``disk_thresholds`` an in-code
+        default is fine here, because a missing block cannot silently borrow the system
+        channel's tuning -- there is no system-side equivalent to borrow.
+        """
+        cfg = getattr(self.config, 'disk_psi_weights', None) or {}
+        some_w = cfg.get('some')
+        full_w = cfg.get('full')
+        return (
+            float(some_w) if isinstance(some_w, (int, float)) else self._PSI_IO_SOME_W,
+            float(full_w) if isinstance(full_w, (int, float)) else self._PSI_IO_FULL_W,
+        )
+
     def __init__(self, config):
         self.config = config
         # EWMA-smoothed score and the last emitted level, carried across calls
         # to classify_level (None until the first sample).
         self._score_smoothed = None
         self._last_level = None
+        # Independent smoothing/level state for the disk-IO channel (classify_disk_pressure),
+        # kept separate so it never perturbs the system-score state above.
+        self._disk_score_smoothed = None
+        self._disk_last_level = None
+        # Score breakdown from the current tick's calculate_pressure_score, held for
+        # classify_level to print: the two run back to back on every tick and one
+        # [sys-level] line carrying both the inputs and the level beats two half-lines.
+        self._score_parts = ""
 
     def _mem_scarcity_gate(self, mem_avail: float) -> float:
         """Smooth sigmoid (logistic) gate in [0, 1] for how much of a (possibly saturated)
@@ -122,13 +154,21 @@ class PressureAnalyzer:
         # not inflate the score while RAM is ample.)
         final_score = min(max(load, mem_scarcity), 1.0)
 
-        # is_sys_busy is no longer a control input (the memory gate supersedes it); kept for
-        # observability only.
-        is_sys_busy = usage_data['cpu']['is_busy'] or usage_data['memory']['is_busy']
-        logger.debug(f"score... = {final_score}, load={round(load, 4)}, psi_data={psi_data}, "
-                     f"psi_eff={psi_eff}, usage_data={usage_data}, "
-                     f"is_limited_app_dominant={is_limited_app_dominant}, self_fraction={frac}, "
-                     f"mem_scarcity={round(mem_scarcity, 4)}, is_sys_busy={is_sys_busy}, weights={weights}")
+        # Handed to classify_level, which prints it alongside the level it derived. Formatted
+        # to a fixed precision because mem_scarcity is a logistic that underflows to values
+        # like 1.29e-22 when RAM is ample, and the raw repr of that buries the rest of the line.
+        self._score_parts = (
+            f"load={load:.3f} = w-avg(cpu {psi_eff['cpu']:.3f}, mem {psi_eff['memory']:.3f}, "
+            f"io {psi_eff['io']:.3f}) w={weights['cpu']}:{weights['memory']}:{weights['io']} "
+            f"| mem_scarcity={mem_scarcity:.3f} (free {mem_avail * 100:.0f}%) "
+            f"| cpu {usage_data['cpu'].get('usage', 0.0):.0f}% "
+            f"mem {usage_data['memory'].get('usage', 0.0):.0f}%"
+        )
+        # Named only when a limited app is actually dominant; otherwise the discount is a
+        # no-op and printing it every tick implies something happened.
+        if frac:
+            self._score_parts += (f" | self_disc cpu={frac.get('cpu', 0.0):.2f} "
+                                  f"io={frac.get('io', 0.0):.2f}")
         return round(final_score, 2)
 
     def get_pressure_level(self, score: float, thresholds: dict) -> str:
@@ -167,25 +207,153 @@ class PressureAnalyzer:
             prev = self._score_smoothed
             smoothed = raw_score if prev is None else alpha * raw_score + (1.0 - alpha) * prev
             candidate = self.get_pressure_level(smoothed, thresholds)
-            level = self._apply_level_hysteresis(candidate, smoothed, thresholds)
+            level = self._apply_level_hysteresis(candidate, smoothed, thresholds, self._last_level)
 
         self._score_smoothed = smoothed
         self._last_level = level
-        logger.debug(f"level={level}, smoothed_score={round(smoothed, 4)}, raw_score={round(raw_score, 4)}")
+        # `score` is the smoothed value (returned, shown in the UI, decides every band below
+        # critical); `raw` only decides the critical latch. INFO once the system is out of
+        # the low band, DEBUG otherwise -- this runs every tick.
+        _log = logger.info if level != "low" else logger.debug
+        _log("[sys-level] level=%s score=%.2f raw=%.2f | %s",
+             level, smoothed, raw_score, self._score_parts)
         return level, round(smoothed, 2)
 
-    def _apply_level_hysteresis(self, candidate: str, score: float, thresholds: dict) -> str:
+    @staticmethod
+    def _format_disks(details: dict) -> str:
+        """One-line sub-signal digest of the disks a level can be traced to.
+
+        Busy disks only (``details`` arrives busiest-first); an all-zero row explains
+        nothing. Falls back to the busiest disk so an idle machine still shows what it
+        looked at.
+        """
+        if not details:
+            return "no disks"
+        busy = {d: v for d, v in details.items() if v.get('is_busy')}
+        return " ".join(
+            f"{d}({v['disk_type']}) p={v['pressure']:.3f} util={v['utilization']:.0f}% "
+            f"await={v['await_ms']:.1f}ms aqu={v['aqu']:.0f} "
+            f"rd={v['read_kb_per_sec'] / 1024:.0f} wr={v['write_kb_per_sec'] / 1024:.0f} MB/s"
+            for d, v in (busy or dict(list(details.items())[:1])).items()
+        )
+
+    def classify_disk_pressure(self, disk_combined: float, psi_io_some: float,
+                               psi_io_full: float, self_fraction: dict, thresholds: dict,
+                               disk_details: dict = None) -> tuple:
+        """Map a USE-based ``disk_combined`` to a stable disk-IO ``(level, score, is_stressed)``
+        by gating it with (self-inflicted-discounted) io PSI.
+
+        ``disk_combined`` says *how saturated* the disk subsystem is; the io PSI says whether
+        that saturation is *actually stalling work*. The two are folded into one continuous
+        gated score, so the same EWMA + hysteresis machinery as ``classify_level`` applies
+        (with its own state, see ``_disk_*``):
+
+          * ``stall`` in [0, 1] is a continuous severity from the io PSI (``full`` dominant).
+          * ``sat`` in [0, 1] is how far ``disk_combined`` sits in the ``[low, high]`` band --
+            0 below ``low`` (disk not the cause), 1 at/above ``high``.
+          * the PSI lifts ``disk_combined`` within its remaining headroom, scaled by ``sat``:
+            ``raw = disk_combined + (1 - disk_combined) * stall * sat``.
+
+        The result is monotone and continuous in BOTH signals: the level climbs
+        medium -> high -> critical as saturation and stall rise together (no medium->critical
+        cliff), a saturated-but-not-stalling disk tops out at high (armed, not throttled), and
+        a stalling-but-unsaturated disk (e.g. a network fs) stays low (``sat`` -> 0). Only a
+        disk that is both fully saturated and stalling the whole system reaches critical.
+
+        The PSI is discounted by the same ``_CPU_IO_SELF_GATE`` used for the system score, so a
+        rate-limited app stalling on its own cgroup limit does not fake system-wide IO
+        pressure. ``self_fraction`` may be None (no discount).
+
+        ``thresholds`` must be the DISK bands (``config.disk_thresholds``), never the system
+        ``config.thresholds`` -- the two channels are tuned independently.
+
+        ``disk_details`` is the per-disk sub-signal map behind ``disk_combined``
+        (``DiskPressureMonitor.evaluate()['details']``), logged here rather than at its
+        source so the inputs and the level they produced stay on one line.
+        """
+        gate = self._CPU_IO_SELF_GATE
+        frac = self_fraction or {}
+        disc = 1.0 - frac.get('io', 0.0) * gate
+        some = max(0.0, psi_io_some) * disc
+        full = max(0.0, psi_io_full) * disc
+
+        low = thresholds['low']
+        high = thresholds['high']
+        crit = thresholds['critical']
+
+        # Continuous stall severity from the io PSI, and the saturation ramp over [low, high].
+        some_w, full_w = self._psi_io_weights()
+        stall = min(1.0, some * some_w + full * full_w)
+        sat = (disk_combined - low) / (high - low) if high > low else 1.0
+        sat = max(0.0, min(1.0, sat))
+        # PSI fills disk_combined's headroom, scaled by saturation. Rounded to absorb float
+        # noise so a fully-filled headroom lands exactly on the critical threshold.
+        raw = disk_combined + (1.0 - disk_combined) * stall * sat
+        raw = round(max(0.0, min(1.0, raw)), 2)
+
+        if raw >= crit:
+            # Genuine extreme (fully saturated AND system-wide stall): pin to critical without
+            # EWMA lag (the EWMA cannot asymptotically reach the top threshold). Descent is
+            # still slow-release via the EWMA below on subsequent ticks.
+            smoothed = raw
+            level = "critical"
+        else:
+            alpha = self._SCORE_EWMA_ALPHA
+            prev = self._disk_score_smoothed
+            smoothed = raw if prev is None else alpha * raw + (1.0 - alpha) * prev
+            candidate = self.get_pressure_level(smoothed, thresholds)
+            level = self._apply_level_hysteresis(candidate, smoothed, thresholds, self._disk_last_level)
+
+        self._disk_score_smoothed = smoothed
+        self._disk_last_level = level
+        is_stressed = self._LEVEL_RANK.get(level, 0) >= self._LEVEL_RANK["high"]
+        # At "high" the disk is armed but not throttling, which is when "why not critical?"
+        # gets asked -- so say what is still missing: `need_full` is the io.full that would
+        # tip it over at this saturation and `some`, and an unreachable value there indicts
+        # the workload, not the model.
+        gap = ""
+        if level == "high" and sat > 0 and full_w > 0 and disk_combined < 1.0:
+            need_stall = min(1.0, (crit - disk_combined) / (1.0 - disk_combined) / sat)
+            need_full = max(0.0, (need_stall - some * some_w) / full_w)
+            gap = f" | for critical: stall>={need_stall:.2f} (io.full>={need_full:.3f})"
+        # INFO once the disk is in play, DEBUG while it is idle -- this runs every tick.
+        # `score` is the smoothed value (what is returned, what the UI shows, what decides
+        # every band below critical); `raw` only decides the critical latch.
+        _log = logger.info if (raw >= low or level != "low") else logger.debug
+        _log(
+            "[disk-level] level=%s score=%.2f raw=%.2f | combined=%.3f sat=%.2f stall=%.2f "
+            "(io some=%.3f full=%.3f self_disc=%.2f) | %s%s",
+            level, smoothed, raw, disk_combined, sat, stall, some, full, disc,
+            self._format_disks(disk_details), gap,
+        )
+        return level, round(smoothed, 2), is_stressed
+
+    def _apply_level_hysteresis(self, candidate: str, score: float, thresholds: dict,
+                                prev_level: str) -> str:
         """Make level *downgrades* sticky; upgrades stay immediate.
 
-        A downgrade below the previous level is only accepted once ``score`` has fallen a
+        A downgrade below ``prev_level`` is only accepted once ``score`` has fallen a
         full ``_LEVEL_HYSTERESIS`` below that level's entry threshold. This kills chatter
         right at a boundary (e.g. hovering at 0.60) without adding any lag on the way up.
+        ``prev_level`` is passed in so the system-score and disk channels can each keep
+        their own last level.
+
+        ``critical`` is exempt, in both channels. Every other level is *entered* on the
+        smoothed score, so holding it a little past its entry on the way down is symmetric.
+        Critical is not: it is entered by a latch on the RAW score topping out, so leaving
+        it on ``smoothed >= entry - 0.05`` would report critical at a score of 0.96 -- a
+        level the score itself says was never reached, and one the UI renders as "critical"
+        next to "96%". It also keeps the throttle armed: the balancer acts on the peak level
+        since its last tick, so a hysteresis-held critical throttles another app on evidence
+        that has already expired.
         """
-        prev = self._last_level
+        prev = prev_level
         if prev is None or prev == "unknown":
             return candidate
         if self._LEVEL_RANK.get(candidate, 0) >= self._LEVEL_RANK.get(prev, 0):
             return candidate  # same or higher severity: accept immediately
+        if prev == "critical":
+            return candidate  # latched on the way in, released on the way out
         # Downgrade requested: only leave the current level once clearly below its entry.
         prev_entry = thresholds.get(prev, 0.0)
         if score < prev_entry - self._LEVEL_HYSTERESIS:

@@ -20,12 +20,13 @@ export interface DiskData {
   disk_io: Record<string, DiskDeviceData>
   is_stressed?: boolean
   stressed_disks?: string[]
-  iowait?: number
   busy_disks?: string[]
   total_disks?: number
   busy_ratio?: number | null
   busy_pct?: number | null
   busy_level?: string
+  // PSI-gated disk-IO pressure severity (0-100), separate from busy_pct (breadth).
+  pressure_pct?: number | null
 }
 
 export interface PressureData {
@@ -560,11 +561,6 @@ export interface SystemPressureData {
   mem_gate_steepness: number
   memory_busy_threshold: number
   cpu_busy_threshold: number
-  updated_at?: number
-}
-
-export interface DiskPressureData {
-  disk_utilization_threshold: number
   updated_at?: number
 }
 

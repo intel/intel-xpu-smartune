@@ -601,7 +601,11 @@ class SystemPressureMonitor:
         # during each refresh cycle so that transient spikes cannot be silently
         # skipped by the balancer's idle_check_interval gate.
         self._peak_level = None
-        self._peak_disk_io_stressed = False
+        # Disk-IO pressure level, current and peak-latched. The balancer reads the
+        # peak level (not just a bool) so it can act per-level: identify the top
+        # consumer at "high" and only throttle at "critical".
+        self._current_disk_level = "low"
+        self._peak_disk_level = "low"
 
         # Listeners notified when the system transitions into or out of the
         # "critical" pressure level.  Each entry is a callable(is_critical: bool).
@@ -649,12 +653,13 @@ class SystemPressureMonitor:
                 self.score = score
                 self.is_current_disk_io_stressed = disk_io_stressed
                 self._disk_io_stress = disk_io_stress
+                self._current_disk_level = disk_io_stress.get("level") or "low"
                 # Peak latch: only raise the peak, never lower it.  The balancer
                 # resets the peak via consume_peak_pressure_level().
                 if _LEVEL_ORDER.get(new_level, -1) > _LEVEL_ORDER.get(self._peak_level, -1):
                     self._peak_level = new_level
-                if disk_io_stressed:
-                    self._peak_disk_io_stressed = True
+                if _LEVEL_ORDER.get(self._current_disk_level, -1) > _LEVEL_ORDER.get(self._peak_disk_level, -1):
+                    self._peak_disk_level = self._current_disk_level
             finally:
                 self._update_lock.release()
 
@@ -685,7 +690,26 @@ class SystemPressureMonitor:
                 self._is_limited_app_dominant,
                 self_fraction
             )
-            logger.debug(f"disk_io={disk_io}")
+            # Disk-IO level: gate the USE-based disk_combined with the io PSI (some +
+            # full), reusing psi_data and self_fraction already computed above -- no extra
+            # PSI read beyond io.full. The PSI-gated verdict overwrites the USE-only
+            # is_stressed so the balancer acts on task-stall reality, not raw saturation.
+            disk_level, disk_score, disk_stressed = self.analyzer.classify_disk_pressure(
+                disk_io.get("disk_combined", 0.0),
+                psi_data.get("io", 0.0),
+                self.psi.get_io_full_pressure(),
+                self_fraction,
+                # Disk bands, NOT self.config.thresholds: the disk channel is tuned
+                # independently of when system pressure reaches critical.
+                self.config.disk_thresholds,
+                disk_io.get("details"),
+            )
+            # The USE-only report carries `is_saturated`; `is_stressed` is added here and is
+            # always the PSI-gated verdict, so downstream (UI, balancer) never conflates
+            # "the disk is busy" with "this is hurting the system".
+            disk_io["is_stressed"] = disk_stressed
+            disk_io["level"] = disk_level
+            disk_io["score"] = disk_score
             # Smooth + hysteresis for the level/restore decision; critical stays instantaneous.
             # `score` is the smoothed value so the reported score matches the emitted level.
             level, score = self.analyzer.classify_level(raw_score, self.config.thresholds)
@@ -712,14 +736,15 @@ class SystemPressureMonitor:
 
     def get_current_pressure_level(self) -> tuple:
         """Return the current pressure level as (level, score, is_disk_io_stressed)."""
-        logger.debug("Current PSI level: %s (pressure: %.2f), disk io stressed: %s", self._current_level, self.score,
-                     self.is_current_disk_io_stressed)
         return self._current_level, self.score, self.is_current_disk_io_stressed
 
     def consume_peak_pressure_level(self) -> tuple:
-        """Return the highest pressure level seen since the last call, then reset the peak.
+        """Return the highest pressure seen since the last call, then reset the peak.
 
-        Returns (peak_level, score, peak_disk_io_stressed).
+        Returns (peak_level, score, peak_disk_level).  ``peak_disk_level`` is the
+        disk-IO pressure *level* string ("low"/"medium"/"high"/"critical") -- the
+        balancer keys its two-stage disk policy off it (identify top consumer at
+        "high", throttle only at "critical").
 
         The balancer calls this instead of get_current_pressure_level() so that
         transient spikes (e.g. a brief "critical" window that resolves before the
@@ -735,25 +760,29 @@ class SystemPressureMonitor:
         """
         with self._update_lock:
             peak_level = self._peak_level if self._peak_level is not None else self._current_level
-            peak_disk_io = self._peak_disk_io_stressed
+            peak_disk_level = self._peak_disk_level
             # Reset peak to current instantaneous values ready for the next window.
             self._peak_level = self._current_level
-            self._peak_disk_io_stressed = self.is_current_disk_io_stressed
+            self._peak_disk_level = self._current_disk_level
         logger.debug(
-            "consume_peak: peak_level=%s, peak_disk_io=%s (current=%s)",
-            peak_level, peak_disk_io, self._current_level,
+            "consume_peak: peak_level=%s, peak_disk_level=%s (current=%s)",
+            peak_level, peak_disk_level, self._current_level,
         )
-        return peak_level, self.score, peak_disk_io
+        return peak_level, self.score, peak_disk_level
 
     def get_disk_io_stress(self) -> dict:
         """Return the cached disk IO stress details from the most recent update.
 
-        The dict format matches ResourceMonitor.is_disk_io_stressed:
+        The dict matches ResourceMonitor.is_disk_io_stressed plus the PSI-gated
+        ``level``/``score`` added by the pressure tick:
         {
             "is_stressed": bool,
             "stressed_disks": list[str],
-            "iowait": float,
-            "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec, read_iops, write_iops, is_busy}}
+            "disk_combined": float,
+            "level": str,
+            "score": float,
+            "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec, read_iops,
+                               write_iops, await_ms, aqu, pressure, disk_type, is_busy}}
         }
         """
         return self._disk_io_stress

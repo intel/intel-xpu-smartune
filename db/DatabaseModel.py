@@ -38,6 +38,26 @@ _DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 db = SqliteDatabase(_DB_PATH)
 db.execute_sql('PRAGMA journal_mode=WAL;')
 
+# Per-model write counter, bumped whenever a row actually changes.  Read-side
+# caches compare it to tell whether their in-memory copy still matches the
+# table, so a hot path can be served without touching the database at all --
+# every access below takes the process-wide db_lock, which the monitor's
+# snapshot writer also holds, and a reader that blocks on it while the disk is
+# saturated is exactly the reader that needed to run.
+_write_epochs: dict[str, int] = {}
+
+
+def get_write_epoch(model_cls) -> int:
+    """Return the current write counter for ``model_cls``."""
+    return _write_epochs.get(model_cls.__name__, 0)
+
+
+def _bump_write_epoch(model_cls) -> None:
+    """Record a write against ``model_cls``.  Called with ``db_lock`` held."""
+    name = model_cls.__name__
+    _write_epochs[name] = _write_epochs.get(name, 0) + 1
+
+
 class DataBaseModel(Model):
     create_time = BigIntegerField()
     create_date = DateTimeField()
@@ -75,6 +95,7 @@ class DataBaseModel(Model):
                 with db.atomic():
                     instance, created = cls.get_or_create(id=data['id'], defaults=data)
                     if created:
+                        _bump_write_epoch(cls)
                         return DBStatus.SUCCESS  # True stands for success/already existing
                     else:
                         logger.debug(f"Record with ID {data['id']} already exists.")
@@ -97,6 +118,8 @@ class DataBaseModel(Model):
             try:
                 with db.atomic():
                     updated_count = cls.update(**cls.normalize_data(data)).execute()
+                    if updated_count:
+                        _bump_write_epoch(cls)
                     return updated_count
             except (IntegrityError, OperationalError) as e:
                 logger.error(f"Error batch updating data: {e}")
@@ -119,6 +142,7 @@ class DataBaseModel(Model):
                     if updated_count == 0:
                         exists = cls.select().where(cls.id == id).exists()
                         return DBStatus.NOT_FOUND if not exists else DBStatus.SUCCESS
+                    _bump_write_epoch(cls)
                     return DBStatus.SUCCESS
             except (IntegrityError, OperationalError) as e:
                 logger.error(f"Error updating data: {e}")
@@ -131,6 +155,8 @@ class DataBaseModel(Model):
             try:
                 with db.atomic():
                     deleted_count = cls.delete().where(cls.id == id).execute()
+                    if deleted_count:
+                        _bump_write_epoch(cls)
                     return deleted_count
             except (IntegrityError, OperationalError) as e:
                 logger.error(f"Error deleting data: {e}")

@@ -3008,14 +3008,15 @@ export default function SystemOverview({ active }: Props) {
 
   // Disk IO: use is_disk_io_stressed data
   const diskIsStressed = dynamicInfo?.disk?.is_stressed ?? false
-  const diskIoWaitRaw = dynamicInfo?.disk?.iowait
-  const diskIoWait = isNumber(diskIoWaitRaw) ? diskIoWaitRaw : null
   // Disk IO pressure: read pre-computed values from backend
   const diskBusyNames = dynamicInfo?.disk?.busy_disks ?? []
   const diskTotalCount = dynamicInfo?.disk?.total_disks ?? 0
   const diskBusyCount = diskBusyNames.length
   const diskBusyPct = dynamicInfo?.disk?.busy_pct ?? null
   const diskBusyLevelLabel = dynamicInfo?.disk?.busy_level ?? 'NO DATA'
+  // Gauge shows severity (PSI-gated pressure), not breadth; fall back to busy_pct
+  // when severity is unavailable (USE-only path with no pressure tick).
+  const diskPressurePct = dynamicInfo?.disk?.pressure_pct ?? diskBusyPct
 
   // Network pressure: read pre-computed values from backend
   const networkBusyNics = dynamicInfo?.pressure?.network_busy_nics ?? []
@@ -3238,18 +3239,17 @@ export default function SystemOverview({ active }: Props) {
         <Row gutter={[16, 12]}>
           {showPressureSection && (
             <>
-              {/* Disk IO Pressure: fraction of busy disks; subtitle lists busy vs OK devices */}
+              {/* Disk IO Pressure: gauge shows PSI-gated severity; subtitle lists which/how many disks are busy */}
               <Col xs={24} md={showNetworkPressureCard ? 8 : 12}>
                 <PressurePointerGauge
                   title="Disk IO Pressure"
-                  valuePct={diskBusyPct}
+                  valuePct={diskPressurePct}
                   levelLabel={diskBusyLevelLabel}
                   subtitle={[
                     diskBusyCount > 0 ? `Busy: ${diskBusyNames.join(', ')}` : null,
                     diskTotalCount > 0 ? `${diskBusyCount}/${diskTotalCount} disks busy` : null,
-                    isNumber(diskIoWait) ? `iowait: ${diskIoWait.toFixed(1)}%` : null,
                   ].filter(Boolean).join(' | ')}
-                  description="Fraction of busy disks across all devices"
+                  description="IO pressure severity; subtitle shows which disks are busy"
                 />
               </Col>
 

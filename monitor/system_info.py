@@ -59,6 +59,7 @@ from monitor.metrics.history import (
     persist_monitor_snapshot,
     persist_dynamic_snapshot_if_due,
 )
+from monitor.disk_pressure import compute_disk_pressure
 from utils.logger import logger
 
 _STATIC_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
@@ -332,59 +333,6 @@ def _get_network_runtime_bw() -> Dict[str, Any]:
             "rx_bytes_per_sec": round(total_rx, 2),
             "tx_bytes_per_sec": round(total_tx, 2),
         },
-    }
-
-
-def _compute_disk_pressure(disk_stats: Dict[str, Any]) -> Dict[str, Any]:
-    """Aggregate busy ratio from per-disk is_busy flags.
-
-    Returns busy_disks, total_disks, busy_ratio, busy_pct, busy_level
-    matching the network pressure pattern.
-    """
-    disk_io = disk_stats.get('disk_io')
-    if not isinstance(disk_io, dict) or not disk_io:
-        return {
-            "busy_disks": [],
-            "total_disks": 0,
-            "busy_ratio": None,
-            "busy_pct": None,
-            "busy_level": "NO DATA",
-        }
-
-    busy_disks: List[str] = []
-    total_disks = 0
-    for disk_name, detail in disk_io.items():
-        if not isinstance(detail, dict):
-            continue
-        total_disks += 1
-        if detail.get("is_busy"):
-            busy_disks.append(disk_name)
-
-    busy_count = len(busy_disks)
-    busy_ratio = busy_count / total_disks if total_disks > 0 else None
-    busy_pct = busy_ratio * 100.0 if busy_ratio is not None else None
-
-    _th = b_config.thresholds or {}
-    _th_low = _th.get("low", 0.4)
-    _th_medium = _th.get("medium", 0.6)
-    _th_high = _th.get("high", 0.8)
-    if total_disks == 0 or busy_ratio is None:
-        busy_level = "NO DATA"
-    elif busy_ratio < _th_low:
-        busy_level = "LOW"
-    elif busy_ratio < _th_medium:
-        busy_level = "MEDIUM"
-    elif busy_ratio < _th_high:
-        busy_level = "HIGH"
-    else:
-        busy_level = "CRITICAL"
-
-    return {
-        "busy_disks": busy_disks,
-        "total_disks": total_disks,
-        "busy_ratio": round(busy_ratio, 4) if busy_ratio is not None else None,
-        "busy_pct": round(busy_pct, 2) if busy_pct is not None else None,
-        "busy_level": busy_level,
     }
 
 
@@ -780,7 +728,9 @@ class _DynamicInfoCollector:
                         'disk_io': disk_stress.get('details', {}),
                         'is_stressed': disk_stress.get('is_stressed', False),
                         'stressed_disks': disk_stress.get('stressed_disks', []),
-                        'iowait': disk_stress.get('iowait', 0.0),
+                        # PSI-gated disk-IO level/score from the pressure tick (authoritative).
+                        'level': disk_stress.get('level'),
+                        'score': disk_stress.get('score'),
                     }
             except Exception as e:
                 logger.warning(f"Disk stress check unavailable via SPM: {e}")
@@ -790,20 +740,25 @@ class _DynamicInfoCollector:
                 disk_stress = self._rm.is_disk_io_stressed()
                 disk_stats = {
                     'disk_io': disk_stress.get('details', {}),
-                    'is_stressed': disk_stress.get('is_stressed', False),
+                    # No pressure tick available, so there is no PSI-gated verdict: fall back
+                    # to USE-only saturation. Approximate on purpose -- it can read stressed
+                    # for a busy-but-not-stalling disk that the gated path would call `high`.
+                    'is_stressed': disk_stress.get('is_saturated', False),
                     'stressed_disks': disk_stress.get('stressed_disks', []),
-                    'iowait': disk_stress.get('iowait', 0.0),
                 }
             except Exception as e:
                 logger.warning(f"Disk stress check unavailable: {e}")
 
         # Disk IO pressure: aggregate busy ratio from per-disk is_busy flags
-        disk_pressure = _compute_disk_pressure(disk_stats)
+        disk_pressure = compute_disk_pressure(disk_stats)
         disk_stats['busy_disks'] = disk_pressure['busy_disks']
         disk_stats['total_disks'] = disk_pressure['total_disks']
         disk_stats['busy_ratio'] = disk_pressure['busy_ratio']
         disk_stats['busy_pct'] = disk_pressure['busy_pct']
         disk_stats['busy_level'] = disk_pressure['busy_level']
+        # Severity gauge value (PSI-gated), distinct from busy_pct (breadth). Without this the
+        # UI falls back to busy_pct and shows e.g. 33% next to a CRITICAL label.
+        disk_stats['pressure_pct'] = disk_pressure['pressure_pct']
         return disk_stats
 
     def gpu(self) -> Dict[str, Any]:

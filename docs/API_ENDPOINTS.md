@@ -863,6 +863,14 @@ data: {"app_id": "com.example.app", "app_name": "example", "status": "running", 
         "io_write_rate": 30.1,
         "io_read_iops": 1200.0,
         "io_write_iops": 800.0,
+        "io_per_disk": {
+          "nvme0n1": {
+            "read_mb_s": 50.2,
+            "write_mb_s": 30.1,
+            "read_iops": 1200.0,
+            "write_iops": 800.0
+          }
+        },
         "score": 72.5
       }
     ]
@@ -875,9 +883,17 @@ data: {"app_id": "com.example.app", "app_name": "example", "status": "running", 
 |-------|------|-------------|
 | io_read_rate | float | Read throughput in MB/s |
 | io_write_rate | float | Write throughput in MB/s |
-| io_read_iops | float | Read operations per second |
-| io_write_iops | float | Write operations per second |
+| io_read_iops | float | Read **device requests** per second (see note) |
+| io_write_iops | float | Write **device requests** per second (see note) |
+| io_per_disk | object | Same four rates broken down per whole disk, keyed by kernel disk name (`nvme0n1`, `sda`). Partitions are folded into their parent disk. Empty when the app did no I/O in the sampling window |
 | score | float | Combined I/O ranking score |
+
+**Note on IOPS:** these are block-layer request counts taken from cgroup v2 `io.stat`
+(`rios`/`wios`), not `read()`/`write()` syscall counts. The two differ by up to ~8x for
+large buffered writes, because the block layer splits each write into `max_sectors_kb`
+chunks — so a syscall-derived figure under-reports a large-block or async writer by an
+order of magnitude. Run `balancer/test/probe_cgroup_io.py` to reproduce the comparison
+on your own hardware.
 
 ---
 
@@ -994,7 +1010,7 @@ data: {"app_id": "com.example.app", "app_name": "example", "status": "running", 
     "memory": { "usage_percent": 50.0, "total_gb": 64.0, "available_gb": 32.0, "swap_total_gb": 8.0, "swap_used_gb": 1.2 },
     "pressure": { "level": "medium", "score": 45.2, "cpu": 12.5, "memory": 8.0, "io": 3.2, "network_busy_level": "medium", "..." },
     "network": { "per_nic": {"eth0": {"tx_mbps": 120.5, "rx_mbps": 85.3}} },
-    "disk": { "is_stressed": false, "iowait": 2.1, "busy_level": "low", "disk_io": {"sda": {"read_mbps": 50.0, "write_mbps": 30.0, "is_busy": false}}, "..." },
+    "disk": { "is_stressed": false, "level": "low", "score": 0.12, "busy_level": "LOW", "busy_pct": 0.0, "pressure_pct": 12.0, "stressed_disks": [], "disk_io": {"sda": {"read_mbps": 50.0, "write_mbps": 30.0, "pressure": 0.12, "disk_type": "sata_ssd", "is_busy": false}}, "..." },
     "gpu": { "vram": {"card0": {"used_mb": 1024, "total_mb": 8192, "free_mb": 7168}}, "gpu_usage": {"devices": [{"engines": ["rcs","bcs","vcs","vecs","ccs"], "engine_util": {"rcs": 45.2, "vcs": 80.5, "..."}, "freqs": [{"name": "gt0", "cur_mhz": 1200, "act_mhz": 1150, "max_mhz": 1500, "rc6_pct": 85.0}], "power_w": {"gpu": 15.2, "pkg": 28.0}}]} },
     "npu": { "npu_smi": {} },
     "monitored_sections_updated_at": 1718600000
@@ -1496,9 +1512,16 @@ Sections are grouped to match the Settings UI cards. Every field is optional in 
 
 | Section | Fields | Constraints |
 |---------|--------|-------------|
-| `system_pressure` | `regular_update_sys_pressure_time`, `thresholds{low,medium,high,critical}`, `weights{cpu,memory,io}`, `dominant_app_reduce_factor` | interval seconds `1–3600`; thresholds in `(0,1]` and ordered `low ≤ medium ≤ high ≤ critical`; weights non-negative integers; factor `1–100` |
-| `disk_pressure` | `disk_utilization_threshold` | Percent, `0–100` (I/O-wait & throughput thresholds stay config-only) |
-| `limit_policy` | `policy` (`combined`/`separated`); `cpu`/`memory` = `{enabled, rate:{high,medium,low,undefined}}` (fractions `(0,1]`); `disk_io` = `{enabled, rate:{<priority>:{write,read,write_iops,read_iops}}}` (integers `≥ 1`) | Nested; any subset of leaves accepted |
+| `system_pressure` | `regular_update_sys_pressure_time`, `thresholds{low,medium,high,critical}`, `weights{cpu,memory,io}`, `mem_gate_steepness`, `memory_busy_threshold`, `cpu_busy_threshold` | interval seconds `1–3600`; thresholds in `(0,1]` and ordered `low ≤ medium ≤ high ≤ critical`; weights non-negative integers; steepness `1–50`; busy thresholds percent `0–100` |
+| `disk_pressure` | `disk_thresholds{low,medium,high,critical}`, `disk_pressure_model{sub_weights{latency,queue,util}, sigmoid_k, max_p_weight}` | Disk bands in `(0,1]` and ordered, kept separate from the system `thresholds`; sub-weights in `[0,1]` and summing to `≤ 1`; `sigmoid_k` `1–50`; `max_p_weight` in `[0,1]` |
+| `network_pressure` | `network_thresholds{low,medium,high,critical}` | In `(0,1]`, ordered, and all four required |
+| `limit_policy` | `policy` (`combined`/`separated`); `cpu`/`memory` = `{enabled, rate:{high,medium,low,undefined}}` (fractions `(0,1]`); `disk_io` = `{enabled, rate:{<priority>:{write,read,write_iops,read_iops}}}` (integers `≥ 1`), plus `media_scale:{<media>: coefficient}` and `candidate_floor:{<media>:{mb_s,iops}}` | Nested; any subset of leaves accepted. `<media>` is one of `nvme`, `sata_ssd`, `mmc`, `hdd`, `usb`, `unknown`; coefficients in `(0,1]`, floors `> 0` |
+
+`network_control` is a section of this same endpoint too; its fields are documented in detail above.
+
+`GET disk_pressure` answers with the values actually in force — `config.disk_pressure_model` merged over the built-in defaults — so a knob absent from `config.yaml` reads back as the default the model uses rather than `null`. The per-media half-point tables (`await_half_ms`, `queue_half`, `util_half_pct`), `activity_util_pct` and `disk_psi_weights` are not writable here: they are calibrated per device class and stay config-only.
+
+`disk_io.rate` is calibrated for NVMe. `media_scale` multiplies it before the cap is written to a disk of that media class, and `candidate_floor` is the per-disk rate an app must reach before it is considered worth throttling at all (either `mb_s` or `iops` clearing the floor qualifies). Both are per-class merges over the built-in defaults, so a partial `POST` leaves the other classes alone. `unknown` covers a device that matches no rule and defaults to the HDD numbers.
 
 **Request Example (`POST /monitor/config/system_pressure`):**
 ```json
@@ -1513,7 +1536,9 @@ Sections are grouped to match the Settings UI cards. Every field is optional in 
   "data": {
     "thresholds": { "low": 0.4, "medium": 0.6, "high": 0.75, "critical": 1.0 },
     "weights": { "cpu": 2, "memory": 6, "io": 1 },
-    "dominant_app_reduce_factor": 3.5,
+    "mem_gate_steepness": 8.0,
+    "memory_busy_threshold": 80.0,
+    "cpu_busy_threshold": 90.0,
     "success": true,
     "updated_at": 1718603800
   }

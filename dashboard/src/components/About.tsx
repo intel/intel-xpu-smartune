@@ -497,7 +497,7 @@ export default function About({ active }: Props) {
                         <div>
                           <Text style={{ color: COLORS.text, fontWeight: 500 }}>压力监测</Text>
                           <Paragraph style={{ color: COLORS.textMuted, margin: '4px 0 0', fontSize: 12 }}>
-                            基于 Linux PSI（Pressure Stall Information）实时采集 CPU、内存和 I/O 压力数据，计算综合评分并划分低/中/高/临界四个压力等级；同时通过 eBPF 拦截 execve 系统调用实时感知受控应用的启动与退出，并独立监控磁盘 I/O 利用率和系统 iowait。
+                            基于 Linux PSI（Pressure Stall Information）实时采集 CPU 与 I/O 阻塞数据，配合内存可用率的 sigmoid 稀缺度，计算综合评分并划分低/中/高/临界四个压力等级；磁盘 I/O 走独立通道，以每盘 USE 模型（利用率/await/队列深度，按介质类型归一）叠加 io PSI 门控，单独得分与分级；同时通过 eBPF 拦截 execve 系统调用实时感知受控应用的启动与退出。
                           </Paragraph>
                         </div>
                       ),

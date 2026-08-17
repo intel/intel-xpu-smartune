@@ -23,7 +23,8 @@ from utils.logger import logger
 
 from monitor import PSIMonitor
 from monitor.app_discovery import is_noise_process
-from monitor.disk_pressure import DiskIOMonitor
+from monitor.cgroup import IO_STAT_FIELDS, as_io_rates, io_stat_deltas, snapshot_cgroup_io
+from monitor.disk_pressure import DiskIOMonitor, disk_name_for_devno
 from utils.self_ident import is_own_process
 
 _GPU_DRM_DRIVERS = frozenset({'i915', 'xe'})
@@ -414,6 +415,12 @@ class ResourceMonitor:
         :param samples: number of sampling rounds for the top process
         :param interval: sampling interval in seconds
         :param mode: scoring mode — 'default' ranks by combined CPU+memory score; 'io' ranks by IO throughput
+
+        In 'io' mode the reported I/O comes from cgroup v2 ``io.stat`` (bytes AND request
+        counts), not from per-PID ``io_counters()``. That is not an optimisation: psutil's
+        ``read_count``/``write_count`` are syscall counts, so the IOPS this method used to
+        report was ~8x low on large buffered writes and worse on async O_DIRECT. See
+        ``monitor/cgroup.py`` for the measurements. Default mode is unchanged.
         """
         # Step 1: Sample candidate processes (weighted, per-process-group)
         num_candidates = max(n * 3, 9)  # ensures enough candidates to cover at least n distinct cgroups
@@ -477,6 +484,9 @@ class ResourceMonitor:
             'io_write_total': 0,   # cumulative IO write bytes delta for all processes
             'io_read_count_total': 0,   # cumulative IO read count delta (for IOPS)
             'io_write_count_total': 0,  # cumulative IO write count delta (for IOPS)
+            # Per-device I/O counts for this window, {"maj:min": {rbytes, wbytes, rios, wios}}.
+            # Populated from cgroup io.stat in 'io' mode only; empty in default mode.
+            'io_per_device': {},
             'count': 0,
             'pids': set(),
             'names': set(),
@@ -519,10 +529,27 @@ class ResourceMonitor:
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
 
+        # In 'io' mode the reported I/O comes from cgroup v2 io.stat, not from the
+        # per-PID counters read below. The per-PID pass still runs -- it supplies the
+        # names, memory and the dominant process -- but its read_count/write_count are
+        # syscall counts (syscr/syscw), not device requests, and under-report real IOPS
+        # by ~8x on large buffered writes and worse on async O_DIRECT. Bytes agree
+        # between the two sources; only the operation counts diverge. See
+        # monitor/cgroup.py and balancer/test/probe_cgroup_io.py.
+        io_stat_t0 = snapshot_cgroup_io(cgroup_pids.keys()) if mode == 'io' else None
+
         # Sleep covers both CPU and IO measurement intervals
         t0 = time.time()
         time.sleep(io_sample_interval)
         elapsed = time.time() - t0
+
+        # Close the io.stat window right after the sleep, before the (slower) per-PID
+        # pass below. Reading it afterwards would stretch the window by however long
+        # that pass takes while still dividing by `elapsed`, understating every rate.
+        io_stat_elapsed, io_stat_counts = 0.0, {}
+        if mode == 'io':
+            io_stat_elapsed, io_stat_counts = io_stat_deltas(
+                *io_stat_t0, *snapshot_cgroup_io(cgroup_pids.keys()))
 
         # Second pass: read final counters and compute deltas
         for cgroup_path, pids_in_cgroup in cgroup_pids.items():
@@ -576,6 +603,21 @@ class ResourceMonitor:
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
 
+        # Step 3a: In 'io' mode, replace the per-PID I/O totals with the cgroup io.stat
+        # counts for the same window. Done here -- after the per-PID pass, before the
+        # multi-process merge -- so the merge and the scoring below need no special case:
+        # they keep summing the same four fields, which now hold device-side numbers.
+        # A cgroup absent from io.stat did no I/O this window and is zeroed rather than
+        # left holding syscall-derived values.
+        if mode == 'io':
+            for cgroup_path, data in cgroup_data.items():
+                counts = io_stat_counts.get(cgroup_path) or {}
+                data['io_read_total'] = counts.get('rbytes', 0)
+                data['io_write_total'] = counts.get('wbytes', 0)
+                data['io_read_count_total'] = counts.get('rios', 0)
+                data['io_write_count_total'] = counts.get('wios', 0)
+                data['io_per_device'] = counts.get('per_device', {})
+
         # Step 3b: Merge cgroup_data entries that belong to the same multi-process app.
         # Entries whose cgroup_path appears in multiapp_cgroup_to_app are grouped by
         # app_id; all but the first (primary) cgroup are folded in and deleted.
@@ -611,6 +653,14 @@ class ResourceMonitor:
                     cgroup_data[primary]['io_write_total'] += d['io_write_total']
                     cgroup_data[primary]['io_read_count_total'] += d['io_read_count_total']
                     cgroup_data[primary]['io_write_count_total'] += d['io_write_count_total']
+                    # Per-device counts merge per device, not by concatenation: a
+                    # multi-cgroup app usually hits the SAME disk from every cgroup, and
+                    # the limit path needs one number per disk to write one io.max line.
+                    merged_dev = cgroup_data[primary]['io_per_device']
+                    for dev, dev_counts in d['io_per_device'].items():
+                        target = merged_dev.setdefault(dev, {k: 0 for k in IO_STAT_FIELDS})
+                        for field in IO_STAT_FIELDS:
+                            target[field] += dev_counts.get(field, 0)
                     cgroup_data[primary]['count'] += d['count']
                     cgroup_data[primary]['pids'] |= d['pids']
                     cgroup_data[primary]['names'] |= d['names']
@@ -633,12 +683,20 @@ class ResourceMonitor:
         processes = []
         for cgroup_path, data in cgroup_data.items():
             if data['count'] > 0:
+                # 'io' mode divides by the io.stat window, which closed right after the
+                # sleep; default mode divides by the per-PID window. Using one `elapsed`
+                # for both would misdate whichever source it did not come from.
+                io_window = io_stat_elapsed if mode == 'io' else elapsed
+                if io_window <= 0:
+                    io_window = elapsed or io_sample_interval
                 # IO rates: delta bytes / elapsed seconds → MB/s
-                io_read_rate_mb = data['io_read_total'] / elapsed / (1024 ** 2)
-                io_write_rate_mb = data['io_write_total'] / elapsed / (1024 ** 2)
-                # IO operations per second (IOPS)
-                io_read_iops = data['io_read_count_total'] / elapsed
-                io_write_iops = data['io_write_count_total'] / elapsed
+                io_read_rate_mb = data['io_read_total'] / io_window / (1024 ** 2)
+                io_write_rate_mb = data['io_write_total'] / io_window / (1024 ** 2)
+                # IOPS. In 'io' mode these are rios/wios -- requests the device actually
+                # saw. In default mode they remain psutil's syscall counts, which is fine
+                # there because nothing ranks or caps on them.
+                io_read_iops = data['io_read_count_total'] / io_window
+                io_write_iops = data['io_write_count_total'] / io_window
                 if mode == 'io':
                     # IO mode: rank by total read+write throughput and IOPS
                     # IOPS is scaled down (divided by 1000) to balance with MB/s
@@ -676,6 +734,13 @@ class ResourceMonitor:
                     'io_write_rate': round(io_write_rate_mb, 4),
                     'io_read_iops': round(io_read_iops, 1),
                     'io_write_iops': round(io_write_iops, 1),
+                    # Per-disk breakdown of this app's I/O, keyed by kernel device name
+                    # ("nvme0n1"), each {read_mb_s, write_mb_s, read_iops, write_iops}.
+                    # Only populated in 'io' mode. This is what lets a cap target the one
+                    # disk the app is hammering instead of every disk on the box, and what
+                    # lets the throttle decision compare an app against the device class
+                    # it is actually loading.
+                    'io_per_disk': self._per_disk_rates(data['io_per_device'], io_window),
                     'names': list(data['names']),
                     'cmdlines': list(data['cmdlines']),
                     'dominant_name': dominant_name,
@@ -685,6 +750,26 @@ class ResourceMonitor:
         # logger.debug(f"Aggregated processes by cgroup: {processes}")
         # Step 5: Return the highest-scored process information
         return sorted(processes, key=lambda x: x['score'], reverse=True)[:n]
+
+    @staticmethod
+    def _per_disk_rates(per_device, elapsed):
+        """Convert ``{"maj:min": counts}`` from io.stat into ``{disk_name: rates}``.
+
+        Several devnos can resolve to the same disk name (a partition and its parent),
+        so counts are accumulated per name before the division rather than overwritten.
+        """
+        if not per_device or elapsed <= 0:
+            return {}
+        by_disk = {}
+        for devno, counts in per_device.items():
+            disk = disk_name_for_devno(devno)
+            target = by_disk.setdefault(disk, {k: 0 for k in IO_STAT_FIELDS})
+            for field in IO_STAT_FIELDS:
+                target[field] += counts.get(field, 0)
+        return {
+            disk: {k: round(v, 4) for k, v in as_io_rates(counts, elapsed).items()}
+            for disk, counts in by_disk.items()
+        }
 
     def _get_candidate_processes(self, num, samples, interval, dynamic_weights):
         """Sample candidate processes and return their PIDs and names (scores used for filtering only).
@@ -1158,8 +1243,14 @@ class ResourceMonitor:
                     # IOPS is surfaced alongside MB/s because a 4k random workload is
                     # bandwidth-light but IOPS-heavy: the throttle decision needs both to
                     # tell "worth capping" from "capping this cannot relieve the device".
+                    # Both come from cgroup io.stat, so the IOPS is the request count the
+                    # device saw -- not a syscall count (see monitor/cgroup.py).
                     'io_read_iops': process['io_read_iops'],
                     'io_write_iops': process['io_write_iops'],
+                    # {disk_name: {read_mb_s, write_mb_s, read_iops, write_iops}} -- which
+                    # disks this app is actually loading, so a cap can name them instead
+                    # of being written to every disk on the box.
+                    'io_per_disk': process.get('io_per_disk', {}),
                 },
                 'app': app_info,
                 # Full PID list (see get_top_resource_consumers) for close-detection.
@@ -1176,7 +1267,8 @@ class ResourceMonitor:
             " | ".join(
                 f"#{i} {r['process']['name']} app={(r['app'] or {}).get('id')!r} "
                 f"rd={r['process']['io_read_rate']:.1f} wr={r['process']['io_write_rate']:.1f} MB/s "
-                f"riops={r['process']['io_read_iops']:.0f} wiops={r['process']['io_write_iops']:.0f}"
+                f"riops={r['process']['io_read_iops']:.0f} wiops={r['process']['io_write_iops']:.0f} "
+                f"disks={','.join(r['process']['io_per_disk']) or '-'}"
                 for i, r in enumerate(results, 1)
             ) or "none",
         )
@@ -1477,8 +1569,9 @@ class ResourceMonitor:
                 'balancer_candidate': balancer_candidate,
                 'io_read_rate': process['io_read_rate'],                # MB/s
                 'io_write_rate': process['io_write_rate'],              # MB/s
-                'io_read_iops': process['io_read_iops'],                # ops/s
-                'io_write_iops': process['io_write_iops'],              # ops/s
+                'io_read_iops': process['io_read_iops'],                # ops/s (device requests)
+                'io_write_iops': process['io_write_iops'],              # ops/s (device requests)
+                'io_per_disk': process.get('io_per_disk', {}),          # {disk: {...rates}}
                 'score': round(process['score'], 3),
             })
 
@@ -1525,6 +1618,11 @@ class ResourceMonitor:
     def is_disk_io_stressed(self, device: str = None, threshold: float = None) -> dict:
         """Determine whether disk I/O is under stress (see DiskIOMonitor.is_disk_io_stressed)."""
         return self._disk_io.is_disk_io_stressed(device, threshold)
+
+    def get_disk_pressure_model(self) -> dict:
+        """Return the USE-model knobs actually in force: ``config.disk_pressure_model``
+        merged over the defaults in disk_pressure.py (see DiskIOMonitor._model)."""
+        return self._disk_io._model()
 
 def main():
     """Debug entry point."""

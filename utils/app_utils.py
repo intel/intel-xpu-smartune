@@ -133,6 +133,40 @@ def get_cgroup_path_by_pid(pid):
     return None
 
 
+def dominant_cgroup_by_pids(pids) -> tuple:
+    """Pick the cgroup that holds most of *pids*, as ``(cgroup_path, representative_pid)``.
+
+    The first matched PID is not a safe representative: an app started through a wrapper
+    (``sudo systemd-run --scope ...``) keeps the wrapper in the *launcher's* cgroup -- the
+    terminal's ``vte-spawn-*.scope`` -- while every worker it spawned lives in the scope
+    the app actually owns.  ``pids[0]`` is usually that wrapper (lowest PID, spawned
+    first), so the limit lands on the terminal and the workers run unthrottled.
+
+    A majority vote over the matched PIDs cannot be fooled by a single stray process.
+    Ties break on the lexicographically-smallest path, matching the "primary cgroup"
+    convention used when an app legitimately spans several cgroups.
+
+    Returns ``(None, None)`` when no PID has a readable cgroup.
+    """
+    counts: Dict[str, int] = {}
+    first_pid: Dict[str, int] = {}
+    for pid in pids:
+        path = get_cgroup_path_by_pid(pid)
+        if not path:
+            continue
+        counts[path] = counts.get(path, 0) + 1
+        first_pid.setdefault(path, pid)
+    if not counts:
+        return None, None
+    winner = min(counts, key=lambda p: (-counts[p], p))
+    if len(counts) > 1:
+        logger.debug(
+            f"[cgroup-vote] {len(pids)} pid(s) span {len(counts)} cgroup(s) "
+            f"{ {os.path.basename(p): c for p, c in counts.items()} }; picked {winner}"
+        )
+    return winner, first_pid[winner]
+
+
 def get_controlled_apps_config(apps_dict=None):
     if apps_dict is None:
         apps_dict = {}
@@ -790,15 +824,13 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
             logger.warning(f"No processes found for app {app_name} (ID: {app_id})")
             return {}
 
-        representative_pid = pids[0]
-        # Locate the cgroup from the first PID
-        cgroup_path = get_cgroup_path_by_pid(representative_pid)
+        cgroup_path, representative_pid = dominant_cgroup_by_pids(pids)
         logger.debug(
             f"[resource_usage] representative_pid={representative_pid}, "
             f"cgroup_path='{cgroup_path}'"
         )
         if not cgroup_path:
-            logger.warning(f"No cgroup found for PID {representative_pid} of app {app_name}")
+            logger.warning(f"No cgroup found for any of {len(pids)} PID(s) of app {app_name}")
             return {}
 
         # Log the process cmdline for the representative PID to confirm we found the right process

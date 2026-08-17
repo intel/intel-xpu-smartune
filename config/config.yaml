@@ -48,13 +48,17 @@ disk_pressure_model:
     util: 0.10      # %util vs util_half_pct
   sigmoid_k: 8.0            # squash steepness; larger = sharper transition at the half-point
   # Every "_half" below is the metric value that reads as 0.5, given PER MEDIA CLASS
-  # (hdd / sata_ssd / nvme / usb) -- that is where "busy" is made relative to what the
-  # device can sustain: a 20 ms await is routine for an HDD and catastrophic for an NVMe,
-  # and a queue of 4 is nothing to an NVMe but a backlog on a USB bridge. A single number
-  # is also accepted for any of these maps and is then applied to all media classes.
-  # Because P_disk comes out media-normalised, the busy mark applied to it
+  # (hdd / sata_ssd / nvme / usb / mmc / unknown) -- that is where "busy" is made relative
+  # to what the device can sustain: a 20 ms await is routine for an HDD and catastrophic
+  # for an NVMe, and a queue of 4 is nothing to an NVMe but a backlog on a USB bridge. A
+  # single number is also accepted for any of these maps and is then applied to all media
+  # classes. Because P_disk comes out media-normalised, the busy mark applied to it
   # (disk_thresholds.medium) stays media-agnostic on purpose -- per-media there too would
   # apply the correction twice. Any class may be omitted and keeps its in-code default.
+  #
+  # `unknown` covers anything whose media could not be determined (virtio, device-mapper,
+  # md) and carries the HDD numbers, i.e. the most tolerant ones -- an unidentifiable disk
+  # should read as calm rather than be judged by an NVMe yardstick it cannot meet.
   #
   # %util that reads as 0.5. Media-dependent because util only measures "time with >=1 IO
   # in flight" and says nothing about remaining concurrency: a single-actuator HDD at 80%
@@ -64,19 +68,21 @@ disk_pressure_model:
     sata_ssd: 85.0
     nvme: 95.0
     usb: 80.0
+    mmc: 80.0
+    unknown: 95.0
   # Below this %util a disk is treated as ramping toward idle and its await/queue
   # sub-signals are scaled down, so a few background ops on an idle disk read as ~0.
-  activity_util_pct:
-    hdd: 20.0
-    sata_ssd: 20.0
-    nvme: 20.0
-    usb: 20.0
+  # A single number, NOT per media: %util is already a normalised time fraction, so
+  # "almost nothing was in flight" means the same on every device.
+  activity_util_pct: 20.0
   # Average per-IO latency (ms) that reads as 0.5.
   await_half_ms:
     hdd: 20.0
     sata_ssd: 5.0
     nvme: 1.0
     usb: 30.0
+    mmc: 10.0
+    unknown: 1.0
   # Average queue depth that reads as 0.5. A device advertising a SMALLER queue_depth in
   # sysfs lowers its own half-point; the value here is the ceiling, never raised by probing.
   queue_half:
@@ -84,6 +90,8 @@ disk_pressure_model:
     sata_ssd: 16.0
     nvme: 32.0
     usb: 1.0
+    mmc: 2.0
+    unknown: 32.0
   # How strongly the single worst disk dominates the aggregate:
   #   combined = 1 - (1 - avg_p) * (1 - max_p * max_p_weight)
   # 0 = plain mean (one saturated disk among many is averaged away); 1 = the worst disk
@@ -202,6 +210,49 @@ limit_policy: # Default resource limit ratios for apps at different priority lev
         read: 20
         write_iops: 1000
         read_iops: 8000
+    # The `rate` table above is calibrated for NVMe. `media_scale` re-expresses it for
+    # slower media: effective cap = rate[priority][field] * media_scale[media], applied to
+    # the disk the app is actually hitting rather than to every disk at once. A single
+    # coefficient per class (rather than a full media x priority x field table) is what
+    # keeps the `iops = MB/s * 300` relationship above intact -- scaling bandwidth and IOPS
+    # by the same factor preserves the block size at which the IOPS cap starts to bind,
+    # whereas separate per-media IOPS values would break it on the first tuning pass.
+    media_scale:
+      nvme: 1.0        # the class `rate` was tuned against; NVMe behaviour is unchanged
+      sata_ssd: 0.6
+      mmc: 0.30        # eMMC/SD: ~50-100 MB/s sequential write
+      hdd: 0.25        # ~120 MB/s sequential, ~1-2 MB/s random
+      usb: 0.15        # USB 3 flash: ~20-40 MB/s write, USB 2 tops out near 30
+      unknown: 1.0    # same as nvme -- see disk_pressure_model above
+    # Minimum I/O an app must be doing ON A GIVEN DISK before capping it is worthwhile:
+    # throttling a light user cannot relieve the device. EITHER floor qualifies, because
+    # bandwidth alone would miss small-block random workloads, which move few MB but
+    # saturate the device on IOPS -- on an HDD the iops floor is the one that fires, on an
+    # NVMe usually the mb_s one.
+    #
+    # These are absolute, so they interact with contention: the more apps share a disk, the
+    # smaller each one's share and the less likely any of them clears the floor. Measured on
+    # a ~270 MB/s NVMe, 30 MB/s still catches the top app when up to ~9 apps are competing;
+    # raise these only if throttling fires on apps too light to be worth capping.
+    candidate_floor:
+      nvme:
+        mb_s: 30
+        iops: 2000
+      sata_ssd:
+        mb_s: 20
+        iops: 1200
+      mmc:
+        mb_s: 10
+        iops: 400
+      hdd:
+        mb_s: 5
+        iops: 60        # ~150 iops is a 7200 rpm disk's random ceiling
+      usb:
+        mb_s: 4
+        iops: 50
+      unknown:           # same as nvme
+        mb_s: 30
+        iops: 2000
 enable_network_control: false # Whether to enable network traffic control
 enable_network_pressure_shaping: false  # Whether to enable pressure-driven dynamic throttle/recover within network classes
 network_thresholds:

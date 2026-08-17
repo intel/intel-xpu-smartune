@@ -1,0 +1,540 @@
+Dropping page cache (needs sudo)...
+  PROFILE=device: engine=libaio direct=1 fsync=0 bs=4k jobs=16 iodepth=128 runtime=600s+600s
+  NOTE: this profile saturates the device but produces little task stall, so the gate may
+        stop at 'high'. Use PROFILE=stall to force it to critical.
+--------------------------------------------------------------------------------
+Three workloads run CONCURRENTLY (only together do they push the disk hard enough
+to matter), first a write phase and then a read phase over the same files.
+While running:
+  1. In the dashboard "Add App" wizard, register exactly TWO of them:
+       fio_hi   -> priority Critical   (never throttled)
+       fio_lo   -> priority Low        (throttled when disk IO hits critical)
+       fio_lo2  -> priority Low        (throttled when disk IO hits critical)
+  2. The [write]/[read] lines show each scope's live rd/wr MB/s and IOPS, tagged
+     free / CAP <n>. Once smartune throttles a scope its rate drops to the cap while
+     hi-io keeps running at full speed.
+  3. On exit (run end or Ctrl-C) ONE table covering both phases prints, followed by
+     pressure diagnostics explaining the outcome either way.
+     (Also: python3 balancer/test/psi_probe.py 600 1 \
+              --scope hi-io.scope,lo-io.scope,lo2-io.scope)
+--------------------------------------------------------------------------------
+
+===== phase 'write' (randwrite, 600s): hi-io (Critical), lo-io (Low), lo2-io (unregistered) =====
+Running as unit: lo-io.scope; invocation ID: e9bcfb87d44f49a0afe3875bf53f404b
+Running as unit: hi-io.scope; invocation ID: 7efd2e548f7c452f9bf6b9746ccff6b5
+Running as unit: lo2-io.scope; invocation ID: 292d0f9539104af9a042473f6a342a27
+hi: (g=0): rw=randwrite, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=libaio, iodepth=128
+lo2: (g=0): rw=randwrite, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=libaio, iodepth=128
+...
+lo: (g=0): rw=randwrite, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=libaio, iodepth=128
+...
+...
+fio-3.36
+fio-3.36
+fio-3.36
+Starting 16 processes
+Starting 16 processes
+Starting 16 processes
+lo2: Laying out IO file (1 file / 2048MiB)
+hi: Laying out IO file (1 file / 2048MiB)
+lo: Laying out IO file (1 file / 2048MiB)
+[write] hi-io[free]: rd=  0.0 wr=124.3 MB/s  rIOPS=     0 wIOPS= 31823 | lo-io[free]: rd=  0.0 wr=123.6 MB/s  rIOPS=     0 wIOPS= 31645 | lo2-io[free]: rd=  0.0 wr=115.3 MB/s  rIOPS=     0 wIOPS= 29525 
+[write] hi-io[free]: rd=  0.0 wr=170.0 MB/s  rIOPS=     0 wIOPS= 43530 | lo-io[free]: rd=  0.0 wr=169.9 MB/s  rIOPS=     0 wIOPS= 43484 | lo2-io[free]: rd=  0.0 wr=164.4 MB/s  rIOPS=     0 wIOPS= 42077 
+[write] hi-io[free]: rd=  0.0 wr=190.4 MB/s  rIOPS=     0 wIOPS= 48744 | lo-io[free]: rd=  0.0 wr=191.3 MB/s  rIOPS=     0 wIOPS= 48971 | lo2-io[free]: rd=  0.0 wr=191.7 MB/s  rIOPS=     0 wIOPS= 49074 
+[write] hi-io[free]: rd=  0.0 wr=197.6 MB/s  rIOPS=     0 wIOPS= 50597 | lo-io[free]: rd=  0.0 wr=196.1 MB/s  rIOPS=     0 wIOPS= 50197 | lo2-io[free]: rd=  0.0 wr=196.7 MB/s  rIOPS=     0 wIOPS= 50361 
+[write] hi-io[free]: rd=  0.0 wr=190.8 MB/s  rIOPS=     0 wIOPS= 48836 | lo-io[free]: rd=  0.0 wr=192.0 MB/s  rIOPS=     0 wIOPS= 49144 | lo2-io[free]: rd=  0.0 wr=192.0 MB/s  rIOPS=     0 wIOPS= 49152 
+[write] hi-io[free]: rd=  0.0 wr=190.2 MB/s  rIOPS=     0 wIOPS= 48687 | lo-io[free]: rd=  0.0 wr=188.8 MB/s  rIOPS=     0 wIOPS= 48320 | lo2-io[free]: rd=  0.0 wr=189.7 MB/s  rIOPS=     0 wIOPS= 48573 
+[write] hi-io[free]: rd=  0.0 wr=185.6 MB/s  rIOPS=     0 wIOPS= 47507 | lo-io[free]: rd=  0.0 wr=185.1 MB/s  rIOPS=     0 wIOPS= 47390 | lo2-io[free]: rd=  0.0 wr=184.1 MB/s  rIOPS=     0 wIOPS= 47131 
+[write] hi-io[free]: rd=  0.0 wr=193.6 MB/s  rIOPS=     0 wIOPS= 49569 | lo-io[free]: rd=  0.0 wr=193.9 MB/s  rIOPS=     0 wIOPS= 49633 | lo2-io[free]: rd=  0.0 wr=194.1 MB/s  rIOPS=     0 wIOPS= 49682 
+[write] hi-io[free]: rd=  0.0 wr=192.8 MB/s  rIOPS=     0 wIOPS= 49365 | lo-io[free]: rd=  0.0 wr=192.3 MB/s  rIOPS=     0 wIOPS= 49232 | lo2-io[free]: rd=  0.0 wr=191.9 MB/s  rIOPS=     0 wIOPS= 49129 
+[write] hi-io[free]: rd=  0.0 wr=188.0 MB/s  rIOPS=     0 wIOPS= 48116 | lo-io[free]: rd=  0.0 wr=187.8 MB/s  rIOPS=     0 wIOPS= 48068 | lo2-io[free]: rd=  0.0 wr=189.6 MB/s  rIOPS=     0 wIOPS= 48545 
+[write] hi-io[free]: rd=  0.0 wr=195.6 MB/s  rIOPS=     0 wIOPS= 50082 | lo-io[free]: rd=  0.0 wr=192.6 MB/s  rIOPS=     0 wIOPS= 49316 | lo2-io[free]: rd=  0.0 wr=193.8 MB/s  rIOPS=     0 wIOPS= 49605 
+[write] hi-io[free]: rd=  0.0 wr=194.0 MB/s  rIOPS=     0 wIOPS= 49674 | lo-io[free]: rd=  0.0 wr=196.4 MB/s  rIOPS=     0 wIOPS= 50288 | lo2-io[free]: rd=  0.0 wr=194.6 MB/s  rIOPS=     0 wIOPS= 49811 
+[write] hi-io[free]: rd=  0.0 wr=187.4 MB/s  rIOPS=     0 wIOPS= 47979 | lo-io[free]: rd=  0.0 wr=185.8 MB/s  rIOPS=     0 wIOPS= 47562 | lo2-io[free]: rd=  0.0 wr=184.9 MB/s  rIOPS=     0 wIOPS= 47338 
+[write] hi-io[free]: rd=  0.0 wr=234.8 MB/s  rIOPS=     0 wIOPS= 60119 | lo-io[CAP w20r30]: rd=  0.0 wr= 86.8 MB/s  rIOPS=     0 wIOPS= 22218 | lo2-io[free]: rd=  0.0 wr=240.0 MB/s  rIOPS=     0 wIOPS= 61432 
+[write] hi-io[free]: rd=  0.0 wr=273.7 MB/s  rIOPS=     0 wIOPS= 70056 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.8 MB/s  rIOPS=     0 wIOPS=  5325 | lo2-io[free]: rd=  0.0 wr=274.4 MB/s  rIOPS=     0 wIOPS= 70237 
+[write] hi-io[free]: rd=  0.0 wr=458.1 MB/s  rIOPS=     0 wIOPS=117272 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 | lo2-io[CAP w20r30]: rd=  0.0 wr= 93.3 MB/s  rIOPS=     0 wIOPS= 23893 
+[write] hi-io[free]: rd=  0.0 wr=537.3 MB/s  rIOPS=     0 wIOPS=137556 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.6 MB/s  rIOPS=     0 wIOPS=  5275 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 
+[write] hi-io[free]: rd=  0.0 wr=530.0 MB/s  rIOPS=     0 wIOPS=135692 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.6 MB/s  rIOPS=     0 wIOPS=  5272 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.8 MB/s  rIOPS=     0 wIOPS=  5325 
+[write] hi-io[free]: rd=  0.0 wr=527.3 MB/s  rIOPS=     0 wIOPS=134979 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.8 MB/s  rIOPS=     0 wIOPS=  5325 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.8 MB/s  rIOPS=     0 wIOPS=  5325 
+[write] hi-io[free]: rd=  0.0 wr=541.5 MB/s  rIOPS=     0 wIOPS=138618 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.8 MB/s  rIOPS=     0 wIOPS=  5325 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 
+[write] hi-io[free]: rd=  0.0 wr=532.0 MB/s  rIOPS=     0 wIOPS=136185 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.7 MB/s  rIOPS=     0 wIOPS=  5297 
+[write] hi-io[free]: rd=  0.0 wr=540.7 MB/s  rIOPS=     0 wIOPS=138407 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5224 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.5 MB/s  rIOPS=     0 wIOPS=  5250 
+[write] hi-io[free]: rd=  0.0 wr=538.6 MB/s  rIOPS=     0 wIOPS=137889 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.8 MB/s  rIOPS=     0 wIOPS=  5323 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.7 MB/s  rIOPS=     0 wIOPS=  5301 
+[write] hi-io[free]: rd=  0.0 wr=529.5 MB/s  rIOPS=     0 wIOPS=135546 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.5 MB/s  rIOPS=     0 wIOPS=  5246 
+[write] hi-io[free]: rd=  0.0 wr=535.6 MB/s  rIOPS=     0 wIOPS=137125 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.6 MB/s  rIOPS=     0 wIOPS=  5281 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 
+[write] hi-io[free]: rd=  0.0 wr=536.3 MB/s  rIOPS=     0 wIOPS=137302 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.6 MB/s  rIOPS=     0 wIOPS=  5266 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.8 MB/s  rIOPS=     0 wIOPS=  5325 
+[write] hi-io[free]: rd=  0.0 wr=538.0 MB/s  rIOPS=     0 wIOPS=137721 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.5 MB/s  rIOPS=     0 wIOPS=  5248 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 
+[write] hi-io[free]: rd=  0.0 wr=539.4 MB/s  rIOPS=     0 wIOPS=138085 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.7 MB/s  rIOPS=     0 wIOPS=  5299 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.8 MB/s  rIOPS=     0 wIOPS=  5325 
+[write] hi-io[free]: rd=  0.0 wr=537.5 MB/s  rIOPS=     0 wIOPS=137600 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.5 MB/s  rIOPS=     0 wIOPS=  5251 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 
+[write] hi-io[free]: rd=  0.0 wr=538.5 MB/s  rIOPS=     0 wIOPS=137850 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.7 MB/s  rIOPS=     0 wIOPS=  5296 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.8 MB/s  rIOPS=     0 wIOPS=  5319 
+[write] hi-io[free]: rd=  0.0 wr=523.4 MB/s  rIOPS=     0 wIOPS=134001 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5228 
+[write] hi-io[free]: rd=  0.0 wr=538.9 MB/s  rIOPS=     0 wIOPS=137947 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.8 MB/s  rIOPS=     0 wIOPS=  5325 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.6 MB/s  rIOPS=     0 wIOPS=  5264 
+[write] hi-io[free]: rd=  0.0 wr=539.9 MB/s  rIOPS=     0 wIOPS=138208 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.6 MB/s  rIOPS=     0 wIOPS=  5283 
+[write] hi-io[free]: rd=  0.0 wr=540.0 MB/s  rIOPS=     0 wIOPS=138252 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.8 MB/s  rIOPS=     0 wIOPS=  5325 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 
+[write] hi-io[free]: rd=  0.0 wr=457.0 MB/s  rIOPS=     0 wIOPS=116987 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.6 MB/s  rIOPS=     0 wIOPS=  5285 
+[write] hi-io[free]: rd=  0.0 wr=357.4 MB/s  rIOPS=     0 wIOPS= 91494 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5222 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.6 MB/s  rIOPS=     0 wIOPS=  5262 
+[write] hi-io[free]: rd=  0.0 wr=307.1 MB/s  rIOPS=     0 wIOPS= 78612 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.4 MB/s  rIOPS=     0 wIOPS=  4710 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.5 MB/s  rIOPS=     0 wIOPS=  4724 
+[write] hi-io[free]: rd=  0.0 wr=252.0 MB/s  rIOPS=     0 wIOPS= 64510 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.5 MB/s  rIOPS=     0 wIOPS=  5003 | lo2-io[CAP w20r30]: rd=  0.0 wr= 19.1 MB/s  rIOPS=     0 wIOPS=  4884 
+[write] hi-io[free]: rd=  0.0 wr=249.7 MB/s  rIOPS=     0 wIOPS= 63928 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.0 MB/s  rIOPS=     0 wIOPS=  4614 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.4 MB/s  rIOPS=     0 wIOPS=  4705 
+[write] hi-io[free]: rd=  0.0 wr=209.0 MB/s  rIOPS=     0 wIOPS= 53507 | lo-io[CAP w20r30]: rd=  0.0 wr= 16.6 MB/s  rIOPS=     0 wIOPS=  4250 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.4 MB/s  rIOPS=     0 wIOPS=  4455 
+[write] hi-io[free]: rd=  0.0 wr=203.0 MB/s  rIOPS=     0 wIOPS= 51969 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.3 MB/s  rIOPS=     0 wIOPS=  4436 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.8 MB/s  rIOPS=     0 wIOPS=  4568 
+[write] hi-io[free]: rd=  0.0 wr=253.8 MB/s  rIOPS=     0 wIOPS= 64972 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.1 MB/s  rIOPS=     0 wIOPS=  4893 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.5 MB/s  rIOPS=     0 wIOPS=  4746 
+[write] hi-io[free]: rd=  0.0 wr=183.0 MB/s  rIOPS=     0 wIOPS= 46844 | lo-io[CAP w20r30]: rd=  0.0 wr= 15.5 MB/s  rIOPS=     0 wIOPS=  3976 | lo2-io[CAP w20r30]: rd=  0.0 wr= 15.5 MB/s  rIOPS=     0 wIOPS=  3973 
+[write] hi-io[free]: rd=  0.0 wr=306.6 MB/s  rIOPS=     0 wIOPS= 78486 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.7 MB/s  rIOPS=     0 wIOPS=  5301 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.7 MB/s  rIOPS=     0 wIOPS=  5291 
+[write] hi-io[free]: rd=  0.0 wr=249.6 MB/s  rIOPS=     0 wIOPS= 63885 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.7 MB/s  rIOPS=     0 wIOPS=  4797 | lo2-io[CAP w20r30]: rd=  0.0 wr= 19.1 MB/s  rIOPS=     0 wIOPS=  4893 
+[write] hi-io[free]: rd=  0.0 wr=259.6 MB/s  rIOPS=     0 wIOPS= 66466 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.6 MB/s  rIOPS=     0 wIOPS=  4760 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.0 MB/s  rIOPS=     0 wIOPS=  4620 
+[write] hi-io[free]: rd=  0.0 wr=199.5 MB/s  rIOPS=     0 wIOPS= 51081 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.1 MB/s  rIOPS=     0 wIOPS=  4630 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.3 MB/s  rIOPS=     0 wIOPS=  4677 
+[write] hi-io[free]: rd=  0.0 wr=240.4 MB/s  rIOPS=     0 wIOPS= 61534 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.7 MB/s  rIOPS=     0 wIOPS=  4527 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.7 MB/s  rIOPS=     0 wIOPS=  4541 
+[write] hi-io[free]: rd=  0.0 wr=266.3 MB/s  rIOPS=     0 wIOPS= 68165 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.5 MB/s  rIOPS=     0 wIOPS=  4998 | lo2-io[CAP w20r30]: rd=  0.0 wr= 19.3 MB/s  rIOPS=     0 wIOPS=  4942 
+[write] hi-io[free]: rd=  0.0 wr=225.6 MB/s  rIOPS=     0 wIOPS= 57758 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.1 MB/s  rIOPS=     0 wIOPS=  4623 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.0 MB/s  rIOPS=     0 wIOPS=  4612 
+[write] hi-io[free]: rd=  0.0 wr=214.2 MB/s  rIOPS=     0 wIOPS= 54831 | lo-io[CAP w20r30]: rd=  0.0 wr= 16.4 MB/s  rIOPS=     0 wIOPS=  4206 | lo2-io[CAP w20r30]: rd=  0.0 wr= 16.9 MB/s  rIOPS=     0 wIOPS=  4334 
+[write] hi-io[free]: rd=  0.0 wr=268.0 MB/s  rIOPS=     0 wIOPS= 68613 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.1 MB/s  rIOPS=     0 wIOPS=  4900 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.6 MB/s  rIOPS=     0 wIOPS=  4772 
+[write] hi-io[free]: rd=  0.0 wr=218.5 MB/s  rIOPS=     0 wIOPS= 55944 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.5 MB/s  rIOPS=     0 wIOPS=  4477 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.7 MB/s  rIOPS=     0 wIOPS=  4542 
+[write] hi-io[free]: rd=  0.0 wr=230.7 MB/s  rIOPS=     0 wIOPS= 59056 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.3 MB/s  rIOPS=     0 wIOPS=  4434 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.1 MB/s  rIOPS=     0 wIOPS=  4371 
+[write] hi-io[free]: rd=  0.0 wr=256.2 MB/s  rIOPS=     0 wIOPS= 65587 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.9 MB/s  rIOPS=     0 wIOPS=  5338 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.9 MB/s  rIOPS=     0 wIOPS=  5340 
+[write] hi-io[free]: rd=  0.0 wr=290.2 MB/s  rIOPS=     0 wIOPS= 74285 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.5 MB/s  rIOPS=     0 wIOPS=  5260 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.7 MB/s  rIOPS=     0 wIOPS=  5295 
+[write] hi-io[free]: rd=  0.0 wr=191.7 MB/s  rIOPS=     0 wIOPS= 49073 | lo-io[CAP w20r30]: rd=  0.0 wr= 15.5 MB/s  rIOPS=     0 wIOPS=  3976 | lo2-io[CAP w20r30]: rd=  0.0 wr= 16.1 MB/s  rIOPS=     0 wIOPS=  4127 
+[write] hi-io[free]: rd=  0.0 wr=212.1 MB/s  rIOPS=     0 wIOPS= 54286 | lo-io[CAP w20r30]: rd=  0.0 wr= 16.8 MB/s  rIOPS=     0 wIOPS=  4295 | lo2-io[CAP w20r30]: rd=  0.0 wr= 16.8 MB/s  rIOPS=     0 wIOPS=  4292 
+[write] hi-io[free]: rd=  0.0 wr=278.8 MB/s  rIOPS=     0 wIOPS= 71380 | lo-io[CAP w20r30]: rd=  0.0 wr= 21.1 MB/s  rIOPS=     0 wIOPS=  5389 | lo2-io[CAP w20r30]: rd=  0.0 wr= 21.0 MB/s  rIOPS=     0 wIOPS=  5383 
+[write] hi-io[free]: rd=  0.0 wr=247.0 MB/s  rIOPS=     0 wIOPS= 63221 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.6 MB/s  rIOPS=     0 wIOPS=  5023 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.0 MB/s  rIOPS=     0 wIOPS=  5115 
+[write] hi-io[free]: rd=  0.0 wr=265.0 MB/s  rIOPS=     0 wIOPS= 67845 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.1 MB/s  rIOPS=     0 wIOPS=  4888 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.5 MB/s  rIOPS=     0 wIOPS=  4737 
+[write] hi-io[free]: rd=  0.0 wr=193.2 MB/s  rIOPS=     0 wIOPS= 49457 | lo-io[CAP w20r30]: rd=  0.0 wr= 14.5 MB/s  rIOPS=     0 wIOPS=  3722 | lo2-io[CAP w20r30]: rd=  0.0 wr= 14.6 MB/s  rIOPS=     0 wIOPS=  3734 
+[write] hi-io[free]: rd=  0.0 wr=203.2 MB/s  rIOPS=     0 wIOPS= 52031 | lo-io[CAP w20r30]: rd=  0.0 wr= 15.6 MB/s  rIOPS=     0 wIOPS=  3999 | lo2-io[CAP w20r30]: rd=  0.0 wr= 15.8 MB/s  rIOPS=     0 wIOPS=  4048 
+[write] hi-io[free]: rd=  0.0 wr=304.0 MB/s  rIOPS=     0 wIOPS= 77818 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5227 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5233 
+[write] hi-io[free]: rd=  0.0 wr=304.9 MB/s  rIOPS=     0 wIOPS= 78051 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.3 MB/s  rIOPS=     0 wIOPS=  5187 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.2 MB/s  rIOPS=     0 wIOPS=  5167 
+[write] hi-io[free]: rd=  0.0 wr=170.4 MB/s  rIOPS=     0 wIOPS= 43623 | lo-io[CAP w20r30]: rd=  0.0 wr= 16.7 MB/s  rIOPS=     0 wIOPS=  4264 | lo2-io[CAP w20r30]: rd=  0.0 wr= 16.7 MB/s  rIOPS=     0 wIOPS=  4275 
+[write] hi-io[free]: rd=  0.0 wr=219.7 MB/s  rIOPS=     0 wIOPS= 56235 | lo-io[CAP w20r30]: rd=  0.0 wr= 16.0 MB/s  rIOPS=     0 wIOPS=  4095 | lo2-io[CAP w20r30]: rd=  0.0 wr= 15.8 MB/s  rIOPS=     0 wIOPS=  4045 
+[write] hi-io[free]: rd=  0.0 wr=217.4 MB/s  rIOPS=     0 wIOPS= 55655 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.4 MB/s  rIOPS=     0 wIOPS=  4444 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.7 MB/s  rIOPS=     0 wIOPS=  4782 
+[write] hi-io[free]: rd=  0.0 wr=230.0 MB/s  rIOPS=     0 wIOPS= 58891 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.5 MB/s  rIOPS=     0 wIOPS=  4479 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.2 MB/s  rIOPS=     0 wIOPS=  4648 
+[write] hi-io[free]: rd=  0.0 wr=187.5 MB/s  rIOPS=     0 wIOPS= 48009 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.1 MB/s  rIOPS=     0 wIOPS=  4641 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.6 MB/s  rIOPS=     0 wIOPS=  4494 
+[write] hi-io[free]: rd=  0.0 wr=312.2 MB/s  rIOPS=     0 wIOPS= 79913 | lo-io[CAP w20r30]: rd=  0.0 wr= 21.4 MB/s  rIOPS=     0 wIOPS=  5476 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.7 MB/s  rIOPS=     0 wIOPS=  5296 
+[write] hi-io[free]: rd=  0.0 wr=257.9 MB/s  rIOPS=     0 wIOPS= 66011 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.7 MB/s  rIOPS=     0 wIOPS=  4536 | lo2-io[CAP w20r30]: rd=  0.0 wr= 19.2 MB/s  rIOPS=     0 wIOPS=  4928 
+[write] hi-io[free]: rd=  0.0 wr=266.2 MB/s  rIOPS=     0 wIOPS= 68150 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.1 MB/s  rIOPS=     0 wIOPS=  4625 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.9 MB/s  rIOPS=     0 wIOPS=  4837 
+[write] hi-io[free]: rd=  0.0 wr=226.4 MB/s  rIOPS=     0 wIOPS= 57963 | lo-io[CAP w20r30]: rd=  0.0 wr= 16.7 MB/s  rIOPS=     0 wIOPS=  4281 | lo2-io[CAP w20r30]: rd=  0.0 wr= 16.8 MB/s  rIOPS=     0 wIOPS=  4293 
+[write] hi-io[free]: rd=  0.0 wr=187.7 MB/s  rIOPS=     0 wIOPS= 48054 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.1 MB/s  rIOPS=     0 wIOPS=  4375 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.0 MB/s  rIOPS=     0 wIOPS=  4363 
+[write] hi-io[free]: rd=  0.0 wr=226.2 MB/s  rIOPS=     0 wIOPS= 57907 | lo-io[CAP w20r30]: rd=  0.0 wr= 15.9 MB/s  rIOPS=     0 wIOPS=  4077 | lo2-io[CAP w20r30]: rd=  0.0 wr= 15.7 MB/s  rIOPS=     0 wIOPS=  4026 
+[write] hi-io[free]: rd=  0.0 wr=206.7 MB/s  rIOPS=     0 wIOPS= 52913 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.5 MB/s  rIOPS=     0 wIOPS=  4489 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.7 MB/s  rIOPS=     0 wIOPS=  4542 
+[write] hi-io[free]: rd=  0.0 wr=297.2 MB/s  rIOPS=     0 wIOPS= 76090 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.5 MB/s  rIOPS=     0 wIOPS=  5240 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.5 MB/s  rIOPS=     0 wIOPS=  5250 
+[write] hi-io[free]: rd=  0.0 wr=252.2 MB/s  rIOPS=     0 wIOPS= 64560 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.0 MB/s  rIOPS=     0 wIOPS=  4857 | lo2-io[CAP w20r30]: rd=  0.0 wr= 19.0 MB/s  rIOPS=     0 wIOPS=  4867 
+[write] hi-io[free]: rd=  0.0 wr=217.2 MB/s  rIOPS=     0 wIOPS= 55595 | lo-io[CAP w20r30]: rd=  0.0 wr= 16.5 MB/s  rIOPS=     0 wIOPS=  4228 | lo2-io[CAP w20r30]: rd=  0.0 wr= 16.6 MB/s  rIOPS=     0 wIOPS=  4252 
+[write] hi-io[free]: rd=  0.0 wr=219.3 MB/s  rIOPS=     0 wIOPS= 56147 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.1 MB/s  rIOPS=     0 wIOPS=  4893 | lo2-io[CAP w20r30]: rd=  0.0 wr= 19.1 MB/s  rIOPS=     0 wIOPS=  4883 
+[write] hi-io[free]: rd=  0.0 wr=233.3 MB/s  rIOPS=     0 wIOPS= 59737 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.3 MB/s  rIOPS=     0 wIOPS=  4930 | lo2-io[CAP w20r30]: rd=  0.0 wr= 19.6 MB/s  rIOPS=     0 wIOPS=  5005 
+[write] hi-io[free]: rd=  0.0 wr=233.8 MB/s  rIOPS=     0 wIOPS= 59840 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.4 MB/s  rIOPS=     0 wIOPS=  4721 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.9 MB/s  rIOPS=     0 wIOPS=  4591 
+[write] hi-io[free]: rd=  0.0 wr=245.0 MB/s  rIOPS=     0 wIOPS= 62726 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.5 MB/s  rIOPS=     0 wIOPS=  4994 | lo2-io[CAP w20r30]: rd=  0.0 wr= 19.8 MB/s  rIOPS=     0 wIOPS=  5078 
+[write] hi-io[free]: rd=  0.0 wr=227.3 MB/s  rIOPS=     0 wIOPS= 58190 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.6 MB/s  rIOPS=     0 wIOPS=  5012 | lo2-io[CAP w20r30]: rd=  0.0 wr= 19.4 MB/s  rIOPS=     0 wIOPS=  4958 
+[write] hi-io[free]: rd=  0.0 wr=190.6 MB/s  rIOPS=     0 wIOPS= 48803 | lo-io[CAP w20r30]: rd=  0.0 wr= 16.9 MB/s  rIOPS=     0 wIOPS=  4314 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.1 MB/s  rIOPS=     0 wIOPS=  4371 
+[write] hi-io[free]: rd=  0.0 wr=177.9 MB/s  rIOPS=     0 wIOPS= 45535 | lo-io[CAP w20r30]: rd=  0.0 wr= 15.3 MB/s  rIOPS=     0 wIOPS=  3929 | lo2-io[CAP w20r30]: rd=  0.0 wr= 15.4 MB/s  rIOPS=     0 wIOPS=  3931 
+[write] hi-io[free]: rd=  0.0 wr=235.1 MB/s  rIOPS=     0 wIOPS= 60191 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.6 MB/s  rIOPS=     0 wIOPS=  4767 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.7 MB/s  rIOPS=     0 wIOPS=  4785 
+[write] hi-io[free]: rd=  0.0 wr=230.8 MB/s  rIOPS=     0 wIOPS= 59085 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.0 MB/s  rIOPS=     0 wIOPS=  4604 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.9 MB/s  rIOPS=     0 wIOPS=  4595 
+[write] hi-io[free]: rd=  0.0 wr=201.0 MB/s  rIOPS=     0 wIOPS= 51447 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.7 MB/s  rIOPS=     0 wIOPS=  4535 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.8 MB/s  rIOPS=     0 wIOPS=  4548 
+[write] hi-io[free]: rd=  0.0 wr=225.9 MB/s  rIOPS=     0 wIOPS= 57829 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.0 MB/s  rIOPS=     0 wIOPS=  4619 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.9 MB/s  rIOPS=     0 wIOPS=  4571 
+[write] hi-io[free]: rd=  0.0 wr=213.2 MB/s  rIOPS=     0 wIOPS= 54568 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.6 MB/s  rIOPS=     0 wIOPS=  4771 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.5 MB/s  rIOPS=     0 wIOPS=  4747 
+[write] hi-io[free]: rd=  0.0 wr=222.2 MB/s  rIOPS=     0 wIOPS= 56879 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.0 MB/s  rIOPS=     0 wIOPS=  4347 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.1 MB/s  rIOPS=     0 wIOPS=  4372 
+[write] hi-io[free]: rd=  0.0 wr=255.7 MB/s  rIOPS=     0 wIOPS= 65468 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.9 MB/s  rIOPS=     0 wIOPS=  5099 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.0 MB/s  rIOPS=     0 wIOPS=  5120 
+[write] hi-io[free]: rd=  0.0 wr=258.6 MB/s  rIOPS=     0 wIOPS= 66214 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.7 MB/s  rIOPS=     0 wIOPS=  4777 | lo2-io[CAP w20r30]: rd=  0.0 wr= 19.1 MB/s  rIOPS=     0 wIOPS=  4895 
+[write] hi-io[free]: rd=  0.0 wr=289.6 MB/s  rIOPS=     0 wIOPS= 74131 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.9 MB/s  rIOPS=     0 wIOPS=  5359 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.3 MB/s  rIOPS=     0 wIOPS=  5186 
+[write] hi-io[free]: rd=  0.0 wr=164.9 MB/s  rIOPS=     0 wIOPS= 42211 | lo-io[CAP w20r30]: rd=  0.0 wr= 16.5 MB/s  rIOPS=     0 wIOPS=  4231 | lo2-io[CAP w20r30]: rd=  0.0 wr= 16.7 MB/s  rIOPS=     0 wIOPS=  4269 
+[write] hi-io[free]: rd=  0.0 wr=202.0 MB/s  rIOPS=     0 wIOPS= 51701 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.4 MB/s  rIOPS=     0 wIOPS=  4443 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.4 MB/s  rIOPS=     0 wIOPS=  4454 
+[write] hi-io[free]: rd=  0.0 wr=211.1 MB/s  rIOPS=     0 wIOPS= 54048 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.3 MB/s  rIOPS=     0 wIOPS=  4694 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.4 MB/s  rIOPS=     0 wIOPS=  4709 
+[write] hi-io[free]: rd=  0.0 wr=272.8 MB/s  rIOPS=     0 wIOPS= 69833 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.0 MB/s  rIOPS=     0 wIOPS=  4866 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.9 MB/s  rIOPS=     0 wIOPS=  4830 
+[write] hi-io[free]: rd=  0.0 wr=207.2 MB/s  rIOPS=     0 wIOPS= 53056 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.5 MB/s  rIOPS=     0 wIOPS=  4738 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.4 MB/s  rIOPS=     0 wIOPS=  4715 
+[write] hi-io[free]: rd=  0.0 wr=177.8 MB/s  rIOPS=     0 wIOPS= 45506 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.8 MB/s  rIOPS=     0 wIOPS=  4548 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.0 MB/s  rIOPS=     0 wIOPS=  4610 
+[write] hi-io[free]: rd=  0.0 wr=232.0 MB/s  rIOPS=     0 wIOPS= 59384 | lo-io[CAP w20r30]: rd=  0.0 wr= 16.9 MB/s  rIOPS=     0 wIOPS=  4317 | lo2-io[CAP w20r30]: rd=  0.0 wr= 16.7 MB/s  rIOPS=     0 wIOPS=  4284 
+[write] hi-io[free]: rd=  0.0 wr=273.1 MB/s  rIOPS=     0 wIOPS= 69923 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.5 MB/s  rIOPS=     0 wIOPS=  5257 | lo2-io[CAP w20r30]: rd=  0.0 wr= 20.4 MB/s  rIOPS=     0 wIOPS=  5223 
+[write] hi-io[free]: rd=  0.0 wr=185.7 MB/s  rIOPS=     0 wIOPS= 47536 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.4 MB/s  rIOPS=     0 wIOPS=  4465 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.8 MB/s  rIOPS=     0 wIOPS=  4549 
+[write] hi-io[free]: rd=  0.0 wr=259.9 MB/s  rIOPS=     0 wIOPS= 66525 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.6 MB/s  rIOPS=     0 wIOPS=  4753 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.5 MB/s  rIOPS=     0 wIOPS=  4724 
+[write] hi-io[free]: rd=  0.0 wr=249.9 MB/s  rIOPS=     0 wIOPS= 63972 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.3 MB/s  rIOPS=     0 wIOPS=  4679 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.0 MB/s  rIOPS=     0 wIOPS=  4617 
+[write] hi-io[free]: rd=  0.0 wr=236.8 MB/s  rIOPS=     0 wIOPS= 60611 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.3 MB/s  rIOPS=     0 wIOPS=  4696 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.6 MB/s  rIOPS=     0 wIOPS=  4758 
+[write] hi-io[free]: rd=  0.0 wr=168.2 MB/s  rIOPS=     0 wIOPS= 43047 | lo-io[CAP w20r30]: rd=  0.0 wr= 16.7 MB/s  rIOPS=     0 wIOPS=  4281 | lo2-io[CAP w20r30]: rd=  0.0 wr= 16.5 MB/s  rIOPS=     0 wIOPS=  4230 
+[write] hi-io[free]: rd=  0.0 wr=214.9 MB/s  rIOPS=     0 wIOPS= 55007 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.5 MB/s  rIOPS=     0 wIOPS=  4743 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.5 MB/s  rIOPS=     0 wIOPS=  4738 
+[write] hi-io[free]: rd=  0.0 wr=244.5 MB/s  rIOPS=     0 wIOPS= 62588 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.8 MB/s  rIOPS=     0 wIOPS=  4820 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.8 MB/s  rIOPS=     0 wIOPS=  4817 
+[write] hi-io[free]: rd=  0.0 wr=165.9 MB/s  rIOPS=     0 wIOPS= 42465 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.6 MB/s  rIOPS=     0 wIOPS=  4507 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.7 MB/s  rIOPS=     0 wIOPS=  4530 
+[write] hi-io[free]: rd=  0.0 wr=199.5 MB/s  rIOPS=     0 wIOPS= 51061 | lo-io[CAP w20r30]: rd=  0.0 wr= 17.7 MB/s  rIOPS=     0 wIOPS=  4542 | lo2-io[CAP w20r30]: rd=  0.0 wr= 17.9 MB/s  rIOPS=     0 wIOPS=  4588 
+[write] hi-io[free]: rd=  0.0 wr=255.2 MB/s  rIOPS=     0 wIOPS= 65328 | lo-io[CAP w20r30]: rd=  0.0 wr= 20.1 MB/s  rIOPS=     0 wIOPS=  5149 | lo2-io[CAP w20r30]: rd=  0.0 wr= 19.7 MB/s  rIOPS=     0 wIOPS=  5033 
+[write] hi-io[free]: rd=  0.0 wr=235.1 MB/s  rIOPS=     0 wIOPS= 60189 | lo-io[CAP w20r30]: rd=  0.0 wr= 18.3 MB/s  rIOPS=     0 wIOPS=  4693 | lo2-io[CAP w20r30]: rd=  0.0 wr= 18.5 MB/s  rIOPS=     0 wIOPS=  4741 
+[write] hi-io[free]: rd=  0.0 wr=296.4 MB/s  rIOPS=     0 wIOPS= 75870 | lo-io[CAP w20r30]: rd=  0.0 wr= 19.1 MB/s  rIOPS=     0 wIOPS=  4877 | lo2-io[CAP w20r30]: rd=  0.0 wr= 19.1 MB/s  rIOPS=     0 wIOPS=  4891 
+Jobs: 16 (f=16): [w(16)][100.0%][w=22.6MiB/s][w=5791 IOPS][eta 00m:00s]
+hi: (groupid=0, jobs=16): err= 0: pid=684692: Mon Aug 17 18:06:32 2026
+  write: IOPS=69.6k, BW=272MiB/s (285MB/s)(159GiB/600036msec); 0 zone resets
+    slat (nsec): min=1216, max=948493k, avg=30403.39, stdev=1036040.93
+    clat (nsec): min=1389, max=1255.7M, avg=29388002.20, stdev=52684743.59
+     lat (usec): min=24, max=1264.1k, avg=29418.41, stdev=52708.20
+    clat percentiles (usec):
+     |  1.00th=[   660],  5.00th=[  1532], 10.00th=[  2769], 20.00th=[  5669],
+     | 30.00th=[  9110], 40.00th=[ 13042], 50.00th=[ 17957], 60.00th=[ 24511],
+     | 70.00th=[ 32900], 80.00th=[ 40633], 90.00th=[ 54264], 95.00th=[ 63701],
+     | 99.00th=[295699], 99.50th=[421528], 99.90th=[624952], 99.95th=[708838],
+     | 99.99th=[851444]
+   bw (  KiB/s): min= 2824, max=663434, per=100.00%, avg=278886.25, stdev=9592.84, samples=19152
+   iops        : min=  706, max=165858, avg=69720.94, stdev=2398.22, samples=19152
+  lat (usec)   : 2=0.01%, 4=0.01%, 10=0.01%, 20=0.01%, 50=0.01%
+  lat (usec)   : 100=0.01%, 250=0.01%, 500=0.38%, 750=1.03%, 1000=1.21%
+  lat (msec)   : 2=4.39%, 4=7.39%, 10=18.12%, 20=21.06%, 50=33.54%
+  lat (msec)   : 100=10.43%, 250=1.15%, 500=1.05%, 750=0.23%, 1000=0.03%
+  lat (msec)   : 2000=0.01%
+  cpu          : usr=1.50%, sys=4.38%, ctx=19818289, majf=0, minf=202
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=0.1%, >=64=100.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.1%
+     issued rwts: total=0,41769248,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=128
+
+Run status group 0 (all jobs):
+  WRITE: bw=272MiB/s (285MB/s), 272MiB/s-272MiB/s (285MB/s-285MB/s), io=159GiB (171GB), run=600036-600036msec
+
+Disk stats (read/write):
+  nvme0n1: ios=2826/53653339, sectors=119864/430710192, merge=740/180635, ticks=84867/1829716442, in_queue=1829813825, util=84.38%
+
+lo2: (groupid=0, jobs=16): err= 0: pid=684689: Mon Aug 17 18:06:32 2026
+  write: IOPS=10.4k, BW=40.7MiB/s (42.7MB/s)(23.8GiB/600137msec); 0 zone resets
+    slat (nsec): min=759, max=426804k, avg=75483.08, stdev=1765190.20
+    clat (nsec): min=702, max=1996.1M, avg=196597850.79, stdev=257005852.47
+     lat (usec): min=20, max=1996.1k, avg=196673.33, stdev=256980.06
+    clat percentiles (msec):
+     |  1.00th=[    5],  5.00th=[   20], 10.00th=[   32], 20.00th=[   38],
+     | 30.00th=[   40], 40.00th=[   42], 50.00th=[   48], 60.00th=[   60],
+     | 70.00th=[  334], 80.00th=[  384], 90.00th=[  426], 95.00th=[  760],
+     | 99.00th=[ 1150], 99.50th=[ 1234], 99.90th=[ 1552], 99.95th=[ 1687],
+     | 99.99th=[ 1972]
+   bw (  KiB/s): min=  160, max=292328, per=100.00%, avg=41924.21, stdev=3815.91, samples=19065
+   iops        : min=   40, max=73082, avg=10479.85, stdev=953.99, samples=19065
+  lat (nsec)   : 750=0.01%
+  lat (usec)   : 2=0.01%, 4=0.01%, 20=0.01%, 50=0.01%, 100=0.01%
+  lat (usec)   : 250=0.01%, 500=0.03%, 750=0.06%, 1000=0.05%
+  lat (msec)   : 2=0.22%, 4=0.47%, 10=1.58%, 20=2.88%, 50=46.94%
+  lat (msec)   : 100=11.95%, 250=1.66%, 500=25.93%, 750=3.09%, 1000=2.94%
+  lat (msec)   : 2000=2.19%
+  cpu          : usr=0.34%, sys=0.82%, ctx=4158818, majf=0, minf=180
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=0.1%, >=64=100.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.1%
+     issued rwts: total=0,6249096,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=128
+
+Run status group 0 (all jobs):
+  WRITE: bw=40.7MiB/s (42.7MB/s), 40.7MiB/s-40.7MiB/s (42.7MB/s-42.7MB/s), io=23.8GiB (25.6GB), run=600137-600137msec
+
+Disk stats (read/write):
+  nvme0n1: ios=2826/53664203, sectors=119864/430797104, merge=740/180635, ticks=84867/1829991995, in_queue=1830089378, util=84.38%
+
+lo: (groupid=0, jobs=16): err= 0: pid=684688: Mon Aug 17 18:06:32 2026
+  write: IOPS=9403, BW=36.7MiB/s (38.5MB/s)(21.5GiB/600205msec); 0 zone resets
+    slat (nsec): min=731, max=424510k, avg=79092.68, stdev=1726917.35
+    clat (nsec): min=998, max=1995.9M, avg=217678069.49, stdev=264444567.38
+     lat (usec): min=20, max=1995.9k, avg=217757.16, stdev=264412.87
+    clat percentiles (msec):
+     |  1.00th=[    9],  5.00th=[   29], 10.00th=[   37], 20.00th=[   39],
+     | 30.00th=[   41], 40.00th=[   44], 50.00th=[   53], 60.00th=[  122],
+     | 70.00th=[  355], 80.00th=[  393], 90.00th=[  447], 95.00th=[  793],
+     | 99.00th=[ 1167], 99.50th=[ 1250], 99.90th=[ 1569], 99.95th=[ 1703],
+     | 99.99th=[ 1972]
+   bw (  KiB/s): min=  136, max=235839, per=100.00%, avg=37835.39, stdev=3356.99, samples=19080
+   iops        : min=   34, max=58959, avg=9457.98, stdev=839.25, samples=19080
+  lat (nsec)   : 1000=0.01%
+  lat (usec)   : 2=0.01%, 4=0.01%, 10=0.01%, 20=0.01%, 50=0.01%
+  lat (usec)   : 100=0.01%, 250=0.01%, 500=0.02%, 750=0.03%, 1000=0.03%
+  lat (msec)   : 2=0.11%, 4=0.24%, 10=0.87%, 20=1.87%, 50=43.57%
+  lat (msec)   : 100=12.74%, 250=1.85%, 500=29.56%, 750=3.43%, 1000=3.24%
+  lat (msec)   : 2000=2.43%
+  cpu          : usr=0.31%, sys=0.75%, ctx=3783536, majf=0, minf=169
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=0.1%, >=64=100.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.1%
+     issued rwts: total=0,5644128,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=128
+
+Run status group 0 (all jobs):
+  WRITE: bw=36.7MiB/s (38.5MB/s), 36.7MiB/s-36.7MiB/s (38.5MB/s-38.5MB/s), io=21.5GiB (23.1GB), run=600205-600205msec
+
+Disk stats (read/write):
+  nvme0n1: ios=2826/53664132, sectors=119864/430796544, merge=740/180635, ticks=84867/1829990223, in_queue=1830087606, util=84.37%
+Dropping page cache before the read phase (needs sudo)...
+
+===== phase 'read' (randread, 600s): hi-io (Critical), lo-io (Low), lo2-io (unregistered) =====
+Running as unit: lo2-io.scope; invocation ID: b8398845c5e64ab88841b11fabdc8084
+Running as unit: hi-io.scope; invocation ID: 7dda3eee3c044a0c8287767f1ddaf7f4
+Running as unit: lo-io.scope; invocation ID: 49b3acd79219405a887bd2d43cc5f90c
+lo2: (g=0): rw=randread, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=libaio, iodepth=128
+hi: (g=0): rw=randread, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=libaio, iodepth=128
+...
+lo: (g=0): rw=randread, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=libaio, iodepth=128
+...
+fio-3.36
+fio-3.36
+...
+fio-3.36
+Starting 16 processes
+Starting 16 processes
+Starting 16 processes
+[read] hi-io[free]: rd=169.6 wr=  0.0 MB/s  rIOPS= 43406 wIOPS=     0 | lo-io[free]: rd=164.5 wr=  0.0 MB/s  rIOPS= 42111 wIOPS=     0 | lo2-io[free]: rd=163.4 wr=  0.0 MB/s  rIOPS= 41830 wIOPS=     0 
+[read] hi-io[free]: rd=196.4 wr=  0.0 MB/s  rIOPS= 50288 wIOPS=     0 | lo-io[free]: rd=196.5 wr=  0.0 MB/s  rIOPS= 50295 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 89.1 wr=  0.0 MB/s  rIOPS= 22808 wIOPS=     0 
+[read] hi-io[free]: rd=227.1 wr=  0.0 MB/s  rIOPS= 58137 wIOPS=     0 | lo-io[free]: rd=226.5 wr=  0.0 MB/s  rIOPS= 57975 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7834 wIOPS=     0 
+[read] hi-io[free]: rd=335.1 wr=  0.0 MB/s  rIOPS= 85797 wIOPS=     0 | lo-io[CAP w20r30]: rd=116.9 wr=  0.0 MB/s  rIOPS= 29914 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.2 wr=  0.0 MB/s  rIOPS=  7723 wIOPS=     0 
+[read] hi-io[free]: rd=423.0 wr=  0.0 MB/s  rIOPS=108289 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.5 wr=  0.0 MB/s  rIOPS=  7810 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7869 wIOPS=     0 
+[read] hi-io[free]: rd=421.6 wr=  0.0 MB/s  rIOPS=107932 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7930 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7911 wIOPS=     0 
+[read] hi-io[free]: rd=422.4 wr=  0.0 MB/s  rIOPS=108134 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7874 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7866 wIOPS=     0 
+[read] hi-io[free]: rd=424.2 wr=  0.0 MB/s  rIOPS=108586 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7910 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7852 wIOPS=     0 
+[read] hi-io[free]: rd=420.1 wr=  0.0 MB/s  rIOPS=107545 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7909 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7970 wIOPS=     0 
+[read] hi-io[free]: rd=425.3 wr=  0.0 MB/s  rIOPS=108888 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7943 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7859 wIOPS=     0 
+[read] hi-io[free]: rd=422.9 wr=  0.0 MB/s  rIOPS=108266 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7871 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7895 wIOPS=     0 
+[read] hi-io[free]: rd=423.3 wr=  0.0 MB/s  rIOPS=108354 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7862 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7936 wIOPS=     0 
+[read] hi-io[free]: rd=422.0 wr=  0.0 MB/s  rIOPS=108034 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7891 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7860 wIOPS=     0 
+[read] hi-io[free]: rd=423.4 wr=  0.0 MB/s  rIOPS=108379 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7876 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7894 wIOPS=     0 
+[read] hi-io[free]: rd=422.1 wr=  0.0 MB/s  rIOPS=108070 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7914 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7886 wIOPS=     0 
+[read] hi-io[free]: rd=424.8 wr=  0.0 MB/s  rIOPS=108751 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7867 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7904 wIOPS=     0 
+[read] hi-io[free]: rd=425.1 wr=  0.0 MB/s  rIOPS=108832 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7872 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7952 wIOPS=     0 
+[read] hi-io[free]: rd=423.2 wr=  0.0 MB/s  rIOPS=108340 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.2 wr=  0.0 MB/s  rIOPS=  7979 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7825 wIOPS=     0 
+[read] hi-io[free]: rd=423.1 wr=  0.0 MB/s  rIOPS=108304 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7927 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7921 wIOPS=     0 
+[read] hi-io[free]: rd=424.3 wr=  0.0 MB/s  rIOPS=108620 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7850 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7884 wIOPS=     0 
+[read] hi-io[free]: rd=418.9 wr=  0.0 MB/s  rIOPS=107234 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7883 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7879 wIOPS=     0 
+[read] hi-io[free]: rd=424.0 wr=  0.0 MB/s  rIOPS=108537 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7864 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7964 wIOPS=     0 
+[read] hi-io[free]: rd=422.5 wr=  0.0 MB/s  rIOPS=108152 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7942 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.5 wr=  0.0 MB/s  rIOPS=  7807 wIOPS=     0 
+[read] hi-io[free]: rd=424.8 wr=  0.0 MB/s  rIOPS=108753 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7851 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.2 wr=  0.0 MB/s  rIOPS=  7981 wIOPS=     0 
+[read] hi-io[free]: rd=424.1 wr=  0.0 MB/s  rIOPS=108579 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7880 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7867 wIOPS=     0 
+[read] hi-io[free]: rd=421.3 wr=  0.0 MB/s  rIOPS=107853 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7957 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7945 wIOPS=     0 
+[read] hi-io[free]: rd=423.3 wr=  0.0 MB/s  rIOPS=108363 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7869 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.5 wr=  0.0 MB/s  rIOPS=  7807 wIOPS=     0 
+[read] hi-io[free]: rd=423.1 wr=  0.0 MB/s  rIOPS=108303 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7917 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7960 wIOPS=     0 
+[read] hi-io[free]: rd=423.0 wr=  0.0 MB/s  rIOPS=108279 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7852 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7881 wIOPS=     0 
+[read] hi-io[free]: rd=425.0 wr=  0.0 MB/s  rIOPS=108790 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7932 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7844 wIOPS=     0 
+[read] hi-io[free]: rd=421.9 wr=  0.0 MB/s  rIOPS=108011 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7878 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7944 wIOPS=     0 
+[read] hi-io[free]: rd=421.7 wr=  0.0 MB/s  rIOPS=107956 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7931 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7902 wIOPS=     0 
+[read] hi-io[free]: rd=423.3 wr=  0.0 MB/s  rIOPS=108375 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7912 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7920 wIOPS=     0 
+[read] hi-io[free]: rd=423.4 wr=  0.0 MB/s  rIOPS=108392 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7897 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7828 wIOPS=     0 
+[read] hi-io[free]: rd=423.4 wr=  0.0 MB/s  rIOPS=108387 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7834 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7927 wIOPS=     0 
+[read] hi-io[free]: rd=422.4 wr=  0.0 MB/s  rIOPS=108126 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7971 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7952 wIOPS=     0 
+[read] hi-io[free]: rd=425.4 wr=  0.0 MB/s  rIOPS=108900 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7859 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7935 wIOPS=     0 
+[read] hi-io[free]: rd=423.1 wr=  0.0 MB/s  rIOPS=108324 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7932 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.5 wr=  0.0 MB/s  rIOPS=  7808 wIOPS=     0 
+[read] hi-io[free]: rd=424.2 wr=  0.0 MB/s  rIOPS=108595 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7856 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7910 wIOPS=     0 
+[read] hi-io[free]: rd=424.9 wr=  0.0 MB/s  rIOPS=108785 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7918 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7894 wIOPS=     0 
+[read] hi-io[free]: rd=423.6 wr=  0.0 MB/s  rIOPS=108452 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7956 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7939 wIOPS=     0 
+[read] hi-io[free]: rd=423.9 wr=  0.0 MB/s  rIOPS=108508 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7860 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7941 wIOPS=     0 
+[read] hi-io[free]: rd=424.3 wr=  0.0 MB/s  rIOPS=108622 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7939 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7879 wIOPS=     0 
+[read] hi-io[free]: rd=423.2 wr=  0.0 MB/s  rIOPS=108336 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7874 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7916 wIOPS=     0 
+[read] hi-io[free]: rd=423.9 wr=  0.0 MB/s  rIOPS=108522 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7934 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7895 wIOPS=     0 
+[read] hi-io[free]: rd=422.9 wr=  0.0 MB/s  rIOPS=108275 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7871 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7861 wIOPS=     0 
+[read] hi-io[free]: rd=422.0 wr=  0.0 MB/s  rIOPS=108023 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7863 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.2 wr=  0.0 MB/s  rIOPS=  7997 wIOPS=     0 
+[read] hi-io[free]: rd=423.7 wr=  0.0 MB/s  rIOPS=108466 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7931 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7838 wIOPS=     0 
+[read] hi-io[free]: rd=424.0 wr=  0.0 MB/s  rIOPS=108553 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7890 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7936 wIOPS=     0 
+[read] hi-io[free]: rd=420.7 wr=  0.0 MB/s  rIOPS=107697 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7917 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7847 wIOPS=     0 
+[read] hi-io[free]: rd=423.5 wr=  0.0 MB/s  rIOPS=108416 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7905 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.2 wr=  0.0 MB/s  rIOPS=  7981 wIOPS=     0 
+[read] hi-io[free]: rd=422.5 wr=  0.0 MB/s  rIOPS=108168 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7862 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7841 wIOPS=     0 
+[read] hi-io[free]: rd=423.3 wr=  0.0 MB/s  rIOPS=108371 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7948 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7866 wIOPS=     0 
+[read] hi-io[free]: rd=424.4 wr=  0.0 MB/s  rIOPS=108653 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7915 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7938 wIOPS=     0 
+[read] hi-io[free]: rd=425.5 wr=  0.0 MB/s  rIOPS=108916 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7851 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7902 wIOPS=     0 
+[read] hi-io[free]: rd=420.2 wr=  0.0 MB/s  rIOPS=107577 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7913 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7958 wIOPS=     0 
+[read] hi-io[free]: rd=422.7 wr=  0.0 MB/s  rIOPS=108207 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.5 wr=  0.0 MB/s  rIOPS=  7821 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7877 wIOPS=     0 
+[read] hi-io[free]: rd=423.3 wr=  0.0 MB/s  rIOPS=108353 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.2 wr=  0.0 MB/s  rIOPS=  7984 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7873 wIOPS=     0 
+[read] hi-io[free]: rd=423.1 wr=  0.0 MB/s  rIOPS=108306 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7925 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7905 wIOPS=     0 
+[read] hi-io[free]: rd=425.9 wr=  0.0 MB/s  rIOPS=109021 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7919 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.4 wr=  0.0 MB/s  rIOPS=  7783 wIOPS=     0 
+[read] hi-io[free]: rd=422.6 wr=  0.0 MB/s  rIOPS=108188 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.5 wr=  0.0 MB/s  rIOPS=  7818 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.3 wr=  0.0 MB/s  rIOPS=  8004 wIOPS=     0 
+[read] hi-io[free]: rd=421.9 wr=  0.0 MB/s  rIOPS=108008 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7964 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.5 wr=  0.0 MB/s  rIOPS=  7816 wIOPS=     0 
+[read] hi-io[free]: rd=424.8 wr=  0.0 MB/s  rIOPS=108756 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7916 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.2 wr=  0.0 MB/s  rIOPS=  7979 wIOPS=     0 
+[read] hi-io[free]: rd=426.4 wr=  0.0 MB/s  rIOPS=109166 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7893 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7949 wIOPS=     0 
+[read] hi-io[free]: rd=423.5 wr=  0.0 MB/s  rIOPS=108417 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7927 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7893 wIOPS=     0 
+[read] hi-io[free]: rd=423.1 wr=  0.0 MB/s  rIOPS=108322 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7895 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7824 wIOPS=     0 
+[read] hi-io[free]: rd=423.7 wr=  0.0 MB/s  rIOPS=108469 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7880 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.2 wr=  0.0 MB/s  rIOPS=  7991 wIOPS=     0 
+[read] hi-io[free]: rd=420.8 wr=  0.0 MB/s  rIOPS=107730 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7927 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7865 wIOPS=     0 
+[read] hi-io[free]: rd=424.1 wr=  0.0 MB/s  rIOPS=108561 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7923 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7944 wIOPS=     0 
+[read] hi-io[free]: rd=424.0 wr=  0.0 MB/s  rIOPS=108534 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7840 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7835 wIOPS=     0 
+[read] hi-io[free]: rd=423.8 wr=  0.0 MB/s  rIOPS=108488 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7897 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7853 wIOPS=     0 
+[read] hi-io[free]: rd=423.0 wr=  0.0 MB/s  rIOPS=108297 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7892 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7970 wIOPS=     0 
+[read] hi-io[free]: rd=424.7 wr=  0.0 MB/s  rIOPS=108717 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7936 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7875 wIOPS=     0 
+[read] hi-io[free]: rd=422.6 wr=  0.0 MB/s  rIOPS=108195 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7847 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7893 wIOPS=     0 
+[read] hi-io[free]: rd=423.9 wr=  0.0 MB/s  rIOPS=108522 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7952 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7904 wIOPS=     0 
+[read] hi-io[free]: rd=423.5 wr=  0.0 MB/s  rIOPS=108412 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7892 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7891 wIOPS=     0 
+[read] hi-io[free]: rd=424.4 wr=  0.0 MB/s  rIOPS=108638 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7826 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7889 wIOPS=     0 
+[read] hi-io[free]: rd=424.3 wr=  0.0 MB/s  rIOPS=108626 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7915 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7888 wIOPS=     0 
+[read] hi-io[free]: rd=420.2 wr=  0.0 MB/s  rIOPS=107569 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7908 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7951 wIOPS=     0 
+[read] hi-io[free]: rd=423.4 wr=  0.0 MB/s  rIOPS=108380 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7903 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7920 wIOPS=     0 
+[read] hi-io[free]: rd=424.3 wr=  0.0 MB/s  rIOPS=108609 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7904 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7892 wIOPS=     0 
+[read] hi-io[free]: rd=423.7 wr=  0.0 MB/s  rIOPS=108468 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7867 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7880 wIOPS=     0 
+[read] hi-io[free]: rd=424.7 wr=  0.0 MB/s  rIOPS=108714 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7934 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7873 wIOPS=     0 
+[read] hi-io[free]: rd=422.4 wr=  0.0 MB/s  rIOPS=108133 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7901 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7918 wIOPS=     0 
+[read] hi-io[free]: rd=421.5 wr=  0.0 MB/s  rIOPS=107904 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7890 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7855 wIOPS=     0 
+[read] hi-io[free]: rd=424.7 wr=  0.0 MB/s  rIOPS=108728 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7935 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7949 wIOPS=     0 
+[read] hi-io[free]: rd=423.1 wr=  0.0 MB/s  rIOPS=108321 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7888 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7877 wIOPS=     0 
+[read] hi-io[free]: rd=423.8 wr=  0.0 MB/s  rIOPS=108503 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7874 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7893 wIOPS=     0 
+[read] hi-io[free]: rd=421.3 wr=  0.0 MB/s  rIOPS=107862 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7849 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7883 wIOPS=     0 
+[read] hi-io[free]: rd=423.2 wr=  0.0 MB/s  rIOPS=108334 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7910 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7902 wIOPS=     0 
+[read] hi-io[free]: rd=419.9 wr=  0.0 MB/s  rIOPS=107486 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7941 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7904 wIOPS=     0 
+[read] hi-io[free]: rd=423.4 wr=  0.0 MB/s  rIOPS=108400 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7862 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7853 wIOPS=     0 
+[read] hi-io[free]: rd=424.6 wr=  0.0 MB/s  rIOPS=108693 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7927 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.2 wr=  0.0 MB/s  rIOPS=  7992 wIOPS=     0 
+[read] hi-io[free]: rd=422.5 wr=  0.0 MB/s  rIOPS=108168 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7922 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7868 wIOPS=     0 
+[read] hi-io[free]: rd=424.7 wr=  0.0 MB/s  rIOPS=108735 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7933 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7920 wIOPS=     0 
+[read] hi-io[free]: rd=421.8 wr=  0.0 MB/s  rIOPS=107981 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7846 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7858 wIOPS=     0 
+[read] hi-io[free]: rd=423.7 wr=  0.0 MB/s  rIOPS=108459 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7874 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7889 wIOPS=     0 
+[read] hi-io[free]: rd=422.0 wr=  0.0 MB/s  rIOPS=108021 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7926 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7924 wIOPS=     0 
+[read] hi-io[free]: rd=420.4 wr=  0.0 MB/s  rIOPS=107632 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7905 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7848 wIOPS=     0 
+[read] hi-io[free]: rd=424.0 wr=  0.0 MB/s  rIOPS=108551 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7893 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.2 wr=  0.0 MB/s  rIOPS=  7990 wIOPS=     0 
+[read] hi-io[free]: rd=424.2 wr=  0.0 MB/s  rIOPS=108602 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7879 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7830 wIOPS=     0 
+[read] hi-io[free]: rd=424.4 wr=  0.0 MB/s  rIOPS=108637 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7899 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7916 wIOPS=     0 
+[read] hi-io[free]: rd=420.4 wr=  0.0 MB/s  rIOPS=107626 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7902 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7943 wIOPS=     0 
+[read] hi-io[free]: rd=425.0 wr=  0.0 MB/s  rIOPS=108795 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7921 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7861 wIOPS=     0 
+[read] hi-io[free]: rd=424.4 wr=  0.0 MB/s  rIOPS=108640 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7858 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7923 wIOPS=     0 
+[read] hi-io[free]: rd=423.2 wr=  0.0 MB/s  rIOPS=108335 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7935 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7835 wIOPS=     0 
+[read] hi-io[free]: rd=424.5 wr=  0.0 MB/s  rIOPS=108683 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7924 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7974 wIOPS=     0 
+[read] hi-io[free]: rd=423.6 wr=  0.0 MB/s  rIOPS=108429 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7859 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7854 wIOPS=     0 
+[read] hi-io[free]: rd=422.7 wr=  0.0 MB/s  rIOPS=108218 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7944 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7898 wIOPS=     0 
+[read] hi-io[free]: rd=423.7 wr=  0.0 MB/s  rIOPS=108470 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.7 wr=  0.0 MB/s  rIOPS=  7853 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7958 wIOPS=     0 
+[read] hi-io[free]: rd=423.8 wr=  0.0 MB/s  rIOPS=108488 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7944 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7872 wIOPS=     0 
+[read] hi-io[free]: rd=423.1 wr=  0.0 MB/s  rIOPS=108306 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7903 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.9 wr=  0.0 MB/s  rIOPS=  7923 wIOPS=     0 
+[read] hi-io[free]: rd=423.2 wr=  0.0 MB/s  rIOPS=108333 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7876 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.6 wr=  0.0 MB/s  rIOPS=  7830 wIOPS=     0 
+[read] hi-io[free]: rd=425.5 wr=  0.0 MB/s  rIOPS=108923 wIOPS=     0 | lo-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7887 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7959 wIOPS=     0 
+[read] hi-io[free]: rd=423.9 wr=  0.0 MB/s  rIOPS=108524 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7945 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 31.1 wr=  0.0 MB/s  rIOPS=  7950 wIOPS=     0 
+[read] hi-io[free]: rd=423.7 wr=  0.0 MB/s  rIOPS=108455 wIOPS=     0 | lo-io[CAP w20r30]: rd= 31.0 wr=  0.0 MB/s  rIOPS=  7938 wIOPS=     0 | lo2-io[CAP w20r30]: rd= 30.8 wr=  0.0 MB/s  rIOPS=  7879 wIOPS=     0 
+Jobs: 16 (f=16): [r(16)][100.0%][r=30.6MiB/s][r=7824 IOPS][eta 00m:00s]
+hi: (groupid=0, jobs=16): err= 0: pid=696501: Mon Aug 17 18:16:33 2026
+  read: IOPS=103k, BW=404MiB/s (424MB/s)(237GiB/600024msec)
+    slat (nsec): min=1236, max=54691k, avg=16336.21, stdev=118403.69
+    clat (usec): min=3, max=204434, avg=19781.16, stdev=17653.79
+     lat (usec): min=103, max=236516, avg=19797.49, stdev=17657.47
+    clat percentiles (usec):
+     |  1.00th=[  486],  5.00th=[ 1029], 10.00th=[ 1565], 20.00th=[ 2835],
+     | 30.00th=[ 4817], 40.00th=[ 8356], 50.00th=[13960], 60.00th=[21103],
+     | 70.00th=[28705], 80.00th=[41157], 90.00th=[49021], 95.00th=[50070],
+     | 99.00th=[52167], 99.50th=[54264], 99.90th=[60556], 99.95th=[62653],
+     | 99.99th=[93848]
+   bw (  KiB/s): min=95286, max=510062, per=100.00%, avg=414084.73, stdev=2978.06, samples=19184
+   iops        : min=23819, max=127513, avg=103519.69, stdev=744.50, samples=19184
+  lat (usec)   : 4=0.01%, 50=0.01%, 100=0.01%, 250=0.11%, 500=0.97%
+  lat (usec)   : 750=1.64%, 1000=2.06%
+  lat (msec)   : 2=8.99%, 4=12.71%, 10=16.94%, 20=15.07%, 50=35.67%
+  lat (msec)   : 100=5.84%, 250=0.01%
+  cpu          : usr=2.23%, sys=6.09%, ctx=50330407, majf=0, minf=2219
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=0.1%, >=64=100.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.1%
+     issued rwts: total=62061680,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=128
+
+Run status group 0 (all jobs):
+   READ: bw=404MiB/s (424MB/s), 404MiB/s-404MiB/s (424MB/s-424MB/s), io=237GiB (254GB), run=600024-600024msec
+
+Disk stats (read/write):
+  nvme0n1: ios=72409153/1715, sectors=579326776/65624, merge=3279/1952, ticks=1667341428/40825, in_queue=1667391450, util=70.54%
+
+lo: (groupid=0, jobs=16): err= 0: pid=696502: Mon Aug 17 18:16:33 2026
+  read: IOPS=9048, BW=35.3MiB/s (37.1MB/s)(20.7GiB/600056msec)
+    slat (nsec): min=611, max=53409k, avg=17123.71, stdev=240961.02
+    clat (usec): min=2, max=451525, avg=226301.93, stdev=164818.24
+     lat (usec): min=113, max=451528, avg=226319.06, stdev=164805.27
+    clat percentiles (usec):
+     |  1.00th=[  1205],  5.00th=[  3687], 10.00th=[  9503], 20.00th=[ 31589],
+     | 30.00th=[ 49546], 40.00th=[ 55313], 50.00th=[329253], 60.00th=[350225],
+     | 70.00th=[367002], 80.00th=[375391], 90.00th=[387974], 95.00th=[396362],
+     | 99.00th=[413139], 99.50th=[417334], 99.90th=[429917], 99.95th=[434111],
+     | 99.99th=[446694]
+   bw (  KiB/s): min=22284, max=239104, per=100.00%, avg=36209.84, stdev=1884.40, samples=19184
+   iops        : min= 5570, max=59776, avg=9050.69, stdev=471.13, samples=19184
+  lat (usec)   : 4=0.01%, 250=0.02%, 500=0.13%, 750=0.24%, 1000=0.31%
+  lat (msec)   : 2=1.64%, 4=3.07%, 10=4.86%, 20=4.70%, 50=17.47%
+  lat (msec)   : 100=8.38%, 250=0.17%, 500=59.01%
+  cpu          : usr=0.33%, sys=0.58%, ctx=5187320, majf=0, minf=2220
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=0.1%, >=64=100.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.1%
+     issued rwts: total=5429602,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=128
+
+Run status group 0 (all jobs):
+   READ: bw=35.3MiB/s (37.1MB/s), 35.3MiB/s-35.3MiB/s (37.1MB/s-37.1MB/s), io=20.7GiB (22.2GB), run=600056-600056msec
+
+Disk stats (read/write):
+  nvme0n1: ios=72409285/1715, sectors=579327832/65624, merge=3279/1952, ticks=1667344326/40825, in_queue=1667394348, util=70.52%
+
+lo2: (groupid=0, jobs=16): err= 0: pid=696504: Mon Aug 17 18:16:33 2026
+  read: IOPS=8214, BW=32.1MiB/s (33.6MB/s)(18.8GiB/600053msec)
+    slat (nsec): min=708, max=52968k, avg=15127.20, stdev=240004.33
+    clat (usec): min=40, max=434779, avg=249269.80, stdev=127146.10
+     lat (usec): min=127, max=434784, avg=249284.92, stdev=127130.95
+    clat percentiles (usec):
+     |  1.00th=[  1287],  5.00th=[  5342], 10.00th=[ 22414], 20.00th=[ 50594],
+     | 30.00th=[283116], 40.00th=[299893], 50.00th=[308282], 60.00th=[316670],
+     | 70.00th=[325059], 80.00th=[337642], 90.00th=[350225], 95.00th=[358613],
+     | 99.00th=[375391], 99.50th=[379585], 99.90th=[392168], 99.95th=[396362],
+     | 99.99th=[404751]
+   bw (  KiB/s): min=21074, max=174517, per=100.00%, avg=32874.31, stdev=1046.67, samples=19184
+   iops        : min= 5268, max=43628, avg=8217.41, stdev=261.68, samples=19184
+  lat (usec)   : 50=0.01%, 100=0.01%, 250=0.02%, 500=0.12%, 750=0.21%
+  lat (usec)   : 1000=0.27%
+  lat (msec)   : 2=1.34%, 4=2.19%, 10=2.75%, 20=2.53%, 50=8.50%
+  lat (msec)   : 100=6.60%, 250=0.62%, 500=74.86%
+  cpu          : usr=0.32%, sys=0.53%, ctx=4764356, majf=0, minf=2234
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=0.1%, >=64=100.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.1%
+     issued rwts: total=4929355,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=128
+
+Run status group 0 (all jobs):
+   READ: bw=32.1MiB/s (33.6MB/s), 32.1MiB/s-32.1MiB/s (33.6MB/s-33.6MB/s), io=18.8GiB (20.2GB), run=600053-600053msec
+
+Disk stats (read/write):
+  nvme0n1: ios=72409407/1715, sectors=579328808/65624, merge=3279/1952, ticks=1667347097/40825, in_queue=1667397119, util=70.53%
+Testing done.
+
+======================== Throughput: before vs after throttle ========================
+scope    priority    workload  phase     rd MB/s   wr MB/s   rd IOPS   wr IOPS    secs      cap
+hi-io    critical    write     before        0.0     187.4         0     47971      67        -
+hi-io    critical    write     after         0.0     284.4         0     72802     525        -
+lo-io    low         write     before        0.0     176.0         0     45062      67        -
+lo-io    low         write     after         0.0      18.2         0      4656     525   w20r30
+lo2-io   low         write     before        0.0     184.3         0     47182      78        -
+lo2-io   low         write     after         0.0      18.2         0      4663     514   w20r30
+
+hi-io    critical    read      before      152.5       0.0     39039         0      12        -
+hi-io    critical    read      after       409.3       0.0    104783         0     586        -
+lo-io    low         read      before      160.1       0.0     40976         0      22        -
+lo-io    low         read      after        30.0       0.0      7680         0     576   w20r30
+lo2-io   low         read      before      105.2       0.0     26932         0      12        -
+lo2-io   low         read      after        30.0       0.0      7682         0     586   w20r30
+
+  cap: the io.max bandwidth smartune wrote, w=write r=read, in MB/s.
+  hi-io is split at the run first throttle (it is never capped itself), so its
+  before/after rows cover the same windows as the scopes above -- flat is a pass.
+
+------- aggregate and share (every scope split at the RUN first throttle) -------
+scope    workload  phase     rd MB/s   wr MB/s   share%    secs
+hi-io    write     before        0.0     187.4    34.0%      67
+lo-io    write     before        0.0     176.0    32.0%      67
+lo2-io   write     before        0.0     187.1    34.0%      67
+TOTAL    write     before        0.0     550.5   100.0%      67
+
+hi-io    write     after         0.0     284.4    87.8%     525
+lo-io    write     after         0.0      18.2     5.6%     525
+lo2-io   write     after         0.0      21.3     6.6%     525
+TOTAL    write     after         0.0     323.9   100.0%     525
+
+hi-io    read      before      152.5       0.0    37.4%      12
+lo-io    read      before      150.4       0.0    36.9%      12
+lo2-io   read      before      105.2       0.0    25.8%      12
+TOTAL    read      before      408.1       0.0   100.0%      12
+
+hi-io    read      after       409.3       0.0    86.8%     586
+lo-io    read      after        32.4       0.0     6.9%     586
+lo2-io   read      after        30.0       0.0     6.4%     586
+TOTAL    read      after       471.7       0.0   100.0%     586
+
+  TOTAL is the three scopes summed (~whole-device throughput on an idle box);
+  share% is of TOTAL in the phase direction. A working cap RAISES hi-io share.
+  If TOTAL drops too, the device itself got slower -- that is not the cap.
+======================================================================================
+
+----------------------------- pressure diagnostics -----------------------------
+  /proc/pressure/io (system-wide task stall on IO):
+    some avg10=33.48 avg60=33.35 avg300=34.02 total=5273623449
+    full avg10=25.49 avg60=24.92 avg300=24.83 total=4191199898
+    NOTE: the disk gate needs stall severity = min(1, some*W_some + full*W_full)
+          to reach 1.0 while the disk is saturated. With the shipped weights
+          (some=0.5 full=3.0) that means io.full >= ~0.33. If 'full avg10' above
+          is near zero, the workload never blocks tasks on IO -- re-run with
+          ENGINE=psync, or raise disk_psi_weights.some in config/config.yaml.
+  io.max actually written by smartune:
+    hi-io: (no cap / cgroup already gone)
+    lo-io: (no cap / cgroup already gone)
+    lo2-io: (no cap / cgroup already gone)
+  smartune's own view (grep the service log for these tags):
+    [disk-level] the disk level, the USE + PSI numbers behind it, per-disk detail
+    [disk-io]    candidate list, why each was skipped, and the cap applied
+--------------------------------------------------------------------------------

@@ -113,9 +113,17 @@ export interface AppDiskIoEntry {
   balancer_candidate?: boolean  // false for shells / self — hides "Add to balancer"
   io_read_rate: number    // MB/s
   io_write_rate: number   // MB/s
-  io_read_iops: number    // ops/s
-  io_write_iops: number   // ops/s
+  io_read_iops: number    // device requests/s (cgroup io.stat rios, not a syscall count)
+  io_write_iops: number   // device requests/s (cgroup io.stat wios, not a syscall count)
+  io_per_disk?: Record<string, DiskIoRates>  // per whole disk; partitions fold into the parent
   score: number
+}
+
+export interface DiskIoRates {
+  read_mb_s: number
+  write_mb_s: number
+  read_iops: number
+  write_iops: number
 }
 
 export interface AppDiskIoStatsData {
@@ -580,11 +588,27 @@ export interface DiskIoRateFields {
   read_iops?: number
 }
 
+// Media classes the backend recognises (monitor/disk_pressure.py MEDIA_CLASSES).
+export type DiskMedia = 'nvme' | 'sata_ssd' | 'mmc' | 'hdd' | 'usb' | 'unknown'
+
+export interface DiskCandidateFloor {
+  mb_s?: number
+  iops?: number
+}
+
 export interface LimitPolicyData {
   policy: string
   cpu: { enabled: boolean; rate: LimitRates }
   memory: { enabled: boolean; rate: LimitRates }
-  disk_io: { enabled: boolean; rate: Partial<Record<LimitPriority, DiskIoRateFields>> }
+  disk_io: {
+    enabled: boolean
+    rate: Partial<Record<LimitPriority, DiskIoRateFields>>
+    // `rate` above is calibrated for NVMe; these two re-express it per media class --
+    // media_scale shrinks the cap, candidate_floor is the "heavy enough to be worth
+    // capping" bar an app has to clear on that disk.
+    media_scale?: Partial<Record<DiskMedia, number>>
+    candidate_floor?: Partial<Record<DiskMedia, DiskCandidateFloor>>
+  }
   updated_at?: number
 }
 

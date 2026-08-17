@@ -36,6 +36,7 @@ import type {
   SaveResult,
   LimitPriority,
   LimitPolicyData,
+  DiskMedia,
 } from '../api/types'
 import { COLORS } from '../styles/theme'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
@@ -335,6 +336,18 @@ function MonitoredSectionsCard() {
   )
 }
 
+// The disk channel's config mirrors config.yaml, where the model knobs are nested one
+// level down; the form keeps them flat.
+interface DiskPressureConfig {
+  disk_thresholds: Record<string, number>
+  disk_pressure_model: {
+    sub_weights: Record<string, number>
+    sigmoid_k: number
+    max_p_weight: number
+  }
+  updated_at?: number
+}
+
 // ---------------------------------------------------------------------------
 // Monitor tab: sections + collection cadence + pressure detection params.
 // ---------------------------------------------------------------------------
@@ -343,6 +356,12 @@ function MonitorPanel() {
     Object.fromEntries(Object.entries(thresholds).map(([level, value]) => [level, Math.round(value * 100)]))
   const toRatioThresholds = (thresholds: Record<string, number>) =>
     Object.fromEntries(Object.entries(thresholds).map(([level, value]) => [level, value / 100]))
+  const diskPressureToValues = (d: DiskPressureConfig) => ({
+    disk_thresholds: toPercentageThresholds(d.disk_thresholds ?? {}),
+    sub_weights: d.disk_pressure_model?.sub_weights,
+    sigmoid_k: d.disk_pressure_model?.sigmoid_k,
+    max_p_weight: d.disk_pressure_model?.max_p_weight,
+  })
 
   return (
     <>
@@ -480,25 +499,91 @@ function MonitorPanel() {
 
       <FormCard
         title="Disk I/O pressure"
-        description="Each disk is judged on its own: a disk is marked busy when its own utilisation exceeds this percent (together with a throughput check). One busy disk does not mark the others busy."
+        description="A channel of its own: each disk is scored from its latency, queue depth and utilisation (normalised against what its media class can sustain), the disks are combined, and the I/O PSI decides how much of that saturation counts. Critical on this channel is what authorises an io.max cap — it never feeds the system pressure score above."
         scope="disk_pressure"
         load={async () => {
-          const d = await api.getConfig<{ disk_utilization_threshold: number; updated_at?: number }>('disk_pressure')
-          return { values: { disk_utilization_threshold: d.disk_utilization_threshold }, updatedAt: d.updated_at }
+          const d = await api.getConfig<DiskPressureConfig>('disk_pressure')
+          return { values: diskPressureToValues(d), updatedAt: d.updated_at }
         }}
         save={(values, ts) =>
-          api.updateConfig('disk_pressure', { disk_utilization_threshold: Number(values.disk_utilization_threshold) }, ts)
+          api.updateConfig('disk_pressure', {
+            disk_thresholds: toRatioThresholds(values.disk_thresholds as Record<string, number>),
+            disk_pressure_model: {
+              sub_weights: values.sub_weights,
+              sigmoid_k: Number(values.sigmoid_k),
+              max_p_weight: Number(values.max_p_weight),
+            },
+          }, ts)
         }
-        currentToValues={(c) => ({ disk_utilization_threshold: c.disk_utilization_threshold })}
+        currentToValues={(c) => diskPressureToValues(c as unknown as DiskPressureConfig)}
       >
+        <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
+          <SectionLabel
+            required
+            text="Level thresholds (%, ordered)"
+            tip="Bands of the disk-IO score, separate from the system ones. Low/high are also the ends of the ramp that decides how much of an I/O stall is blamed on the local disk; medium marks a disk busy in the UI; critical triggers throttling."
+          />
+        </Divider>
+        <Row gutter={16}>
+          {(['low', 'medium', 'high', 'critical'] as const).map((k) => (
+            <Col span={6} key={k}>
+              <Form.Item
+                label={k[0].toUpperCase() + k.slice(1)}
+                name={['disk_thresholds', k]}
+                required={false}
+                rules={[{ required: true, type: 'number', min: 1, max: 100 }]}
+              >
+                <InputNumber style={{ width: '100%' }} min={1} max={100} step={1} addonAfter="%" />
+              </Form.Item>
+            </Col>
+          ))}
+        </Row>
+
+        <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
+          <SectionLabel
+            required
+            text="Per-disk sub-signal weights (sum ≤ 1)"
+            tip="How much each USE sub-signal contributes to a single disk's pressure. Latency dominates because it is what users feel; utilisation is only a tie-breaker, since a parallel device sits at 100% with headroom to spare."
+          />
+        </Divider>
+        <Row gutter={16}>
+          {([
+            ['latency', 'Latency (await)'],
+            ['queue', 'Queue depth'],
+            ['util', 'Utilisation'],
+          ] as const).map(([key, label]) => (
+            <Col span={8} key={key}>
+              <Form.Item
+                label={label}
+                name={['sub_weights', key]}
+                required={false}
+                rules={[{ required: true, type: 'number', min: 0, max: 1 }]}
+              >
+                <InputNumber style={{ width: '100%' }} min={0} max={1} step={0.05} />
+              </Form.Item>
+            </Col>
+          ))}
+        </Row>
+
         <Row gutter={16}>
           <Col span={8}>
             <Form.Item
-              label="Disk utilisation threshold (%)"
-              name="disk_utilization_threshold"
-              rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
+              label="Sigmoid steepness"
+              name="sigmoid_k"
+              tooltip="Steepness of the curve that squashes each sub-signal around its media-specific half-point: larger is more switch-like, smaller is a gentler ramp."
+              rules={[{ required: true, type: 'number', min: 1, max: 50 }]}
             >
-              <InputNumber style={{ width: '100%' }} min={0} max={100} step={1} />
+              <InputNumber style={{ width: '100%' }} min={1} max={50} step={0.5} />
+            </Form.Item>
+          </Col>
+          <Col span={8}>
+            <Form.Item
+              label="Worst-disk weight"
+              name="max_p_weight"
+              tooltip="How strongly the single busiest disk carries the aggregate: 0 is a plain mean (one hammered disk among many is averaged away), 1 lets the worst disk decide on its own."
+              rules={[{ required: true, type: 'number', min: 0, max: 1 }]}
+            >
+              <InputNumber style={{ width: '100%' }} min={0} max={1} step={0.05} />
             </Form.Item>
           </Col>
         </Row>
@@ -605,6 +690,63 @@ function DiskRateMatrix({ disabled }: { disabled?: boolean }) {
               </Form.Item>
             </Col>
           ))}
+        </Row>
+      ))}
+    </>
+  )
+}
+
+const DISK_MEDIA: Array<{ key: DiskMedia; label: string }> = [
+  { key: 'nvme', label: 'NVMe' },
+  { key: 'sata_ssd', label: 'SATA SSD' },
+  { key: 'mmc', label: 'eMMC / SD' },
+  { key: 'hdd', label: 'HDD' },
+  { key: 'usb', label: 'USB' },
+  { key: 'unknown', label: 'Unknown' },
+]
+
+// The rate matrix above is one row of numbers for the whole machine, but 30 MB/s is idle on
+// an NVMe and more than a thumb drive can deliver.  These two columns are how a mixed box is
+// made to behave: the cap written to each disk is rate x scale, and an app has to clear that
+// disk's floor before it is considered worth capping at all.
+function DiskMediaMatrix({ disabled }: { disabled?: boolean }) {
+  const form = Form.useFormInstance()
+  const enabled = (Form.useWatch(['disk_io', 'enabled'], form) ?? true) as boolean
+  const fieldsDisabled = disabled || !enabled
+  return (
+    <>
+      <Row gutter={8}>
+        <Col span={4} />
+        <Col span={6}>
+          <Text type="secondary" style={{ fontSize: 12 }}>Cap scale (x rate)</Text>
+        </Col>
+        <Col span={6}>
+          <Text type="secondary" style={{ fontSize: 12 }}>Floor MB/s</Text>
+        </Col>
+        <Col span={6}>
+          <Text type="secondary" style={{ fontSize: 12 }}>Floor IOPS</Text>
+        </Col>
+      </Row>
+      {DISK_MEDIA.map((m) => (
+        <Row gutter={8} align="middle" key={m.key} style={{ marginBottom: 8 }}>
+          <Col span={4}>
+            <Text type={fieldsDisabled ? 'secondary' : undefined}>{m.label}</Text>
+          </Col>
+          <Col span={6}>
+            <Form.Item name={['disk_io', 'media_scale', m.key]} noStyle rules={[{ type: 'number', min: 0.01, max: 1 }]}>
+              <InputNumber style={{ width: '100%' }} min={0.01} max={1} step={0.05} disabled={fieldsDisabled} />
+            </Form.Item>
+          </Col>
+          <Col span={6}>
+            <Form.Item name={['disk_io', 'candidate_floor', m.key, 'mb_s']} noStyle rules={[{ type: 'number', min: 0.1 }]}>
+              <InputNumber style={{ width: '100%' }} min={0.1} step={1} disabled={fieldsDisabled} />
+            </Form.Item>
+          </Col>
+          <Col span={6}>
+            <Form.Item name={['disk_io', 'candidate_floor', m.key, 'iops']} noStyle rules={[{ type: 'number', min: 1 }]}>
+              <InputNumber style={{ width: '100%' }} min={1} step={50} disabled={fieldsDisabled} />
+            </Form.Item>
+          </Col>
         </Row>
       ))}
     </>
@@ -790,6 +932,14 @@ function AutoControlPanel() {
                 </Form.Item>
               </Divider>
               <DiskRateMatrix disabled={!autoEnabled} />
+
+              <Divider orientation="left" orientationMargin={0} plain style={{ margin: '12px 0 8px' }}>
+                <SectionLabel
+                  text="Per-media adjustment"
+                  tip="The rates above are calibrated for NVMe. Cap scale multiplies them for slower media, so a USB disk is not handed an NVMe-sized cap. Floor is how much an app must be doing on a disk of that media before throttling it is worth doing at all -- below the floor the cap would not relieve the device. Either MB/s or IOPS clearing the floor qualifies."
+                />
+              </Divider>
+              <DiskMediaMatrix disabled={!autoEnabled} />
             </>
           )}
         </Form>

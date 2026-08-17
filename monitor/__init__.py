@@ -13,24 +13,38 @@ Usage::
     from monitor import (
         PSIMonitor,
         ResourceMonitor,
-        CgroupMonitor,
         PressureAnalyzer,
         NetworkMonitor,
         WindowDiffHistory,
+        snapshot_cgroup_io,
+        io_stat_deltas,
     )
 """
 
 from .psi import PSIMonitor
+from .cgroup import (
+    CGROUP_MOUNT,
+    IO_STAT_FIELDS,
+    as_io_rates,
+    io_stat_deltas,
+    read_cgroup_io_stat,
+    snapshot_cgroup_io,
+)
 from .res_monitor import ResourceMonitor
-from .cgroup import CgroupMonitor
 from .pressure import PressureAnalyzer
 from .network import NetworkMonitor, WindowDiffHistory
 
 __all__ = [
     "PSIMonitor",
     "ResourceMonitor",
-    "CgroupMonitor",
     "PressureAnalyzer",
     "NetworkMonitor",
     "WindowDiffHistory",
+    # cgroup v2 io.stat accounting (see monitor/cgroup.py)
+    "CGROUP_MOUNT",
+    "IO_STAT_FIELDS",
+    "as_io_rates",
+    "io_stat_deltas",
+    "read_cgroup_io_stat",
+    "snapshot_cgroup_io",
 ]

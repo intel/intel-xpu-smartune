@@ -20,6 +20,10 @@ from monitor.system_info import (
     DYNAMIC_INFO_SECTIONS,
 )
 from monitor.app_discovery import is_noise_process
+# The media taxonomy is owned by the pressure model; the per-media disk_io tables are keyed
+# by it, so it is imported rather than restated -- a copy would drift the moment a class is
+# added there.
+from monitor.disk_pressure import MEDIA_CLASSES as _DISK_MEDIA_CLASSES
 from utils.app_utils import get_cgroup_path_by_pid
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
@@ -1936,7 +1940,9 @@ def update_passive_control():
 _LIMIT_POLICY_MODES = ("combined", "separated")
 _LIMIT_PRIORITIES = ("high", "medium", "low", "undefined")
 _DISK_RATE_FIELDS = ("write", "read", "write_iops", "read_iops")
+_DISK_FLOOR_FIELDS = ("mb_s", "iops")
 _THRESHOLD_KEYS = ("low", "medium", "high", "critical")
+_DISK_SUB_WEIGHT_KEYS = ("latency", "queue", "util")
 _PSI_WEIGHT_KEYS = ("cpu", "memory", "io")
 _NETWORK_PRIORITIES = ("system", "critical", "high", "low")
 
@@ -1948,7 +1954,7 @@ def _cfg():
 
 
 # --- system_pressure: update interval + level cut-offs + weights + factor -----
-def _get_system_pressure():
+def _get_system_pressure_config():
     cfg = _cfg()
     return {
         "regular_update_sys_pressure_time": getattr(cfg, "regular_update_sys_pressure_time", 5),
@@ -1960,7 +1966,7 @@ def _get_system_pressure():
     }
 
 
-def _validate_system_pressure(body):
+def _validate_system_pressure_config(body):
     updates = {}
 
     if body.get("regular_update_sys_pressure_time") is not None:
@@ -2020,7 +2026,7 @@ def _validate_system_pressure(body):
     return updates
 
 
-def _write_system_pressure(updates):
+def _write_system_pressure_config(updates):
     cfg = _cfg()
     if "thresholds" in updates:
         cfg.update_config_section("thresholds", updates["thresholds"])
@@ -2041,28 +2047,107 @@ def _write_system_pressure(updates):
     return True
 
 
-# --- disk_pressure: disk utilisation threshold -------------------------------
-# (iowait / throughput thresholds stay config-only; see is_disk_io_stressed)
-def _get_disk_pressure():
-    return {"disk_utilization_threshold": getattr(_cfg(), "disk_utilization_threshold", None)}
+# --- disk_pressure: disk-IO channel bands + USE-model calibration -------------
+# Exposed: the four bands and the four knobs that reshape P_disk regardless of hardware.
+# The per-media half-point tables and disk_psi_weights stay config-only: those are
+# calibrated against measurements of a specific device class, not steered from a dialog.
+def _get_disk_pressure_config():
+    # Effective values, i.e. config merged over the defaults in disk_pressure.py, so a knob
+    # omitted from config.yaml shows what the model actually uses instead of a blank field.
+    model = _get_resource_monitor().get_disk_pressure_model()
+    return {
+        "disk_thresholds": dict(_cfg().disk_thresholds or {}),
+        "disk_pressure_model": {
+            "sub_weights": {
+                "latency": model["w_latency"],
+                "queue": model["w_queue"],
+                "util": model["w_util"],
+            },
+            "sigmoid_k": model["sigmoid_k"],
+            "max_p_weight": model["max_p_weight"],
+        },
+    }
 
 
-def _validate_disk_pressure(body):
-    key = "disk_utilization_threshold"
-    if key not in body or body[key] is None:
-        raise ValueError(f"{key} is required")
-    val = float(body[key])
-    if not (0 <= val <= 100):
-        raise ValueError(f"{key} must be within [0, 100]")
-    return {key: val}
+def _validate_disk_pressure_config(body):
+    updates = {}
+
+    th_body = body.get("disk_thresholds")
+    if isinstance(th_body, dict):
+        th = {}
+        for key in _THRESHOLD_KEYS:
+            if th_body.get(key) is None:
+                continue
+            val = float(th_body[key])
+            if not (0 < val <= 1):
+                raise ValueError(f"disk threshold {key} must be within (0, 1]")
+            th[key] = val
+        if th:
+            merged = {**(_cfg().disk_thresholds or {}), **th}
+            ordered = [merged[k] for k in _THRESHOLD_KEYS if merged.get(k) is not None]
+            if ordered != sorted(ordered):
+                raise ValueError("disk_thresholds must be ordered low <= medium <= high <= critical")
+            updates["disk_thresholds"] = th
+
+    model_body = body.get("disk_pressure_model")
+    if isinstance(model_body, dict):
+        model = {}
+
+        sw_body = model_body.get("sub_weights")
+        if isinstance(sw_body, dict):
+            sw = {}
+            for key in _DISK_SUB_WEIGHT_KEYS:
+                if sw_body.get(key) is None:
+                    continue
+                val = float(sw_body[key])
+                if not (0 <= val <= 1):
+                    raise ValueError(f"sub_weight {key} must be within [0, 1]")
+                sw[key] = val
+            if sw:
+                # P_disk is a weighted sum, not an average: weights summing above 1 let it
+                # exceed 1 and carry that overflow into the noisy-OR and the level bands.
+                current = _get_disk_pressure_config()["disk_pressure_model"]["sub_weights"]
+                total = sum({**current, **sw}.values())
+                if total > 1 + 1e-9:
+                    raise ValueError(f"sub_weights must sum to at most 1 (got {total:g})")
+                model["sub_weights"] = sw
+
+        if model_body.get("sigmoid_k") is not None:
+            val = float(model_body["sigmoid_k"])
+            if not (1 <= val <= 50):
+                raise ValueError("sigmoid_k must be within [1, 50]")
+            model["sigmoid_k"] = val
+
+        if model_body.get("max_p_weight") is not None:
+            val = float(model_body["max_p_weight"])
+            if not (0 <= val <= 1):
+                raise ValueError("max_p_weight must be within [0, 1]")
+            model["max_p_weight"] = val
+
+        if model:
+            updates["disk_pressure_model"] = model
+
+    if not updates:
+        raise ValueError("No valid disk_pressure updates provided")
+    return updates
+
+
+def _write_disk_pressure_config(updates):
+    cfg = _cfg()
+    modified = False
+    if "disk_thresholds" in updates:
+        modified = cfg.update_config_section("disk_thresholds", updates["disk_thresholds"]) or modified
+    if "disk_pressure_model" in updates:
+        modified = cfg.set_disk_pressure_model(updates["disk_pressure_model"]) or modified
+    return modified
 
 
 # --- network_pressure: network utilisation level cut-offs --------------------
-def _get_network_pressure():
+def _get_network_pressure_config():
     return {"network_thresholds": dict(_cfg().network_thresholds or {})}
 
 
-def _validate_network_pressure(body):
+def _validate_network_pressure_config(body):
     thresholds_body = body.get("network_thresholds")
     if not isinstance(thresholds_body, dict):
         raise ValueError("network_thresholds must be an object")
@@ -2082,12 +2167,12 @@ def _validate_network_pressure(body):
     return {"network_thresholds": thresholds}
 
 
-def _write_network_pressure(updates):
+def _write_network_pressure_config(updates):
     return _cfg().update_config_section("network_thresholds", updates["network_thresholds"])
 
 
 # --- limit_policy: full nested policy + per-resource enable/rate --------------
-def _limit_policy_snapshot():
+def _get_limit_policy_config():
     """Full limit_policy view (policy + per-resource enabled/rate)."""
     lp = _cfg().limit_policy or {}
 
@@ -2095,15 +2180,27 @@ def _limit_policy_snapshot():
         cfg = lp.get(name) or {}
         return {"enabled": bool(cfg.get("enabled", True)), "rate": dict(cfg.get("rate") or {})}
 
+    # disk_io carries two per-media tables the other resources have no analogue for: the
+    # rate row above is calibrated for NVMe, and both the cap and the "is this app heavy
+    # enough to cap" floor have to be re-expressed for slower media.
+    disk_cfg = lp.get("disk_io") or {}
+    disk = _res("disk_io")
+    disk["media_scale"] = dict(disk_cfg.get("media_scale") or {})
+    disk["candidate_floor"] = {
+        media: dict(entry)
+        for media, entry in (disk_cfg.get("candidate_floor") or {}).items()
+        if isinstance(entry, dict)
+    }
+
     return {
         "policy": lp.get("policy", "combined"),
         "cpu": _res("cpu"),
         "memory": _res("memory"),
-        "disk_io": _res("disk_io"),
+        "disk_io": disk,
     }
 
 
-def _validate_limit_policy(body):
+def _validate_limit_policy_config(body):
     """Validate a (partial) nested limit_policy update from the UI."""
     updates = {}
 
@@ -2155,6 +2252,35 @@ def _validate_limit_policy(body):
                     rate[pri] = fields
             if rate:
                 disk_upd["rate"] = rate
+        if isinstance(disk_body.get("media_scale"), dict):
+            scale = {}
+            for media in _DISK_MEDIA_CLASSES:
+                if disk_body["media_scale"].get(media) is not None:
+                    val = float(disk_body["media_scale"][media])
+                    # 1.0 is the NVMe anchor `rate` was calibrated at; above it the
+                    # "media correction" would be loosening the cap, not adapting it.
+                    if not (0 < val <= 1):
+                        raise ValueError(f"disk_io {media} media_scale must be within (0, 1]")
+                    scale[media] = val
+            if scale:
+                disk_upd["media_scale"] = scale
+        if isinstance(disk_body.get("candidate_floor"), dict):
+            floor = {}
+            for media in _DISK_MEDIA_CLASSES:
+                fields_body = disk_body["candidate_floor"].get(media)
+                if not isinstance(fields_body, dict):
+                    continue
+                fields = {}
+                for key in _DISK_FLOOR_FIELDS:
+                    if fields_body.get(key) is not None:
+                        val = float(fields_body[key])
+                        if val <= 0:
+                            raise ValueError(f"disk_io {media} candidate_floor {key} must be > 0")
+                        fields[key] = val
+                if fields:
+                    floor[media] = fields
+            if floor:
+                disk_upd["candidate_floor"] = floor
         if disk_upd:
             updates["disk_io"] = disk_upd
 
@@ -2164,7 +2290,7 @@ def _validate_limit_policy(body):
 
 
 # --- network_control: class bandwidth ratios + network switch ----------------
-def _get_network_control():
+def _get_network_control_config():
     cfg = _cfg()
     from monitor.system_info import _get_network_static_info
 
@@ -2206,7 +2332,7 @@ def _get_network_control():
     }
 
 
-def _validate_network_control(body):
+def _validate_network_control_config(body):
     updates: dict[str, Any] = {}
 
     if "enable_network_control" in body:
@@ -2315,7 +2441,7 @@ def _validate_network_control(body):
     return updates
 
 
-def _write_network_control(updates):
+def _write_network_control_config(updates):
     interface_updates = updates.pop("network_interfaces", None)
     modified = _cfg().set_network_control_policy(updates) if updates else False
     if interface_updates is not None:
@@ -2326,28 +2452,28 @@ def _write_network_control(updates):
 # section -> {get: ()->dict, validate: (body)->updates, write: (updates)->bool}
 _CONFIG_SPECS = {
     "system_pressure": {
-        "get": _get_system_pressure,
-        "validate": _validate_system_pressure,
-        "write": _write_system_pressure,
+        "get": _get_system_pressure_config,
+        "validate": _validate_system_pressure_config,
+        "write": _write_system_pressure_config,
     },
     "disk_pressure": {
-        "get": _get_disk_pressure,
-        "validate": _validate_disk_pressure,
-        "write": lambda u: _cfg().update_top_level_scalars(u),
+        "get": _get_disk_pressure_config,
+        "validate": _validate_disk_pressure_config,
+        "write": _write_disk_pressure_config,
     },
     "network_pressure": {
-        "get": _get_network_pressure,
-        "validate": _validate_network_pressure,
-        "write": _write_network_pressure,
+        "get": _get_network_pressure_config,
+        "validate": _validate_network_pressure_config,
+        "write": _write_network_pressure_config,
     },
     "network_control": {
-        "get": _get_network_control,
-        "validate": _validate_network_control,
-        "write": _write_network_control,
+        "get": _get_network_control_config,
+        "validate": _validate_network_control_config,
+        "write": _write_network_control_config,
     },
     "limit_policy": {
-        "get": _limit_policy_snapshot,
-        "validate": _validate_limit_policy,
+        "get": _get_limit_policy_config,
+        "validate": _validate_limit_policy_config,
         "write": lambda u: _cfg().set_limit_policy(u),
     },
 }

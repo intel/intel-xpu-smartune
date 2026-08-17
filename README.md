@@ -143,11 +143,14 @@ Dynamically restricts CPU, memory, and disk I/O resource usage for the most reso
 - CPU frequency governor switching (powersave/performance) based on pressure level
 
 ### 2. Pressure Monitoring
-Real-time collection of CPU, memory, and I/O pressure data based on Linux PSI (Pressure Stall Information), computing a composite score and classifying it into four pressure levels (low/medium/high/critical). Intercepts execve system calls via eBPF to detect controlled app launches and exits in real-time, while independently monitoring disk I/O utilization and system iowait.
-- PSI-based pressure monitoring (CPU/memory/I/O) with four levels: low/medium/high/critical
+Real-time collection of CPU and I/O stall data from Linux PSI (Pressure Stall Information) plus memory scarcity from a free-RAM sigmoid, combined into a composite score and classified into four pressure levels (low/medium/high/critical). Disk I/O runs as a **second, independent channel** with its own score and levels, so a saturated disk authorizes an `io.max` cap without inflating the system score. Intercepts execve system calls via eBPF to detect controlled app launches and exits in real-time.
+- Two pressure channels, each with four levels (low/medium/high/critical): system (CPU/IO PSI + memory scarcity) and disk I/O
+- Per-disk USE model (utilization / await / queue depth, normalized per media class) gated by the io PSI, so "busy" only becomes "critical" when work is actually stalling
+- EWMA smoothing, per-level hysteresis and critical fast-attack on both channels
 - eBPF (via BCC) execve interception for real-time app launch/exit detection
 - Disk I/O stress detection and top disk consumer throttling
-- 📖 Deep dive: [System Pressure Model](docs/pressure_model.md) — the scoring formulas, sigmoid/EWMA curves, and how each tuning parameter affects behavior
+- 📖 Deep dive: [Pressure Algorithm](docs/pressure_algorithm.md) — the two channels (system + disk I/O), their scoring formulas and sigmoid/EWMA curves, how to read the `[sys-level]` / `[disk-level]` log lines, and what every tuning parameter does
+- 📊 Measured results: [Disk I/O under pressure](docs/disk_io_throttle_results.md) — what the `io.max` caps do to real throughput, and how a Critical app's share of a saturated NVMe goes from ~1/3 to ~85%
 
 ### 3. Priority Queue
 When system pressure reaches critical level or disk I/O is busy, new app launch requests are suspended and inserted into a max-priority queue. Once resources recover, queued apps are automatically launched in priority order, with support for manual cancellation of queued launches.
@@ -219,7 +222,7 @@ intel-xpu-smartune/
 ├── my_database.db              # Peewee SQLite DB (generated at runtime)
 ├── key/                        # Generated TLS certificate/key (b_server.crt / .key)
 ├── logs/                       # Runtime logs
-├── docs/                       # Docs: API_ENDPOINTS.md, pressure_model.md (+ images/)
+├── docs/                       # Docs: API_ENDPOINTS.md, pressure_algorithm.md, disk_io_throttle_results.md (+ images/)
 ├── config/                     # config.yaml (thresholds, weights, app list) and config loader
 ├── utils/                      # Shared utilities: logger, app_utils, http_utils
 ├── db/                         # Peewee ORM database model for controlled app records

@@ -301,5 +301,48 @@ class RegisteredAppMatchTests(unittest.TestCase):
         self.assertEqual(result['id'], 'lo2-io.scope')
 
 
+class RepresentativeCgroupTests(unittest.TestCase):
+    """Which cgroup an app's matched PIDs are taken to live in.
+
+    The limit is written to this cgroup, so picking it from a single PID is a
+    correctness question, not a convenience one: the measured failure was a Low-priority
+    fio capped on the *terminal's* vte-spawn scope while its workers ran unthrottled,
+    because the launcher (lowest PID, so first in the list) never left the terminal.
+    """
+
+    def _vote(self, table):
+        self.addCleanup(setattr, app_utils, 'get_cgroup_path_by_pid',
+                        app_utils.get_cgroup_path_by_pid)
+        app_utils.get_cgroup_path_by_pid = lambda pid: table.get(pid)
+        return app_utils.dominant_cgroup_by_pids(sorted(table))
+
+    def test_lone_launcher_does_not_decide_the_cgroup(self):
+        cg, pid = self._vote({
+            525660: '/user.slice/.../vte-spawn-9a573be3.scope',   # sudo systemd-run wrapper
+            525663: '/system.slice/lo-io.scope',
+            525664: '/system.slice/lo-io.scope',
+            525665: '/system.slice/lo-io.scope',
+        })
+        self.assertEqual(cg, '/system.slice/lo-io.scope')
+        self.assertEqual(pid, 525663)
+
+    def test_single_process_app_is_unchanged(self):
+        cg, pid = self._vote({4242: '/system.slice/hi-io.scope'})
+        self.assertEqual((cg, pid), ('/system.slice/hi-io.scope', 4242))
+
+    def test_tie_breaks_deterministically(self):
+        # Same convention as the primary-cgroup pick in _resolve_controlled_target, so the
+        # two agree on which cgroup is "the" one when an app genuinely straddles both.
+        cg, _ = self._vote({1: '/system.slice/b.scope', 2: '/system.slice/a.scope'})
+        self.assertEqual(cg, '/system.slice/a.scope')
+
+    def test_pids_without_a_readable_cgroup_yield_nothing(self):
+        self.assertEqual(self._vote({7: None, 8: None}), (None, None))
+
+    def test_unreadable_pids_do_not_outvote_a_real_cgroup(self):
+        cg, pid = self._vote({7: None, 8: '/system.slice/lo-io.scope', 9: None})
+        self.assertEqual((cg, pid), ('/system.slice/lo-io.scope', 8))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

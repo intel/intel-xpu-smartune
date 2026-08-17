@@ -57,28 +57,73 @@ _SIGMOID_K = 8.0  # steepness; larger = sharper transition around the half-point
 # applied to it (disk_thresholds.medium) is deliberately media-AGNOSTIC: P_disk = 0.6 means
 # "60% of the way to this device class's own pain point" whatever the device is. Making that
 # threshold per-media too would apply the media correction twice.
-_MEDIA_CLASSES = ('hdd', 'sata_ssd', 'nvme', 'usb')
+# `unknown` is where a device that matches no rule lands, and it deliberately carries the
+# HDD numbers: HDD is the most TOLERANT class (largest half-points), so an unrecognised
+# device reads as "not under pressure" instead of being judged by NVMe-class latency and
+# reporting saturation permanently. It is also the fallback for a media class missing from
+# any map below, so adding a class here without filling in all three maps degrades to HDD
+# behaviour rather than raising inside the pressure tick.
+MEDIA_CLASSES = ('hdd', 'sata_ssd', 'nvme', 'usb', 'mmc', 'unknown')
 # %util that reads as 0.5. Media-dependent because util measures "time with >=1 IO in
 # flight", which says nothing about how much concurrency was left: a single-actuator HDD at
 # 80% util is near saturation, while an NVMe with a 1023-deep queue can sit at 100% util
 # with one IO outstanding and enormous headroom. So the more parallel the device, the higher
 # the util reading has to be before it counts.
-_UTIL_HALF = {'hdd': 80.0, 'sata_ssd': 85.0, 'nvme': 95.0, 'usb': 80.0}
+_UTIL_HALF = {'hdd': 80.0, 'sata_ssd': 85.0, 'nvme': 95.0, 'usb': 80.0,
+              'mmc': 80.0, 'unknown': 80.0}
 # Below this utilisation (%) a disk is treated as (ramping toward) idle and its await/queue
 # sub-signals are scaled down: with almost no IO in flight, a few background ops (a log flush)
-# can show multi-ms await that is noise, not pressure.
-_ACTIVITY_UTIL_PCT = {'hdd': 20.0, 'sata_ssd': 20.0, 'nvme': 20.0, 'usb': 20.0}
+# can show multi-ms await that is noise, not pressure. Media-AGNOSTIC on purpose: %util is
+# already a normalised time fraction, so "almost nothing was in flight" means the same thing
+# on every device -- unlike the half-points, where the same raw latency means opposite things.
+_ACTIVITY_UTIL_PCT = 20.0
 # await half-points cannot be probed reliably (idle disks issue no IO), so they are
 # media-class defaults, in ms.  `usb` covers removable mass storage, whose write latency is
 # routinely tens of ms -- judging it by the SATA-SSD 5 ms point would report a healthy thumb
-# drive as permanently saturated.
-_AWAIT_HALF_MS = {'hdd': 20.0, 'sata_ssd': 5.0, 'nvme': 1.0, 'usb': 30.0}
+# drive as permanently saturated. `mmc` (eMMC/SD) sits between the two.
+_AWAIT_HALF_MS = {'hdd': 20.0, 'sata_ssd': 5.0, 'nvme': 1.0, 'usb': 30.0,
+                  'mmc': 10.0, 'unknown': 20.0}
 # queue-depth half-points -- the avg queue depth at which the queue sub-signal reads 0.5.
 # These are "starts hurting" points, deliberately well below a device's advertised max
 # concurrency (which is capacity, not pain): sustained queueing at these depths already means
 # work is waiting. Used as the default AND as a ceiling on any device-derived value.
-# `usb` bridges typically expose queue_depth=1, so any sustained queue means waiting.
-_QUEUE_HALF_DEFAULT = {'hdd': 3.0, 'sata_ssd': 16.0, 'nvme': 32.0, 'usb': 1.0}
+# `usb` bridges typically expose queue_depth=1, so any sustained queue means waiting; `mmc`
+# only gained command queueing in eMMC 5.1, so most parts still behave close to depth 1.
+_QUEUE_HALF_DEFAULT = {'hdd': 3.0, 'sata_ssd': 16.0, 'nvme': 32.0, 'usb': 1.0,
+                       'mmc': 2.0, 'unknown': 3.0}
+
+
+def _for_media(table: Dict[str, float], media: str) -> float:
+    """Per-media lookup that falls back to ``unknown`` (== HDD) for an uncovered class."""
+    value = table.get(media)
+    return table['unknown'] if value is None else value
+
+
+# {disk_name: media_class}. Cached forever because it describes the hardware; a disk that
+# appears later (hotplug) simply misses once and is probed then.
+_DISK_MEDIA: Dict[str, str] = {}
+
+
+def media_for_disk(disk: str) -> str:
+    """Media class of a whole disk, probed from sysfs and cached.
+
+    Module-level rather than a :class:`DiskIOMonitor` method because the throttle path
+    needs it too -- an io.max cap has to be sized against what the device can deliver,
+    and it should not have to own a pressure monitor to ask.
+    """
+    media = _DISK_MEDIA.get(disk)
+    if media is None:
+        rotational = _read_int(f"/sys/block/{disk}/queue/rotational")
+        removable = _read_int(f"/sys/block/{disk}/removable")
+        # The symlink target carries the bus topology, e.g.
+        # ../devices/pci.../usb1/1-2/1-2:1.0/host6/... -- the only reliable way to spot a
+        # USB bridge that reports itself as a plain non-rotational SCSI disk.
+        dev_path = os.path.realpath(f"/sys/block/{disk}")
+        media = _classify_media(disk, rotational, removable, dev_path)
+        _DISK_MEDIA[disk] = media
+        logger.debug(f"disk media {disk}: {media} (rotational={rotational} "
+                     f"removable={removable} path={dev_path})")
+    return media
 
 
 def _classify_media(disk: str, rotational, removable, dev_path: str) -> str:
@@ -87,7 +132,13 @@ def _classify_media(disk: str, rotational, removable, dev_path: str) -> str:
     Order matters. Removable/USB is checked BEFORE the rotational flag because USB mass
     storage reports ``rotational=0`` and would otherwise be classed as a SATA SSD and held
     to SSD-class latency -- the single worst misclassification available here, since the
-    two differ by an order of magnitude in what counts as slow.
+    two differ by an order of magnitude in what counts as slow. It is also checked before
+    ``mmcblk`` so that a card in a reader is judged by the slower removable numbers, while
+    a soldered-down eMMC gets the ``mmc`` ones.
+
+    Anything whose ``rotational`` flag could not be read (virtio, device-mapper, md) is
+    ``unknown`` rather than a guess -- see the note at :data:`MEDIA_CLASSES` for why that
+    class carries the HDD numbers.
 
     :param disk: kernel device name (e.g. "nvme0n1", "sda", "vdb").
     :param rotational: ``queue/rotational`` as int, or None when unreadable.
@@ -98,9 +149,13 @@ def _classify_media(disk: str, rotational, removable, dev_path: str) -> str:
         return 'nvme'
     if removable == 1 or '/usb' in (dev_path or '').lower():
         return 'usb'
+    if disk.startswith('mmcblk'):
+        return 'mmc'
     if rotational == 1:
         return 'hdd'
-    return 'sata_ssd'  # non-rotational, non-NVMe, non-removable
+    if rotational == 0:
+        return 'sata_ssd'  # non-rotational, non-NVMe, non-removable, non-eMMC
+    return 'unknown'
 
 # noisy-OR: how strongly the single worst disk dominates the aggregate (0..1).
 _MAX_P_WEIGHT = 0.8
@@ -123,6 +178,64 @@ def _read_int(path: str):
             return int(f.read().strip())
     except (OSError, ValueError):
         return None
+
+
+# {"maj:min": "nvme0n1"} for every block device, cached because it describes the
+# hardware. Rebuilt on a lookup miss rather than on a timer, which is what makes
+# hotplug work: a USB disk plugged in after start-up misses once, triggers a rebuild,
+# and is resolved from then on.
+_DEVNO_TO_DISK: Dict[str, str] = {}
+
+
+def _build_devno_map() -> Dict[str, str]:
+    """Scan ``/sys/block`` for ``maj:min`` -> whole-disk name.
+
+    Partitions are mapped to their PARENT disk, not to themselves. cgroup ``io.stat``
+    charges I/O to the whole-disk devno on current kernels (verified: writing to
+    ``/tmp`` on ``nvme0n1p2`` shows up under ``259:0``), but a kernel that charged the
+    partition would otherwise produce a device this code cannot name -- and the two
+    consumers of the name, ``io.max`` and the media classification, are both whole-disk
+    concepts anyway.
+    """
+    mapping: Dict[str, str] = {}
+    try:
+        disks = os.listdir('/sys/block')
+    except OSError as e:
+        logger.debug("cannot list /sys/block: %s", e)
+        return mapping
+
+    for disk in disks:
+        base = f"/sys/block/{disk}"
+        try:
+            with open(f"{base}/dev") as f:
+                mapping[f.read().strip()] = disk
+        except OSError:
+            continue
+        # Partitions are the subdirectories carrying their own `dev` file.
+        try:
+            for entry in os.listdir(base):
+                try:
+                    with open(f"{base}/{entry}/dev") as f:
+                        mapping[f.read().strip()] = disk  # parent disk, deliberately
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return mapping
+
+
+def disk_name_for_devno(devno: str) -> str:
+    """Kernel disk name for a ``"maj:min"`` string, or the devno itself if unknown.
+
+    Returning the raw devno instead of None keeps it usable as a dict key downstream:
+    an unnameable device still needs to be counted, just not classified.
+    """
+    global _DEVNO_TO_DISK
+    name = _DEVNO_TO_DISK.get(devno)
+    if name is None:
+        _DEVNO_TO_DISK = _build_devno_map()
+        name = _DEVNO_TO_DISK.get(devno)
+    return name or devno
 
 
 class DiskIOMonitor:
@@ -167,7 +280,7 @@ class DiskIOMonitor:
             'w_util': _w('util', _W_UTIL),
             'sigmoid_k': _num('sigmoid_k', _SIGMOID_K),
             'util_half_pct': _media_map('util_half_pct', _UTIL_HALF),
-            'activity_util_pct': _media_map('activity_util_pct', _ACTIVITY_UTIL_PCT),
+            'activity_util_pct': _num('activity_util_pct', _ACTIVITY_UTIL_PCT),
             'await_half_ms': _media_map('await_half_ms', _AWAIT_HALF_MS),
             'queue_half': _media_map('queue_half', _QUEUE_HALF_DEFAULT),
             'max_p_weight': _num('max_p_weight', _MAX_P_WEIGHT),
@@ -238,28 +351,21 @@ class DiskIOMonitor:
         """
         probe = self._profiles.get(disk)
         if probe is None:
-            rotational = _read_int(f"/sys/block/{disk}/queue/rotational")
-            removable = _read_int(f"/sys/block/{disk}/removable")
-            # The symlink target carries the bus topology, e.g.
-            # ../devices/pci.../usb1/1-2/1-2:1.0/host6/... -- the only reliable way to spot
-            # a USB bridge that reports itself as a plain non-rotational SCSI disk.
-            dev_path = os.path.realpath(f"/sys/block/{disk}")
             probe = {
-                'media': _classify_media(disk, rotational, removable, dev_path),
+                'media': media_for_disk(disk),
                 # device/queue_depth is the hardware's max concurrency (capacity), not the
                 # depth at which latency starts to suffer -- on NVMe it can be 128-1023.
                 'queue_depth': _read_int(f"/sys/block/{disk}/device/queue_depth"),
             }
             self._profiles[disk] = probe
-            logger.debug(f"disk probe {disk}: {probe} "
-                         f"(rotational={rotational} removable={removable} path={dev_path})")
+            logger.debug(f"disk probe {disk}: {probe}")
 
         model = self._model()
         media = probe['media']
         if media == 'hdd':
             # A single actuator: any sustained queue means waiting, regardless of the
             # block layer's advertised depth.
-            queue_half = model['queue_half']['hdd']
+            queue_half = _for_media(model['queue_half'], 'hdd')
         else:
             # Use the advertised depth only to make a low-concurrency device MORE
             # sensitive, never to push the half-point above the media pain ceiling. A
@@ -267,15 +373,15 @@ class DiskIOMonitor:
             # class default would judge a device that can hold one request in flight as if
             # it could hold sixteen.
             qd = probe['queue_depth']
-            default = model['queue_half'][media]
+            default = _for_media(model['queue_half'], media)
             queue_half = min(float(qd), default) if qd and qd >= 1 else default
 
         return {
             'media': media,
-            'await_half_ms': model['await_half_ms'][media],
+            'await_half_ms': _for_media(model['await_half_ms'], media),
             'queue_half': queue_half,
-            'util_half_pct': model['util_half_pct'][media],
-            'activity_util_pct': model['activity_util_pct'][media],
+            'util_half_pct': _for_media(model['util_half_pct'], media),
+            'activity_util_pct': model['activity_util_pct'],
         }
 
     def _collect_disk_io_stats(self) -> dict:

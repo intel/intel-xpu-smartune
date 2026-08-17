@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
-"""Regenerate the figures embedded in docs/pressure_model.md.
+"""Regenerate the figures embedded in docs/pressure_algorithm.md.
 
 Dependency-free (pure-Python SVG, no matplotlib/numpy so it runs anywhere the
 project does). Emits vector SVGs into docs/images/, which render inline on

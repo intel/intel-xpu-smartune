@@ -14,6 +14,7 @@ Run:  python3 balancer/test/test_disk_pressure.py
 import os
 import sys
 import unittest
+from unittest import mock
 
 # Allow running the file directly from anywhere.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -25,7 +26,9 @@ from monitor.disk_pressure import (
     compute_disk_pressure,
     _classify_media,
     _sigmoid_pressure,
-    _MEDIA_CLASSES,
+    _AWAIT_HALF_MS,
+    MEDIA_CLASSES,
+    _QUEUE_HALF_DEFAULT,
 )
 from monitor.pressure import PressureAnalyzer
 
@@ -98,7 +101,7 @@ class PerDiskPressureTests(unittest.TestCase):
 
 class MediaClassificationTests(unittest.TestCase):
     """Media class decides every half-point, so a misclassified device is judged by the
-    wrong yardstick. Tested as a pure function -- no machine has all four media classes."""
+    wrong yardstick. Tested as a pure function -- no machine has every media class."""
 
     def test_nvme_by_name(self):
         # NVMe has no `device/queue_depth` and reports rotational=0; the name is the signal.
@@ -118,17 +121,48 @@ class MediaClassificationTests(unittest.TestCase):
         self.assertEqual(_classify_media("sdc", 0, 0, usb_path), "usb")
         self.assertEqual(_classify_media("sdc", 0, 1, "/devices/whatever"), "usb")
 
-    def test_unreadable_sysfs_falls_back_to_ssd(self):
-        # None everywhere (container / restricted sysfs): the modern-default class, not a crash.
-        self.assertEqual(_classify_media("vda", None, None, ""), "sata_ssd")
+    def test_emmc_by_name(self):
+        # eMMC reports rotational=0 and removable=0, so only the name separates it from a
+        # SATA SSD -- whose 5 ms await point would call a healthy eMMC permanently saturated.
+        self.assertEqual(_classify_media("mmcblk0", 0, 0, "/devices/pci0000:00/.../mmc0"), "mmc")
+
+    def test_removable_card_is_usb_not_mmc(self):
+        """A card in a reader is judged by the slower removable numbers; only a soldered-down
+        part gets the eMMC ones. Hence the usb check runs before the mmcblk name check."""
+        self.assertEqual(_classify_media("mmcblk0", 0, 1, "/devices/whatever"), "usb")
+
+    def test_unreadable_sysfs_is_unknown(self):
+        # Container / restricted sysfs / virtio / md: say so rather than guess. `unknown`
+        # carries the HDD numbers, so the device reads as calm instead of falsely saturated.
+        self.assertEqual(_classify_media("vda", None, None, ""), "unknown")
+
+    def test_unknown_is_as_tolerant_as_hdd(self):
+        """The point of the fallback: an unidentifiable disk must not be held to a stricter
+        yardstick than the slowest class we know about."""
+        m = DiskIOMonitor(_Cfg())._model()
+        for key in ("await_half_ms", "queue_half", "util_half_pct"):
+            self.assertEqual(m[key]["unknown"], m[key]["hdd"], key)
 
     def test_every_class_has_all_half_points(self):
         """A class present in the taxonomy but missing from a half-point map would KeyError
         on the pressure tick for whoever owns that hardware."""
         m = DiskIOMonitor(_Cfg())._model()
-        for key in ("await_half_ms", "queue_half", "util_half_pct", "activity_util_pct"):
-            for media in _MEDIA_CLASSES:
+        for key in ("await_half_ms", "queue_half", "util_half_pct"):
+            for media in MEDIA_CLASSES:
                 self.assertIn(media, m[key], f"{key} missing {media}")
+
+    def test_uncovered_media_falls_back_instead_of_raising(self):
+        """Adding a class without filling in every map must degrade to `unknown`, not blow
+        up inside the pressure tick."""
+        m = _monitor({}, {"sdz": {"media": "future_class", "queue_depth": None}})
+        prof = m._disk_profile("sdz")
+        self.assertEqual(prof["await_half_ms"], _AWAIT_HALF_MS["unknown"])
+        self.assertEqual(prof["queue_half"], _QUEUE_HALF_DEFAULT["unknown"])
+
+    def test_activity_gate_is_a_scalar_not_per_media(self):
+        """%util is already a normalised time fraction, so the idle gate is media-agnostic;
+        keeping it as a map invited four identical numbers drifting apart."""
+        self.assertIsInstance(DiskIOMonitor(_Cfg())._model()["activity_util_pct"], float)
 
 
 class MediaAwareUtilTests(unittest.TestCase):
@@ -361,6 +395,72 @@ class UiAggregationTests(unittest.TestCase):
     def test_no_data(self):
         r = compute_disk_pressure({})
         self.assertEqual(r["busy_level"], "NO DATA")
+
+
+class ConfigSurfaceTests(unittest.TestCase):
+    """The bands and the four hardware-independent model knobs are UI-editable, so the
+    validator and the YAML line patcher have to agree with what the model reads back."""
+
+    def setUp(self):
+        from monitor import monitor_api
+        self.api = monitor_api
+        # The GET side reports effective values, which it reads through the shared
+        # ResourceMonitor; a stub keeps that off real disks. _model() only needs
+        # ``config``, so skip __init__ and its sampling entirely.
+        stub = DiskIOMonitor.__new__(DiskIOMonitor)
+        stub.config = _Cfg()
+        model = stub._model()
+        patcher = mock.patch.object(
+            monitor_api, "_get_resource_monitor",
+            return_value=mock.Mock(get_disk_pressure_model=lambda: model))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_get_reports_effective_values(self):
+        """A knob absent from config.yaml must read back as the default in force, not null."""
+        data = self.api._get_disk_pressure_config()
+        self.assertEqual(set(data["disk_pressure_model"]["sub_weights"]),
+                         {"latency", "queue", "util"})
+        self.assertIsInstance(data["disk_pressure_model"]["max_p_weight"], float)
+
+    def test_partial_update_keeps_the_nesting(self):
+        upd = self.api._validate_disk_pressure_config(
+            {"disk_pressure_model": {"sub_weights": {"util": 0.05}, "sigmoid_k": 9}})
+        self.assertEqual(upd["disk_pressure_model"]["sub_weights"], {"util": 0.05})
+        self.assertEqual(upd["disk_pressure_model"]["sigmoid_k"], 9.0)
+        self.assertNotIn("disk_thresholds", upd)
+
+    def test_unordered_bands_are_rejected(self):
+        with self.assertRaises(ValueError):
+            self.api._validate_disk_pressure_config({"disk_thresholds": {"low": 0.9}})
+
+    def test_sub_weights_summing_above_one_are_rejected(self):
+        """P_disk is a weighted sum: weights over 1 let it exceed 1 and carry the overflow
+        into the noisy-OR and the bands."""
+        with self.assertRaises(ValueError):
+            self.api._validate_disk_pressure_config(
+                {"disk_pressure_model": {"sub_weights": {"util": 0.5}}})  # 0.55+0.35+0.5
+
+    def test_max_p_weight_out_of_range_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.api._validate_disk_pressure_config({"disk_pressure_model": {"max_p_weight": 1.5}})
+
+    def test_shipped_yaml_is_reachable_by_the_line_patcher(self):
+        """Every editable key has to exist in config.yaml at a fixed indent: the patcher
+        rewrites lines it can find and silently no-ops on the ones it cannot."""
+        from config.config import Config
+        path = os.path.join(_REPO_ROOT, "config", "config.yaml")
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        for band in ("low", "medium", "high", "critical"):
+            self.assertTrue(Config._replace_yaml_scalar_line(
+                lines, ("disk_thresholds", band), 0.5), band)
+        for key in ("latency", "queue", "util"):
+            self.assertTrue(Config._replace_yaml_scalar_line(
+                lines, ("disk_pressure_model", "sub_weights", key), 0.3), key)
+        for key in ("sigmoid_k", "max_p_weight"):
+            self.assertTrue(Config._replace_yaml_scalar_line(
+                lines, ("disk_pressure_model", key), 0.5), key)
 
 
 if __name__ == "__main__":

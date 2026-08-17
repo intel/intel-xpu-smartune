@@ -600,7 +600,9 @@ class Config:
               "memory":  {"enabled": True, "rate": {"high": 0.3, ...}},
               "disk_io": {"enabled": True,
                           "rate": {"high": {"write": 50, "read": 60,
-                                            "write_iops": 15000, "read_iops": 18000}, ...}},
+                                            "write_iops": 15000, "read_iops": 18000}, ...},
+                          "media_scale": {"usb": 0.15, ...},
+                          "candidate_floor": {"usb": {"mb_s": 4, "iops": 50}, ...}},
             }
 
         Only the leaves that actually change are rewritten (comments preserved).
@@ -668,10 +670,89 @@ class Config:
                             if prio_cfg.get(key) != ival:
                                 prio_cfg[key] = ival
                                 yaml_updates[("limit_policy", "disk_io", "rate", pri, key)] = ival
+                if isinstance(disk_upd.get("media_scale"), dict):
+                    scale = cfg.setdefault("media_scale", {})
+                    for media, raw in disk_upd["media_scale"].items():
+                        try:
+                            fval = float(raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if scale.get(media) != fval:
+                            scale[media] = fval
+                            yaml_updates[("limit_policy", "disk_io", "media_scale", media)] = fval
+                if isinstance(disk_upd.get("candidate_floor"), dict):
+                    floor = cfg.setdefault("candidate_floor", {})
+                    for media, fields in disk_upd["candidate_floor"].items():
+                        if not isinstance(fields, dict):
+                            continue
+                        media_cfg = floor.setdefault(media, {})
+                        for key in ("mb_s", "iops"):
+                            if key not in fields:
+                                continue
+                            try:
+                                fval = float(fields[key])
+                            except (TypeError, ValueError):
+                                continue
+                            if media_cfg.get(key) != fval:
+                                media_cfg[key] = fval
+                                yaml_updates[("limit_policy", "disk_io",
+                                              "candidate_floor", media, key)] = fval
 
             self.limit_policy = lp
             if yaml_updates:
                 logger.info(f"Configuration updated: limit_policy - {list(yaml_updates.keys())}")
+                self._patch_limit_policy_yaml(yaml_updates, self._config_path)
+
+        return bool(yaml_updates)
+
+    def set_disk_pressure_model(self, updates: dict[str, Any]) -> bool:
+        """Persist the hardware-independent knobs of ``disk_pressure_model``::
+
+            {"sub_weights": {"latency": 0.55, "queue": 0.35, "util": 0.10},
+             "sigmoid_k": 8.0, "max_p_weight": 0.8}
+
+        The per-media half-point maps are not settable here: they are calibrated per
+        device class and are edited in config.yaml. Only changed leaves are rewritten
+        (comments preserved); returns True if anything changed.
+        """
+        from utils.logger import logger
+
+        if not isinstance(updates, dict) or not updates:
+            return False
+
+        yaml_updates: dict[tuple[str, ...], Any] = {}
+
+        with self._persist_lock:
+            model = self.disk_pressure_model if isinstance(self.disk_pressure_model, dict) else {}
+
+            sub_weights = updates.get("sub_weights")
+            if isinstance(sub_weights, dict):
+                current = model.setdefault("sub_weights", {})
+                for key in ("latency", "queue", "util"):
+                    if key not in sub_weights:
+                        continue
+                    try:
+                        val = float(sub_weights[key])
+                    except (TypeError, ValueError):
+                        continue
+                    if current.get(key) != val:
+                        current[key] = val
+                        yaml_updates[("disk_pressure_model", "sub_weights", key)] = val
+
+            for key in ("sigmoid_k", "max_p_weight"):
+                if key not in updates:
+                    continue
+                try:
+                    val = float(updates[key])
+                except (TypeError, ValueError):
+                    continue
+                if model.get(key) != val:
+                    model[key] = val
+                    yaml_updates[("disk_pressure_model", key)] = val
+
+            self.disk_pressure_model = model
+            if yaml_updates:
+                logger.info(f"Configuration updated: disk_pressure_model - {list(yaml_updates.keys())}")
                 self._patch_limit_policy_yaml(yaml_updates, self._config_path)
 
         return bool(yaml_updates)

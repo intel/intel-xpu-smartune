@@ -5,7 +5,7 @@ import json
 import os, signal, subprocess, time
 import psutil
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from collections import OrderedDict
 from controller.app_intercept import AppIntercept
@@ -19,6 +19,7 @@ import queue
 import heapq
 from controller.network import NetworkController
 from controller.io import IOController
+from monitor.disk_pressure import media_for_disk
 
 
 IO_LIMIT_MBPS_THRESHOLD = 100
@@ -125,6 +126,22 @@ class LimitRegistry:
         """
         for key, app in self.apps.items():
             if app.public_app_id == public_app_id and (source is None or app.source == source):
+                return key, app
+        return None
+
+    def by_any_id(self, ident: str, source: Optional[str] = None) -> "Optional[tuple[str, LimitedApp]]":
+        """Find the (key, LimitedApp) *ident* refers to under any of its names, or None.
+
+        One limited app answers to several ids: the public app id, the primary cgroup it
+        is keyed by, and every extra cgroup it spans.  A caller that only has one of them
+        -- the disk-IO candidate loop holds the id the top-consumer sample reported, which
+        for a resolved multi-cgroup app is none of the above by the time the limit lands --
+        would otherwise conclude the app is unlimited and cap it again every tick.
+        """
+        for key, app in self.apps.items():
+            if source is not None and app.source != source:
+                continue
+            if ident == key or ident == app.public_app_id or ident in (app.cgroups or []):
                 return key, app
         return None
 
@@ -415,13 +432,29 @@ class DynamicBalancer:
     # next heavy user.  Kept small: the candidate-sampling floor in _get_top_processes
     # (max(n*3, 9)) means values up to 3 cost the same as fetching just #1.
     _DISK_IO_TOP_N = 3
-    # Minimum disk IO a candidate must itself be doing before capping it is worthwhile --
-    # throttling a light user cannot relieve the device. EITHER floor qualifies: bandwidth
-    # alone would miss small-block random workloads, which move few MB but saturate the
-    # device on IOPS. The IOPS floor sits above the highest per-priority IOPS cap in
-    # limit_policy, so a candidate only qualifies when a cap would really slow it down.
-    _DISK_IO_LIMIT_MIN_MB = 50.0
-    _DISK_IO_LIMIT_MIN_IOPS = 2500.0
+    # Fallbacks for the per-media tables in `limit_policy.disk_io` (see config.yaml for
+    # what each number means and how it was chosen). Kept here so the throttle path keeps
+    # working against a config that predates these keys.
+    #
+    # candidate_floor: the minimum I/O an app must be doing ON ONE DISK before capping it
+    # is worthwhile -- throttling a light user cannot relieve the device. EITHER floor
+    # qualifies, because bandwidth alone would miss small-block random workloads that move
+    # few MB but saturate the device on IOPS.
+    _CANDIDATE_FLOOR_DEFAULT = {
+        'nvme': {'mb_s': 30.0, 'iops': 2000.0},
+        'sata_ssd': {'mb_s': 20.0, 'iops': 1200.0},
+        'mmc': {'mb_s': 10.0, 'iops': 400.0},
+        'hdd': {'mb_s': 5.0, 'iops': 60.0},
+        'usb': {'mb_s': 4.0, 'iops': 50.0},
+        'unknown': {'mb_s': 5.0, 'iops': 60.0},
+    }
+    # media_scale: the `rate` table in limit_policy is calibrated for NVMe; these
+    # re-express it for slower media so a priority means the same fraction of what the
+    # device can do rather than the same absolute MB/s.
+    _MEDIA_SCALE_DEFAULT = {
+        'nvme': 1.0, 'sata_ssd': 0.6, 'mmc': 0.30,
+        'hdd': 0.25, 'usb': 0.15, 'unknown': 0.25,
+    }
 
     def __init__(self):
         self.bpf_monitor = AppIntercept("controller/bpf_event.c")
@@ -467,6 +500,105 @@ class DynamicBalancer:
         and any disk-IO stress counts as threshold-crossing, so it is always True.
         """
         return self.resource_monitor.get_top_disk_io_consumers(n=self._DISK_IO_TOP_N), True
+
+    def _disk_io_table(self, key: str) -> dict:
+        """Raw per-media table from ``limit_policy.disk_io``, or ``{}`` if unusable."""
+        policy = getattr(self.config, 'limit_policy', None) or {}
+        table = (policy.get('disk_io') or {}).get(key)
+        return table if isinstance(table, dict) else {}
+
+    def _media_scales(self) -> Dict[str, float]:
+        """Per-media coefficient applied to the priority rate row, merged over the defaults.
+
+        Merged per class rather than all-or-nothing: an operator who only wants to soften
+        ``usb`` writes that one key and keeps the calibrated values for the rest, and a typo
+        costs one media class instead of the whole table.
+        """
+        raw = self._disk_io_table('media_scale')
+        scales = dict(self._MEDIA_SCALE_DEFAULT)
+        for media in scales:
+            value = raw.get(media)
+            if isinstance(value, (int, float)) and 0 < float(value) <= 1.0:
+                scales[media] = float(value)
+        return scales
+
+    def _candidate_floors(self) -> Dict[str, Dict[str, float]]:
+        """Per-media ``{mb_s, iops}`` qualification floors, merged over the defaults."""
+        raw = self._disk_io_table('candidate_floor')
+        floors = {media: dict(entry) for media, entry in self._CANDIDATE_FLOOR_DEFAULT.items()}
+        for media, entry in floors.items():
+            configured = raw.get(media)
+            if not isinstance(configured, dict):
+                continue
+            for field in ('mb_s', 'iops'):
+                value = configured.get(field)
+                if isinstance(value, (int, float)) and float(value) >= 0:
+                    entry[field] = float(value)
+        return floors
+
+    def _qualifies_for_throttle(self, proc: dict) -> Tuple[bool, str]:
+        """Is this app heavy enough on some ONE disk that capping it would help?
+
+        Judged per disk against that disk's media floor, because the floors differ by an
+        order of magnitude across media: 5 MB/s is nothing on an NVMe and most of what a
+        thumb drive can deliver. ``io_per_disk`` comes from cgroup ``io.stat`` (see
+        ``monitor/cgroup.py``), so the numerator and the disk attribution share a source.
+
+        With no per-disk breakdown the app's totals are judged against the STRICTEST floor
+        of any media class: a missing breakdown is not evidence of a slow device, so the
+        conservative reading is the one that avoids throttling a light user.
+
+        :return: ``(qualifies, reason)`` -- *reason* is for the decision log either way.
+        """
+        floors = self._candidate_floors()
+        per_disk = proc.get('io_per_disk') or {}
+
+        if not per_disk:
+            strictest = max(floors.values(), key=lambda f: f['mb_s'])
+            mb = (proc.get('io_read_rate') or 0.0) + (proc.get('io_write_rate') or 0.0)
+            iops = (proc.get('io_read_iops') or 0.0) + (proc.get('io_write_iops') or 0.0)
+            ok = mb >= strictest['mb_s'] or iops >= strictest['iops']
+            return ok, (f"totals {mb:.1f}MB/s {iops:.0f}iops vs strictest floor "
+                        f"{strictest['mb_s']}MB/s / {strictest['iops']}iops (no per-disk data)")
+
+        for disk, rates in per_disk.items():
+            media = media_for_disk(disk)
+            floor = floors.get(media, floors['unknown'])
+            mb = (rates.get('read_mb_s') or 0.0) + (rates.get('write_mb_s') or 0.0)
+            iops = (rates.get('read_iops') or 0.0) + (rates.get('write_iops') or 0.0)
+            if mb >= floor['mb_s'] or iops >= floor['iops']:
+                return True, (f"{disk}({media}) {mb:.1f}MB/s {iops:.0f}iops "
+                              f">= floor {floor['mb_s']}MB/s / {floor['iops']}iops")
+        busiest = max(per_disk, key=lambda d: sum(per_disk[d].get(k) or 0.0
+                                                  for k in ('read_mb_s', 'write_mb_s')))
+        return False, (f"no disk over its media floor (busiest {busiest}"
+                       f"/{media_for_disk(busiest)})")
+
+    def _scaled_io_limits(self, io_limits: dict, disk_filter=None) -> Dict[str, Dict[str, int]]:
+        """Expand one priority rate row into a per-disk ``io.max`` map, scaled by media.
+
+        The same 20 MB/s cap is a mild nudge on an NVMe and more than a USB stick can
+        deliver at all, so each disk gets the rate row multiplied by its media coefficient.
+        Bandwidth and IOPS are scaled by the SAME factor on purpose: the rate table is built
+        on ``iops = MB/s * 300``, and scaling them independently would move the block size
+        at which the IOPS cap starts to bind.
+
+        ``default`` stays unscaled, matching the previous behaviour, so a disk that appears
+        between this enumeration and the write is capped rather than accidentally freed --
+        and is capped at the loosest value, not at a thumb drive's.
+        """
+        base = {
+            'rbps': io_limits['read'] * 1024 ** 2,
+            'wbps': io_limits['write'] * 1024 ** 2,
+            'riops': io_limits['read_iops'],
+            'wiops': io_limits['write_iops'],
+        }
+        scales = self._media_scales()
+        limits: Dict[str, Dict[str, int]] = {'default': {k: max(1, int(v)) for k, v in base.items()}}
+        for disk in (self.io_ctl.get_disk_id(disk_filter) or {}):
+            scale = scales.get(media_for_disk(disk), scales['unknown'])
+            limits[disk] = {k: max(1, int(v * scale)) for k, v in base.items()}
+        return limits
 
     def start(self):
         """
@@ -1064,14 +1196,7 @@ class DynamicBalancer:
 
         io_limits = limit_rates.get("disk_io_rate", {})
         if io_limits and self.is_running:
-            limits = {
-                "default": {
-                    "rbps": io_limits['read'] * 1024 ** 2,
-                    "wbps": io_limits['write'] * 1024 ** 2,
-                    "wiops": io_limits['write_iops'],
-                    "riops": io_limits['read_iops']
-                }
-            }
+            limits = self._scaled_io_limits(io_limits)
             io_limited = self.io_ctl.set_disk_io_throttle(
                 app_id,
                 limits=limits
@@ -1082,8 +1207,12 @@ class DynamicBalancer:
                 self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
         if resource_limited or io_limited:
+            # app_id addresses cgroups (it may have been rewritten to the resolved primary
+            # cgroup); the DB row and the UI know the app by its public id. Writing the
+            # cgroup name into public_app_id makes every later status update miss its row.
+            public_id = target.get('public_app_id') or app_id
             self.all_limits.apps[app_id] = LimitedApp(
-                public_app_id=app_id,
+                public_app_id=public_id,
                 app_name=app_name,
                 source="auto",
                 limit_rates=limit_rates,
@@ -1095,10 +1224,10 @@ class DynamicBalancer:
             )
 
             if is_controlled:
-                app_utils.update_app_status(app_id, "limited")
+                app_utils.update_app_status(public_id, "limited")
 
             app_utils.callback_manager.send_callback_notification({
-                'app_id': app_id,
+                'app_id': public_id,
                 'app_name': app_name,
                 'status': "limited",
                 'purpose': "app"
@@ -1174,18 +1303,17 @@ class DynamicBalancer:
                     io_restored = True
                     io_limits = limit_rates["disk_io_rate"]
 
-                    limits = {
-                        "default": {
-                            "rbps": io_limits['read'] * 2 * 1024 ** 2,
-                            "wbps": io_limits['write'] * 2 * 1024 ** 2,
-                            "wiops": io_limits['write_iops'] * 2,
-                            "riops": io_limits['read_iops'] * 2
-                        }
-                    }
                     # Same disks the cap was written to, never "all": a relaxed cap is
                     # still a cap, so an unfiltered replay throttles disks the limit
                     # never touched. Empty means it was applied to all.
                     disks = entry.limit_disks or None
+                    # Re-scaled by media, like the original cap. Doubling the raw rate row
+                    # instead would hand a USB disk many times the cap it was given, since
+                    # its coefficient is the smallest -- "2x" has to mean 2x of what was
+                    # actually written.
+                    relaxed = {k: io_limits[k] * 2
+                               for k in ('read', 'write', 'read_iops', 'write_iops')}
+                    limits = self._scaled_io_limits(relaxed, disks)
                     logger.info(
                         f"[disk-io] partial restore for {app_name!r} (app_id={app_id!r}): "
                         f"relaxing io.max to 2x rd={io_limits['read']*2}MB/s wr={io_limits['write']*2}MB/s "
@@ -1390,25 +1518,19 @@ class DynamicBalancer:
         if is_disk_io_stressed and limit_rates.get("disk_io_rate"):
             io_limits = limit_rates.get("disk_io_rate", {})
             if io_limits and self.is_running:
-                limits = {
-                    "default": {
-                        "rbps": io_limits['read'] * 1024 ** 2,
-                        "wbps": io_limits['write'] * 1024 ** 2,
-                        "wiops": io_limits['write_iops'],
-                        "riops": io_limits['read_iops']
-                    }
-                }
                 # Cap only the disks that are actually saturated. Without a filter the same
                 # io.max is written to every physical disk, so an app is throttled on disks
                 # that have nothing to do with the pressure. None/empty means "could not
                 # tell" -- fall back to all disks rather than silently skipping the limit.
                 stressed_disks = self._stressed_disks()
                 limited_disks = list(stressed_disks)
+                limits = self._scaled_io_limits(io_limits, stressed_disks or None)
                 logger.info(
                     f"[disk-io] applying io.max to {app_name!r} (app_id={app_id!r}): "
-                    f"rd={io_limits['read']}MB/s wr={io_limits['write']}MB/s "
-                    f"riops={io_limits['read_iops']} wiops={io_limits['write_iops']} "
-                    f"disks={stressed_disks or 'ALL (no stressed-disk info)'} "
+                    f"base rd={io_limits['read']}MB/s wr={io_limits['write']}MB/s "
+                    f"riops={io_limits['read_iops']} wiops={io_limits['write_iops']} -> "
+                    f"per-disk {({d: v['wbps'] // 1024 ** 2 for d, v in limits.items() if d != 'default'})} "
+                    f"MB/s write; disks={stressed_disks or 'ALL (no stressed-disk info)'} "
                     f"extra_cgroups={extra_cgroup_ids}"
                 )
                 io_limited = self.io_ctl.set_disk_io_throttle(
@@ -1420,8 +1542,12 @@ class DynamicBalancer:
                         extra_id, limits=limits, disk_filter=stressed_disks or None)
 
         if resource_limited or io_limited:
+            # app_id addresses cgroups (it may have been rewritten to the resolved primary
+            # cgroup); the DB row and the UI know the app by its public id. Writing the
+            # cgroup name into public_app_id makes every later status update miss its row.
+            public_id = target_app.get('public_app_id') or app_id
             self.all_limits.apps[app_id] = LimitedApp(
-                public_app_id=app_id,
+                public_app_id=public_id,
                 app_name=app_name,
                 source="auto",
                 limit_rates=limit_rates,
@@ -1434,10 +1560,10 @@ class DynamicBalancer:
             )
 
             if is_controlled:
-                app_utils.update_app_status(app_id, "limited")
+                app_utils.update_app_status(public_id, "limited")
 
             app_utils.callback_manager.send_callback_notification({
-                'app_id': app_id,
+                'app_id': public_id,
                 'app_name': app_name,
                 'status': "limited",
                 'purpose': "app"
@@ -1538,10 +1664,11 @@ class DynamicBalancer:
           2. not already under an auto disk-IO limit -- so successive critical ticks move
              on to the *next* heavy consumer (limit the 2nd, then the 3rd, ...) instead of
              re-limiting the same app;
-          3. itself doing enough disk IO for a cap to matter -- either
-             >= ``_DISK_IO_LIMIT_MIN_MB`` MB/s or >= ``_DISK_IO_LIMIT_MIN_IOPS`` ops/s.
-             Bandwidth alone is not a sufficient test: a 4k random workload is
-             bandwidth-light but IOPS-heavy, and capping it *does* relieve the device.
+          3. itself doing enough disk IO for a cap to matter -- see
+             :meth:`_qualifies_for_throttle`, which judges each disk the app touches
+             against that disk's media floor. Bandwidth alone is not a sufficient test: a
+             4k random workload is bandwidth-light but IOPS-heavy, and capping it *does*
+             relieve the device.
 
         Controlled non-critical apps are capped at their own priority's rates; uncontrolled
         apps count as ``undefined`` (lowest tier), i.e. a heavy unmanaged writer is
@@ -1582,16 +1709,23 @@ class DynamicBalancer:
                 logger.info(f"[disk-io] skip {cand}: Critical app, never throttled")
                 continue
             # 2) Already io-limited (auto) -- skip so we advance to the next heavy user.
-            existing = self.all_limits.by_public_id(app_id, source="auto")
-            if existing and existing[1].limit_parts.get('io_limited'):
-                logger.info(f"[disk-io] skip {cand}: already io-limited")
+            #    Checked under every id the candidate can appear as: this runs *before* the
+            #    cgroup resolution below, so the id in hand is the sample's, while the
+            #    registry entry was keyed by the resolved cgroup. Matching only one of them
+            #    would re-cap the same app on every critical tick and never reach the
+            #    second-heaviest consumer.
+            known_ids = [i for i in (app_id, (controlled_data or {}).get('app_id')) if i]
+            existing = next(
+                (e for e in (self.all_limits.by_any_id(i, source="auto") for i in known_ids)
+                 if e and e[1].limit_parts.get('io_limited')), None)
+            if existing:
+                logger.info(f"[disk-io] skip {cand}: already io-limited as {existing[0]!r}")
                 continue
-            # 3) Only limit a genuinely heavy disk user -- below both floors a cap won't help.
-            if cand_mb < self._DISK_IO_LIMIT_MIN_MB and cand_iops < self._DISK_IO_LIMIT_MIN_IOPS:
-                logger.info(
-                    f"[disk-io] skip {cand}: too light (floors "
-                    f"{self._DISK_IO_LIMIT_MIN_MB}MB/s / {self._DISK_IO_LIMIT_MIN_IOPS}iops)"
-                )
+            # 3) Only limit a genuinely heavy disk user -- below its disk's floor a cap
+            #    won't help. Judged per disk, per media: see _qualifies_for_throttle.
+            qualifies, floor_reason = self._qualifies_for_throttle(proc)
+            if not qualifies:
+                logger.info(f"[disk-io] skip {cand}: too light -- {floor_reason}")
                 continue
 
             # Resolve a controlled app to its real cgroup set before we try to write io.max.
@@ -1606,7 +1740,8 @@ class DynamicBalancer:
                 f"[disk-io] SELECTED {cand} -> cap {app_id!r} at "
                 f"'{priority or 'undefined'}' rates rd={io_rates.get('read')} "
                 f"wr={io_rates.get('write')} MB/s riops={io_rates.get('read_iops')} "
-                f"wiops={io_rates.get('write_iops')} extra_cgroups={app_info.get('extra_cgroups')}"
+                f"wiops={io_rates.get('write_iops')} (pre-media-scale; qualified on "
+                f"{floor_reason}) extra_cgroups={app_info.get('extra_cgroups')}"
             )
             return True, is_controlled, app_id, rates, app_info, idx
 
@@ -1653,6 +1788,9 @@ class DynamicBalancer:
         extras = [e for e in effective_ids if e != primary]
 
         app_info['extra_cgroups'] = extras
+        # The returned id addresses cgroups from here on, so the id the DB and the UI know
+        # the app by has to survive separately -- see _apply_resource_limits.
+        app_info['public_app_id'] = public_id
         if usage.get('pids'):
             app_info['pids'] = usage['pids']
         if usage.get('per_cgroup_mem'):

@@ -96,7 +96,7 @@ disk_pressure_model:
   #   combined = 1 - (1 - avg_p) * (1 - max_p * max_p_weight)
   # 0 = plain mean (one saturated disk among many is averaged away); 1 = the worst disk
   # alone decides. Raise this if one hammered disk out of N should count for more.
-  max_p_weight: 0.8
+  max_p_weight: 0.65
 weights:
   cpu: 4
   memory: 5

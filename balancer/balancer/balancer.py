@@ -42,7 +42,14 @@ class LimitedApp:
       * limit_rates   — the rate config used when the limit was applied.
       * limit_parts   — {'cpu_mem_limited': bool, 'io_limited': bool}.
       * state         — ``None`` for fully limited, ``"partially_restored"``
-            after a partial restore (auto only).
+            once *any* channel has been partially restored (auto only).
+      * partial_parts — {'sys': bool, 'disk_io': bool}: which channel has
+            already had its staged (2x) relaxation.  Under the separated
+            policy the sys (CPU/memory) and disk-IO channels recover on
+            independent timers, so a single ``state`` flag would let the
+            first channel to relax block the other one forever; ``state``
+            stays as the coarse "has been relaxed at all" signal that the
+            PSI-dominant check reads.
       * cgroups       — [primary, *extras]; multi-cgroup apps fan restores
             out across every entry.
       * limit_disks   — disk names the io.max cap was written to, empty for
@@ -59,6 +66,8 @@ class LimitedApp:
     limit_rates: dict
     limit_parts: dict
     state: Optional[str] = None
+    partial_parts: dict = field(
+        default_factory=lambda: {'sys': False, 'disk_io': False})
     cgroups: list = field(default_factory=list)
     limit_disks: list = field(default_factory=list)
     pids: set = field(default_factory=set)
@@ -103,6 +112,30 @@ class LimitRegistry:
         for key, app in self.apps.items():
             if app.source == "auto":
                 return key, app
+        return None
+
+    def first_auto_with_part(self, part: str,
+                             skip_partially_restored: bool = False) -> "Optional[tuple[str, LimitedApp]]":
+        """Oldest auto-limited entry that still holds *part*, or None.
+
+        *part* is a ``limit_parts`` key ('cpu_mem_limited' / 'io_limited').
+        The separated policy recovers the sys and disk-IO channels on their own
+        timers, so a restore must pick a target that actually carries the
+        channel whose timer fired — ``first_auto()`` returns the oldest entry
+        regardless of channel, which under a mixed set of limits relaxes a cap
+        whose own stability window has not elapsed.
+
+        With *skip_partially_restored* the entries already relaxed on that
+        channel are skipped, so a staged partial restore advances through the
+        queue instead of re-examining the same head every tick.
+        """
+        channel = 'sys' if part == 'cpu_mem_limited' else 'disk_io'
+        for key, app in self.apps.items():
+            if app.source != "auto" or not app.limit_parts.get(part):
+                continue
+            if skip_partially_restored and app.partial_parts.get(channel):
+                continue
+            return key, app
         return None
 
     def pop_last_auto(self) -> "Optional[tuple[str, LimitedApp]]":
@@ -161,6 +194,8 @@ class _MonitorLoopState:
     network_sample_interval: float = 5.0          # network sampling interval (seconds)
     top_consume_apps: list = None
     reach_threshold: bool = False                 # some apps may have negligible resource usage; skip limiting them
+    top_source: Optional[str] = None              # channel the held batch was sampled for: "sys" | "disk_io"
+    top_fetched_at: float = 0.0                   # when the held batch was sampled (batch-age guard)
     restore_pending: bool = False                 # True when there are apps waiting to be restored
     pressure_start_time: Optional[float] = None   # timestamp when pressure entered medium/low
     current_pressure: Optional[str] = None        # current pressure level; used to detect stability
@@ -181,6 +216,11 @@ class _MonitorLoopState:
     # can reach them directly.
     STABLE_PERIOD: int = 1800                     # 30-minute stability period (seconds)
     STABLE_DISK_IO_PERIOD: int = 300              # 5-minute disk IO stability period (seconds)
+    # A candidate batch describes the machine at the moment it was sampled. The disk
+    # channel holds an unconsumed batch while it sits at "high" (see
+    # _tick_separated_policy), so without an age bound a batch can outlive the episode
+    # it was warmed for by hours and be spent on apps that have since exited.
+    TOP_BATCH_TTL: float = 30.0                   # max age of a held candidate batch (seconds)
 
     def __post_init__(self):
         if self.top_consume_apps is None:
@@ -188,9 +228,43 @@ class _MonitorLoopState:
 
     def reset(self) -> None:
         """Clear transient state when the loop bails out of a tick."""
-        self.top_consume_apps = []
+        self.drop_top_batch()
         self.idle_check_interval = self.default_idle_check_interval
         self.pressure_start_time = None
+
+    def drop_top_batch(self) -> None:
+        """Forget the held candidate batch and everything derived from it."""
+        self.top_consume_apps = []
+        self.reach_threshold = False
+        self.top_source = None
+        self.top_fetched_at = 0.0
+
+    def keep_top_batch(self, apps: list, reach_threshold: bool, source: str, now: float) -> None:
+        """Record a freshly sampled batch together with its channel and age."""
+        self.top_consume_apps = apps
+        self.reach_threshold = reach_threshold
+        self.top_source = source
+        self.top_fetched_at = now
+
+    def stale_top_batch_reason(self, source: str, now: float) -> Optional[str]:
+        """Why the held batch must not be reused for *source*, or None.
+
+        Two disqualifiers, both observed in the field:
+          * it was sampled for the other channel — the sys channel ranks apps by
+            CPU/memory and the disk channel by IO, so spending a disk batch on a
+            CPU/memory critical caps an app nobody measured as a CPU/memory hog
+            (and vice versa);
+          * it is older than ``TOP_BATCH_TTL`` — the pressure that justified it
+            is no longer the pressure being handled.
+        """
+        if not self.top_consume_apps:
+            return None
+        if self.top_source != source:
+            return f"sampled for {self.top_source!r}, needed for {source!r}"
+        age = now - self.top_fetched_at
+        if age > self.TOP_BATCH_TTL:
+            return f"batch age {age:.1f}s > {self.TOP_BATCH_TTL:.0f}s"
+        return None
 
 
 class TopConsumerPrefetcher:
@@ -814,6 +888,16 @@ class DynamicBalancer:
                 state.disk_last_recheck_time = now
         else:
             state.disk_high_since = None
+            # The disk channel holds its batch unconsumed while it sits at "high"
+            # (nothing is throttled below critical). Once the disk calms down that
+            # batch describes an episode that is over, so drop it here rather than
+            # leaving it for whichever channel next reads the slot.
+            if state.top_source == "disk_io" and state.top_consume_apps:
+                logger.debug(
+                    "[disk-io] stress ended: dropping %d held candidate(s)",
+                    len(state.top_consume_apps),
+                )
+                state.drop_top_batch()
 
     def _drain_pending_app_queue(self, state: "_MonitorLoopState") -> None:
         """Pop one pending app off ``app_priority_queue`` and resume it:
@@ -913,18 +997,33 @@ class DynamicBalancer:
         if passive_enabled and (pressure == "critical" or is_disk_io_stressed):
             state.restore_pending = False
 
+            # The two channels keep their candidates in the same slot, so a batch left
+            # behind by one of them must never be spent by the other (nor by a later
+            # episode of its own channel): both the app ranking and reach_threshold
+            # would then describe pressure that is no longer the pressure being handled.
+            channel = "disk_io" if is_disk_io_stressed else "sys"
+            stale_reason = state.stale_top_batch_reason(channel, state.current_time)
+            if stale_reason:
+                logger.info(
+                    "Discarding %d held top-consumer candidate(s): %s",
+                    len(state.top_consume_apps), stale_reason,
+                )
+                state.drop_top_batch()
+
             if not is_disk_io_stressed:
                 state.pressure_start_time = None
                 if not state.top_consume_apps:
-                    state.top_consume_apps, state.reach_threshold = self.top_prefetcher.resolve_for_critical()
+                    apps, reach_threshold = self.top_prefetcher.resolve_for_critical()
+                    state.keep_top_batch(apps, reach_threshold, channel, state.current_time)
             else:
                 state.disk_io_not_stressed_start_time = None
                 # Serve from the prefetch cache instead of re-sampling every tick. The
                 # staleness check matters at "high", where the batch is never consumed:
                 # without it we keep acting on the list captured when the disk got busy.
                 if not state.top_consume_apps or self.disk_top_prefetcher.is_stale():
-                    state.top_consume_apps, _ = self.disk_top_prefetcher.resolve_for_critical()
-                state.reach_threshold = True  # IO pressure always counts as threshold-crossing
+                    apps, _ = self.disk_top_prefetcher.resolve_for_critical()
+                    # IO pressure always counts as threshold-crossing.
+                    state.keep_top_batch(apps, True, channel, state.current_time)
             if state.top_consume_apps:
                 self._update_dominant_flag_from_top(state)
 
@@ -947,7 +1046,7 @@ class DynamicBalancer:
                     can_apply = (disk_level == "critical"
                                  and state.reach_threshold and should_adjust and app_id)
 
-                if can_apply and target_app:
+                if can_apply and target_app and self._target_still_present(target_app, app_id):
                     self._apply_resource_limits(
                         target_app,
                         app_id,
@@ -959,6 +1058,8 @@ class DynamicBalancer:
                 if is_disk_io_stressed and disk_level != "critical":
                     # "high" is the armed state: identify the target but keep the prefetched
                     # list intact, or the critical tick it was warmed for finds it empty.
+                    # Held only for as long as the episode and the batch TTL last (see
+                    # stale_top_batch_reason) -- never across episodes or channels.
                     logger.debug(
                         "[disk-io] level=high: holding %d prefetched candidate(s), no throttle",
                         len(state.top_consume_apps),
@@ -976,7 +1077,7 @@ class DynamicBalancer:
                         "[disk-io] critical but no throttleable candidate in this batch; "
                         "discarding it to force a fresh top-consumer list next tick"
                     )
-                    state.top_consume_apps = []
+                    state.drop_top_batch()
             else:
                 state.reset()
 
@@ -994,9 +1095,16 @@ class DynamicBalancer:
         """Staged restore arm of the separated-policy tick.
 
         Tracks two independent stability timers (pressure and disk-IO) and
-        runs partial / full restore on the head of ``auto_limited_apps``
-        once the relevant timer crosses ``STABLE_PERIOD`` /
-        ``STABLE_DISK_IO_PERIOD``.
+        runs partial / full restore once the relevant timer crosses
+        ``STABLE_PERIOD`` / ``STABLE_DISK_IO_PERIOD``.
+
+        Separated policy means separated recovery: a timer only ever lifts the
+        caps of *its own* channel, and only on an app that actually carries
+        them.  Restoring both channels off whichever timer happened to fire
+        would hand back disk bandwidth because CPU/memory has been calm for
+        30 minutes — while the disk may still be under stress — and would let
+        one app's sys limit be relaxed on the strength of another app's
+        disk-IO stability.
         """
         if not (self.all_limits.first_auto() is not None and not state.restore_pending):
             return
@@ -1038,60 +1146,92 @@ class DynamicBalancer:
 
         if pressure_stable and pressure == "medium":
             state.restore_pending = True
-            app_id, entry = self.all_limits.first_auto()
-            app_name, limit_rates, limit_parts = entry.app_name, entry.limit_rates, entry.limit_parts
-            if entry.state != "partially_restored":
-                logger.info(
-                    f"Pressure remained at 'medium' for {state.STABLE_PERIOD} sec. "
-                    f"Partially restoring app {app_id}.")
-                if self.restore_resources(app_id, app_name, limit_rates, limit_parts, "partial"):
-                    entry.state = "partially_restored"
-                else:
-                    logger.warning(f"Partial restore failed for {app_name}")
-                self.all_limits.apps.move_to_end(app_id)
+            self._restore_channel("sys", "partial",
+                                  f"Pressure remained at 'medium' for {state.STABLE_PERIOD} sec")
         elif io_stable and not io_double_stable:
             state.restore_pending = True
-            app_id, entry = self.all_limits.first_auto()
-            app_name, limit_rates, limit_parts = entry.app_name, entry.limit_rates, entry.limit_parts
-            if entry.state != "partially_restored":
-                logger.info(f"Disk IO stress resolved. Partially restoring app {app_id}.")
-                if self.restore_resources(app_id, app_name, limit_rates, limit_parts, "partial"):
-                    entry.state = "partially_restored"
-                else:
-                    logger.warning(f"Partial restore failed for {app_name}")
-                self.all_limits.apps.move_to_end(app_id)
+            self._restore_channel("disk_io", "partial", "Disk IO stress resolved")
         elif (pressure_stable and pressure == "low") or io_double_stable:
             state.restore_pending = True
-            app_id, entry = self.all_limits.first_auto()
-            app_name, limit_rates, limit_parts = entry.app_name, entry.limit_rates, entry.limit_parts
-
-            success = self.restore_resources(app_id, app_name, limit_rates, limit_parts,
-                                             "full")
-            if success:
-                updated_limits = entry.limit_parts
-                is_fully_restored = not (
-                            updated_limits.get('cpu_mem_limited') or updated_limits.get('io_limited'))
-                if is_fully_restored:
-                    app_utils.update_app_status(app_id, "running")
-                    app_utils.callback_manager.send_callback_notification({
-                        'app_id': app_id,
-                        'app_name': app_name,
-                        'status': "running",
-                        'purpose': "app"
-                    }, False)
-                    self.all_limits.apps.pop(app_id, None)
-                    logger.info(f"Fully restored app {app_id}, removed from limited apps")
-
-                    if io_double_stable:
-                        state.disk_io_not_stressed_start_time = None
-                        logger.debug("Reset IO stress timer after full restoration")
-                else:
-                    self.all_limits.apps.move_to_end(app_id)
-                    logger.info(f"Partial restore for app {app_id}, moved to end of queue")
-            else:
-                logger.error(f"Failed to restore resources for app {app_id}")
-                self.all_limits.apps.move_to_end(app_id)
+            # Both timers can be ripe on the same tick; each still only lifts its own
+            # caps, on its own target.
+            if pressure_stable and pressure == "low":
+                self._restore_channel("sys", "full",
+                                      f"Pressure remained at 'low' for {state.STABLE_PERIOD} sec")
+            if io_double_stable:
+                if self._restore_channel(
+                        "disk_io", "full",
+                        f"Disk IO stayed calm for {state.STABLE_DISK_IO_PERIOD * 2} sec"):
+                    state.disk_io_not_stressed_start_time = None
+                    logger.debug("Reset IO stress timer after full restoration")
         state.restore_pending = False
+
+    # Which limit_parts flag each recovery channel owns.
+    _CHANNEL_PART = {'sys': 'cpu_mem_limited', 'disk_io': 'io_limited'}
+
+    def _restore_channel(self, channel: str, restore_type: str, why: str) -> bool:
+        """Run one staged restore step for *channel* ("sys" | "disk_io").
+
+        Picks the oldest auto-limited app that still carries this channel's cap
+        (skipping, for a partial step, the ones already relaxed on it) and
+        restores that channel alone — the other channel's caps stay untouched
+        until its own timer says otherwise.
+
+        :returns: True when a full restore actually completed, so the caller can
+            reset the channel's stability timer.
+        """
+        part = self._CHANNEL_PART[channel]
+        found = self.all_limits.first_auto_with_part(
+            part, skip_partially_restored=(restore_type == "partial"))
+        if not found:
+            return False
+
+        app_id, entry = found
+        app_name = entry.app_name
+        # Only this channel's flag is set, so restore_resources leaves the other
+        # channel's cap in place even when the app is limited on both.
+        parts = {'cpu_mem_limited': part == 'cpu_mem_limited',
+                 'io_limited': part == 'io_limited'}
+        logger.info(f"{why}. {restore_type.capitalize()} restore of {channel} "
+                    f"limits for app {app_id}.")
+
+        if not self.restore_resources(app_id, app_name, entry.limit_rates, parts, restore_type):
+            logger.warning(f"{restore_type.capitalize()} {channel} restore failed for {app_name}")
+            self.all_limits.apps.move_to_end(app_id)
+            return False
+
+        if restore_type == "partial":
+            entry.partial_parts[channel] = True
+            # Coarse flag the PSI-dominant check reads: this app is no longer
+            # under its full original cap.
+            entry.state = "partially_restored"
+            self.all_limits.apps.move_to_end(app_id)
+            return False
+
+        # Full restore: restore_resources has cleared this channel's flag on the
+        # entry; the app only leaves the registry once neither channel is capped.
+        entry.partial_parts[channel] = False
+        still_limited = (entry.limit_parts.get('cpu_mem_limited')
+                         or entry.limit_parts.get('io_limited'))
+        if still_limited:
+            self.all_limits.apps.move_to_end(app_id)
+            logger.info(f"Restored {channel} limits for app {app_id}; "
+                        f"remaining limits {entry.limit_parts}, moved to end of queue")
+            return True
+
+        # The DB row and the UI know the app by its public id, which for a
+        # resolved multi-cgroup app is not the cgroup key used here.
+        public_id = entry.public_app_id or app_id
+        app_utils.update_app_status(public_id, "running")
+        app_utils.callback_manager.send_callback_notification({
+            'app_id': public_id,
+            'app_name': app_name,
+            'status': "running",
+            'purpose': "app"
+        }, False)
+        self.all_limits.apps.pop(app_id, None)
+        logger.info(f"Fully restored app {app_id}, removed from limited apps")
+        return True
 
     def _tick_combined_policy(
         self,
@@ -1103,7 +1243,8 @@ class DynamicBalancer:
 
         Combined policy treats CPU/memory and disk-IO as a single pressure
         signal, so there's no parallel disk-IO branch and no double-stable
-        timer. Three mutually-exclusive cases:
+        timer: one channel ("sys") fills the candidate batch and one limit
+        covers CPU/Mem + IO together. Three mutually-exclusive cases:
           * critical pressure         — apply or refresh limits (CPU/Mem + IO together)
           * pending app launches      — drain queue when pressure isn't critical
           * medium/low pressure       — staged restore on a single timer
@@ -1111,17 +1252,32 @@ class DynamicBalancer:
         if passive_enabled and pressure == "critical":
             state.pressure_start_time = None
             state.restore_pending = False
+            # Only one channel here, so a held batch can only be stale by age --
+            # a multi-entry batch left over from an earlier critical episode
+            # would otherwise be consumed one entry per tick, long after the
+            # apps it named stopped being the heavy ones.
+            stale_reason = state.stale_top_batch_reason("sys", state.current_time)
+            if stale_reason:
+                logger.info(
+                    "Discarding %d held top-consumer candidate(s): %s",
+                    len(state.top_consume_apps), stale_reason,
+                )
+                state.drop_top_batch()
             if not state.top_consume_apps:
-                state.top_consume_apps, state.reach_threshold = self.top_prefetcher.resolve_for_critical()
+                apps, reach_threshold = self.top_prefetcher.resolve_for_critical()
+                state.keep_top_batch(apps, reach_threshold, "sys", state.current_time)
 
             if state.top_consume_apps:
                 self._update_dominant_flag_from_top(state)
                 should_adjust, is_controlled, app_id, limit_rates = self._handle_critical_pressure(
                     state.top_consume_apps, state.reach_threshold)
 
-                if not self.all_limits.is_limited_app_dominant and state.reach_threshold and should_adjust and app_id:
+                target_app = state.top_consume_apps[0]
+                if (not self.all_limits.is_limited_app_dominant and state.reach_threshold
+                        and should_adjust and app_id
+                        and self._target_still_present(target_app, app_id)):
                     self._apply_combined_critical_limits(
-                        state.top_consume_apps[0], app_id, limit_rates, is_controlled
+                        target_app, app_id, limit_rates, is_controlled
                     )
 
                 state.top_consume_apps.pop(0)
@@ -1337,7 +1493,10 @@ class DynamicBalancer:
                         restore_success = False
 
                 if restore_success:
+                    # Combined policy relaxes both channels in one step, so both
+                    # are marked; there is no per-channel timer to advance here.
                     entry.state = "partially_restored"
+                    entry.partial_parts.update({'sys': True, 'disk_io': True})
                 else:
                     logger.warning(f"Partial restore failed for {app_name}")
 
@@ -1379,9 +1538,12 @@ class DynamicBalancer:
                     restore_success = False
 
             if restore_success:
-                app_utils.update_app_status(app_id, "running")
+                # Status/callbacks are keyed by the public app id, which for a
+                # resolved multi-cgroup app is not the cgroup key used above.
+                public_id = entry.public_app_id or app_id
+                app_utils.update_app_status(public_id, "running")
                 app_utils.callback_manager.send_callback_notification({
-                    'app_id': app_id,
+                    'app_id': public_id,
                     'app_name': app_name,
                     'status': "running",
                     'purpose': "app"
@@ -1575,7 +1737,10 @@ class DynamicBalancer:
         :param app_id: application ID
         :param app_name: application name
         :param limit_rates: rate-limit configuration
-        :param limit_parts: flags indicating which resources were limited
+        :param limit_parts: which resources to act on this call.  The separated
+            policy passes a single channel's flag so only that channel's cap is
+            lifted; a full restore therefore clears exactly the flags it was
+            asked for on the registry entry and leaves the rest as they were.
         :param restore_type: restore scope ("partial" or "full")
         :return: (success, restored_parts)
         """
@@ -1604,10 +1769,7 @@ class DynamicBalancer:
                         logger.error(f"Failed to fully restore CPU/Memory for {app_name}")
                         restore_success = False
                     elif entry is not None:
-                        entry.limit_parts = {
-                            'cpu_mem_limited': False,
-                            'io_limited': limit_parts['io_limited'],
-                        }
+                        entry.limit_parts['cpu_mem_limited'] = False
                     for extra_id in extra_ids:
                         self.control_manager.adjust_resources(extra_id, "low")
             if limit_parts.get('io_limited', False):
@@ -1615,14 +1777,14 @@ class DynamicBalancer:
                 disks = (entry.limit_disks or None) if entry is not None else None
                 if restore_type == "partial" and "disk_io_rate" in limit_rates:
                     io_limits = limit_rates["disk_io_rate"]
-                    limits = {
-                        "default": {
-                            "rbps": io_limits['read'] * 2 * 1024 ** 2,
-                            "wbps": io_limits['write'] * 2 * 1024 ** 2,
-                            "wiops": io_limits['write_iops'] * 2,
-                            "riops": io_limits['read_iops'] * 2
-                        }
-                    }
+                    # Re-scaled by media, exactly like the original cap (and like the
+                    # combined-policy partial restore): doubling the raw rate row instead
+                    # would hand a slow disk several times the cap it was actually given,
+                    # since its coefficient is the smallest -- "2x" has to mean 2x of what
+                    # was written.
+                    relaxed = {k: io_limits[k] * 2
+                               for k in ('read', 'write', 'read_iops', 'write_iops')}
+                    limits = self._scaled_io_limits(relaxed, disks)
                     logger.info(
                         f"[disk-io] partial restore for {app_name!r} (app_id={app_id!r}): "
                         f"relaxing io.max to 2x rd={io_limits['read']*2}MB/s wr={io_limits['write']*2}MB/s "
@@ -1645,10 +1807,7 @@ class DynamicBalancer:
                         logger.error(f"Failed to fully restore disk IO for {app_name}")
                         restore_success = False
                     elif entry is not None:
-                        entry.limit_parts = {
-                            'cpu_mem_limited': limit_parts['cpu_mem_limited'],
-                            'io_limited': False,
-                        }
+                        entry.limit_parts['io_limited'] = False
                     for extra_id in extra_ids:
                         self.io_ctl.restore_disk_io_throttle(extra_id, disk_filter=disks)
 
@@ -2045,6 +2204,31 @@ class DynamicBalancer:
         if pending & fatal_mask:
             logger.info(f"PID {pid} has a pending fatal signal; treating as gone")
             return True
+        return False
+
+    def _target_still_present(self, target_app: dict, app_id: str) -> bool:
+        """Is the app this candidate names still around to be limited?
+
+        A candidate is a snapshot: by the time it is acted on the app may have
+        exited, and every limit call then fails three times against a unit that
+        no longer exists ("Unit <x> not found") before being given up on.  PIDs
+        are checked first because it is a cheap read of /proc; only when all of
+        them are gone do we pay for the cgroup lookup, which still says "present"
+        for a long-lived scope whose worker PIDs have churned.
+
+        Unknown-by-construction cases (no PID snapshot) fall back to the cgroup
+        check, and an unreadable cgroup tree is read as "present" so a lookup
+        failure never silently suppresses a limit.
+        """
+        pids = [pid for pid in (target_app.get('pids') or []) if pid]
+        if any(not self._pid_gone_or_dying(pid) for pid in pids):
+            return True
+        if self._cgroup_exists(app_id):
+            return True
+        logger.warning(
+            "Skipping limit for %r: app is already gone (pids=%s, no cgroup)",
+            app_id, sorted(pids)[:5] or "unknown",
+        )
         return False
 
     def _is_app_closed(self, entry: "LimitedApp") -> bool:

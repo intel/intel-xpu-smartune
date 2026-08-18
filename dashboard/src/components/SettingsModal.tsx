@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useContext, useEffect, useRef, useState } from 'react'
 import {
   Modal,
   Tabs,
@@ -73,23 +73,102 @@ function formatTimestamp(ts: number | undefined | null): string {
   return new Date(ts * 1000).toLocaleString()
 }
 
-// Section divider label with an optional required marker and a help tooltip.
-function SectionLabel({ text, tip, required }: { text: string; tip: string; required?: boolean }) {
+// Reuses the slot the required asterisk used to occupy, for something the user can
+// actually act on: which knobs are ordinary settings and which are calibrated model
+// coefficients best left alone. The tag carries its own tooltip, so no legend is needed.
+const ADVANCED_TIP =
+  'Advanced option — changing it is not recommended. The shipped value is calibrated; '
+  + 'a guess here degrades detection or throttling instead of tuning it.'
+
+function AdvancedTag() {
+  return (
+    <Tooltip title={ADVANCED_TIP}>
+      <Tag
+        bordered={false}
+        color="orange"
+        style={{ fontSize: 10, lineHeight: '16px', padding: '0 4px', marginInlineStart: 6, marginInlineEnd: 0 }}
+      >
+        ADV
+      </Tag>
+    </Tooltip>
+  )
+}
+
+// Field label carrying the advanced marker, for single knobs that sit outside a section.
+function advancedLabel(text: string) {
   return (
     <span>
-      {required && <span style={{ color: '#ff4d4f', marginRight: 4 }}>*</span>}
+      {text}
+      <AdvancedTag />
+    </span>
+  )
+}
+
+// Section divider label with a help tooltip. No required marker: every field in
+// this dialog already has a value loaded from the server, so a red asterisk marks
+// nothing the user has to supply — the field rules still reject empty/out-of-range
+// input on save. `advanced` marks a whole section whose fields are model coefficients.
+function SectionLabel({ text, tip, advanced }: { text: string; tip: string; advanced?: boolean }) {
+  return (
+    <span>
       {text}
       <Tooltip title={tip}>
         <QuestionCircleOutlined style={{ color: COLORS.textMuted, fontSize: 12, marginLeft: 6 }} />
       </Tooltip>
+      {advanced && <AdvancedTag />}
     </span>
   )
 }
 
 // ---------------------------------------------------------------------------
+// One Save for the whole dialog: each card registers how to validate and
+// persist itself, and the footer button drives all of them.  A Save per card
+// meant editing three cards took three clicks, with no way to tell from the
+// dialog which ones were already written -- Reset stays per card, since
+// reloading one card's server values is genuinely a per-card action.
+//
+// Cards are registered only while mounted, and the Tabs below drop hidden tabs,
+// so the footer only ever saves what the user can actually see.
+// ---------------------------------------------------------------------------
+type SaveOutcome = 'ok' | 'conflict' | 'error'
+
+interface SaveHandle {
+  // Optional: cards without a form (checkbox lists) have nothing to validate.
+  validate?: () => Promise<boolean>
+  // Untouched cards are skipped, so saving one tab does not bump the
+  // concurrency token of every section on it (which would make another client's
+  // in-progress edit conflict for no reason).
+  isDirty?: () => boolean
+  save: () => Promise<SaveOutcome>
+}
+
+interface SaveRegistry {
+  register: (id: string, handle: SaveHandle) => () => void
+}
+
+const SettingsSaveContext = React.createContext<SaveRegistry | null>(null)
+
+// Registers *handle* for as long as the calling card is mounted. The registry
+// stores a stable wrapper that reads the newest closure, so a re-render with
+// fresh form state never leaves a stale handler behind.
+function useRegisterSave(id: string, handle: SaveHandle) {
+  const registry = useContext(SettingsSaveContext)
+  const latest = useRef(handle)
+  latest.current = handle
+  useEffect(
+    () => registry?.register(id, {
+      validate: () => Promise.resolve(latest.current.validate?.() ?? true),
+      isDirty: () => latest.current.isDirty?.() ?? true,
+      save: () => latest.current.save(),
+    }),
+    [registry, id],
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Reusable "load → edit form → save with optimistic-concurrency" card.
-// On success it relies on the antd `message` toast (auto-dismissing); a global
-// notice banner is only raised on a cross-client conflict.
+// Saving is driven by the dialog footer; a global notice banner is only raised
+// on a cross-client conflict.
 // ---------------------------------------------------------------------------
 interface FormCardProps {
   title: string
@@ -130,12 +209,12 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
     void doLoad()
   }, [doLoad])
 
-  const onSave = async () => {
+  const onSave = async (): Promise<SaveOutcome> => {
     let values: Record<string, unknown>
     try {
       values = await form.validateFields()
     } catch {
-      return
+      return 'error'
     }
     setSaving(true)
     try {
@@ -164,23 +243,36 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
             })
           },
         })
-        return
+        return 'conflict'
       }
 
       const data = result.data
       if (data.success) {
         setUpdatedAt(data.updated_at)
-        message.success(`${title} saved`)
-      } else {
-        message.error(`Failed to update ${title}`)
+        return 'ok'
       }
+      message.error(`Failed to update ${title}`)
+      return 'error'
     } catch (error) {
       message.error(`Failed to save ${title}`)
       console.error(error)
+      return 'error'
     } finally {
       setSaving(false)
     }
   }
+
+  const validate = async () => {
+    try {
+      await form.validateFields()
+      return true
+    } catch {
+      message.error(`${title}: fix the highlighted fields before saving`)
+      return false
+    }
+  }
+
+  useRegisterSave(scope, { validate, isDirty: () => form.isFieldsTouched(), save: onSave })
 
   return (
     <Card size="small" title={title} style={{ marginBottom: 16 }}>
@@ -197,14 +289,14 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
           Last saved: {formatTimestamp(updatedAt)}
         </Text>
         <div>
-          <Space style={{ marginTop: 12 }}>
-            <Button icon={<ReloadOutlined />} onClick={doLoad} disabled={saving}>
-              Reset
-            </Button>
-            <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={onSave}>
-              Save
-            </Button>
-          </Space>
+          <Button
+            icon={<ReloadOutlined />}
+            onClick={doLoad}
+            disabled={saving}
+            style={{ marginTop: 12 }}
+          >
+            Reset
+          </Button>
         </div>
       </Spin>
     </Card>
@@ -221,11 +313,14 @@ function MonitoredSectionsCard() {
   const [allSections, setAllSections] = useState<string[]>([])
   const [selected, setSelected] = useState<string[]>([])
   const [updatedAt, setUpdatedAt] = useState<number | undefined>(undefined)
+  // No Form here to ask, so track edits by hand (see SaveHandle.isDirty).
+  const [dirty, setDirty] = useState(false)
 
   const applyData = useCallback((data: MonitoredSectionsData) => {
     setAllSections(data.all_sections ?? [])
     setSelected(data.sections ?? [])
     setUpdatedAt(data.updated_at)
+    setDirty(false)
   }, [])
 
   const load = useCallback(async () => {
@@ -244,7 +339,7 @@ function MonitoredSectionsCard() {
     void load()
   }, [load])
 
-  const handleSave = async () => {
+  const handleSave = async (): Promise<SaveOutcome> => {
     setSaving(true)
     try {
       const result = await api.updateMonitoredSections(selected, updatedAt)
@@ -271,22 +366,25 @@ function MonitoredSectionsCard() {
             })
           },
         })
-        return
+        return 'conflict'
       }
       const response = result.data
       if (response.success) {
         applyData(response)
-        message.success('Monitored sections saved')
-      } else {
-        message.error('Failed to update monitored sections')
+        return 'ok'
       }
+      message.error('Failed to update monitored sections')
+      return 'error'
     } catch (error) {
       message.error('Failed to save monitored sections')
       console.error(error)
+      return 'error'
     } finally {
       setSaving(false)
     }
   }
+
+  useRegisterSave('monitored_sections', { isDirty: () => dirty, save: handleSave })
 
   return (
     <Card size="small" title="Monitored sections" style={{ marginBottom: 16 }}>
@@ -309,7 +407,10 @@ function MonitoredSectionsCard() {
         )}
         <Checkbox.Group
           value={selected}
-          onChange={(vals) => setSelected(vals as string[])}
+          onChange={(vals) => {
+            setSelected(vals as string[])
+            setDirty(true)
+          }}
           style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 24px' }}
         >
           {allSections.map((s) => (
@@ -323,14 +424,9 @@ function MonitoredSectionsCard() {
             Last saved: {formatTimestamp(updatedAt)}
           </Text>
         </div>
-        <Space style={{ marginTop: 12 }}>
-          <Button icon={<ReloadOutlined />} onClick={load} disabled={saving}>
-            Reset
-          </Button>
-          <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={handleSave}>
-            Save
-          </Button>
-        </Space>
+        <Button icon={<ReloadOutlined />} onClick={load} disabled={saving} style={{ marginTop: 12 }}>
+          Reset
+        </Button>
       </Spin>
     </Card>
   )
@@ -412,6 +508,7 @@ function MonitorPanel() {
               label="Update interval (s)"
               name="regular_update_sys_pressure_time"
               tooltip="How often the system-pressure level is recomputed. Lower reacts faster but costs more CPU."
+              required={false}
               rules={[{ required: true, type: 'number', min: 1, max: 3600 }]}
             >
               <InputNumber style={{ width: '100%' }} min={1} max={3600} step={1} />
@@ -421,7 +518,6 @@ function MonitorPanel() {
 
         <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
           <SectionLabel
-            required
             text="Level thresholds (%, ordered)"
             tip="Maps the system pressure score to a level. Each threshold is the lower bound of that level and they must increase in order (low < medium < high < critical)."
           />
@@ -443,9 +539,9 @@ function MonitorPanel() {
 
         <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
           <SectionLabel
-            required
             text="Resource weights"
             tip="Relative importance of each resource when combining them into the overall pressure score. Larger weight means that resource contributes more; the values are normalised against their sum."
+            advanced
           />
         </Divider>
         <Row gutter={16}>
@@ -466,9 +562,10 @@ function MonitorPanel() {
         <Row gutter={16}>
           <Col span={8}>
             <Form.Item
-              label="Memory gate steepness"
+              label={advancedLabel('Memory gate steepness')}
               name="mem_gate_steepness"
               tooltip="Steepness of the memory-discount sigmoid gate: larger makes the transition around the memory busy point sharper."
+              required={false}
               rules={[{ required: true, type: 'number', min: 1, max: 50 }]}
             >
               <InputNumber style={{ width: '100%' }} min={1} max={50} step={0.5} />
@@ -476,9 +573,10 @@ function MonitorPanel() {
           </Col>
           <Col span={8}>
             <Form.Item
-              label="Memory busy threshold (%)"
+              label={advancedLabel('Memory busy threshold (%)')}
               name="memory_busy_threshold"
               tooltip="Memory usage percentage where memory pressure starts to be treated as busy."
+              required={false}
               rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
             >
               <InputNumber style={{ width: '100%' }} min={0} max={100} step={1} />
@@ -486,9 +584,10 @@ function MonitorPanel() {
           </Col>
           <Col span={8}>
             <Form.Item
-              label="CPU busy threshold (%)"
+              label={advancedLabel('CPU busy threshold (%)')}
               name="cpu_busy_threshold"
               tooltip="CPU usage percentage where CPU pressure starts to be treated as busy."
+              required={false}
               rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
             >
               <InputNumber style={{ width: '100%' }} min={0} max={100} step={1} />
@@ -519,7 +618,6 @@ function MonitorPanel() {
       >
         <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
           <SectionLabel
-            required
             text="Level thresholds (%, ordered)"
             tip="Bands of the disk-IO score, separate from the system ones. Low/high are also the ends of the ramp that decides how much of an I/O stall is blamed on the local disk; medium marks a disk busy in the UI; critical triggers throttling."
           />
@@ -541,9 +639,9 @@ function MonitorPanel() {
 
         <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
           <SectionLabel
-            required
             text="Per-disk sub-signal weights (sum ≤ 1)"
             tip="How much each USE sub-signal contributes to a single disk's pressure. Latency dominates because it is what users feel; utilisation is only a tie-breaker, since a parallel device sits at 100% with headroom to spare."
+            advanced
           />
         </Divider>
         <Row gutter={16}>
@@ -568,9 +666,10 @@ function MonitorPanel() {
         <Row gutter={16}>
           <Col span={8}>
             <Form.Item
-              label="Sigmoid steepness"
+              label={advancedLabel('Sigmoid steepness')}
               name="sigmoid_k"
               tooltip="Steepness of the curve that squashes each sub-signal around its media-specific half-point: larger is more switch-like, smaller is a gentler ramp."
+              required={false}
               rules={[{ required: true, type: 'number', min: 1, max: 50 }]}
             >
               <InputNumber style={{ width: '100%' }} min={1} max={50} step={0.5} />
@@ -578,9 +677,10 @@ function MonitorPanel() {
           </Col>
           <Col span={8}>
             <Form.Item
-              label="Worst-disk weight"
+              label={advancedLabel('Worst-disk weight')}
               name="max_p_weight"
               tooltip="How strongly the single busiest disk carries the aggregate: 0 is a plain mean (one hammered disk among many is averaged away), 1 lets the worst disk decide on its own."
+              required={false}
               rules={[{ required: true, type: 'number', min: 0, max: 1 }]}
             >
               <InputNumber style={{ width: '100%' }} min={0} max={1} step={0.05} />
@@ -605,7 +705,6 @@ function MonitorPanel() {
       >
         <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
           <SectionLabel
-            required
             text="Utilisation thresholds (%, ordered)"
             tip="Maps overall network utilisation to low, medium, high, and critical. Thresholds must increase in that order."
           />
@@ -616,6 +715,7 @@ function MonitorPanel() {
               <Form.Item
                 label={level[0].toUpperCase() + level.slice(1)}
                 name={['network_thresholds', level]}
+                required={false}
                 rules={[{ required: true, type: 'number', min: 1, max: 100 }]}
               >
                 <InputNumber style={{ width: '100%' }} min={1} max={100} step={1} addonAfter="%" />
@@ -629,7 +729,7 @@ function MonitorPanel() {
 }
 
 // ---------------------------------------------------------------------------
-// Control Policy tab content: system control + network control.
+// Control tab content: Smartune control + network control.
 // ---------------------------------------------------------------------------
 function LimitRateRow({ resource, disabled }: { resource: 'cpu' | 'memory'; disabled?: boolean }) {
   const form = Form.useFormInstance()
@@ -661,11 +761,10 @@ const DISK_FIELDS: Array<{ key: 'write' | 'read' | 'write_iops' | 'read_iops'; l
   { key: 'read_iops', label: 'Read IOPS' },
 ]
 
+// Rendered only while disk I/O control is on (the parent collapses this section with the
+// switch), so `disabled` here carries just the master system-control gate.
 function DiskRateMatrix({ disabled }: { disabled?: boolean }) {
-  const form = Form.useFormInstance()
-  // Disk I/O off greys out the whole matrix; the master switch greys out everything.
-  const enabled = (Form.useWatch(['disk_io', 'enabled'], form) ?? true) as boolean
-  const ratesDisabled = disabled || !enabled
+  const ratesDisabled = disabled
   return (
     <>
       <Row gutter={8}>
@@ -705,46 +804,58 @@ const DISK_MEDIA: Array<{ key: DiskMedia; label: string }> = [
   { key: 'unknown', label: 'Unknown' },
 ]
 
-// The rate matrix above is one row of numbers for the whole machine, but 30 MB/s is idle on
-// an NVMe and more than a thumb drive can deliver.  These two columns are how a mixed box is
-// made to behave: the cap written to each disk is rate x scale, and an app has to clear that
-// disk's floor before it is considered worth capping at all.
-function DiskMediaMatrix({ disabled }: { disabled?: boolean }) {
-  const form = Form.useFormInstance()
-  const enabled = (Form.useWatch(['disk_io', 'enabled'], form) ?? true) as boolean
-  const fieldsDisabled = disabled || !enabled
+// The rate matrix above is one row of numbers for the whole machine, but 30 MB/s is idle on an
+// NVMe and more than a thumb drive can deliver.  This scales the written cap per media class so
+// a priority means the same fraction of what the device can actually do.
+function DiskScaleMatrix({ disabled }: { disabled?: boolean }) {
+  return (
+    <Row gutter={[8, 8]}>
+      {DISK_MEDIA.map((m) => (
+        <Col span={8} key={m.key}>
+          <Form.Item
+            label={<Text type="secondary" style={{ fontSize: 12 }}>{m.label}</Text>}
+            name={['disk_io', 'media_scale', m.key]}
+            rules={[{ type: 'number', min: 0.01, max: 1 }]}
+            style={{ marginBottom: 0 }}
+          >
+            <InputNumber style={{ width: '100%' }} min={0.01} max={1} step={0.05}
+                         addonAfter="x" disabled={disabled} />
+          </Form.Item>
+        </Col>
+      ))}
+    </Row>
+  )
+}
+
+// A different question from the scale above, and the reason the two are no longer one table:
+// this is not how hard to cap an app, it is how much I/O an app must already be doing on a
+// disk before capping it is worth doing at all.  Below the floor a cap cannot relieve the
+// device, so the app is left alone and the next candidate is considered.
+function DiskFloorMatrix({ disabled }: { disabled?: boolean }) {
   return (
     <>
       <Row gutter={8}>
-        <Col span={4} />
-        <Col span={6}>
-          <Text type="secondary" style={{ fontSize: 12 }}>Cap scale (x rate)</Text>
+        <Col span={6} />
+        <Col span={9}>
+          <Text type="secondary" style={{ fontSize: 12 }}>Bandwidth (MB/s)</Text>
         </Col>
-        <Col span={6}>
-          <Text type="secondary" style={{ fontSize: 12 }}>Floor MB/s</Text>
-        </Col>
-        <Col span={6}>
-          <Text type="secondary" style={{ fontSize: 12 }}>Floor IOPS</Text>
+        <Col span={9}>
+          <Text type="secondary" style={{ fontSize: 12 }}>IOPS</Text>
         </Col>
       </Row>
       {DISK_MEDIA.map((m) => (
         <Row gutter={8} align="middle" key={m.key} style={{ marginBottom: 8 }}>
-          <Col span={4}>
-            <Text type={fieldsDisabled ? 'secondary' : undefined}>{m.label}</Text>
-          </Col>
           <Col span={6}>
-            <Form.Item name={['disk_io', 'media_scale', m.key]} noStyle rules={[{ type: 'number', min: 0.01, max: 1 }]}>
-              <InputNumber style={{ width: '100%' }} min={0.01} max={1} step={0.05} disabled={fieldsDisabled} />
-            </Form.Item>
+            <Text type={disabled ? 'secondary' : undefined}>{m.label}</Text>
           </Col>
-          <Col span={6}>
+          <Col span={9}>
             <Form.Item name={['disk_io', 'candidate_floor', m.key, 'mb_s']} noStyle rules={[{ type: 'number', min: 0.1 }]}>
-              <InputNumber style={{ width: '100%' }} min={0.1} step={1} disabled={fieldsDisabled} />
+              <InputNumber style={{ width: '100%' }} min={0.1} step={1} disabled={disabled} />
             </Form.Item>
           </Col>
-          <Col span={6}>
+          <Col span={9}>
             <Form.Item name={['disk_io', 'candidate_floor', m.key, 'iops']} noStyle rules={[{ type: 'number', min: 1 }]}>
-              <InputNumber style={{ width: '100%' }} min={1} step={50} disabled={fieldsDisabled} />
+              <InputNumber style={{ width: '100%' }} min={1} step={50} disabled={disabled} />
             </Form.Item>
           </Col>
         </Row>
@@ -753,19 +864,22 @@ function DiskMediaMatrix({ disabled }: { disabled?: boolean }) {
   )
 }
 
-// System Control is a single card with one Save: the master "system control
-// control" switch gates (grays out) the limit-policy settings below, which are
-// meaningless while system control is off.  One save persists both the switch
-// (passive_control section) and the limit policy (limit_policy section).
+// Smartune Control holds System Control and Disk I/O Control as two nested cards, but they
+// share ONE form and one save: both live in the same `limit_policy` config section, so two
+// independent saves would race on its optimistic-concurrency token and the second would
+// always conflict. The master "auto control" switch and the policy mode sit on the outer
+// card because they gate and shape both channels, not just CPU/memory.
 function AutoControlPanel() {
   const [form] = Form.useForm()
   const { publishNotice } = useGlobalConfigNotices()
   const [policyExpanded, setPolicyExpanded] = useState(false)
+  const [diskExpanded, setDiskExpanded] = useState(false)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [enabledTs, setEnabledTs] = useState<number | undefined>(undefined)
   const [limitTs, setLimitTs] = useState<number | undefined>(undefined)
   const autoEnabled = (Form.useWatch('enabled', form) ?? false) as boolean
+  const diskEnabled = (Form.useWatch(['disk_io', 'enabled'], form) ?? false) as boolean
   const toPercentageRates = (resource: LimitPolicyData['cpu']) => ({
     ...resource,
     rate: Object.fromEntries(Object.entries(resource.rate).map(([priority, rate]) => [priority, Math.round(Number(rate) * 100)])),
@@ -790,10 +904,11 @@ function AutoControlPanel() {
         disk_io: lp.disk_io,
       })
       setPolicyExpanded(Boolean(pc.enabled))
+      setDiskExpanded(Boolean(lp.disk_io?.enabled))
       setEnabledTs(pc.updated_at)
       setLimitTs(lp.updated_at)
     } catch (error) {
-      message.error('Failed to load system control settings')
+      message.error('Failed to load Smartune control settings')
       console.error(error)
     } finally {
       setLoading(false)
@@ -804,12 +919,12 @@ function AutoControlPanel() {
     void load()
   }, [load])
 
-  const onSave = async () => {
+  const onSave = async (): Promise<SaveOutcome> => {
     let values: Record<string, unknown>
     try {
       values = await form.validateFields()
     } catch {
-      return
+      return 'error'
     }
     setSaving(true)
     try {
@@ -837,39 +952,62 @@ function AutoControlPanel() {
         Modal.confirm({
           title: 'Settings changed by another client',
           content: (
-            <p>System control settings were changed elsewhere while you were editing. Reload the latest values?</p>
+            <p>Smartune control settings were changed elsewhere while you were editing. Reload the latest values?</p>
           ),
           okText: 'Reload latest values',
           cancelText: 'Cancel',
           onOk: () => {
             void load()
             publishNotice({
-              title: 'System control updated',
-              description: 'Another client changed system control settings. Your form has been reloaded.',
+              title: 'Smartune control updated',
+              description: 'Another client changed Smartune control settings. Your form has been reloaded.',
               scope: 'auto_control',
             })
           },
         })
-        return
+        return 'conflict'
       }
 
       if (r1.data.success && r2.data.success) {
-        message.success('System control settings saved')
-      } else {
-        message.error('Failed to update system control settings')
+        return 'ok'
       }
+      message.error('Failed to update Smartune control settings')
+      return 'error'
     } catch (error) {
-      message.error('Failed to save system control settings')
+      message.error('Failed to save Smartune control settings')
       console.error(error)
+      return 'error'
     } finally {
       setSaving(false)
     }
   }
 
+  const validate = async () => {
+    try {
+      await form.validateFields()
+      return true
+    } catch {
+      message.error('Smartune control: fix the highlighted fields before saving')
+      return false
+    }
+  }
+
+  useRegisterSave('auto_control', { validate, isDirty: () => form.isFieldsTouched(), save: onSave })
+
+  const resetButton = (
+    <Button icon={<ReloadOutlined />} onClick={load} disabled={saving} style={{ marginTop: 12 }}>
+      Reset
+    </Button>
+  )
+
   return (
-    <Card size="small" title="System Control (CPU/Memory/Disk I/O)" style={{ marginBottom: 16 }}>
-      <Spin spinning={loading}>
-        <Form form={form} layout="vertical">
+    <Spin spinning={loading}>
+      {/* One Form spanning the whole block: the master switch, the policy mode and both
+          per-channel sections are one config section server-side, so they are saved and
+          reset together. The switch and the policy mode sit on the outer card because
+          they govern both channels, not just CPU/memory. */}
+      <Form form={form} layout="vertical">
+        <Card size="small" title="Smartune Control" style={{ marginBottom: 16 }}>
           <Form.Item
             label={
               <Space size={4}>
@@ -881,14 +1019,14 @@ function AutoControlPanel() {
                   icon={policyExpanded
                     ? <DownOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />
                     : <RightOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />}
-                  aria-label="Toggle system policy details"
+                  aria-label="Toggle Smartune control details"
                 />
-                <span>Auto system control</span>
+                <span>Auto control</span>
               </Space>
             }
             name="enabled"
             valuePropName="checked"
-            tooltip="When enabled, the balancer automatically throttles top apps under critical system pressure. When disabled, only manual per-app limits active in Balancer tab."
+            tooltip="When enabled, the balancer automatically throttles top apps under critical pressure. When disabled, only manual per-app limits active in Balancer tab. Gates both the system and the disk I/O control below."
             style={{ marginBottom: 4 }}
           >
             <Switch checkedChildren="On" unCheckedChildren="Off" onChange={setPolicyExpanded} />
@@ -896,69 +1034,103 @@ function AutoControlPanel() {
           {policyExpanded && (
             <>
               <Text type="secondary">
-                The limit policy below only applies while system control is enabled.
+                The policy below only applies while auto control is enabled.
               </Text>
 
               <Divider orientation="left" orientationMargin={0} plain style={{ margin: '12px 0 8px' }}>
                 <SectionLabel
                   text="Policy mode"
-                  tip="Combined applies one shared limit across all matched processes of an app; Separated applies the limit to each process individually."
+                  tip="How the disk-IO channel relates to the CPU/memory one. Separated: disk I/O is judged on its own thresholds and its own top-consumer list, so a saturated disk is throttled even while CPU and memory are calm, and each channel recovers on its own timer. Combined: there is only the system pressure score (disk I/O enters it as the I/O weight), so caps are applied only when that score is critical, and CPU/memory + disk caps are applied and lifted together."
                 />
               </Divider>
-              <Form.Item name="policy" rules={[{ required: true }]}>
+              <Form.Item name="policy" rules={[{ required: true }]} style={{ marginBottom: 4 }}>
                 <Radio.Group disabled={!autoEnabled}>
                   <Radio.Button value="combined">Combined</Radio.Button>
                   <Radio.Button value="separated">Separated</Radio.Button>
                 </Radio.Group>
               </Form.Item>
+              <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 12 }}>
+                Separated is recommended when disk I/O matters on its own: under Combined, disk
+                pressure only contributes the I/O weight to the system score, so a disk-only
+                storm rarely reaches critical and may never be throttled.
+              </Text>
 
-              <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 8px' }}>
-                <SectionLabel
-                  text="System rate (%)"
-                  tip="Per-priority CPU and memory cap as a percentage of total system capacity. A throttled app in that priority is held at or below this share. Toggle a resource off to leave it uncapped."
-                />
-              </Divider>
-              <LimitRateRow resource="cpu" disabled={!autoEnabled} />
-              <LimitRateRow resource="memory" disabled={!autoEnabled} />
+              <Card size="small" type="inner" title="System Control" style={{ marginBottom: 12 }}>
+                <Divider orientation="left" orientationMargin={0} plain style={{ margin: '0 0 8px' }}>
+                  <SectionLabel
+                    text="System rate (%)"
+                    tip="Per-priority CPU and memory cap as a percentage of total system capacity. A throttled app in that priority is held at or below this share. Toggle a resource off to leave it uncapped."
+                  />
+                </Divider>
+                <LimitRateRow resource="cpu" disabled={!autoEnabled} />
+                <LimitRateRow resource="memory" disabled={!autoEnabled} />
+              </Card>
 
-              <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 8px' }}>
-                <SectionLabel
-                  text="Disk I/O rate"
-                  tip="Per-priority absolute disk limits (MB/s and IOPS, read and write). Toggle off to leave disk I/O uncapped."
-                />
-                &nbsp;
-                <Form.Item name={['disk_io', 'enabled']} valuePropName="checked" noStyle>
-                  <Switch size="small" checkedChildren="On" unCheckedChildren="Off" disabled={!autoEnabled} />
-                </Form.Item>
-              </Divider>
-              <DiskRateMatrix disabled={!autoEnabled} />
+              <Card size="small" type="inner" title="Disk I/O Control" style={{ marginBottom: 4 }}>
+                <Space size={4} align="center">
+                  <Button
+                    size="small"
+                    type="text"
+                    onClick={() => setDiskExpanded((expanded) => !expanded)}
+                    disabled={!autoEnabled || !diskEnabled}
+                    icon={diskExpanded && diskEnabled
+                      ? <DownOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />
+                      : <RightOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />}
+                    aria-label="Toggle disk I/O policy details"
+                  />
+                  <Text strong>Disk I/O rate</Text>
+                  <Tooltip title="Per-priority absolute disk caps (MB/s and IOPS, read and write) written as io.max. Off leaves disk I/O uncapped, and the details below do not apply.">
+                    <QuestionCircleOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />
+                  </Tooltip>
+                  <Form.Item name={['disk_io', 'enabled']} valuePropName="checked" noStyle>
+                    <Switch
+                      size="small"
+                      checkedChildren="On"
+                      unCheckedChildren="Off"
+                      disabled={!autoEnabled}
+                      onChange={setDiskExpanded}
+                    />
+                  </Form.Item>
+                </Space>
 
-              <Divider orientation="left" orientationMargin={0} plain style={{ margin: '12px 0 8px' }}>
-                <SectionLabel
-                  text="Per-media adjustment"
-                  tip="The rates above are calibrated for NVMe. Cap scale multiplies them for slower media, so a USB disk is not handed an NVMe-sized cap. Floor is how much an app must be doing on a disk of that media before throttling it is worth doing at all -- below the floor the cap would not relieve the device. Either MB/s or IOPS clearing the floor qualifies."
-                />
-              </Divider>
-              <DiskMediaMatrix disabled={!autoEnabled} />
+                {/* Collapsed while disk I/O control is off: the rates, the per-disk scale and the
+                    floors are all meaningless without a cap to apply them to. */}
+                {diskEnabled && diskExpanded && (
+                  <div style={{ marginTop: 12 }}>
+                    <DiskRateMatrix disabled={!autoEnabled} />
+
+                    <Divider orientation="left" orientationMargin={0} plain style={{ margin: '12px 0 8px' }}>
+                      <SectionLabel
+                        text="Per-disk adjustment"
+                        tip="The rates above are calibrated for NVMe. The cap written to a disk is rate x this factor, so a priority means the same fraction of what that device can actually do instead of the same absolute MB/s."
+                        advanced
+                      />
+                    </Divider>
+                    <DiskScaleMatrix disabled={!autoEnabled} />
+
+                    <Divider orientation="left" orientationMargin={0} plain style={{ margin: '16px 0 8px' }}>
+                      <SectionLabel
+                        text="Minimum app I/O worth throttling"
+                        tip="Not how hard to cap, but whether capping helps at all: an app must already be doing at least this much on a disk of that media before it is considered a throttle candidate. Below it, capping cannot relieve the device, so the app is skipped and the next-heaviest consumer is considered. Either bandwidth or IOPS clearing the bar qualifies, because a small-block random workload moves few MB but still saturates the device."
+                        advanced
+                      />
+                    </Divider>
+                    <DiskFloorMatrix disabled={!autoEnabled} />
+                  </div>
+                )}
+              </Card>
             </>
           )}
-        </Form>
-
-        <Text type="secondary" style={{ fontSize: 12 }}>
-          Last saved: {formatTimestamp(limitTs ?? enabledTs)}
-        </Text>
-        <div>
-          <Space style={{ marginTop: 12 }}>
-            <Button icon={<ReloadOutlined />} onClick={load} disabled={saving}>
-              Reset
-            </Button>
-            <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={onSave}>
-              Save
-            </Button>
-          </Space>
-        </div>
-      </Spin>
-    </Card>
+          <div style={{ marginTop: 12 }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              Last saved: {formatTimestamp(limitTs ?? enabledTs)}
+            </Text>
+          </div>
+          {/* One Reset for the whole block, matching the single Save in the footer. */}
+          <div>{resetButton}</div>
+        </Card>
+      </Form>
+    </Spin>
   )
 }
 
@@ -973,7 +1145,7 @@ function NetworkPanel() {
 
   return (
     <FormCard
-      title="Network Control"
+      title="Network I/O Control"
       scope="network_control"
       load={async () => {
         const d = await api.getConfig<{
@@ -1109,7 +1281,6 @@ function NetworkPanel() {
 
                   <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
                     <SectionLabel
-                      required
                       text="Controlled network interfaces"
                       tip="Select the automatically detected physical interfaces to control. Link bandwidth is detected by the operating system."
                     />
@@ -1167,7 +1338,6 @@ function NetworkPanel() {
 
                   <Divider orientation="left" orientationMargin={0} plain style={{ margin: '16px 0 12px' }}>
                     <SectionLabel
-                      required
                       text="Network bandwidth ranges"
                       tip="Set the minimum and maximum ratio of NIC link bandwidth for each application priority. The application minimum total cannot exceed the capacity remaining after the system reservation."
                     />
@@ -1268,6 +1438,45 @@ function ReservedPanel({ title, description }: { title: string; description: str
 }
 
 export default function SettingsModal({ visible, onClose, balancerEnabled }: Props) {
+  // Cards register here while mounted; hidden tabs are destroyed, so this only
+  // ever holds the cards the user is looking at.
+  const handles = useRef(new Map<string, SaveHandle>())
+  const [saving, setSaving] = useState(false)
+  const register = useCallback<SaveRegistry['register']>((id, handle) => {
+    handles.current.set(id, handle)
+    return () => {
+      handles.current.delete(id)
+    }
+  }, [])
+
+  const saveAll = async () => {
+    const pending = [...handles.current.values()].filter((handle) => handle.isDirty?.() ?? true)
+    if (pending.length === 0) {
+      onClose()
+      return
+    }
+    setSaving(true)
+    try {
+      // Validate everything first: a half-written tab (one card saved, the next
+      // rejected for a bad number) is worse than saving nothing.
+      for (const handle of pending) {
+        if (!(await handle.validate?.() ?? true)) return
+      }
+      const outcomes: SaveOutcome[] = []
+      for (const handle of pending) {
+        outcomes.push(await handle.save())
+      }
+      // Each card reports its own failure; a conflict opens its own reload
+      // dialog. Either way the modal stays open so the user can act on it.
+      if (outcomes.every((outcome) => outcome === 'ok')) {
+        message.success('Settings saved')
+        onClose()
+      }
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const items = [
     {
       key: 'monitor',
@@ -1279,7 +1488,7 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
       ),
       children: <MonitorPanel />,
     },
-    // Control Policy configures the balancer; in monitor-only mode the
+    // The Control tab configures the balancer; in monitor-only mode the
     // balancer is not running, so these tabs are omitted entirely (matching how
     // the main Balancer tab is hidden in App.tsx).
     ...(balancerEnabled
@@ -1289,7 +1498,7 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
             label: (
               <Space>
                 <ControlOutlined />
-                Control Policy
+                Control
               </Space>
             ),
             children: (
@@ -1315,14 +1524,20 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
       onCancel={onClose}
       destroyOnClose
       footer={[
-        <Button key="close" onClick={onClose}>
+        <Button key="save" type="primary" icon={<SaveOutlined />} loading={saving} onClick={saveAll}>
+          Save
+        </Button>,
+        <Button key="close" onClick={onClose} disabled={saving}>
           Close
         </Button>,
       ]}
-      width={1040}
-      styles={{ body: { maxHeight: '72vh', overflowY: 'auto' } }}
+      width={1140}
+      // The default header margin leaves the title almost touching the first tab label.
+      styles={{ header: { marginBottom: 20 }, body: { maxHeight: '72vh', overflowY: 'auto' } }}
     >
-      <Tabs tabPosition="left" items={items} style={{ minHeight: 440 }} destroyOnHidden />
+      <SettingsSaveContext.Provider value={{ register }}>
+        <Tabs tabPosition="left" items={items} style={{ minHeight: 440 }} destroyOnHidden />
+      </SettingsSaveContext.Provider>
     </Modal>
   )
 }

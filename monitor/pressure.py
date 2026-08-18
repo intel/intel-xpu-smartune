@@ -136,7 +136,7 @@ class PressureAnalyzer:
 
         # NORMALIZED weighted average, not a raw sum. A raw sum let CPU/IO each add their
         # full PSI (weight 1) so cpu 100% alone reached ~0.7-0.9 -- "high" -- even with RAM
-        # ample, which contradicts the intent (weights 1:8:1) that memory dominates and CPU
+        # ample, which contradicts the intent (weights 1:7:2) that memory dominates and CPU
         # saturation is benign. Dividing by Σweights keeps CPU/IO minor (their small share)
         # and lets memory carry most of the average.
         total_weight = sum(weights.values()) or 1

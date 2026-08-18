@@ -22,8 +22,22 @@ AXIS = "#64748b"
 GRID = "#e2e8f0"
 TEXT = "#334155"
 SERIES = ["#2563eb", "#e11d48", "#059669", "#d97706", "#7c3aed"]
-BANDS = [("low", 0.0, "#f1f5f9"), ("medium", 0.4, "#fef9c3"),
-         ("high", 0.6, "#fed7aa"), ("critical", 0.8, "#fecaca")]
+# Band edges are the ENTRY thresholds from PressureAnalyzer.get_pressure_level
+# (``score >= thresholds[X]`` -> level X), not the exits: with the default
+# 0.4/0.6/0.8/1.0 a score of 0.5 is still `low`, and `critical` is the top edge only.
+# Each band is drawn from its own entry threshold up to the next one, so plots that
+# carry bands need yhi > 1.0 for the `critical` sliver to be visible.
+BANDS = [("low", 0.0, "#f1f5f9"), ("medium", 0.6, "#fef9c3"),
+         ("high", 0.8, "#fed7aa"), ("critical", 1.0, "#fecaca")]
+
+# ---- values the figures are drawn with, mirroring config/config.yaml -------
+# Keep these in step with the shipped config: the figures are the doc's statement of
+# what the *deployed* defaults do, not of the in-code fallbacks.
+MEM_BUSY_PCT = 80          # memory_busy_threshold
+MEM_K = 8                  # mem_gate_steepness
+WEIGHTS = (1, 7, 2)        # weights.cpu / weights.memory / weights.io
+MAX_P_WEIGHT = 0.8         # disk_pressure_model.max_p_weight
+DISK_LOW, DISK_HIGH = 0.4, 0.8   # disk_thresholds.low / .high (the saturation ramp)
 
 W, H = 880, 440
 ML, MR, MT, MB = 70, 250, 40, 55   # margins (wide right margin so legend text never clips)
@@ -116,7 +130,7 @@ def plot(path, series, xlo, xhi, ylo, yhi, xlabel, ylabel, title,
 
 # --------------------------------------------------------------------------
 # model functions (copied 1:1 from monitor/pressure.py)
-def scarcity(mem_avail, busy_pct=80, steepness=8.0):
+def scarcity(mem_avail, busy_pct=MEM_BUSY_PCT, steepness=MEM_K):
     busy = busy_pct / 100.0
     center = max(1.0 - busy, 1e-3)
     x = (mem_avail - center) / center * steepness
@@ -133,7 +147,7 @@ def sig(x, x_half, k=8.0):
     return 1.0 / (1.0 + math.exp(z))
 
 
-def combined(p_busiest, n_disks, max_w=0.8):
+def combined(p_busiest, n_disks, max_w=MAX_P_WEIGHT):
     """noisy-OR of the mean and the worst disk. Idle disks only dilute the mean."""
     avg = p_busiest / n_disks
     return 1.0 - (1.0 - avg) * (1.0 - p_busiest * max_w)
@@ -143,7 +157,7 @@ def stall_severity(some, full, w_some=0.5, w_full=3.0):
     return min(1.0, some * w_some + full * w_full)
 
 
-def disk_raw(comb, stall, low=0.4, high=0.8):
+def disk_raw(comb, stall, low=DISK_LOW, high=DISK_HIGH):
     """PSI fills disk_combined's remaining headroom, scaled by the saturation ramp."""
     sat = min(1.0, max(0.0, (comb - low) / (high - low)))
     return min(1.0, comb + (1.0 - comb) * stall * sat)
@@ -155,23 +169,25 @@ def main():
 
     # 1. memory scarcity gate -- steepness sweep
     plot("mem_gate_steepness.svg",
-         [(f"k = {k}", [(x, scarcity(x, 80, k)) for x in XS], SERIES[i])
+         [(f"k = {k}" + ("  (config)" if k == MEM_K else ""),
+           [(x, scarcity(x, MEM_BUSY_PCT, k)) for x in XS], SERIES[i])
           for i, k in enumerate([2, 4, 8, 16])],
          0, 1, 0, 1,
          "free-memory ratio (available_ratio)", "mem_scarcity  (memory contribution)",
-         "Memory scarcity gate — effect of mem_gate_steepness (busy=80%)",
+         f"Memory scarcity gate — effect of mem_gate_steepness (busy={MEM_BUSY_PCT}%)",
          [0, 0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0], [0, 0.25, 0.5, 0.75, 1.0],
-         vlines=[(0.2, "busy point (center)", "#0f172a")],
-         notes=["higher k -> sharper switch", "at center scarcity = 0.5"])
+         vlines=[(1 - MEM_BUSY_PCT / 100, "busy point (center)", "#0f172a")],
+         notes=["higher k -> sharper switch", "at center scarcity = 0.5",
+                f"config.yaml ships k={MEM_K}"])
 
     # 2. memory scarcity gate -- busy-threshold sweep (center shift)
     plot("mem_gate_busy_threshold.svg",
          [(f"busy = {b}%  (center={round(1-b/100,2)})",
-           [(x, scarcity(x, b, 8)) for x in XS], SERIES[i])
+           [(x, scarcity(x, b, MEM_K)) for x in XS], SERIES[i])
           for i, b in enumerate([70, 80, 90])],
          0, 1, 0, 1,
          "free-memory ratio (available_ratio)", "mem_scarcity",
-         "Memory scarcity gate — effect of memory_busy_threshold (k=8)",
+         f"Memory scarcity gate — effect of memory_busy_threshold (k={MEM_K})",
          [0, 0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0], [0, 0.25, 0.5, 0.75, 1.0],
          notes=["bigger busy% -> curve shifts left", "(tolerate less free RAM)"])
 
@@ -214,33 +230,45 @@ def main():
                 "code uses alpha=0.3"])
 
     # 5. final score vs memory used% : the max(load, scarcity) channel
-    #    hold cpu/io fixed, sweep memory usage; weights 1:8:1
-    def final_score(used_pct, cpu_eff=0.4, io_eff=0.35, w=(1, 8, 1)):
-        avail = 1 - used_pct / 100
-        sc = scarcity(avail, 80, 8)
+    #    hold cpu/io fixed, sweep memory usage
+    CPU_EFF, IO_EFF = 0.4, 0.35
+
+    def mem_parts(used_pct, cpu_eff=CPU_EFF, io_eff=IO_EFF, w=WEIGHTS):
+        """(scarcity, load, final score) at a given memory usage -- one source for all 3 curves."""
+        sc = scarcity(1 - used_pct / 100)
         load = (w[0] * cpu_eff + w[1] * sc + w[2] * io_eff) / sum(w)
-        return min(max(load, sc), 1.0)
-    US = [u / 1 for u in range(0, 101)]
+        return sc, load, min(max(load, sc), 1.0)
+
+    def crossing(target):
+        """Lowest memory used% whose (rounded) score reaches `target` -- for the callouts."""
+        for u in range(0, 10001):
+            if round(mem_parts(u / 100)[2], 2) >= target:
+                return u / 100
+        return None
+    US = [u / 2 for u in range(0, 201)]
     # The final score IS the pointwise max of its two inputs, so a plain solid line for it
     # is hidden under whichever input is currently winning. Draw the inputs dashed and the
     # score thick: it then reads as the envelope, visible through both dash patterns.
     plot("score_vs_memory.svg",
-         [("final score", [(u, final_score(u)) for u in US], SERIES[0], {"w": 3.6}),
-          ("mem_scarcity (floor)", [(u, scarcity(1 - u / 100, 80, 8)) for u in US],
+         [("final score", [(u, mem_parts(u)[2]) for u in US], SERIES[0], {"w": 3.6}),
+          ("mem_scarcity (floor)", [(u, mem_parts(u)[0]) for u in US],
            SERIES[1], {"w": 1.8, "dash": "7 5"}),
-          ("load (normalized avg)",
-           [(u, (1 * 0.4 + 8 * scarcity(1 - u / 100, 80, 8) + 1 * 0.35) / 10) for u in US],
+          ("load (normalized avg)", [(u, mem_parts(u)[1]) for u in US],
            SERIES[2], {"w": 1.8, "dash": "2 4"})],
-         0, 100, 0, 1.0,
+         0, 100, 0, 1.05,
          "memory used (%)", "score",
-         "Final score vs memory usage (weights 1:8:1)",
+         "Final score vs memory usage (weights {}:{}:{}, k={})".format(*WEIGHTS, MEM_K),
          [0, 20, 40, 60, 80, 100], [0, 0.4, 0.6, 0.8, 1.0],
-         vlines=[(80, "busy 80%", "#0f172a")],
+         vlines=[(MEM_BUSY_PCT, f"busy {MEM_BUSY_PCT}%", "#0f172a")],
          bands=BANDS,
-         notes=["fixed: cpu_eff=0.40, io_eff=0.35",
+         notes=[f"fixed: cpu_eff={CPU_EFF:.2f}, io_eff={IO_EFF:.2f}",
                 "score = min(max(load, scarcity), 1)",
                 "score follows load, then the floor",
-                "cpu/io-only stays LOW; OOM -> CRITICAL"])
+                f"load alone caps at {mem_parts(100)[1]:.2f} (mem's",
+                f"share is {WEIGHTS[1]}/{sum(WEIGHTS)}) -- the floor is what",
+                "reaches critical",
+                f"medium at {crossing(0.6):.1f}% used, high at",
+                f"{crossing(0.8):.1f}%, critical at {crossing(1.0):.1f}%"])
 
     # 6. level hysteresis on a hovering score
     #    demonstrate up-threshold vs down-threshold on the medium/low boundary
@@ -284,16 +312,20 @@ def main():
          [(f"{n} disk{'s' if n > 1 else ''} ({n-1} idle)",
            [(p, combined(p, n)) for p in PS], SERIES[i])
           for i, n in enumerate([1, 2, 3, 4])],
-         0, 1, 0, 1.0,
+         0, 1, 0, 1.05,
          "P_disk of the busiest disk", "disk_combined",
-         "Aggregation — noisy-OR of mean and worst disk (max_p_weight=0.8)",
+         f"Aggregation — noisy-OR of mean and worst disk (max_p_weight={MAX_P_WEIGHT})",
          [0, 0.2, 0.4, 0.6, 0.8, 1.0], [0, 0.4, 0.6, 0.8, 1.0],
          bands=BANDS,
-         notes=["combined = 1-(1-avg)(1-max*0.8)",
+         notes=[f"combined = 1-(1-avg)(1-max*{MAX_P_WEIGHT})",
                 "idle disks dilute the mean only",
-                "3 disks, busiest 0.91 -> 0.81",
-                "raise max_p_weight to weigh",
-                "the worst disk more"])
+                f"3 disks, busiest 0.91 -> {combined(0.91, 3):.2f}",
+                f"with the worst disk at 1.0, N disks",
+                f"top out at 1-(1-1/N)(1-{MAX_P_WEIGHT}); at {MAX_P_WEIGHT}",
+                f"that stays above the {DISK_HIGH:g} which sat=1",
+                f"(and critical) needs, for every N",
+                "lower it and multi-disk boxes stop",
+                "being able to reach critical at all"])
 
     # 9. the PSI gate: saturation and stall both required
     ST = [i / 200 for i in range(201)]
@@ -306,9 +338,10 @@ def main():
          [0, 0.25, 0.5, 0.75, 1.0], [0, 0.4, 0.6, 0.8, 1.0],
          bands=BANDS,
          notes=["sat ramps 0->1 over [low, high]",
-                "= [0.4, 0.8] by default",
+                f"= [{DISK_LOW:g}, {DISK_HIGH:g}] by default",
                 "saturated but no stall -> high",
-                "stall but not saturated -> low",
+                f"below combined {DISK_LOW:g} a stall is not",
+                "blamed on the disk at all (sat=0)",
                 "critical needs both maxed"])
 
     # 10. stall severity from the two io PSI terms

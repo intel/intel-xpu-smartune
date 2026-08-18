@@ -66,8 +66,8 @@ level — see Part III.
 | `psi.cpu`, `psi.io`, `psi.memory` | `/proc/pressure/*` (`some`, rolling avg) | fraction of time **some** task stalled on that resource, `0..1` |
 | `self_fraction.cpu/io` | per-cgroup `*.pressure` ÷ system PSI | share of the stall caused by the **already-limited** app(s), `0..1` |
 | `available_ratio` | `MemAvailable / MemTotal` | free-memory ratio, `0..1` |
-| `weights` | `config.yaml` → `weights` | relative importance, default `cpu:1, memory:8, io:1` |
-| `thresholds` | `config.yaml` → `thresholds` | level cut-offs, default `0.4 / 0.6 / 0.8 / 1.0` |
+| `weights` | `config.yaml` → `weights` | relative importance, shipped `cpu:1, memory:7, io:2` |
+| `thresholds` | `config.yaml` → `thresholds` | level **entry** cut-offs, shipped `0.4 / 0.6 / 0.8 / 1.0` — see the band table in §4 |
 
 **Why PSI and not CPU%?** PSI measures *stall* (contention), not utilization. CPU at
 100% with no one waiting is benign; PSI stays low. That distinction is the whole point
@@ -126,6 +126,23 @@ Lower gate → less discount → higher score. Higher gate → more discount →
 
 `calculate_pressure_score` returns the **raw** score; `classify_level` turns a stream of
 raw scores into a **stable level** plus the smoothed score that is reported to the UI.
+
+**The bands.** `thresholds` are *entry* thresholds — `get_pressure_level` returns level `X`
+for `score >= thresholds[X]` — so with the shipped `0.4 / 0.6 / 0.8 / 1.0` the bands are:
+
+| score | level |
+|---|---|
+| `[0, 0.6)` | `low` |
+| `[0.6, 0.8)` | `medium` |
+| `[0.8, 1.0)` | `high` |
+| `1.0` | `critical` |
+
+Two consequences that are easy to get wrong: a score of **0.5 is still `low`**, not medium;
+and `critical` is the top edge only, reachable because the score is rounded to 2 dp
+(`round(score, 2)`), so a scarcity of 0.997 does land on `critical`. `thresholds.low` has
+**no effect on the system level** (both branches below `medium` return `low`); it is only
+load-bearing on the disk channel, where `disk_thresholds.low` is the start of the
+saturation ramp (§13).
 Both channels run this same filter, on **separate state** — the system channel on
 `_score_smoothed` / `_last_level`, the disk channel on `_disk_score_smoothed` /
 `_disk_last_level` — so a disk transition never disturbs the system level or vice versa.
@@ -204,8 +221,8 @@ $$
 
 where $m\equiv$ `mem_scarcity`, $a\equiv$ `available_ratio`, and $T_{\mathrm{mem}}\equiv$ `memory_busy_threshold`.
 
-- `c` = **center** = free-RAM ratio at the "busy" point (default busy 80 % → `c = 0.2`).
-- `k` = `mem_gate_steepness` (default **8**).
+- `c` = **center** = free-RAM ratio at the "busy" point (shipped busy 80 % → `c = 0.2`).
+- `k` = `mem_gate_steepness` (shipped **8**, same as the in-code fallback).
 - At the center, `x = 0` → `mem_scarcity = 0.5`. It is ~0 while RAM is ample and rises
   smoothly toward 1 as free RAM runs out. Continuous and differentiable — no hard step.
 
@@ -220,6 +237,21 @@ applied (memory scarcity is *never* discounted — that preserves OOM safety, si
 - Larger `k` → sharper, more switch-like transition around the busy point (fast escalation
   once RAM tips over, but less gradient to steer by).
 - Smaller `k` → gentler ramp (earlier warning, softer landing).
+
+**Why 8 and not 16.** `k` sets how many points of memory usage the `low → critical` traverse
+is spread over, and that window is the balancer's entire time budget for acting gradually:
+
+| `k` | `low → critical` spans | width of `medium` |
+|---|---|---|
+| **8** (shipped) | 81.0 % → 93.2 % (~12 points) | ~2.4 points |
+| 16 | 80.5 % → 86.6 % (~6 points) | ~1.2 points |
+
+The level is not the raw score — it is EWMA-smoothed (α = 0.3, effective memory ≈ 3.3 ticks)
+and hysteresis-held (§4). At `k = 16` a normal memory ramp can cross `medium` in fewer ticks
+than the filter needs to register it, so the smoothed score arrives at `critical` having
+never reported `medium`: staged partial limiting is skipped and only the emergency step is
+left. `k = 8` keeps the `medium` band wide enough that the filter can resolve it. Raise `k`
+only if you want strictly binary behaviour (fine, or emergency) and no staged response.
 
 ### Effect of `memory_busy_threshold` (center shift)
 
@@ -247,10 +279,10 @@ Two design decisions live in this one line:
 
 1. **Normalized average, not a raw sum.** A raw weighted sum let CPU (weight 1) add its
    full PSI, so `cpu 100%` alone reached ~0.7–0.9 ("high") even with RAM ample — which
-   contradicts the intent that memory (weight 8) dominates and CPU saturation is benign.
-   Dividing by `Σweights` keeps CPU/IO to their small share (`1/10` each by default).
+   contradicts the intent that memory (weight 7) dominates and CPU saturation is benign.
+   Dividing by `Σweights` keeps CPU/IO to their small share (`1/10` and `2/10` as shipped).
 2. **Independent memory channel** (`max(load, mem_scarcity)`). Because the average caps
-   memory's own contribution at `w_mem / Σweights` (`= 0.8` by default, `< 1`), a genuine
+   memory's own contribution at `w_mem / Σweights` (`= 0.7` as shipped, `< 1`), a genuine
    near-OOM condition could never reach `critical` through the average alone. Flooring the
    score at `mem_scarcity` restores that: memory can drive the score to 1.0 on its own,
    while CPU/IO cannot.
@@ -259,27 +291,60 @@ Two design decisions live in this one line:
 
 ![Final score vs memory usage](images/score_vs_memory.svg)
 
-With CPU/IO fixed, the score tracks the **normalized load** while RAM is ample (staying
-LOW), then the **mem_scarcity floor** takes over past the busy point and carries it up to
-CRITICAL near OOM. Net behaviour:
+The figure sweeps memory usage with CPU/IO held at a **genuinely busy** `cpu_eff = 0.40`,
+`io_eff = 0.35`. Three curves, and the score is always the higher of the other two:
 
-- CPU/IO-only load (RAM fine) → **LOW** (won't auto-throttle).
-- RAM at the busy point (≈80 %) → **medium**.
-- RAM near OOM → **critical**.
+| curve | what it is |
+|---|---|
+| 🔵 `final score` (thick) | `min(max(load, mem_scarcity), 1)` — what the balancer acts on |
+| 🔴 `mem_scarcity` (dashed) | the §5 sigmoid; also the **floor** under the score |
+| 🟢 `load` (dotted) | the normalized weighted average of all three inputs |
+
+Read it in three parts:
+
+1. **0 → ~79 % used: a flat line at 0.11.** `mem_scarcity` is ~0, so the score is
+   just `load`, and `load` can't get anywhere: CPU and IO together own only
+   `(w_cpu + w_io) / Σweights = 3/10` of the average, so even a busy CPU *and* a busy disk
+   cap out around 0.11. **A CPU/IO-bound job with RAM to spare can never trigger a limit** —
+   that flat line is the whole point of the normalized average.
+2. **78.6 %: the floor takes over.** `mem_scarcity` overtakes `load` and the score switches
+   from tracking the average to tracking memory — continuously, no step, no corner.
+3. **79 → 93 %: the climb.** `medium` at **81.0 %**, `high` at **83.4 %**, `critical` at
+   **93.2 %** (all at the shipped `k = 8`).
+
+The single most useful detail in the figure: the green `load` curve **flattens at 0.81** and
+never reaches the top, because memory's share of the average is capped at `7/10`. Without
+the floor, a machine one allocation away from an OOM kill would still report `high`. The red
+floor is what punches through that ceiling — and it is also why `load` is worth plotting at
+all.
+
+Net behaviour: CPU/IO-only load (RAM fine) → **low**, won't auto-throttle. RAM at the busy
+point (80 %) → score 0.50, still **low** — about a point of usage short of `medium`. RAM near
+OOM → **critical**.
 
 ---
 
 ## 7. Worked examples
 
+At the shipped `weights = 1:7:2` and `mem_gate_steepness = 8`:
+
 | Scenario | `psi` cpu/io | RAM used | `mem_scarcity` | `load` | **score** | level |
 |---|---|---|---|---|---|---|
 | Idle | 0.02 / 0.0 | 12 % | ~0 | 0.002 | **0.00** | low |
-| 1× `stress` (cpu 100 %) | 0.68 / 0.20 | 50 % | ~0 | 0.088 | **0.09** | low |
-| 2× limited, RAM moderate | 0.66 / 0.44¹ | 75 % | 0.12 | 0.16 | **0.16** | low |
-| At busy point | 0.6 / 0.4 | 80 % | 0.50 | 0.50 | **0.50** | medium |
-| Near-OOM | 0.5 / 0.3 | 92 % | 0.99 | ~0.86 | **0.99** | critical |
+| 1× `stress` (cpu 100 %) | 0.68 / 0.20 | 50 % | ~0 | 0.108 | **0.11** | low |
+| 2× limited, RAM moderate | 0.66 / 0.44¹ | 75 % | 0.119 | 0.237 | **0.24** | low |
+| At busy point | 0.6 / 0.4 | 80 % | 0.500 | 0.490 | **0.50** | low² |
+| Just past busy | 0.6 / 0.4 | 81 % | 0.599 | 0.559 | **0.60** | medium |
+| Deep in the ramp | 0.5 / 0.3 | 92 % | 0.992 | 0.804 | **0.99** | high³ |
+| Near-OOM | 0.5 / 0.3 | 95 % | 0.998 | 0.808 | **1.00** | critical |
 
 ¹ discounted by `self_fraction` before entering `load`.
+² the busy point is where `mem_scarcity = 0.5` **by definition** (§5), and 0.5 is inside the
+`low` band (§4). "Busy" is where memory *starts counting*, not where it escalates; escalation
+follows about a point of usage later.
+³ `critical` needs the score to *top out* (§4), so the last stretch of the sigmoid — 93 % up —
+is what `critical` costs. 92 % is `high`: armed and already being acted on, but not the
+emergency band. That gap is the staged-response window `k = 8` buys.
 
 The middle rows are exactly the cases that used to mis-read (`cpu 100%` → "high";
 `2× limited` → stuck "critical") before the normalized-average + independent-memory-channel
@@ -293,8 +358,8 @@ The channel prints **one line per tick**, INFO once it is out of `low` and DEBUG
 is quiet.
 
 ```
-[sys-level] level=low score=0.18 raw=0.18 | load=0.182 = w-avg(cpu 0.350, mem 0.000, io 0.420)
-            w=4:5:1 | mem_scarcity=0.000 (free 29%) | cpu 78% mem 71%
+[sys-level] level=low score=0.12 raw=0.12 | load=0.119 = w-avg(cpu 0.350, mem 0.000, io 0.420)
+            w=1:7:2 | mem_scarcity=0.000 (free 29%) | cpu 78% mem 71%
 ```
 
 | Field | Meaning |
@@ -303,7 +368,7 @@ is quiet.
 | `score` | the smoothed score behind `level`; this is what the UI gauge shows |
 | `raw` | this tick's unsmoothed score. `raw` alone latches `critical`; a gap between the two is the EWMA still catching up |
 | `load` | the normalized weighted average of the three inputs — the `w-avg(...)` right after it is those inputs, already self-discounted (§3) |
-| `w=4:5:1` | the live `cpu:memory:io` weights, re-read from `config.yaml` every tick |
+| `w=1:7:2` | the live `cpu:memory:io` weights, re-read from `config.yaml` every tick |
 | `mem_scarcity` | the memory gate (§5): ~0 while RAM is ample, →1 as free RAM runs out. It is both the `mem` term in the average **and** a floor under `score` |
 | `free N%` | free-RAM ratio — the only input `mem_scarcity` has |
 | `cpu N% mem N%` | plain utilisation, for context only; nothing is computed from them |
@@ -336,10 +401,10 @@ not lift the system score at all — it only needs to authorize an `io.max` cap.
 
 ## 10. Why disk IO needs its own channel
 
-Disk IO cannot ride on the system score. With `weights.io = 1` out of `Σweights`, the io
-term contributes at most `1/Σweights` (§6) — a disk can be completely saturated and the
-system score still reads `low`. That is correct for the system channel (a busy disk is not
-an emergency) but useless for deciding `io.max` caps, which need their own trigger.
+Disk IO cannot ride on the system score. With `weights.io = 2` out of `Σweights = 10`, the io
+term contributes at most `0.2` (§6) — a disk can be completely saturated and the system score
+still reads `low`. That is correct for the system channel (a busy disk is not an emergency)
+but useless for deciding `io.max` caps, which need their own trigger.
 
 So the disk channel is a parallel pipeline: its own saturation model, its own bands
 (`disk_thresholds`, never the system `thresholds`), and its own EWMA + hysteresis state
@@ -434,7 +499,8 @@ C = 1 - (1 - \bar{P})\,(1 - P_{\max} w_{\max})
 $$
 
 where $C\equiv$ `disk_combined`, $\bar P\equiv$ `avg_p` over all physical disks,
-$P_{\max}\equiv$ `max_p`, and $w_{\max}\equiv$ `max_p_weight` (default **0.8**).
+$P_{\max}\equiv$ `max_p`, and $w_{\max}\equiv$ `max_p_weight` (shipped **0.8**, same as the
+in-code fallback).
 
 ![Noisy-OR aggregation](images/disk_noisy_or.svg)
 
@@ -444,8 +510,28 @@ subsystem is busy", the max term guarantees a single saturated disk still lands 
 
 On a box with three physical disks where only one is loaded, a `P_disk` of **0.91** yields
 `C ≈ 0.81` — the two idle disks cost about 0.1 of aggregate pressure. That is the intended
-dilution, but it also means `C` sits close to the `high` band edge on such a box; if one
+dilution, but it also means `C` sits just past the `high` band edge on such a box; if one
 saturated disk out of N should count for more, raise `max_p_weight`.
+
+> ### Why `max_p_weight` cannot go much below 0.8
+>
+> The dilution is not only a shift in sensitivity — it puts a **ceiling** on `C`. With `N`
+> physical disks and even the worst one fully saturated (`P_disk = 1`), `C` tops out at
+> `1 − (1 − 1/N)(1 − w_max)`, which falls as `N` grows. Reaching `critical` needs `sat = 1`,
+> i.e. `C ≥ disk_thresholds.high` (0.8), so a box can only ever throttle if
+>
+> $$w_{\max} \ \ge\ 1 - \frac{0.2\,N}{N-1}$$
+>
+> — **≥ 0.70 for 3 disks, ≥ 0.73 for 4, ≥ 0.75 for 5, rising to 0.8 as `N → ∞`.** The shipped
+> **0.8** is therefore the lowest value that keeps `io.max` reachable on a machine with *any*
+> number of disks: at 0.8 a fully saturated worst disk gives `C = 0.87` on 3 disks and `0.83`
+> on 6, both clear of the 0.8 that `sat = 1` needs.
+>
+> Lowering it does not just damp the aggregate, it can make `critical` **unreachable** — at
+> 0.65, for instance, `C` caps at 0.77 on a 3-disk box, so `disk_level` never leaves `high`
+> and `io.max` is never written no matter how hard one disk is hammered. Check the bound above
+> against the disk count of the target machines before going below 0.8, or lower
+> `disk_thresholds.high` to move the `sat = 1` point down with it.
 
 ---
 
@@ -487,11 +573,13 @@ straight from `medium` to `critical`:
 | disk not saturated (`C < low`) | `low` | `low` — `sat = 0`, so the stall is not blamed on the local disk (a network fs, a stuck USB device) |
 | disk saturated (`C ≥ high`) | **`high`** — armed: the top consumer is identified and logged, nothing is throttled | **`critical`** — throttle |
 
-Note the corollary in the figure: with `C ≈ 0.81` (the 3-disk box above), `raw` reaches
-1.00 only when `stall` is essentially 1.0. The saturation side of this gate has enormous
-headroom on a deep-queue workload — `σ` is long since saturated — so in practice **it is
-the PSI that decides the level**, and `disk_combined` just decides whether the PSI is
-allowed to count.
+Note the corollary in the figure: with `C ≈ 0.81` (the 3-disk box above) `sat` is already 1,
+so `raw` reaches 1.00 exactly when `stall` does. The saturation side of this gate has enormous
+headroom on a deep-queue workload — `σ` is long since saturated — so in practice **it is the
+PSI that decides the level**, and `disk_combined` just decides whether the PSI is allowed to
+count. The one way to break that is to lower `max_p_weight` far enough that `C` can no longer
+reach `disk_thresholds.high` on the machine's disk count; then `sat < 1` and saturation
+becomes the binding constraint instead (see the box in §12).
 
 ### 13.1 Self-inflicted discount
 
@@ -556,12 +644,17 @@ allowed at all.
 
 System channel and shared machinery:
 
-| Parameter | Where | Default | Increase it → | Decrease it → |
+"Shipped" is the value in `config/config.yaml` — what actually runs. Where the in-code
+fallback (`config/config.py`) differs it is noted, since that is what applies if the key is
+deleted; `thresholds`, `weights` and `disk_thresholds` have no fallback at all and must be
+present.
+
+| Parameter | Where | Shipped | Increase it → | Decrease it → |
 |---|---|---|---|---|
-| `weights.{cpu,memory,io}` | `config.yaml` | `1 / 8 / 1` | that resource weighs more in `load` | weighs less |
-| `thresholds.{low,medium,high,critical}` | `config.yaml` | `0.4/0.6/0.8/1.0` | levels harder to reach | easier to reach |
-| `memory_busy_threshold` | `config.yaml` | `80` | tolerate less free RAM (curve ← ) | escalate earlier |
-| `mem_gate_steepness` (`k`) | `config.yaml` | `8` | sharper OOM switch | gentler ramp |
+| `weights.{cpu,memory,io}` | `config.yaml` | `1 / 7 / 2` | that resource weighs more in `load` | weighs less |
+| `thresholds.{low,medium,high,critical}` | `config.yaml` | `0.4/0.6/0.8/1.0` | levels harder to reach | easier to reach. `low` is inert on this channel (§4) |
+| `memory_busy_threshold` | `config.yaml` | `80` (fallback `90`) | tolerate less free RAM (curve ← ) | escalate earlier |
+| `mem_gate_steepness` (`k`) | `config.yaml` | `8` | sharper OOM switch, narrower `medium` window (16 ⇒ ~1.2 points wide — the EWMA can miss it, §5) | gentler ramp, more time to steer |
 | `_CPU_IO_SELF_GATE` | `pressure.py` | `0.7` | more discount → lower post-limit score | less discount → higher |
 | `_SCORE_EWMA_ALPHA` | `pressure.py` | `0.3` | faster / noisier level | smoother / laggier |
 | `_LEVEL_HYSTERESIS` | `pressure.py` | `0.05` | stickier levels (less flapping, more lag) | more responsive, more chatter |
@@ -570,15 +663,15 @@ System channel and shared machinery:
 
 Disk channel (Part III) — all under `config.yaml`, re-read every tick, no restart needed:
 
-| Parameter | Default | Increase it → | Decrease it → |
+| Parameter | Shipped | Increase it → | Decrease it → |
 |---|---|---|---|
-| `disk_thresholds.{low,medium,high,critical}` | `0.4/0.6/0.8/1.0` | disk levels harder to reach | easier |
+| `disk_thresholds.{low,medium,high,critical}` | `0.4/0.6/0.8/1.0` | disk levels harder to reach; `high` also raises the `sat=1` point | easier; `low`/`high` narrow the saturation ramp |
 | `disk_psi_weights.{some,full}` | `0.5 / 3.0` | less task stall needed for `critical` | more stall needed |
 | `disk_pressure_model.sub_weights.{latency,queue,util}` | `0.55/0.35/0.10` | that sub-signal dominates `P_disk` | it matters less |
 | `disk_pressure_model.sigmoid_k` | `8.0` | sharper, more switch-like at the half-point | gentler ramp |
 | `disk_pressure_model.{await_half_ms,queue_half,util_half_pct}` | per media class | the same hardware state reads as **less** pressure | as more pressure |
 | `disk_pressure_model.activity_util_pct` | `20` % | more util required before await/queue count | idle-disk noise counts sooner |
-| `disk_pressure_model.max_p_weight` | `0.8` | the single worst disk dominates the aggregate | the mean dominates |
+| `disk_pressure_model.max_p_weight` | `0.8` | the single worst disk dominates the aggregate | the mean dominates — **and caps `C`; below `1 − 0.2N/(N−1)` an N-disk box can never reach `critical`, so 0.8 is the safe floor** (§12) |
 
 ## Tuning cheat-sheet
 
@@ -596,6 +689,15 @@ Disk channel (Part III) — all under `config.yaml`, re-read every tick, no rest
   `disk_psi_weights.some` only if measurements show `full` staying low while `some` is high.
 - **"One hammered disk out of several doesn't register"** — that is the mean diluting it
   (§12); raise `disk_pressure_model.max_p_weight`.
+- **"`disk_level` sticks at `high` and never throttles on a multi-disk box"** — check
+  `combined` in the `[disk-level]` line while one disk reads `p ≈ 1`. If it plateaus *below*
+  `disk_thresholds.high` (0.8), the aggregate is **capped**, not merely damped, and no amount
+  of io PSI can reach `critical`. Compare `max_p_weight` against `1 − 0.2N/(N−1)` for the
+  machine's disk count (§12) — the shipped 0.8 clears it for every N; 0.65 would fail on any
+  box with ≥ 3 disks.
+- **"`medium` flashes past straight into `critical` as RAM fills"** — that is
+  `mem_gate_steepness` too high compressing the traverse (16 ⇒ ~6 points of usage, `medium`
+  only ~1.2 wide, §5); the shipped 8 gives ~12 and ~2.4.
 - **"A USB disk / an HDD reads as permanently saturated"** — check `disk_type` in the
   `[disk-level]` line first (misdetected media applies the wrong half-points), then the
   half-points for that class.

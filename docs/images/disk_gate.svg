@@ -1,13 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="880" height="440" viewBox="0 0 880 440" font-family="Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="880" height="440" fill="white"/>
 <text x="70" y="24" font-size="16" font-weight="600" fill="#334155">Disk gate — raw = combined + (1-combined) x stall x sat</text>
-<rect x="70" y="253.6" width="560" height="131.4" fill="#f1f5f9" opacity="0.6"/>
-<text x="624" y="265.6" font-size="11" text-anchor="end" fill="#334155">low</text>
-<rect x="70" y="187.9" width="560" height="65.7" fill="#fef9c3" opacity="0.6"/>
-<text x="624" y="199.9" font-size="11" text-anchor="end" fill="#334155">medium</text>
-<rect x="70" y="122.1" width="560" height="65.7" fill="#fed7aa" opacity="0.6"/>
-<text x="624" y="134.1" font-size="11" text-anchor="end" fill="#334155">high</text>
-<rect x="70" y="40.0" width="560" height="82.1" fill="#fecaca" opacity="0.6"/>
+<rect x="70" y="187.9" width="560" height="197.1" fill="#f1f5f9" opacity="0.6"/>
+<text x="624" y="199.9" font-size="11" text-anchor="end" fill="#334155">low</text>
+<rect x="70" y="122.1" width="560" height="65.7" fill="#fef9c3" opacity="0.6"/>
+<text x="624" y="134.1" font-size="11" text-anchor="end" fill="#334155">medium</text>
+<rect x="70" y="56.4" width="560" height="65.7" fill="#fed7aa" opacity="0.6"/>
+<text x="624" y="68.4" font-size="11" text-anchor="end" fill="#334155">high</text>
+<rect x="70" y="40.0" width="560" height="16.4" fill="#fecaca" opacity="0.6"/>
 <text x="624" y="52.0" font-size="11" text-anchor="end" fill="#334155">critical</text>
 <line x1="70.0" y1="40" x2="70.0" y2="385" stroke="#e2e8f0"/>
 <text x="70.0" y="403" font-size="11" text-anchor="middle" fill="#334155">0</text>
@@ -48,6 +48,7 @@
 <text x="648" y="150" font-size="10.5" fill="#64748b">sat ramps 0->1 over [low, high]</text>
 <text x="648" y="166" font-size="10.5" fill="#64748b">= [0.4, 0.8] by default</text>
 <text x="648" y="182" font-size="10.5" fill="#64748b">saturated but no stall -> high</text>
-<text x="648" y="198" font-size="10.5" fill="#64748b">stall but not saturated -> low</text>
-<text x="648" y="214" font-size="10.5" fill="#64748b">critical needs both maxed</text>
+<text x="648" y="198" font-size="10.5" fill="#64748b">below combined 0.4 a stall is not</text>
+<text x="648" y="214" font-size="10.5" fill="#64748b">blamed on the disk at all (sat=0)</text>
+<text x="648" y="230" font-size="10.5" fill="#64748b">critical needs both maxed</text>
 </svg>

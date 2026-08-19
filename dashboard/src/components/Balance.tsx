@@ -1779,11 +1779,14 @@ export default function Balance({
 
           {/* (2) Pick configured — choose from controlled_apps already
                 declared in config.yaml and just enable monitoring + set
-                priority. */}
+                priority.  Also lists apps whose config.yaml entry was deleted
+                by hand but whose row survives ("previously managed"): enabling
+                one restores its config entry from the snapshot on that row, so
+                its priority and saved limits come back with it. */}
           <Col xs={24} md={16}>
             <div style={{ marginBottom: 6 }}>
               <Text style={{ color: COLORS.textMuted, fontSize: 11, fontWeight: 600 }}>
-                Option 2 — Pick a configured application
+                Option 2 — Pick a configured or previously managed application
               </Text>
             </div>
             <div
@@ -1820,7 +1823,10 @@ export default function Balance({
                   >
                     {uncontrolledApps.map((app) => (
                       <Option key={app.app_id} value={app.app_id}>
-                        {app.app_name}
+                        {/* Kept a plain string: filterOption above searches option.children. */}
+                        {app.previously_managed
+                          ? `${app.app_name} (previously managed)`
+                          : app.app_name}
                       </Option>
                     ))}
                   </Select>

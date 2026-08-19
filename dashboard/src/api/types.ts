@@ -62,6 +62,10 @@ export interface AppInfo {
   process_names?: string[]
   is_running?: boolean
   is_pending?: boolean
+  // Known to the database but no longer listed in config.yaml's controlled_apps
+  // (its entry was deleted by hand). Selectable in "Option 2", which restores
+  // the config entry from the snapshot stored on the row.
+  previously_managed?: boolean
   app_summary_status?: 'Limited' | 'Partial Limited' | 'Not Limited' | 'No Running Process'
   runtime_hint?: 'Running' | 'Stopped' | 'Pending'
   process_status_rows?: ProcessStatusRow[]

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
 import queue as _queue
 import re
@@ -1122,6 +1123,259 @@ def fetch_all_apps():
         }
         app_list.append(app_data)
     return app_list
+
+
+def build_config_meta(entry: dict) -> Dict[str, Any]:
+    """Extract the config-only fields of a ``controlled_apps`` entry.
+
+    These three live nowhere else: the database knows an app's name, id and
+    cmdline, but not how BPF or the wizard identify its processes.  Mirroring
+    them into ``config_meta_json`` is what makes a hand-deleted entry
+    recoverable.
+    """
+    entry = entry if isinstance(entry, dict) else {}
+    return {
+        "bpf_name": [str(b) for b in (entry.get("bpf_name") or [])],
+        "process_names": [str(p) for p in (entry.get("process_names") or [])],
+        "commandline": str(entry.get("commandline") or ""),
+    }
+
+
+def serialize_config_meta(entry: dict) -> str:
+    """Render :func:`build_config_meta` for storage in ``config_meta_json``."""
+    return json.dumps(build_config_meta(entry), sort_keys=True)
+
+
+def _parse_config_meta(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Decode a stored ``config_meta_json``; None when absent or unreadable."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def render_config_entry_yaml(name: str, app_id: str, meta: Optional[dict]) -> str:
+    """Render a ``controlled_apps`` entry as YAML the user can paste back.
+
+    Uses the same scalar formatter the config writer itself uses
+    (:meth:`config.config.Config._format_yaml_value`), so the block matches what
+    ``append_to_list_section`` would have written.
+    """
+    meta = meta if isinstance(meta, dict) else {}
+    fmt = b_config._format_yaml_value
+    fields = [("name", name), ("id", app_id), ("commandline", meta.get("commandline") or "")]
+    fields += [(key, meta.get(key) or []) for key in ("bpf_name", "process_names")]
+    lines = [f"  - {fields[0][0]}: {fmt(fields[0][1])}"]
+    lines += [f"    {key}: {fmt(value)}" for key, value in fields[1:]]
+    return "\n".join(lines)
+
+
+def config_entry_from_row(row, app_name: str = "", cmdline: str = "") -> Dict[str, Any]:
+    """Rebuild a ``controlled_apps`` entry from a row's stored snapshot.
+
+    Rows written before ``config_meta_json`` existed have no snapshot; they still
+    yield a usable entry (name / id / cmdline), just without the BPF and
+    process-name hints, which the user can fill in later.
+    """
+    meta = _parse_config_meta(getattr(row, "config_meta_json", None)) or {}
+    name = str(getattr(row, "name", "") or "").strip() or app_name
+    return {
+        "name": name,
+        "id": str(getattr(row, "app_id", "") or "").strip(),
+        "commandline": meta.get("commandline") or (getattr(row, "cmdline", None) or cmdline or ""),
+        "bpf_name": list(meta.get("bpf_name") or []),
+        "process_names": list(meta.get("process_names") or []),
+    }
+
+
+def fetch_unregistered_apps() -> List[Dict[str, Any]]:
+    """Apps the database still knows about but ``controlled_apps`` no longer lists.
+
+    These are entries a user deleted from config.yaml by hand;
+    :func:`reconcile_controlled_apps` un-controls them at startup.  Surfacing
+    them alongside :func:`fetch_all_apps` is what lets the UI offer them for
+    re-enabling instead of forcing another trip through the wizard -- their row
+    still carries the priority, OOM score and saved limit overrides.
+
+    Same shape as :func:`fetch_all_apps`, plus ``previously_managed``.
+    """
+    apps = []
+    try:
+        for row in AIAppPriority.query():
+            app_id = str(getattr(row, "app_id", "") or "").strip()
+            name = str(getattr(row, "name", "") or "").strip()
+            if not app_id:
+                continue
+            if _get_controlled_app_entry(app_id=app_id, app_name=name) is not None:
+                continue  # still registered in config.yaml -- fetch_all_apps() has it
+            entry = config_entry_from_row(row)
+            apps.append({
+                "name": entry["name"],
+                "app_name": entry["name"],
+                "app_id": app_id,
+                "cmdline": entry["commandline"],
+                "process_names": entry["process_names"],
+                "display_name": entry["name"],
+                "previously_managed": True,
+            })
+    except Exception as e:
+        logger.error(f"fetch_unregistered_apps failed: {e}", exc_info=True)
+    return apps
+
+
+def restore_config_entry(app_id: str, app_name: str = "", cmdline: str = "") -> bool:
+    """Write an app's ``controlled_apps`` entry back into config.yaml.
+
+    Called when re-enabling an app whose entry the user deleted by hand.  Without
+    it the app would be controlled in the database yet invisible to every
+    config-driven lookup (BPF match cache, process_names, multi-process maps) --
+    the very split state :func:`reconcile_controlled_apps` exists to resolve, and
+    the next restart would simply un-control it again.
+
+    Returns True when an entry was written; False when one already exists, the
+    app is unknown, or the write failed.
+    """
+    if not app_id:
+        return False
+    if _get_controlled_app_entry(app_id=app_id, app_name=app_name) is not None:
+        return False
+
+    try:
+        row = AIAppPriority.query().where(AIAppPriority.app_id == app_id).first()
+    except Exception as e:
+        logger.error(f"restore_config_entry: database lookup failed for '{app_id}': {e}")
+        return False
+    if row is None:
+        return False
+
+    entry = config_entry_from_row(row, app_name=app_name, cmdline=cmdline)
+    if not entry["name"] or not entry["id"]:
+        logger.warning(f"restore_config_entry: row '{app_id}' has no usable name/id; skipping")
+        return False
+
+    if not b_config.append_to_list_section("controlled_apps", entry):
+        logger.warning(f"restore_config_entry: failed to write config.yaml entry for '{app_id}'")
+        return False
+
+    logger.info(
+        "[config-sync] restored controlled_apps entry for '%s' (id=%s) from the stored snapshot",
+        entry["name"], app_id,
+    )
+    return True
+
+
+def diff_controlled_apps(config_apps, db_rows) -> tuple:
+    """Compare ``controlled_apps`` against the app table.
+
+    Returns ``(orphans, stale_meta)``:
+
+    * ``orphans``    – rows still marked ``controlled`` whose config entry is
+      gone, i.e. apps the user un-registered by editing config.yaml.
+    * ``stale_meta`` – rows whose stored ``config_meta_json`` no longer matches
+      their config entry and should be refreshed.
+
+    Rows that are already ``controlled=False`` and absent from config are left
+    alone: that is just a registration the user never enabled, and nothing keys
+    off it.
+
+    Kept free of database and config imports so it can be exercised directly.
+    """
+    by_id: Dict[str, dict] = {}
+    by_name: Dict[str, dict] = {}
+    for entry in (config_apps or []):
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str(entry.get("id") or "").strip()
+        if entry_id:
+            by_id[entry_id] = entry
+            continue
+        # Entries without an id are already skipped by fetch_all_apps(); match
+        # them by name so a malformed-but-intentional entry is not mistaken for
+        # a deletion and silently un-controlled.
+        entry_name = str(entry.get("name") or "").strip().lower()
+        if entry_name:
+            by_name[entry_name] = entry
+
+    orphans, stale_meta = [], []
+    for row in (db_rows or []):
+        app_id = str(getattr(row, "app_id", "") or "").strip()
+        name = str(getattr(row, "name", "") or "").strip()
+        info = {
+            "row_id": getattr(row, "id", None) or app_id,
+            "app_id": app_id,
+            "name": name,
+            "priority": getattr(row, "priority", None),
+        }
+        stored_meta = _parse_config_meta(getattr(row, "config_meta_json", None))
+
+        entry = by_id.get(app_id) or by_name.get(name.lower())
+        if entry is None:
+            if getattr(row, "controlled", False):
+                info["meta"] = stored_meta
+                orphans.append(info)
+            continue
+
+        meta = build_config_meta(entry)
+        if stored_meta != meta:
+            info["meta"] = meta
+            stale_meta.append(info)
+
+    return orphans, stale_meta
+
+
+def reconcile_controlled_apps() -> Dict[str, list]:
+    """Reconcile the app table with config.yaml.  Call once at startup.
+
+    Must run before the service starts: the BPF monitor list is seeded from the
+    database (``controlled=True``) in DynamicBalancer._run_app_intercept_loop,
+    which also re-applies the OOM adjustment, so an app dropped from config has
+    to be un-controlled before any of that happens.
+
+    Never raises -- a reconciliation problem must not keep the service down.
+    """
+    result: Dict[str, list] = {"uncontrolled": [], "meta_refreshed": []}
+    try:
+        rows = list(AIAppPriority.query())
+        orphans, stale_meta = diff_controlled_apps(
+            getattr(b_config, "controlled_apps", None) or [], rows
+        )
+
+        for info in orphans:
+            logger.warning(
+                "[config-sync] '%s' (id=%s, priority=%s) is no longer in config.yaml "
+                "controlled_apps -- switching it to uncontrolled. To manage it again, "
+                "put its entry back under controlled_apps and enable it from the "
+                "Balancer page:\n%s",
+                info["name"] or info["app_id"], info["app_id"], info["priority"],
+                render_config_entry_yaml(info["name"], info["app_id"], info.get("meta")),
+            )
+            if AIAppPriority.update_record(id=info["row_id"], controlled=False) == DBStatus.SUCCESS:
+                result["uncontrolled"].append(info["app_id"])
+            else:
+                logger.warning(f"[config-sync] failed to un-control '{info['app_id']}'")
+
+        for info in stale_meta:
+            updated = AIAppPriority.update_record(
+                id=info["row_id"],
+                config_meta_json=json.dumps(info["meta"], sort_keys=True),
+            )
+            if updated == DBStatus.SUCCESS:
+                result["meta_refreshed"].append(info["app_id"])
+
+        if result["uncontrolled"] or result["meta_refreshed"]:
+            logger.info(
+                "[config-sync] un-controlled %d app(s) %s; refreshed config snapshot for %d app(s)",
+                len(result["uncontrolled"]), result["uncontrolled"], len(result["meta_refreshed"]),
+            )
+        else:
+            logger.info("[config-sync] config.yaml and the app table are already in sync")
+    except Exception as e:
+        logger.error(f"[config-sync] reconciliation failed: {e}", exc_info=True)
+
+    return result
 
 
 def _get_multi_process_app_resource_usage(app_id: str, app_name: str, process_names: list) -> dict:

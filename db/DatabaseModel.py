@@ -193,6 +193,11 @@ class AIAppPriority(DataBaseModel):
     up_time = DateTimeField(null=True, index=True)
     status = CharField(default="NA", max_length=32, null=True, help_text="app status, NA, running, pending, stopped", index=True)
     limit_overrides_json = TextField(null=True, help_text="per-app manual resource limit overrides (JSON)")
+    # Snapshot of this app's config.yaml ``controlled_apps`` entry (bpf_name /
+    # process_names / commandline).  Those fields live only in the YAML, so a
+    # hand-deleted entry used to be unrecoverable; keeping a copy here lets the
+    # startup reconciliation print the exact block to paste back.
+    config_meta_json = TextField(null=True, help_text="snapshot of the config.yaml controlled_apps entry (JSON)")
 
 
 class MonitorSnapshot(DataBaseModel):
@@ -270,6 +275,7 @@ def _apply_migrations():
     migrations = [
         "ALTER TABLE aiapppriority ADD COLUMN limit_overrides_json TEXT",
         "ALTER TABLE aiapppriority ADD COLUMN network_priority VARCHAR(32)",
+        "ALTER TABLE aiapppriority ADD COLUMN config_meta_json TEXT",
     ]
     for sql in migrations:
         try:

@@ -26,7 +26,7 @@ from monitor.monitor_api import (
 )
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
 from smartune_api import auth_bp, smartune_bp, set_balancer_available
-from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, get_priority_value, get_app_processes_for_app, get_cgroup_path_by_pid
+from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, fetch_unregistered_apps, get_priority_value, get_app_processes_for_app, get_cgroup_path_by_pid, reconcile_controlled_apps, restore_config_entry, serialize_config_meta
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
 
@@ -348,6 +348,13 @@ def get_apps():
         data = request.get_json()
         store = data.get('store', False)
         app_list = fetch_all_apps()
+        # Apps whose config.yaml entry was deleted by hand keep their row (the
+        # startup reconciliation only un-controls them), so offer them for
+        # re-enabling too -- otherwise the only way back is the wizard, which
+        # would lose the priority and limit overrides the row still holds.
+        # Appended after the loop below on purpose: they already have a row, and
+        # they carry no config entry to sync one from.
+        unregistered = fetch_unregistered_apps()
         for app in app_list:
             if store:
                 app_id = app["app_id"]
@@ -372,7 +379,7 @@ def get_apps():
                     )
 
         return construct_response(
-            data=app_list,
+            data=app_list + unregistered,
             retmsg="Successfully retrieved app list"
         )
     except Exception as e:
@@ -563,6 +570,12 @@ def set_to_control():
 
         _service.add_control(app_name)
 
+        # Re-enabling an app whose controlled_apps entry was deleted by hand has
+        # to put that entry back first: everything config-driven (BPF match
+        # cache, process_names, multi-process maps) keys off it, and the next
+        # startup reconciliation would otherwise just un-control the app again.
+        if controlled:
+            restore_config_entry(app_id, app_name=app_name, cmdline=cmdline)
 
         update_fields = dict(
             controlled=controlled,
@@ -783,13 +796,14 @@ def new_controlled_app():
                 )
 
         # 1. Persist to config.yaml.
-        ok = b_config.append_to_list_section('controlled_apps', {
+        config_entry = {
             'name': name,
             'id': app_id,
             'commandline': commandline,
             'bpf_name': bpf_name,
             'process_names': process_names,
-        })
+        }
+        ok = b_config.append_to_list_section('controlled_apps', config_entry)
         if not ok:
             return construct_response(
                 data={},
@@ -804,6 +818,10 @@ def new_controlled_app():
         #    crashes Balance.tsx and blanks the tab.
         priority_label = normalize_priority(priority, default="low")
         network_priority_label = normalize_network_priority(priority_label)
+        # Mirror the config-only fields into the row as well, so the entry stays
+        # recoverable if config.yaml is later edited by hand (see
+        # utils.app_utils.reconcile_controlled_apps).
+        config_meta = serialize_config_meta(config_entry)
         try:
             db_result = AIAppPriority.insert_record(
                 id=app_id,
@@ -816,6 +834,7 @@ def new_controlled_app():
                 remark=remark,
                 cmdline=commandline,
                 status="NA",
+                config_meta_json=config_meta,
                 last_update_time=datetime.now(),
             )
 
@@ -836,6 +855,7 @@ def new_controlled_app():
                     remark=remark,
                     cmdline=commandline,
                     status="NA",
+                    config_meta_json=config_meta,
                 )
                 if update_result != DBStatus.SUCCESS:
                     logger.warning(
@@ -1486,6 +1506,11 @@ def main():
         return
 
     init_database()
+    # config.yaml decides *which* apps are managed, and it is read once at import
+    # (no hot reload), so a hand-edited entry only ever takes effect here.  Must
+    # precede start_service(): the BPF monitor list and the OOM adjustment are
+    # seeded from the database's controlled rows once the balancer comes up.
+    reconcile_controlled_apps()
     try:
         preload_static_info()
     except Exception as exc:

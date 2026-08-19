@@ -22,7 +22,6 @@ import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
 import { api } from '../api/client'
 import type { AppResourceEntry, AppDiskIoEntry, ProcessEntry, WeightsTopData, DynamicInfoData } from '../api/types'
-import { usePolling } from '../hooks/usePolling'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 import { ProcessActionsMenu, useProcessDetail } from './ProcessActions'
 import { buildGpuLabelMap } from '../utils/gpu'
@@ -337,12 +336,15 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
   // each child process's PCI address to an iGPU/dGPU label.
   const [dyn, setDyn] = useState<DynamicInfoData | null>(null)
   const [loading, setLoading] = useState(true)
+  // Drives the Refresh button's spinner; `loading` only covers the first fetch.
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [settingsVisible, setSettingsVisible] = useState(false)
   const { openDetail, detailModal } = useProcessDetail()
 
   const fetchData = useCallback(async () => {
+    setRefreshing(true)
     try {
       // The process list backs the expandable child rows (joined by PID); its
       // failure must not blank the app tables, so it is tolerated separately.
@@ -402,14 +404,20 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
       setError(e instanceof Error ? e.message : 'Failed to fetch data')
     } finally {
       setLoading(false)
+      setRefreshing(false)
     }
   }, [])
 
-  usePolling(fetchData, 5000, active)
+  // No periodic polling here: this tab refreshes on demand only.  Entering the
+  // tab pulls once so the tables are never blank / badly stale; after that the
+  // user drives updates with the Refresh button (or an Operation-menu action).
+  useEffect(() => {
+    if (active) fetchData()
+  }, [active, fetchData])
 
   // Suspended (SIGSTOP'd) processes sink to the bottom of the score-sorted tables
-  // and may not surface at all on the 5 s refresh, so — like the Processes tab —
-  // give them a one-click Resume regardless of the current sort/filter.
+  // and may not surface at all in the current snapshot, so — like the Processes
+  // tab — give them a one-click Resume regardless of the current sort/filter.
   const resumeProcess = useCallback(
     async (p: ProcessEntry) => {
       try {
@@ -861,23 +869,27 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
       )}
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', marginBottom: 8, gap: 12 }}>
+        <Tooltip title="Refresh now">
+          <Button
+            size="small"
+            icon={<ReloadOutlined />}
+            loading={refreshing}
+            onClick={() => fetchData()}
+            aria-label="Manual refresh"
+          >
+          </Button>
+        </Tooltip>
+        {lastUpdated && (
+          <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>
+            Updated: {lastUpdated.toLocaleTimeString()}
+          </Text>
+        )}
         <Button
           type="text"
           icon={<SettingOutlined style={{ fontSize: 16, color: COLORS.accent }} />}
           onClick={() => setSettingsVisible(true)}
           style={{ padding: '4px 8px' }}
           title="Configure Score Weights"
-        />
-        {lastUpdated && (
-          <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>
-            <ReloadOutlined style={{ marginRight: 4 }} />
-            Updated: {lastUpdated.toLocaleTimeString()}
-          </Text>
-        )}
-        <Badge
-          status="processing"
-          color={COLORS.green}
-          text={<Text style={{ color: COLORS.textMuted, fontSize: 11 }}>Auto-refresh 5s</Text>}
         />
       </div>
 

@@ -211,6 +211,89 @@ function downsampleLTTB<T>(data: T[], threshold: number, getY: (d: T) => number)
   return out
 }
 
+/** Value-less entry marking a stretch with no samples; breaks the line at `ts`. */
+function makeGapPoint<T>(ts: number): T {
+  return { timestamp: dayjs.unix(ts).format('MM-DD HH:mm:ss'), ts } as unknown as T
+}
+
+/**
+ * Seconds between consecutive samples while collection is running, measured
+ * from the data so any configured cadence works.
+ *
+ * The 25th percentile rather than the median: once more than half the window
+ * is downtime the median is a downtime length, not a cadence, and every real
+ * hole would then look normal.  A low percentile still lands on the running
+ * cadence, and is not thrown off by one unusually short interval the way the
+ * minimum would be.
+ */
+function sampleCadenceSeconds(points: Array<{ ts: number }>): number | null {
+  const deltas: number[] = []
+  for (let i = 1; i < points.length; i++) {
+    const prev = points[i - 1].ts
+    const cur = points[i].ts
+    if (prev > 0 && cur > prev) deltas.push(cur - prev)
+  }
+  if (deltas.length === 0) return null
+  deltas.sort((a, b) => a - b)
+  return deltas[Math.floor(deltas.length * 0.25)]
+}
+
+/**
+ * Downsample a trend series, leaving stretches with no samples blank.
+ *
+ * Snapshots are only written while SmarTune runs, so stopping it leaves a hole
+ * in the series.  A <Line> joins consecutive array entries no matter how far
+ * apart their timestamps are, which would draw a straight line across the
+ * downtime.  Split the series wherever at least one expected sample is missing
+ * (more than twice the observed cadence between neighbours), downsample each
+ * run on its own share of the point budget so LTTB cannot drop the break, then
+ * rejoin the runs with value-less entries.  Recharts' default
+ * connectNulls={false} turns those into a real break, and the time axis gives
+ * the blank its true width.
+ */
+function downsampleWithGaps<T extends { timestamp: string; ts: number }>(
+  points: T[],
+  threshold: number,
+  getY: (d: T) => number,
+): T[] {
+  const cadence = sampleCadenceSeconds(points)
+  if (cadence === null) return downsampleLTTB(points, threshold, getY)
+  const maxDelta = cadence * 2
+
+  const runs: T[][] = []
+  for (const point of points) {
+    const run = runs[runs.length - 1]
+    const prev = run?.[run.length - 1]
+    const broken = !run || !prev || (prev.ts > 0 && point.ts > 0 && point.ts - prev.ts > maxDelta)
+    if (broken) runs.push([point])
+    else run.push(point)
+  }
+  if (runs.length <= 1) return downsampleLTTB(points, threshold, getY)
+
+  const out: T[] = []
+  runs.forEach((run, index) => {
+    if (index > 0) {
+      const from = out[out.length - 1].ts
+      const to = run[0].ts
+      out.push(makeGapPoint<T>(Math.round((from + to) / 2)))
+    }
+    if (run.length === 1) {
+      // A lone sample has no neighbour to draw a line to and dots are off, so
+      // it would vanish.  Give it the width of the sampling interval it stands
+      // for, keeping a short burst of monitoring visible.
+      const half = Math.max(1, Math.round(cadence / 2))
+      out.push(
+        { ...run[0], ts: run[0].ts - half } as T,
+        { ...run[0], ts: run[0].ts + half } as T,
+      )
+      return
+    }
+    const budget = Math.max(3, Math.round((run.length / points.length) * threshold))
+    out.push(...downsampleLTTB(run, budget, getY))
+  })
+  return out
+}
+
 /** Sum absolute numeric values in an object, skipping timestamp keys */
 function sumMetrics(p: Record<string, unknown>): number {
   let s = 0
@@ -241,10 +324,63 @@ function estimateRequiredLimit(
   return Math.max(100, Math.min(estimated, HISTORY_LIMIT_CAP))
 }
 
-function formatHistoryAxisTick(val: string | number): string {
-  const text = String(val)
-  if (text.length >= 11) return text.slice(0, 11) // MM-DD HH:mm
-  return text
+/** Inclusive unix-second window the X axis spans. */
+type TimeDomain = [number, number]
+
+const TIME_TICK_COUNT = 6
+
+/** Evenly spaced ticks across the domain, so the ruler stays uniform in time
+ *  regardless of where the samples happen to fall. */
+function makeTimeTicks([start, end]: TimeDomain): number[] {
+  if (!(end > start)) return [start]
+  const step = (end - start) / (TIME_TICK_COUNT - 1)
+  return Array.from({ length: TIME_TICK_COUNT }, (_, i) => Math.round(start + step * i))
+}
+
+function makeTimeTickFormatter([start, end]: TimeDomain) {
+  const span = Math.max(0, end - start)
+  const fmt = span > 24 * 3600 ? 'MM-DD HH:mm' : span > 3600 ? 'HH:mm' : 'HH:mm:ss'
+  return (val: number) => (val > 0 ? dayjs.unix(val).format(fmt) : '')
+}
+
+function formatTimeLabel(val: number | string): string {
+  const n = typeof val === 'number' ? val : Number(val)
+  return Number.isFinite(n) && n > 0 ? dayjs.unix(n).format('MM-DD HH:mm:ss') : String(val)
+}
+
+/** Shared props turning an XAxis into a real time scale over `domain`. */
+function timeAxisProps(domain: TimeDomain) {
+  return {
+    dataKey: 'ts',
+    type: 'number' as const,
+    domain,
+    allowDataOverflow: true,
+    ticks: makeTimeTicks(domain),
+    tickFormatter: makeTimeTickFormatter(domain),
+  }
+}
+
+interface BrushRange {
+  startIndex: number
+  endIndex: number
+}
+
+/**
+ * X-axis domain for a brushable time chart.  Recharts' Brush only slices the
+ * data; with a fixed numeric domain the axis would not follow it, so map the
+ * selected indices back to their timestamps.
+ */
+function brushedDomain(
+  points: Array<{ ts: number }>,
+  range: BrushRange | null | undefined,
+  fallback: TimeDomain,
+): TimeDomain {
+  if (!range || points.length === 0) return fallback
+  const clamp = (i: number) => Math.max(0, Math.min(i, points.length - 1))
+  const start = points[clamp(range.startIndex)]?.ts
+  const end = points[clamp(range.endIndex)]?.ts
+  if (!start || !end || end <= start) return fallback
+  return [start, end]
 }
 
 const DISK_COLORS = ['#e07b54', '#73bf69', COLORS.accent, COLORS.yellow, COLORS.red, '#b877db', '#56c8d8']
@@ -804,11 +940,12 @@ function usePersistedSet(storageKey: string, defaults: string[]): [Set<string>, 
   return [active, toggle, new Set(defaults)]
 }
 
-function ConfigurableChart<T extends { timestamp: string }>({
+function ConfigurableChart<T extends { timestamp: string; ts: number }>({
   title,
   storageKey,
   allSeries,
   data,
+  timeWindow,
   height = 280,
   showBrush = false,
   hoverPanel = false,
@@ -817,6 +954,7 @@ function ConfigurableChart<T extends { timestamp: string }>({
   storageKey: string
   allSeries: SeriesConfig[]
   data: T[]
+  timeWindow: TimeDomain
   height?: number
   showBrush?: boolean
   hoverPanel?: boolean
@@ -824,6 +962,19 @@ function ConfigurableChart<T extends { timestamp: string }>({
   const defaults = useMemo(() => allSeries.filter((s) => s.defaultOn !== false).map((s) => s.key), [allSeries])
   const [active, toggle] = usePersistedSet(storageKey, defaults)
   const [hoverData, setHoverData] = useState<Array<{ name: string; value: unknown; color: string; unit: string }> | null>(null)
+
+  // Brush selection zooms the time axis; drop it when a refetch replaces the
+  // data, since the indices no longer refer to the same samples.
+  const [brushRange, setBrushRange] = useState<BrushRange | null>(null)
+  useEffect(() => { setBrushRange(null) }, [data])
+  const handleBrushChange = useCallback((range: { startIndex?: number; endIndex?: number }) => {
+    if (range.startIndex === undefined || range.endIndex === undefined) return
+    setBrushRange({ startIndex: range.startIndex, endIndex: range.endIndex })
+  }, [])
+  const xDomain = useMemo(
+    () => brushedDomain(data, brushRange, timeWindow),
+    [data, brushRange, timeWindow],
+  )
 
   // Determine which unit groups are active, assign left/right Y-axis (max 2)
   const { leftUnit, rightUnit, activeSeries } = useMemo(() => {
@@ -953,10 +1104,9 @@ function ConfigurableChart<T extends { timestamp: string }>({
             >
               <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
               <XAxis
-                dataKey="timestamp"
+                {...timeAxisProps(xDomain)}
                 tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                 minTickGap={36}
-                tickFormatter={formatHistoryAxisTick}
               />
               <YAxis
                 yAxisId="left"
@@ -982,6 +1132,7 @@ function ConfigurableChart<T extends { timestamp: string }>({
                   contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
                   wrapperStyle={{ zIndex: 100 }}
                   formatter={tooltipFmt2}
+                  labelFormatter={formatTimeLabel}
                 />
               )}
               {hoverPanel && (
@@ -1004,7 +1155,15 @@ function ConfigurableChart<T extends { timestamp: string }>({
                 />
               ))}
               {showBrush && (
-                <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8} />
+                <Brush
+                  dataKey="ts"
+                  height={24}
+                  stroke={COLORS.accent}
+                  fill={COLORS.bg}
+                  travellerWidth={8}
+                  tickFormatter={formatTimeLabel}
+                  onChange={handleBrushChange}
+                />
               )}
             </LineChart>
           </ResponsiveContainer>
@@ -1051,10 +1210,12 @@ const EMPTY_GPU_HIDDEN: Set<string> = new Set()
 
 function GpuHistoryCard({
   series,
+  timeWindow,
   hidden = EMPTY_GPU_HIDDEN,
   onToggle,
 }: {
   series: GpuTrendSeries
+  timeWindow: TimeDomain
   // Hidden-legend state is owned by the parent (keyed by device id) so it
   // survives data refreshes that would otherwise remount this card and wipe a
   // local useState — matching how the other history charts persist their state.
@@ -1064,12 +1225,17 @@ function GpuHistoryCard({
   const toggle = onToggle
 
   // Shared brush state so both charts stay aligned
-  const [brushRange, setBrushRange] = useState<{ startIndex: number; endIndex: number } | null>(null)
+  const [brushRange, setBrushRange] = useState<BrushRange | null>(null)
+  useEffect(() => { setBrushRange(null) }, [series.points])
   const handleBrushChange = useCallback((range: { startIndex?: number; endIndex?: number }) => {
     if (range.startIndex !== undefined && range.endIndex !== undefined) {
       setBrushRange({ startIndex: range.startIndex, endIndex: range.endIndex })
     }
   }, [])
+  const xDomain = useMemo(
+    () => brushedDomain(series.points, brushRange, timeWindow),
+    [series.points, brushRange, timeWindow],
+  )
 
   const memLabel = series.isIntegrated ? 'Sys Mem %' : 'VRAM %'
 
@@ -1117,10 +1283,9 @@ function GpuHistoryCard({
           <LineChart data={series.points} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
             <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
             <XAxis
-              dataKey="timestamp"
+              {...timeAxisProps(xDomain)}
               tick={{ fill: COLORS.textMuted, fontSize: 11 }}
               minTickGap={36}
-              tickFormatter={formatHistoryAxisTick}
             />
             <YAxis
               yAxisId="util"
@@ -1140,6 +1305,7 @@ function GpuHistoryCard({
             <Tooltip
               contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
               formatter={tooltipFmt2}
+              labelFormatter={formatTimeLabel}
             />
             {engineLines.map((l) => (
               <Line
@@ -1155,7 +1321,8 @@ function GpuHistoryCard({
                 hide={hidden.has(l.key)}
               />
             ))}
-            <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8}
+            <Brush dataKey="ts" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8}
+              tickFormatter={formatTimeLabel}
               {...(brushRange ? { startIndex: brushRange.startIndex, endIndex: brushRange.endIndex } : {})}
               onChange={handleBrushChange} />
           </LineChart>
@@ -1183,10 +1350,9 @@ function GpuHistoryCard({
           <LineChart data={series.points} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
             <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
             <XAxis
-              dataKey="timestamp"
+              {...timeAxisProps(xDomain)}
               tick={{ fill: COLORS.textMuted, fontSize: 11 }}
               minTickGap={36}
-              tickFormatter={formatHistoryAxisTick}
             />
             <YAxis
               tick={{ fill: COLORS.textMuted, fontSize: 11 }}
@@ -1197,6 +1363,7 @@ function GpuHistoryCard({
             <Tooltip
               contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
               formatter={(val: number, name: string) => [`${typeof val === 'number' ? val.toFixed(2) : val} W`, name]}
+              labelFormatter={formatTimeLabel}
             />
             {powerLines.map((l) => (
               <Line
@@ -1211,7 +1378,8 @@ function GpuHistoryCard({
                 hide={hidden.has(l.key)}
               />
             ))}
-            <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8}
+            <Brush dataKey="ts" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8}
+              tickFormatter={formatTimeLabel}
               {...(brushRange ? { startIndex: brushRange.startIndex, endIndex: brushRange.endIndex } : {})}
               onChange={handleBrushChange} />
           </LineChart>
@@ -1221,7 +1389,7 @@ function GpuHistoryCard({
   )
 }
 
-function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
+function CpuPerCoreHistoryCard({ info, timeWindow }: { info: CpuPerCoreInfo; timeWindow: TimeDomain }) {
   const { points, coreCount, pCoreIndices, eCoreIndices, lpeCoreIndices } = info
 
   // Check which cores actually have temperature data in at least one point
@@ -1337,6 +1505,7 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
           title={`CPU P-Core (${pCoreIndices.length}) — Utilization & Frequency`}
           storageKey="history-cpu-pcore"
           data={points}
+          timeWindow={timeWindow}
           allSeries={pCoreSeries}
           height={240}
           showBrush
@@ -1348,6 +1517,7 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
           title={`CPU E-Core (${eCoreIndices.length}) — Utilization & Frequency`}
           storageKey="history-cpu-ecore"
           data={points}
+          timeWindow={timeWindow}
           allSeries={eCoreSeries}
           height={240}
           showBrush
@@ -1359,6 +1529,7 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
           title={`CPU LPE-Core (${lpeCoreIndices.length}) — Utilization & Frequency`}
           storageKey="history-cpu-lpecore"
           data={points}
+          timeWindow={timeWindow}
           allSeries={lpeCoreSeries}
           height={240}
           showBrush
@@ -1370,6 +1541,7 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
           title="CPU Temperature (°C)"
           storageKey="history-cpu-temp"
           data={points}
+          timeWindow={timeWindow}
           allSeries={tempSeries}
           height={200}
           showBrush
@@ -1577,26 +1749,45 @@ export default function HistoryDashboard({ active }: Props) {
     [history],
   )
 
+  // Time span the X axis covers: the window that was actually queried, echoed
+  // back by the server, so the ruler stays put no matter how much of it has
+  // data.  Falls back to the extent of the samples for an unbounded query.
+  const timeWindow = useMemo<TimeDomain>(() => {
+    const start = history?.start_time
+    const end = history?.end_time
+    if (typeof start === 'number' && typeof end === 'number' && end > start) return [start, end]
+    let lo = Number.POSITIVE_INFINITY
+    let hi = Number.NEGATIVE_INFINITY
+    for (const item of dynamicItems) {
+      const ts = item.create_time
+      if (!Number.isFinite(ts) || ts <= 0) continue
+      if (ts < lo) lo = ts
+      if (ts > hi) hi = ts
+    }
+    if (!Number.isFinite(lo)) return [0, SNAPSHOT_INTERVAL_SECONDS]
+    return hi > lo ? [lo, hi] : [lo, lo + SNAPSHOT_INTERVAL_SECONDS]
+  }, [history?.start_time, history?.end_time, dynamicItems])
+
   const pressureTrendPoints = useMemo(() => {
     const raw = buildPressureTrendPoints(dynamicItems)
-    return downsampleLTTB(raw, MAX_CHART_POINTS, (p) => Math.abs(p.systemPressure ?? 0) + Math.abs(p.diskPressure ?? 0) + Math.abs(p.networkPressure ?? 0))
+    return downsampleWithGaps(raw, MAX_CHART_POINTS, (p) => Math.abs(p.systemPressure ?? 0) + Math.abs(p.diskPressure ?? 0) + Math.abs(p.networkPressure ?? 0))
   }, [dynamicItems])
   const cpuMemTrendPoints = useMemo(() => {
     const raw = buildCpuMemTrendPoints(dynamicItems)
-    return downsampleLTTB(raw, MAX_CHART_POINTS, (p) => Math.abs(p.cpuUtilization ?? 0) + Math.abs(p.memoryUtilization ?? 0) + Math.abs(p.pCoreFreqMhz ?? 0) + Math.abs(p.cpuTemperatureC ?? 0))
+    return downsampleWithGaps(raw, MAX_CHART_POINTS, (p) => Math.abs(p.cpuUtilization ?? 0) + Math.abs(p.memoryUtilization ?? 0) + Math.abs(p.pCoreFreqMhz ?? 0) + Math.abs(p.cpuTemperatureC ?? 0))
   }, [dynamicItems])
   const cpuPerCoreInfo = useMemo<CpuPerCoreInfo>(() => {
     const raw = buildCpuPerCoreTrendPoints(dynamicItems)
     return {
       ...raw,
-      points: downsampleLTTB(raw.points, MAX_CHART_POINTS, (p) =>
+      points: downsampleWithGaps(raw.points, MAX_CHART_POINTS, (p) =>
         Math.abs(p.totalUtil as number ?? 0) + Math.abs((p.pkgTemp as number) ?? 0) + Math.abs((p.pAvgFreq as number) ?? 0) / 100,
       ),
     }
   }, [dynamicItems])
   const { points: diskTrendPoints, diskNames, diskMaxThroughput } = useMemo(() => {
     const { points, diskNames: dn, diskMaxThroughput: tp } = buildDiskTrendPoints(dynamicItems)
-    return { points: downsampleLTTB(points, MAX_CHART_POINTS, (p) => sumMetrics(p as unknown as Record<string, unknown>)), diskNames: dn, diskMaxThroughput: tp }
+    return { points: downsampleWithGaps(points, MAX_CHART_POINTS, (p) => sumMetrics(p as unknown as Record<string, unknown>)), diskNames: dn, diskMaxThroughput: tp }
   }, [dynamicItems])
   const { points: networkTrendPoints, nicNames, nicSpeeds } = useMemo(() => {
     const { points, nicNames: nn, nicSpeeds: sp } = buildNetworkTrendPoints(dynamicItems)
@@ -1609,18 +1800,18 @@ export default function HistoryDashboard({ active }: Props) {
         }
       }
     }
-    return { points: downsampleLTTB(points, MAX_CHART_POINTS, (p) => sumMetrics(p as unknown as Record<string, unknown>)), nicNames: nn, nicSpeeds: merged }
+    return { points: downsampleWithGaps(points, MAX_CHART_POINTS, (p) => sumMetrics(p as unknown as Record<string, unknown>)), nicNames: nn, nicSpeeds: merged }
   }, [dynamicItems, staticInfo])
   const npuTrendPoints = useMemo(() => {
     const raw = buildNpuTrendPoints(dynamicItems)
-    return downsampleLTTB(raw, MAX_CHART_POINTS, (p) => Math.abs(p.npuUtilization ?? 0) + Math.abs(p.npuFreqMhz ?? 0) + Math.abs(p.npuPowerW ?? 0) + Math.abs(p.npuTemperatureC ?? 0) + Math.abs(p.npuMemoryMb ?? 0))
+    return downsampleWithGaps(raw, MAX_CHART_POINTS, (p) => Math.abs(p.npuUtilization ?? 0) + Math.abs(p.npuFreqMhz ?? 0) + Math.abs(p.npuPowerW ?? 0) + Math.abs(p.npuTemperatureC ?? 0) + Math.abs(p.npuMemoryMb ?? 0))
   }, [dynamicItems])
   const gpuTrendSeries = useMemo(() => {
     const raw = buildGpuTrendSeries(dynamicItems)
     return raw
       .map((s) => ({
         ...s,
-        points: downsampleLTTB(s.points, MAX_CHART_POINTS, (p) => Math.abs(p.utilization ?? 0) + Math.abs(p.vcs ?? 0) + Math.abs(p.vecs ?? 0) + Math.abs(p.gt0Act ?? 0) + Math.abs(p.gpuPower ?? 0)),
+        points: downsampleWithGaps(s.points, MAX_CHART_POINTS, (p) => Math.abs(p.utilization ?? 0) + Math.abs(p.vcs ?? 0) + Math.abs(p.vecs ?? 0) + Math.abs(p.gt0Act ?? 0) + Math.abs(p.gpuPower ?? 0)),
       }))
       .sort((a, b) => (a.isIntegrated ? 0 : 1) - (b.isIntegrated ? 0 : 1))
   }, [dynamicItems])
@@ -1660,6 +1851,26 @@ export default function HistoryDashboard({ active }: Props) {
       return next
     })
   }, [])
+
+  // Brush selections for the charts rendered inline below.  Disk and network
+  // are keyed by device because those cards are produced by a .map() and so
+  // cannot hold hooks of their own.  A refetch clears every selection: the
+  // indices would otherwise point at different samples.
+  const [pressureBrush, setPressureBrush] = useState<BrushRange | null>(null)
+  const [diskBrush, setDiskBrush] = useState<Record<string, BrushRange>>({})
+  const [networkBrush, setNetworkBrush] = useState<Record<string, BrushRange>>({})
+  useEffect(() => {
+    setPressureBrush(null)
+    setDiskBrush({})
+    setNetworkBrush({})
+  }, [history])
+  const handleBrushChange = useCallback(
+    (apply: (range: BrushRange) => void) => (range: { startIndex?: number; endIndex?: number }) => {
+      if (range.startIndex === undefined || range.endIndex === undefined) return
+      apply({ startIndex: range.startIndex, endIndex: range.endIndex })
+    },
+    [],
+  )
 
   // GPU legend state is kept here (per device id) rather than inside
   // GpuHistoryCard so it is not lost when a refresh remounts the card.
@@ -2219,10 +2430,9 @@ export default function HistoryDashboard({ active }: Props) {
                   <LineChart data={pressureTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
                     <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
                     <XAxis
-                      dataKey="timestamp"
+                      {...timeAxisProps(brushedDomain(pressureTrendPoints, pressureBrush, timeWindow))}
                       tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                       minTickGap={36}
-                      tickFormatter={formatHistoryAxisTick}
                     />
                     <YAxis
                       domain={[0, 100]}
@@ -2234,6 +2444,7 @@ export default function HistoryDashboard({ active }: Props) {
                     <Tooltip
                       contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
                       formatter={tooltipFmt2}
+                      labelFormatter={formatTimeLabel}
                     />
                     {lines.map((l) => (
                       <Line
@@ -2248,7 +2459,15 @@ export default function HistoryDashboard({ active }: Props) {
                         hide={pressureHidden.has(l.key)}
                       />
                     ))}
-                    <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8} />
+                    <Brush
+                      dataKey="ts"
+                      height={24}
+                      stroke={COLORS.accent}
+                      fill={COLORS.bg}
+                      travellerWidth={8}
+                      tickFormatter={formatTimeLabel}
+                      onChange={handleBrushChange(setPressureBrush)}
+                    />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
@@ -2269,6 +2488,7 @@ export default function HistoryDashboard({ active }: Props) {
           title="CPU & Memory"
           storageKey="history-cpu-series"
           data={cpuMemTrendPoints}
+          timeWindow={timeWindow}
           height={280}
           showBrush
           allSeries={[
@@ -2295,7 +2515,7 @@ export default function HistoryDashboard({ active }: Props) {
 
       {/* CPU Per-Core — utilization, frequency, temperature */}
       {visibleSections.includes('cpuPerCore') && !loading && cpuPerCoreInfo.coreCount > 0 && (
-        <CpuPerCoreHistoryCard info={cpuPerCoreInfo} />
+        <CpuPerCoreHistoryCard info={cpuPerCoreInfo} timeWindow={timeWindow} />
       )}
 
       {/* Disk — Utilization & Bandwidth per device */}
@@ -2338,10 +2558,9 @@ export default function HistoryDashboard({ active }: Props) {
                     <LineChart data={diskTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
                       <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
                       <XAxis
-                        dataKey="timestamp"
+                        {...timeAxisProps(brushedDomain(diskTrendPoints, diskBrush[diskName], timeWindow))}
                         tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                         minTickGap={36}
-                        tickFormatter={formatHistoryAxisTick}
                       />
                       <YAxis
                         yAxisId="util"
@@ -2363,6 +2582,7 @@ export default function HistoryDashboard({ active }: Props) {
                       <Tooltip
                         contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
                         formatter={tooltipFmt2}
+                        labelFormatter={formatTimeLabel}
                       />
                       {diskLines.map((l) => (
                         <Line
@@ -2378,7 +2598,17 @@ export default function HistoryDashboard({ active }: Props) {
                           hide={diskHidden.has(l.key)}
                         />
                       ))}
-                      <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8} />
+                      <Brush
+                        dataKey="ts"
+                        height={24}
+                        stroke={COLORS.accent}
+                        fill={COLORS.bg}
+                        travellerWidth={8}
+                        tickFormatter={formatTimeLabel}
+                        onChange={handleBrushChange((range) =>
+                          setDiskBrush((prev) => ({ ...prev, [diskName]: range })),
+                        )}
+                      />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
@@ -2429,10 +2659,9 @@ export default function HistoryDashboard({ active }: Props) {
                     <LineChart data={networkTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
                       <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
                       <XAxis
-                        dataKey="timestamp"
+                        {...timeAxisProps(brushedDomain(networkTrendPoints, networkBrush[nicName], timeWindow))}
                         tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                         minTickGap={36}
-                        tickFormatter={formatHistoryAxisTick}
                       />
                       <YAxis
                         yAxisId="util"
@@ -2454,6 +2683,7 @@ export default function HistoryDashboard({ active }: Props) {
                       <Tooltip
                         contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
                         formatter={tooltipFmt2}
+                        labelFormatter={formatTimeLabel}
                       />
                       {nicLines.map((l) => (
                         <Line
@@ -2469,7 +2699,17 @@ export default function HistoryDashboard({ active }: Props) {
                           hide={networkHidden.has(l.key)}
                         />
                       ))}
-                      <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8} />
+                      <Brush
+                        dataKey="ts"
+                        height={24}
+                        stroke={COLORS.accent}
+                        fill={COLORS.bg}
+                        travellerWidth={8}
+                        tickFormatter={formatTimeLabel}
+                        onChange={handleBrushChange((range) =>
+                          setNetworkBrush((prev) => ({ ...prev, [nicName]: range })),
+                        )}
+                      />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
@@ -2488,6 +2728,7 @@ export default function HistoryDashboard({ active }: Props) {
             title="NPU — Utilization & Frequency"
             storageKey="history-npu-util-freq"
             data={npuTrendPoints}
+            timeWindow={timeWindow}
             height={240}
             showBrush
             allSeries={[
@@ -2500,6 +2741,7 @@ export default function HistoryDashboard({ active }: Props) {
               title="NPU — Power, DDR Bandwidth & Temperature"
               storageKey="history-npu-power-bw-temp"
               data={npuTrendPoints}
+              timeWindow={timeWindow}
               height={240}
               showBrush
               allSeries={[
@@ -2513,6 +2755,7 @@ export default function HistoryDashboard({ active }: Props) {
             title={hasNpuPmtData ? 'NPU — Memory Used & Tiles' : 'NPU — Memory Used'}
             storageKey="history-npu-mem-tiles"
             data={npuTrendPoints}
+            timeWindow={timeWindow}
             height={240}
             showBrush
             allSeries={hasNpuPmtData
@@ -2546,6 +2789,7 @@ export default function HistoryDashboard({ active }: Props) {
             <GpuHistoryCard
               key={series.id}
               series={series}
+              timeWindow={timeWindow}
               hidden={gpuHidden[series.id]}
               onToggle={(key) => toggleGpu(series.id, key)}
             />

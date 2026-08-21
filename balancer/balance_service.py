@@ -84,6 +84,18 @@ class DynamicService:
     def get_limit_snapshot(self, app_id):
         return self.balancer.get_limit_snapshot(app_id)
 
+    def get_auto_limited_apps(self):
+        return self.balancer.get_auto_limited_apps()
+
+    def restore_auto_limited(self, app_id):
+        return self.balancer.restore_auto_limited(app_id)
+
+    def get_auto_limit_exclusions(self):
+        return self.balancer.get_auto_limit_exclusions()
+
+    def remove_auto_limit_exclusion(self, ident):
+        return self.balancer.remove_auto_limit_exclusion(ident)
+
     def add_control(self, app_name):
         self.balancer.bpf_monitor.add_to_monitorlist(app_name)
 
@@ -1415,6 +1427,108 @@ def app_resource_restore():
             )
     except Exception as e:
         logger.error(f"Restore resource failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/auto_limited_apps', methods=['POST'])
+def auto_limited_apps():
+    """List the apps the balancer is currently auto-limiting (pressure-driven only)."""
+    try:
+        payload = _service.get_auto_limited_apps()
+        return construct_response(
+            data=payload,
+            retmsg=f"Found {len(payload.get('apps', []))} auto-limited apps"
+        )
+    except Exception as e:
+        logger.error(f"Get auto-limited apps failed: {str(e)}")
+        return construct_response(
+            data={"apps": [], "sys_pressure_level": "", "disk_pressure_level": ""},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/auto_limit_restore', methods=['POST'])
+def auto_limit_restore():
+    """Restore an auto-limited app on user request and exclude it from future auto-limits.
+
+    Separate from /app/resource_restore, which only lifts manual limits: this one also
+    takes the app out of the auto-limit candidate pool, or the next critical tick would
+    simply limit it again.
+    """
+    try:
+        data = request.get_json() or {}
+        app_id = data.get('app_id', "")
+
+        if not app_id:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="app_id must be provided"
+            )
+
+        ok, msg = _service.restore_auto_limited(app_id)
+        if ok:
+            return construct_response(data={}, retmsg=msg)
+        return construct_response(
+            data={},
+            retcode=RetCode.OPERATING_ERROR,
+            retmsg=msg
+        )
+    except Exception as e:
+        logger.error(f"Restore auto-limited app failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/auto_limit_exclusions', methods=['POST'])
+def auto_limit_exclusions():
+    """List the apps excluded from auto-limiting (runtime-only; cleared on restart)."""
+    try:
+        rows = _service.get_auto_limit_exclusions()
+        return construct_response(
+            data=rows,
+            retmsg=f"Found {len(rows)} auto-limit exclusions"
+        )
+    except Exception as e:
+        logger.error(f"Get auto-limit exclusions failed: {str(e)}")
+        return construct_response(
+            data=[],
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/auto_limit_exclusion_remove', methods=['POST'])
+def auto_limit_exclusion_remove():
+    """Put an excluded app back into the auto-limit candidate pool."""
+    try:
+        data = request.get_json() or {}
+        ident = data.get('key') or data.get('app_id') or ""
+
+        if not ident:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="key or app_id must be provided"
+            )
+
+        if _service.remove_auto_limit_exclusion(ident):
+            return construct_response(data={}, retmsg="Auto-limit exclusion removed")
+        return construct_response(
+            data={},
+            retcode=RetCode.OPERATING_ERROR,
+            retmsg="No matching auto-limit exclusion found"
+        )
+    except Exception as e:
+        logger.error(f"Remove auto-limit exclusion failed: {str(e)}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,

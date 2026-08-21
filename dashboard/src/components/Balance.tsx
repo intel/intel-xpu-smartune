@@ -17,6 +17,7 @@ import {
   Switch,
   Checkbox,
   InputNumber,
+  Popconfirm,
 } from 'antd'
 import {
   PlusOutlined,
@@ -32,11 +33,19 @@ import {
   SearchOutlined,
   RightOutlined,
   DownOutlined,
+  RollbackOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
 import { api } from '../api/client'
-import type { AppInfo, ResourceLimitProfileData, PassiveControlData, ProcessStatusRow } from '../api/types'
+import type {
+  AppInfo,
+  AutoLimitedApp,
+  AutoLimitedAppsData,
+  ResourceLimitProfileData,
+  PassiveControlData,
+  ProcessStatusRow,
+} from '../api/types'
 import { useAppEvents } from '../hooks/useAppEvents'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 import { AddAppWizard } from './AddAppWizard'
@@ -254,6 +263,39 @@ function formatPassiveControlTimestamp(ts: number | undefined | null): string {
   if (!ts) return 'unknown time'
   return new Date(ts * 1000).toLocaleString()
 }
+
+// Elapsed time, not a countdown: auto restore waits for pressure to ease and then runs
+// in stages, so there is no deadline to count down to. sinceMs comes from
+// limitedSinceRef, which the frontend owns (see below).
+function formatElapsed(sinceMs: number | null | undefined, nowMs: number): string {
+  if (!sinceMs) return '—'
+  const total = Math.max(0, Math.floor((nowMs - sinceMs) / 1000))
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  if (h > 0) return `${h}h ${m}m`
+  if (m > 0) return `${m}m ${s}s`
+  return `${s}s`
+}
+
+const AUTO_LIMIT_REASON_LABEL: Record<string, string> = {
+  system_pressure: 'System pressure',
+  disk_pressure: 'Disk I/O pressure',
+}
+
+const PRESSURE_LEVEL_TAG_COLOR: Record<string, string> = {
+  critical: 'error',
+  high: 'warning',
+  medium: 'gold',
+  low: 'success',
+}
+
+// Shared wording so the tooltip, the confirm prompt and the toast all promise the
+// same thing about what Restore does.
+const AUTO_LIMIT_EXCLUSION_HINT =
+  'Apps you restore here are no longer auto-limited under critical pressure — the balancer ' +
+  'limits the next heaviest app instead. To make an app eligible again, remove it under ' +
+  'Settings → Control → Auto-limit exclusions (the list is also cleared when Smartune restarts).'
 
 function deriveDisplayProcessName(row: ProcessStatusRow): string {
   const rawName = (row.process_name || '').trim()
@@ -581,6 +623,20 @@ export default function Balance({
   const [allApps, setAllApps] = useState<AppInfo[]>([])
   const [controlledApps, setControlledApps] = useState<AppInfo[]>([])
   const [pendingApps, setPendingApps] = useState<AppInfo[]>([])
+  const [autoLimitedApps, setAutoLimitedApps] = useState<AutoLimitedApp[]>([])
+  // Live pressure levels. Seeded by the auto-limited request on tab open, then kept
+  // current by the server's 'pressure_level_changed' notification. Never polled.
+  const [pressureLevels, setPressureLevels] = useState<{ sys: string; disk: string }>({
+    sys: '',
+    disk: '',
+  })
+  // Start time (ms) per row for the "Limited For" column, keyed by effective_app_id.
+  // Stamped locally when a row first appears and never touched again while it lives, so
+  // a re-limit cannot rewind the counter. A row that leaves loses its entry.
+  const limitedSinceRef = useRef<Record<string, number>>({})
+  // Drives the "Limited For" column only. Ticks locally so the elapsed time advances
+  // without polling the server for it.
+  const [nowMs, setNowMs] = useState(() => Date.now())
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [messageApi, contextHolder] = message.useMessage()
@@ -591,12 +647,18 @@ export default function Balance({
   const [remark, setRemark] = useState('')
   const [adding, setAdding] = useState(false)
   const [wizardOpen, setWizardOpen] = useState(false)
+  // Keyword the wizard was opened with from inside this tab (an Auto Limited row).
+  // Kept apart from the `registerKeyword` prop, which comes from the Processes tab.
+  const [wizardKeyword, setWizardKeyword] = useState<string | null>(null)
   const [expandedProcessRows, setExpandedProcessRows] = useState<React.Key[]>([])
   const [selectedTargetCgroups, setSelectedTargetCgroups] = useState<Record<string, string[]>>({})
 
   // Opened from the Processes tab: pop the Add-App wizard pre-filled.
   useEffect(() => {
-    if (registerKeyword) setWizardOpen(true)
+    if (registerKeyword) {
+      setWizardKeyword(null)
+      setWizardOpen(true)
+    }
   }, [registerKeyword])
 
   // Per-row priority edit state
@@ -642,12 +704,73 @@ export default function Balance({
     targetProcesses: [],
   })
 
+  // Store the rows + the pressure levels that came with them, and stamp any row we have
+  // not seen before. The server's `limited_at` is not used: the balancer rewrites it on
+  // every re-apply, which is why the column sat at 0 s. The cost of counting locally is
+  // that a page reload restarts from zero.
+  const applyAutoLimited = useCallback((data: AutoLimitedAppsData | null | undefined) => {
+    // Tolerate the older backend, which returned a bare array: otherwise a service that
+    // has not been restarted blanks the card and drops every accumulated base.
+    const apps = Array.isArray(data)
+      ? (data as AutoLimitedApp[])
+      : data?.apps ?? []
+    const now = Date.now()
+    const bases: Record<string, number> = {}
+    for (const app of apps) {
+      bases[app.effective_app_id] = limitedSinceRef.current[app.effective_app_id] ?? now
+    }
+    limitedSinceRef.current = bases
+    setAutoLimitedApps(apps)
+    if (data && !Array.isArray(data)) {
+      setPressureLevels({ sys: data.sys_pressure_level, disk: data.disk_pressure_level })
+    }
+  }, [])
+
+  const applyControlled = useCallback((ctrl: AppInfo[]) => {
+    setControlledApps(ctrl)
+    const priorities: Record<string, string> = {}
+    ctrl.forEach((a: AppInfo) => {
+      // Normalise to lowercase so comparisons are case-insensitive.
+      // The Python Streamlit side stores "Critical"/"High"/… (title-case);
+      // the dashboard stores "critical"/"high"/… (lowercase).
+      priorities[a.app_id] = (a.priority ?? 'medium').toLowerCase()
+    })
+    setRowPriorities((prev) => ({ ...prev, ...priorities }))
+  }, [])
+
+  // Narrow refreshes used by the SSE handler. This tab has no polling fallback, so an
+  // event pulls exactly the slice it can have changed and nothing else.
+  const refreshAutoLimited = useCallback(async () => {
+    try {
+      applyAutoLimited(await api.getAutoLimitedApps())
+    } catch (e: unknown) {
+      console.error('[Balance] auto-limited refresh failed:', e)
+    }
+  }, [applyAutoLimited])
+
+  const refreshControlled = useCallback(async () => {
+    try {
+      applyControlled((await api.getControlledApps()) ?? [])
+    } catch (e: unknown) {
+      console.error('[Balance] controlled refresh failed:', e)
+    }
+  }, [applyControlled])
+
+  const refreshPending = useCallback(async () => {
+    try {
+      setPendingApps((await api.getPendingApps()) ?? [])
+    } catch (e: unknown) {
+      console.error('[Balance] pending refresh failed:', e)
+    }
+  }, [])
+
   const fetchData = useCallback(async () => {
     try {
-      const [apps, controlled, pending, networkControl] = await Promise.allSettled([
+      const [apps, controlled, pending, autoLimited, networkControl] = await Promise.allSettled([
         api.getApps(),
         api.getControlledApps(),
         api.getPendingApps(),
+        api.getAutoLimitedApps(),
         api.getConfig<{
           enable_network_control: boolean
           config_network_bw?: Record<string, { min?: number; max?: number }>
@@ -655,19 +778,9 @@ export default function Balance({
       ])
 
       if (apps.status === 'fulfilled') setAllApps(apps.value ?? [])
-      if (controlled.status === 'fulfilled') {
-        const ctrl = controlled.value ?? []
-        setControlledApps(ctrl)
-        const priorities: Record<string, string> = {}
-        ctrl.forEach((a: AppInfo) => {
-          // Normalise to lowercase so comparisons are case-insensitive.
-          // The Python Streamlit side stores "Critical"/"High"/… (title-case);
-          // the dashboard stores "critical"/"high"/… (lowercase).
-          priorities[a.app_id] = (a.priority ?? 'medium').toLowerCase()
-        })
-        setRowPriorities((prev) => ({ ...prev, ...priorities }))
-      }
+      if (controlled.status === 'fulfilled') applyControlled(controlled.value ?? [])
       if (pending.status === 'fulfilled') setPendingApps(pending.value ?? [])
+      if (autoLimited.status === 'fulfilled') applyAutoLimited(autoLimited.value)
       if (networkControl.status === 'fulfilled') {
         setNetworkControlEnabled(Boolean(networkControl.value.enable_network_control))
         setNetworkBandwidthRanges(sanitizeNetworkBandwidthRanges(networkControl.value.config_network_bw))
@@ -679,7 +792,7 @@ export default function Balance({
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [applyAutoLimited, applyControlled])
 
   // Track whether the startup scan has been triggered for this session.
   // The scan only runs once — the first time this tab becomes active — to detect
@@ -739,19 +852,22 @@ export default function Balance({
     })
   }, [controlledApps])
 
-  // Keep per-process runtime rows fresh even when the overall app status does
-  // not transition (e.g. one instance stops but another is still running).
-  // SSE emits app-level changes, but partial per-instance changes may not
-  // produce an event, so do a light periodic sync while this tab is active.
-  useEffect(() => {
-    if (!active) return
-    const timer = window.setInterval(() => {
-      fetchData()
-    }, 5000)
-    return () => window.clearInterval(timer)
-  }, [active, fetchData])
+  // No periodic sync. One fetch when the tab becomes active (above); after that the
+  // server pushes app status events, 'auto_limit_changed' for staged restores and
+  // 'pressure_level_changed' for the live level, and each one refreshes only the slice
+  // it affects. What this gives up is per-instance churn within one status (a second
+  // copy of a running app starting emits no event), so the expanded per-process table
+  // is refreshed when the user expands a row instead of on a timer.
 
-  // SSE: push updates from server instead of polling every 5 s
+  // Advance the "Limited For" column. Local only, no request, and only while there is
+  // something to count, so an idle tab does no work.
+  useEffect(() => {
+    if (!active || autoLimitedApps.length === 0) return
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [active, autoLimitedApps.length])
+
+  // SSE: the server pushes every update; this tab does not poll
   useAppEvents(
     useCallback((event) => {
       if (event.purpose === 'app' && event.app_id) {
@@ -783,20 +899,50 @@ export default function Balance({
         }
 
         // When an app transitions away from pending (e.g. running, stopped, limited),
-        // remove it from the pending queue immediately without waiting for fetchData()
+        // remove it from the pending queue immediately without waiting for the refresh
         // to complete.  This prevents the card from showing a stale entry during the
         // async round-trip.
-        // Note: the reverse (status === PENDING) is intentionally handled only by the
-        // fetchData() call below, because adding to pendingApps requires a full AppInfo
-        // object that the SSE payload does not carry.
+        // Note: the reverse (status === PENDING) needs refreshPending(), because adding
+        // to pendingApps requires a full AppInfo object the SSE payload does not carry.
         if (event.status !== APP_STATUS.PENDING) {
           setPendingApps((prev) => prev.filter((app) => app.app_id !== event.app_id))
+        } else {
+          refreshPending()
         }
 
-        // Full server sync – also re-fetches controlled and pending lists so any
-        // remaining pending apps (or a newly pending app) are shown correctly.
-        fetchData()
+        // Refresh only what this event can have changed. The controlled list carries the
+        // per-process rows and limit flags, so it is refreshed for every status change;
+        // the auto-limited list only moves when a limit is applied or lifted.
+        refreshControlled()
+        if (
+          event.status === APP_STATUS.LIMITED ||
+          event.status === APP_STATUS.A_LIMITED ||
+          event.status === APP_STATUS.RUNNING ||
+          event.status === APP_STATUS.STOPPED
+        ) {
+          refreshAutoLimited()
+        }
       } else if (event.purpose === 'notify') {
+        // Live pressure level for the Auto Limited card — state only, no request.
+        if (event.status === 'pressure_level_changed') {
+          const sys = event.sys_level ?? ''
+          const disk = event.disk_level ?? ''
+          // Skip no-op updates so a flapping level does not re-render the tab for nothing.
+          setPressureLevels((prev) =>
+            prev.sys === sys && prev.disk === disk ? prev : { sys, disk }
+          )
+          return
+        }
+        // A staged restore relaxed or lifted one channel's cap without changing the
+        // app's status, so this is the only signal that the list has moved.
+        if (
+          event.status === 'auto_limit_changed' ||
+          event.status === 'auto_limit_restored_by_user' ||
+          event.status === 'app_closed_limit_restored'
+        ) {
+          refreshAutoLimited()
+          return
+        }
         // System-level notifications (no specific app_id)
         if (event.status === 'manual_app_limit_by_user') {
           messageApi.warning(
@@ -808,7 +954,7 @@ export default function Balance({
           )
         }
       }
-    }, [messageApi, fetchData]),
+    }, [messageApi, refreshAutoLimited, refreshControlled, refreshPending]),
     active
   )
 
@@ -1037,6 +1183,29 @@ export default function Balance({
       messageApi.success(`Relaunch cancelled for ${app.app_name}`)
     })()
 
+  // Restoring by hand also opts the app out of auto-limiting, so the row is gone for good
+  // (until the exclusion is removed in Settings, or the service restarts). Dropping it
+  // locally keeps the table honest in the moment before the refetch lands.
+  const handleAutoLimitRestore = (row: AutoLimitedApp) =>
+    withLoading(`autolimit-restore-${row.effective_app_id}`, async () => {
+      await api.autoLimitRestore({ app_id: row.app_id })
+      setAutoLimitedApps((prev) =>
+        prev.filter((item) => item.effective_app_id !== row.effective_app_id)
+      )
+      // Forget the elapsed-time base too: if this app is ever auto-limited again it
+      // must start counting from zero, not from the limit the user just lifted.
+      delete limitedSinceRef.current[row.effective_app_id]
+      messageApi.success(`Resources restored for ${row.app_name || row.app_id}`)
+      messageApi.warning({ content: AUTO_LIMIT_EXCLUSION_HINT, duration: 8 })
+    })()
+
+  // Uncontrolled apps can be taken under control straight from the Auto Limited card:
+  // pre-fill the wizard with the app name we already know.
+  const handleAddAutoLimitedToControl = (row: AutoLimitedApp) => {
+    setWizardKeyword(row.app_name || row.app_id)
+    setWizardOpen(true)
+  }
+
   const controlledColumns: ColumnsType<AppInfo> = [
     {
       title: 'App Name',
@@ -1245,6 +1414,146 @@ export default function Balance({
       dataIndex: 'remark',
       key: 'remark',
       render: (v: string) => <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>{v ?? '—'}</Text>,
+    },
+  ]
+
+  const autoLimitedColumns: ColumnsType<AutoLimitedApp> = [
+    {
+      title: 'App Name',
+      dataIndex: 'app_name',
+      key: 'app_name',
+      width: 220,
+      render: (name: string, row) => {
+        const label = name || row.app_id
+        // Uncontrolled apps are identified by their scope, which is what tells two
+        // same-named processes apart — worth surfacing on hover.
+        const tooltip = row.cgroups?.length ? `${label} — ${row.cgroups.join(', ')}` : label
+        return (
+          <Tooltip title={tooltip}>
+            <Text style={{ color: COLORS.accent, fontWeight: 500 }}>{label}</Text>
+          </Tooltip>
+        )
+      },
+    },
+    {
+      title: 'Priority',
+      dataIndex: 'priority',
+      key: 'priority',
+      width: 110,
+      render: (p: string) => <PriorityTag priority={p} />,
+    },
+    {
+      title: 'Status',
+      dataIndex: 'status',
+      key: 'status',
+      width: 160,
+      render: (status: string) =>
+        status === 'partially_restored' ? (
+          <Tooltip title="The balancer has already relaxed this limit by one stage; the rest is released once pressure stays low.">
+            <Tag color="processing" style={{ marginInlineEnd: 0 }}>Partially restored</Tag>
+          </Tooltip>
+        ) : (
+          <Tag color="warning" style={{ marginInlineEnd: 0 }}>Limited</Tag>
+        ),
+    },
+    {
+      title: 'Limited Reason',
+      dataIndex: 'limit_reason',
+      key: 'limit_reason',
+      width: 160,
+      render: (reason: string) => (
+        <Text style={{ color: COLORS.text, fontSize: 12 }}>
+          {AUTO_LIMIT_REASON_LABEL[reason] ?? reason ?? '—'}
+        </Text>
+      ),
+    },
+    {
+      // The *current* level of the channel that limited this app, not the level at
+      // limit time — that is the number that tells the user whether the limit is
+      // about to be released. Pushed by the server on every transition.
+      title: 'Current Pressure Level',
+      key: 'pressure_level',
+      width: 180,
+      render: (_: unknown, row: AutoLimitedApp) => {
+        const live = row.limit_reason === 'disk_pressure' ? pressureLevels.disk : pressureLevels.sys
+        // Before the first push arrives, fall back to the level recorded at limit time.
+        const level = live || row.pressure_level
+        const channel = row.limit_reason === 'disk_pressure' ? 'Disk I/O' : 'System'
+        return level ? (
+          <Tooltip title={`${channel} pressure right now. Staged restore starts once it stays at medium or below.`}>
+            <Tag
+              color={PRESSURE_LEVEL_TAG_COLOR[level.toLowerCase()] ?? 'default'}
+              style={{ marginInlineEnd: 0, textTransform: 'capitalize' }}
+            >
+              {level}
+            </Tag>
+          </Tooltip>
+        ) : (
+          <Text style={{ color: COLORS.textMuted }}>—</Text>
+        )
+      },
+    },
+    {
+      title: 'Limited For',
+      key: 'limited_for',
+      width: 130,
+      render: (_: unknown, row: AutoLimitedApp) => {
+        const since = limitedSinceRef.current[row.effective_app_id]
+        return (
+          <Tooltip
+            title={
+              since
+                ? `Counted by the dashboard since ${new Date(since).toLocaleString()} · released in stages once pressure eases`
+                : 'Release happens in stages once pressure eases'
+            }
+          >
+            <Text style={{ color: COLORS.textMuted, fontSize: 12, fontFamily: 'monospace' }}>
+              {formatElapsed(since, nowMs)}
+            </Text>
+          </Tooltip>
+        )
+      },
+    },
+    {
+      title: 'Actions',
+      key: 'actions',
+      width: 200,
+      align: 'center',
+      render: (_: unknown, row: AutoLimitedApp) => (
+        <Space size={4}>
+          {!row.is_controlled && (
+            <Tooltip title="Add this app to Smartune control so you can set its priority and limits">
+              <Button
+                size="small"
+                type="primary"
+                ghost
+                icon={<PlusOutlined />}
+                onClick={() => handleAddAutoLimitedToControl(row)}
+              >
+                Control
+              </Button>
+            </Tooltip>
+          )}
+          <Popconfirm
+            title="Restore now?"
+            description={<div style={{ maxWidth: 320 }}>{AUTO_LIMIT_EXCLUSION_HINT}</div>}
+            okText="Restore"
+            cancelText="Cancel"
+            onConfirm={() => handleAutoLimitRestore(row)}
+          >
+            <Tooltip title="Release this limit immediately">
+              <Button
+                size="small"
+                danger
+                icon={<RollbackOutlined />}
+                loading={actionLoading[`autolimit-restore-${row.effective_app_id}`]}
+              >
+                Restore
+              </Button>
+            </Tooltip>
+          </Popconfirm>
+        </Space>
+      ),
     },
   ]
 
@@ -1884,9 +2193,10 @@ export default function Balance({
 
       <AddAppWizard
         open={wizardOpen}
-        initialKeyword={registerKeyword ?? undefined}
+        initialKeyword={wizardKeyword ?? registerKeyword ?? undefined}
         onClose={() => {
           setWizardOpen(false)
+          setWizardKeyword(null)
           onRegisterConsumed?.()
         }}
         onSuccess={async (result) => {
@@ -1949,7 +2259,13 @@ export default function Balance({
           rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
           expandable={{
             expandedRowKeys: expandedProcessRows,
-            onExpandedRowsChange: (keys) => setExpandedProcessRows([...keys]),
+            onExpandedRowsChange: (keys) => {
+              setExpandedProcessRows([...keys])
+              // Per-instance churn of an app that keeps its status emits no SSE event,
+              // and this tab does not poll — so pull the rows when the user asks to
+              // see them.
+              if (keys.length > expandedProcessRows.length) refreshControlled()
+            },
             expandedRowRender: (record) => {
               const rows = record.process_status_rows ?? []
               const selected = selectedTargetCgroups[record.app_id] ?? []
@@ -2000,6 +2316,63 @@ export default function Balance({
             ),
           }}
         />
+      </Card>
+
+      {/* Auto Limited – apps the balancer throttled on its own when pressure hit critical.
+          Always shown so the empty state doubles as "nothing is being throttled right now". */}
+      <Card
+        title={
+          <Space size={8}>
+            <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
+              <DatabaseOutlined style={{ marginRight: 8, color: COLORS.orange }} />
+              Auto Limited
+              <Tag color={autoLimitedApps.length > 0 ? 'warning' : 'default'} style={{ marginLeft: 8 }}>
+                {autoLimitedApps.length}
+              </Tag>
+            </Text>
+            <Tooltip
+              // antd caps the bubble at 250px, which wraps this text into a very tall
+              // column — widen the overlay itself, not just the content.
+              overlayStyle={{ maxWidth: 680 }}
+              overlayInnerStyle={{ maxWidth: 680 }}
+              title={
+                <div style={{ maxWidth: 680 }}>
+                  <div>
+                    These apps were limited automatically because system or disk I/O pressure reached
+                    critical. The balancer releases each limit in stages once pressure drops back and
+                    holds there — there is no fixed timer, so the table shows how long the limit has
+                    been listed here instead.
+                  </div>
+                  <div style={{ marginTop: 6 }}>{AUTO_LIMIT_EXCLUSION_HINT}</div>
+                </div>
+              }
+            >
+              <QuestionCircleOutlined style={{ color: COLORS.textMuted }} />
+            </Tooltip>
+          </Space>
+        }
+        style={{
+          background: COLORS.panelBg,
+          border: `1px solid ${COLORS.orange}44`,
+          borderRadius: 6,
+          marginBottom: 12,
+        }}
+        headStyle={{ borderBottom: `1px solid ${COLORS.border}`, padding: '8px 16px', minHeight: 40 }}
+        bodyStyle={{ padding: '0' }}
+      >
+        {autoLimitedApps.length === 0 ? (
+          <div style={{ padding: 24, textAlign: 'center', color: COLORS.textMuted, fontStyle: 'italic' }}>
+            No apps are auto-limited right now
+          </div>
+        ) : (
+          <Table
+            columns={autoLimitedColumns}
+            dataSource={autoLimitedApps.map((a) => ({ ...a, key: a.effective_app_id }))}
+            size="small"
+            pagination={false}
+            rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
+          />
+        )}
       </Card>
 
       {/* Pending Queue – always shown so users can see the empty state (mirrors Python's pending_queue_holder) */}

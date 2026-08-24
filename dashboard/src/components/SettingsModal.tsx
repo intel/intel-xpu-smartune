@@ -18,6 +18,8 @@ import {
   Divider,
   Tooltip,
   Tag,
+  Table,
+  Popconfirm,
   message,
 } from 'antd'
 import {
@@ -29,6 +31,7 @@ import {
   QuestionCircleOutlined,
   RightOutlined,
   DownOutlined,
+  DeleteOutlined,
 } from '@ant-design/icons'
 import { api } from '../api/client'
 import type {
@@ -37,6 +40,7 @@ import type {
   LimitPriority,
   LimitPolicyData,
   DiskMedia,
+  AutoLimitExclusion,
 } from '../api/types'
 import { COLORS } from '../styles/theme'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
@@ -1433,6 +1437,131 @@ function NetworkPanel() {
   )
 }
 
+// Apps the user restored by hand from the Balancer tab's "Auto Limited" list. They are
+// skipped at critical, so the balancer picks the next heaviest app instead. Not
+// registered with useRegisterSave: this is balancer runtime state, not config, so
+// removals take effect immediately rather than on Save.
+function AutoLimitExclusionsCard() {
+  const [rows, setRows] = useState<AutoLimitExclusion[]>([])
+  const [loading, setLoading] = useState(false)
+  const [removing, setRemoving] = useState<Record<string, boolean>>({})
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      setRows(await api.getAutoLimitExclusions())
+    } catch (error) {
+      message.error('Failed to load auto-limit exclusions')
+      console.error(error)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  const remove = async (row: AutoLimitExclusion) => {
+    setRemoving((prev) => ({ ...prev, [row.key]: true }))
+    try {
+      await api.removeAutoLimitExclusion(row.key)
+      setRows((prev) => prev.filter((item) => item.key !== row.key))
+      message.success(`${row.app_name || row.app_id} can be auto-limited again`)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Failed to remove exclusion')
+    } finally {
+      setRemoving((prev) => ({ ...prev, [row.key]: false }))
+    }
+  }
+
+  const columns = [
+    {
+      title: 'App',
+      dataIndex: 'app_name',
+      key: 'app_name',
+      render: (name: string, row: AutoLimitExclusion) => (
+        <Tooltip title={row.cgroups?.length ? row.cgroups.join(', ') : row.app_id}>
+          <Text>{name || row.app_id}</Text>
+        </Tooltip>
+      ),
+    },
+    {
+      title: 'Scope',
+      dataIndex: 'kind',
+      key: 'kind',
+      width: 150,
+      render: (kind: AutoLimitExclusion['kind']) =>
+        kind === 'app' ? (
+          <Tooltip title="Controlled app: every instance of it is excluded.">
+            <Tag color="blue">All instances</Tag>
+          </Tooltip>
+        ) : (
+          <Tooltip title="Only this process instance (this cgroup) is excluded — other processes with the same name are still eligible.">
+            <Tag>This instance</Tag>
+          </Tooltip>
+        ),
+    },
+    {
+      title: 'Excluded At',
+      dataIndex: 'excluded_at',
+      key: 'excluded_at',
+      width: 190,
+      render: (ts: number) => <Text type="secondary">{formatTimestamp(ts)}</Text>,
+    },
+    {
+      title: '',
+      key: 'actions',
+      width: 110,
+      align: 'right' as const,
+      render: (_: unknown, row: AutoLimitExclusion) => (
+        <Popconfirm
+          title="Allow auto-limiting again?"
+          description="The balancer may throttle this app the next time pressure reaches critical."
+          okText="Remove"
+          cancelText="Cancel"
+          onConfirm={() => remove(row)}
+        >
+          <Button size="small" danger icon={<DeleteOutlined />} loading={removing[row.key]}>
+            Remove
+          </Button>
+        </Popconfirm>
+      ),
+    },
+  ]
+
+  return (
+    <Card
+      size="small"
+      title="Auto-limit Exclusions"
+      style={{ marginBottom: 16 }}
+      extra={
+        <Button size="small" icon={<ReloadOutlined />} onClick={load} loading={loading}>
+          Refresh
+        </Button>
+      }
+    >
+      <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+        Apps restored by hand from the Balancer tab are listed here and are never auto-limited
+        under critical pressure. Remove one to make it eligible again. This list lives in memory
+        only — it is cleared when Smartune restarts, and changes here apply immediately.
+      </Text>
+      <Table
+        columns={columns}
+        dataSource={rows.map((row) => ({ ...row, key: row.key }))}
+        size="small"
+        loading={loading}
+        pagination={false}
+        locale={{
+          emptyText: (
+            <div style={{ padding: 12, fontSize: 12 }}>No apps are excluded from auto-limiting</div>
+          ),
+        }}
+      />
+    </Card>
+  )
+}
+
 function ReservedPanel({ title, description }: { title: string; description: string }) {
   return <Alert type="info" showIcon message={title} description={description} style={{ marginTop: 8 }} />
 }
@@ -1505,6 +1634,7 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
               <>
                 <AutoControlPanel />
                 <NetworkPanel />
+                <AutoLimitExclusionsCard />
               </>
             ),
           },

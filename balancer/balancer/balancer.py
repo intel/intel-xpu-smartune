@@ -59,6 +59,16 @@ class LimitedApp:
       * pids          — snapshot of the app's PIDs at limit time, used by
             the reaper to detect that the app has closed (see
             DynamicBalancer._is_app_closed).
+      * priority      — the app's configured priority at limit time
+            ("undefined" for uncontrolled apps), reported to the UI.
+      * is_controlled — True when the app has a DB row.  Decides which
+            identity an auto-limit exclusion is keyed by (see
+            LimitRegistry.add_exclusion).
+      * limit_reason  — which pressure channel triggered the limit:
+            "system_pressure" or "disk_pressure".  The combined policy folds
+            CPU/memory and disk IO into the single system-pressure signal, so
+            everything it limits is reported as "system_pressure".
+      * pressure_level — the level of that channel when the limit landed.
     """
     public_app_id: str
     app_name: str
@@ -66,6 +76,10 @@ class LimitedApp:
     limit_rates: dict
     limit_parts: dict
     state: Optional[str] = None
+    priority: str = "undefined"
+    is_controlled: bool = False
+    limit_reason: str = ""
+    pressure_level: str = ""
     partial_parts: dict = field(
         default_factory=lambda: {'sys': False, 'disk_io': False})
     cgroups: list = field(default_factory=list)
@@ -92,14 +106,20 @@ class LimitRegistry:
       * is_limited_app_dominant — True when the current top process is
             one we already limited; the pressure loop reads this so it
             doesn't count its own throttled traffic as fresh pressure.
-      * lock — guards every mutation of ``apps`` so the reaper thread and
-            the REST manual limit/restore calls never race.
+      * auto_limit_exclusions — {key: exclusion dict} for apps the user
+            restored by hand and therefore does not want auto-limited
+            again.  Process-lifetime only (never persisted): the semantics
+            are "leave it alone for this run of the service".
+      * lock — guards every mutation of ``apps`` and
+            ``auto_limit_exclusions`` so the reaper thread and the REST
+            manual limit/restore calls never race.
     """
 
     def __init__(self):
         self.apps: "OrderedDict[str, LimitedApp]" = OrderedDict()
         self.manual_limit_baseline: Dict[str, dict] = {}
         self.is_limited_app_dominant: bool = False
+        self.auto_limit_exclusions: "OrderedDict[str, dict]" = OrderedDict()
         self.lock = threading.RLock()
 
     # --- Query helpers (preserve the ordering semantics the callers rely on) ---
@@ -176,6 +196,73 @@ class LimitRegistry:
                 continue
             if ident == key or ident == app.public_app_id or ident in (app.cgroups or []):
                 return key, app
+        return None
+
+    # --- Auto-limit exclusions ("do not auto-limit this again") ---
+    #
+    # Created when the user restores an auto-limited app by hand. Two key spaces:
+    #
+    #   * "app:<app_id>" for controlled apps. Covers every instance, which is the unit
+    #     the user sees. app_name matches too, since a controlled app can be sampled
+    #     under its configured id or (cgroup fallback) under its process name.
+    #   * "instance:<cgroup>" for uncontrolled ones. Three shells running `stress` sit in
+    #     three vte-spawn-<uuid>.scope cgroups, so excluding one must leave the others
+    #     throttleable; app_name is stored for display but not matched. Processes sharing
+    #     one scope can't be separated, but neither can the limit, so the exclusion is as
+    #     coarse as the limit was.
+    def exclusion_key(self, is_controlled: bool, public_app_id: str, primary_cgroup: str) -> str:
+        """Key an exclusion is stored under. See the note above for the two identities."""
+        if is_controlled and public_app_id:
+            return f"app:{public_app_id}"
+        return f"instance:{primary_cgroup or public_app_id}"
+
+    def add_exclusion(self, entry: "LimitedApp") -> dict:
+        """Record *entry*'s app as excluded from future auto-limiting."""
+        primary_cgroup = (entry.cgroups or [entry.public_app_id])[0]
+        key = self.exclusion_key(entry.is_controlled, entry.public_app_id, primary_cgroup)
+        record = {
+            "key": key,
+            "kind": "app" if key.startswith("app:") else "instance",
+            "app_id": entry.public_app_id,
+            "app_name": entry.app_name,
+            "priority": entry.priority,
+            "cgroups": list(entry.cgroups or []),
+            "excluded_at": time.time(),
+        }
+        self.auto_limit_exclusions[key] = record
+        return record
+
+    def remove_exclusion(self, ident: str) -> Optional[dict]:
+        """Drop the exclusion *ident* refers to (its key, or the app id/cgroup it holds)."""
+        record = self.auto_limit_exclusions.pop(ident, None)
+        if record is not None:
+            return record
+        for key, rec in list(self.auto_limit_exclusions.items()):
+            if ident == rec.get("app_id") or ident in (rec.get("cgroups") or []):
+                return self.auto_limit_exclusions.pop(key)
+        return None
+
+    def list_exclusions(self) -> list:
+        """Every current exclusion, oldest first."""
+        return [dict(rec) for rec in self.auto_limit_exclusions.values()]
+
+    def is_excluded(self, app_id: str, app_name: str, cgroups=None) -> Optional[dict]:
+        """The exclusion matching this candidate, or None.
+
+        The caller passes whatever identity the top-consumer sample carries, which need
+        not be the one the limit was keyed by, so both key spaces are checked.
+        """
+        if not self.auto_limit_exclusions:
+            return None
+        candidate_ids = {str(i) for i in ([app_id] + list(cgroups or [])) if i}
+        lowered_name = (app_name or "").strip().lower()
+        for rec in self.auto_limit_exclusions.values():
+            if candidate_ids & ({str(rec.get("app_id") or "")} | set(rec.get("cgroups") or [])):
+                return rec
+            # Name matching is an "app"-kind privilege only; see the note above.
+            if (rec.get("kind") == "app" and lowered_name
+                    and lowered_name == (rec.get("app_name") or "").strip().lower()):
+                return rec
         return None
 
 
@@ -710,6 +797,7 @@ class DynamicBalancer:
         policy = self.config.limit_policy['policy']
 
         self.control_manager.register_critical_state_listener(self._on_critical_state_changed)
+        self.control_manager.register_level_change_listener(self._on_pressure_level_changed)
 
         while self.is_running:
             try:
@@ -816,6 +904,26 @@ class DynamicBalancer:
         logger.debug("Critical-state listener fired: triggering top-consumer prefetch")
         self.top_prefetcher.start("critical_listener")
 
+    def _on_pressure_level_changed(self, sys_level: str, disk_level: str) -> None:
+        """Push the new pressure levels to the UI over SSE. Not stored in the DB.
+
+        Runs on the monitor's refresh thread, one notification per transition, so the
+        dashboard can show a live level without polling. Not driven off the monitor-loop
+        tick, which reads the peak-latched level on the idle_check_interval cadence:
+        right for limit decisions, but it lags and overstates the current state.
+        """
+        try:
+            app_utils.callback_manager.send_callback_notification({
+                'app_id': "",
+                'app_name': "",
+                'status': "pressure_level_changed",
+                'sys_level': sys_level,
+                'disk_level': disk_level,
+                'purpose': "notify"
+            }, False)
+        except Exception as exc:
+            logger.error("Failed to push pressure level change: %s", exc)
+
     def _maybe_trigger_prefetch(self, state: "_MonitorLoopState", pressure: str,
                                 disk_level: str, passive_enabled: bool) -> None:
         """Edge-trigger and sustained-critical recheck for the
@@ -917,6 +1025,47 @@ class DynamicBalancer:
         }, True)
         state.reset()
 
+    def _drop_excluded_candidates(self, apps: list) -> list:
+        """Remove candidates the user opted out of auto-limiting.
+
+        Filters the whole batch rather than just the head, so the next candidate becomes
+        #1 and gets limited on the same tick. Dropping one head per tick would cost a
+        tick of reaction latency per excluded app.
+        """
+        if not apps:
+            return apps
+        with self.all_limits.lock:  # is_excluded walks a dict the REST thread mutates
+            kept = []
+            for candidate in apps:
+                app_meta = candidate.get('app') or {}
+                excluded = self.all_limits.is_excluded(
+                    app_meta.get('id') or '',
+                    candidate.get('process', {}).get('name') or '',
+                    candidate.get('extra_cgroups') or [],
+                )
+                if excluded is None:
+                    kept.append(candidate)
+                else:
+                    logger.info(
+                        "Skipping top consumer %r (%s): excluded from auto-limit by user "
+                        "restore (%s)", candidate.get('process', {}).get('name'),
+                        app_meta.get('id'), excluded.get('key'),
+                    )
+        return kept
+
+    def _refilter_held_batch(self, state: "_MonitorLoopState") -> None:
+        """Re-apply the exclusion filter to a batch sampled on an earlier tick.
+
+        Both channels keep their batch across ticks, so an exclusion added while pressure
+        is still up would go unnoticed until the batch aged out and the app the user just
+        freed could be re-limited from the stale list.
+        """
+        if not state.top_consume_apps or not self.all_limits.auto_limit_exclusions:
+            return
+        kept = self._drop_excluded_candidates(state.top_consume_apps)
+        if len(kept) != len(state.top_consume_apps):
+            state.top_consume_apps = kept
+
     def _update_dominant_flag_from_top(self, state: "_MonitorLoopState") -> None:
         """Walk the prefetched top-consumer list and decide whether any
         already-limited (and not yet partially-restored) app is the
@@ -1014,7 +1163,8 @@ class DynamicBalancer:
                 state.pressure_start_time = None
                 if not state.top_consume_apps:
                     apps, reach_threshold = self.top_prefetcher.resolve_for_critical()
-                    state.keep_top_batch(apps, reach_threshold, channel, state.current_time)
+                    state.keep_top_batch(self._drop_excluded_candidates(apps),
+                                         reach_threshold, channel, state.current_time)
             else:
                 state.disk_io_not_stressed_start_time = None
                 # Serve from the prefetch cache instead of re-sampling every tick. The
@@ -1023,7 +1173,9 @@ class DynamicBalancer:
                 if not state.top_consume_apps or self.disk_top_prefetcher.is_stale():
                     apps, _ = self.disk_top_prefetcher.resolve_for_critical()
                     # IO pressure always counts as threshold-crossing.
-                    state.keep_top_batch(apps, True, channel, state.current_time)
+                    state.keep_top_batch(self._drop_excluded_candidates(apps),
+                                         True, channel, state.current_time)
+            self._refilter_held_batch(state)
             if state.top_consume_apps:
                 self._update_dominant_flag_from_top(state)
 
@@ -1052,7 +1204,8 @@ class DynamicBalancer:
                         app_id,
                         limit_rates,
                         is_controlled,
-                        is_disk_io_stressed=is_disk_io_stressed
+                        is_disk_io_stressed=is_disk_io_stressed,
+                        pressure_level=(disk_level if is_disk_io_stressed else pressure),
                     )
 
                 if is_disk_io_stressed and disk_level != "critical":
@@ -1169,6 +1322,24 @@ class DynamicBalancer:
     # Which limit_parts flag each recovery channel owns.
     _CHANNEL_PART = {'sys': 'cpu_mem_limited', 'disk_io': 'io_limited'}
 
+    def _notify_auto_limit_changed(self, public_id: str, app_name: str, detail: str) -> None:
+        """Tell the UI the auto-limited list changed without an app-status transition.
+
+        A staged restore relaxes one of an app's caps while it stays "limited", so no
+        purpose="app" callback fires and the card would show a stale row until something
+        else happened. The dashboard listens to this instead of polling.
+        """
+        try:
+            app_utils.callback_manager.send_callback_notification({
+                'app_id': public_id,
+                'app_name': app_name,
+                'status': "auto_limit_changed",
+                'detail': detail,
+                'purpose': "notify"
+            }, False)
+        except Exception as exc:
+            logger.error("Failed to push auto-limit change notification: %s", exc)
+
     def _restore_channel(self, channel: str, restore_type: str, why: str) -> bool:
         """Run one staged restore step for *channel* ("sys" | "disk_io").
 
@@ -1206,6 +1377,8 @@ class DynamicBalancer:
             # under its full original cap.
             entry.state = "partially_restored"
             self.all_limits.apps.move_to_end(app_id)
+            self._notify_auto_limit_changed(
+                entry.public_app_id or app_id, app_name, f"{channel}_partially_restored")
             return False
 
         # Full restore: restore_resources has cleared this channel's flag on the
@@ -1217,6 +1390,8 @@ class DynamicBalancer:
             self.all_limits.apps.move_to_end(app_id)
             logger.info(f"Restored {channel} limits for app {app_id}; "
                         f"remaining limits {entry.limit_parts}, moved to end of queue")
+            self._notify_auto_limit_changed(
+                entry.public_app_id or app_id, app_name, f"{channel}_restored")
             return True
 
         # The DB row and the UI know the app by its public id, which for a
@@ -1265,7 +1440,9 @@ class DynamicBalancer:
                 state.drop_top_batch()
             if not state.top_consume_apps:
                 apps, reach_threshold = self.top_prefetcher.resolve_for_critical()
-                state.keep_top_batch(apps, reach_threshold, "sys", state.current_time)
+                state.keep_top_batch(self._drop_excluded_candidates(apps),
+                                     reach_threshold, "sys", state.current_time)
+            self._refilter_held_batch(state)
 
             if state.top_consume_apps:
                 self._update_dominant_flag_from_top(state)
@@ -1277,7 +1454,8 @@ class DynamicBalancer:
                         and should_adjust and app_id
                         and self._target_still_present(target_app, app_id)):
                     self._apply_combined_critical_limits(
-                        target_app, app_id, limit_rates, is_controlled
+                        target_app, app_id, limit_rates, is_controlled,
+                        pressure_level=pressure,
                     )
 
                 state.top_consume_apps.pop(0)
@@ -1288,15 +1466,86 @@ class DynamicBalancer:
         else:
             self._tick_combined_restore(state, pressure)
 
+    def _upsert_auto_limited(self, app_id, public_id, app_name, limit_rates,
+                             resource_limited, io_limited, priority, is_controlled,
+                             limit_reason, pressure_level, cgroups,
+                             limit_disks=None, pids=None) -> None:
+        """Record -- or refresh -- the registry entry of an auto-limited app.
+
+        Under sustained critical pressure the same app can be limited again, or capped on
+        the other channel (system pressure first, disk-IO later). Replacing the entry with
+        a fresh LimitedApp would reset limited_at and drop the earlier limit_parts flag,
+        leaking that cap: the restore path would never lift it again.
+
+        So merge instead: keep the first timestamp and reason, union the applied parts,
+        cgroups, disks and PIDs (a cgroup we forget is a cap we never lift), and refresh
+        the pressure level. A channel that was just re-capped loses its partial flag.
+
+        An existing *manual* entry is still replaced, not merged: those carry a user-set
+        rate and their own baseline.
+        """
+        now = time.time()
+        parts = {'cpu_mem_limited': bool(resource_limited), 'io_limited': bool(io_limited)}
+        partial_parts = {'sys': False, 'disk_io': False}
+        state = None
+        limited_at = now
+        cgroups = list(dict.fromkeys(cgroups or []))
+        limit_disks = list(limit_disks or [])
+        pids = set(pids or [])
+
+        prev = self.all_limits.apps.get(app_id)
+        if prev is not None and prev.source == "auto":
+            parts = {
+                'cpu_mem_limited': bool(prev.limit_parts.get('cpu_mem_limited')) or parts['cpu_mem_limited'],
+                'io_limited': bool(prev.limit_parts.get('io_limited')) or parts['io_limited'],
+            }
+            partial_parts = {
+                'sys': bool(prev.partial_parts.get('sys')) and not resource_limited,
+                'disk_io': bool(prev.partial_parts.get('disk_io')) and not io_limited,
+            }
+            state = "partially_restored" if any(partial_parts.values()) else None
+            limited_at = prev.limited_at or now
+            limit_reason = prev.limit_reason or limit_reason
+            # The disk arm's limit_rates carries no cpu_rate/mem_rate, so overwriting
+            # would leave the staged restore of an earlier CPU/memory cap without the
+            # rate it has to double. Fresh values win for the keys this apply did set.
+            limit_rates = {**(prev.limit_rates or {}), **(limit_rates or {})}
+            cgroups = list(dict.fromkeys(list(prev.cgroups) + cgroups))
+            limit_disks = list(dict.fromkeys(list(prev.limit_disks) + limit_disks))
+            pids |= set(prev.pids)
+
+        self.all_limits.apps[app_id] = LimitedApp(
+            public_app_id=public_id,
+            app_name=app_name,
+            source="auto",
+            limit_rates=limit_rates,
+            limit_parts=parts,
+            state=state,
+            priority=priority or "undefined",
+            is_controlled=bool(is_controlled),
+            limit_reason=limit_reason,
+            pressure_level=pressure_level,
+            partial_parts=partial_parts,
+            cgroups=cgroups,
+            limit_disks=limit_disks,
+            pids=pids,
+            limited_at=limited_at,
+        )
+
     def _apply_combined_critical_limits(
         self,
         target: dict,
         app_id: str,
         limit_rates: dict,
         is_controlled: bool,
+        pressure_level: str = "",
     ) -> None:
         """Apply combined-policy CPU/Memory + disk-IO limits to the
         dominant top consumer.
+
+        Both channels are capped off the single system-pressure signal, so the recorded
+        reason is "system_pressure" even for the io.max part -- there is no separate disk
+        level under this policy to attribute it to.
         """
         app_name = target.get('process', {}).get('name') or ''
         total_mem = self.resource_monitor.get_total_memory()
@@ -1367,16 +1616,16 @@ class DynamicBalancer:
             # cgroup); the DB row and the UI know the app by its public id. Writing the
             # cgroup name into public_app_id makes every later status update miss its row.
             public_id = target.get('public_app_id') or app_id
-            self.all_limits.apps[app_id] = LimitedApp(
-                public_app_id=public_id,
-                app_name=app_name,
-                source="auto",
-                limit_rates=limit_rates,
-                limit_parts={'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
-                state=None,
+            self._upsert_auto_limited(
+                app_id, public_id, app_name, limit_rates,
+                resource_limited=resource_limited,
+                io_limited=io_limited,
+                priority=target.get('resolved_priority'),
+                is_controlled=is_controlled,
+                limit_reason="system_pressure",
+                pressure_level=pressure_level,
                 cgroups=[app_id] + list(extra_cgroup_ids),
-                pids=set(target.get('pids') or []),
-                limited_at=time.time(),
+                pids=target.get('pids'),
             )
 
             if is_controlled:
@@ -1497,6 +1746,8 @@ class DynamicBalancer:
                     # are marked; there is no per-channel timer to advance here.
                     entry.state = "partially_restored"
                     entry.partial_parts.update({'sys': True, 'disk_io': True})
+                    self._notify_auto_limit_changed(
+                        entry.public_app_id or app_id, app_name, "partially_restored")
                 else:
                     logger.warning(f"Partial restore failed for {app_name}")
 
@@ -1550,6 +1801,10 @@ class DynamicBalancer:
                 }, False)
             else:
                 logger.error(f"Failed to fully restore resources for {app_name}")
+                # pop_last_auto() already removed the entry, so the row is gone either
+                # way -- tell the UI or it lingers until the next unrelated event.
+                self._notify_auto_limit_changed(
+                    entry.public_app_id or app_id, app_name, "restore_failed")
 
         state.restore_pending = False
         state.reset()  # reset timer and current pressure state
@@ -1625,8 +1880,13 @@ class DynamicBalancer:
             logger.warning(f"[disk-io] could not read stressed disks: {e}")
             return []
 
-    def _apply_resource_limits(self, target_app, app_id, limit_rates, is_controlled, is_disk_io_stressed=False):
-        """Apply resource limits (common logic)."""
+    def _apply_resource_limits(self, target_app, app_id, limit_rates, is_controlled,
+                               is_disk_io_stressed=False, pressure_level=""):
+        """Apply resource limits (common logic).
+
+        *pressure_level* is the level of the channel that triggered this limit; it is
+        recorded on the registry entry so the UI can say *why* the app was limited.
+        """
         app_name = target_app.get('process', {}).get('name') or ''
         total_mem = self.resource_monitor.get_total_memory()
         logger.info(f"Adjusting resources for app: {app_id}")
@@ -1708,17 +1968,17 @@ class DynamicBalancer:
             # cgroup); the DB row and the UI know the app by its public id. Writing the
             # cgroup name into public_app_id makes every later status update miss its row.
             public_id = target_app.get('public_app_id') or app_id
-            self.all_limits.apps[app_id] = LimitedApp(
-                public_app_id=public_id,
-                app_name=app_name,
-                source="auto",
-                limit_rates=limit_rates,
-                limit_parts={'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
-                state=None,  # None indicates fully limited
+            self._upsert_auto_limited(
+                app_id, public_id, app_name, limit_rates,
+                resource_limited=resource_limited,
+                io_limited=io_limited,
+                priority=target_app.get('resolved_priority'),
+                is_controlled=is_controlled,
+                limit_reason="disk_pressure" if is_disk_io_stressed else "system_pressure",
+                pressure_level=pressure_level,
                 cgroups=[app_id] + list(extra_cgroup_ids),
                 limit_disks=limited_disks,
-                pids=set(target_app.get('pids') or []),
-                limited_at=time.time(),
+                pids=target_app.get('pids'),
             )
 
             if is_controlled:
@@ -1867,6 +2127,15 @@ class DynamicBalancer:
             if is_controlled and str(priority).lower() == 'critical':
                 logger.info(f"[disk-io] skip {cand}: Critical app, never throttled")
                 continue
+            # 1b) Excluded by a user restore. Checked again here because this arm holds
+            #     its batch across ticks while the disk sits at "high".
+            with self.all_limits.lock:  # the REST thread can add/remove entries mid-walk
+                excluded = self.all_limits.is_excluded(
+                    app_id, app_name, app_info.get('extra_cgroups') or [])
+            if excluded is not None:
+                logger.info(f"[disk-io] skip {cand}: excluded from auto-limit "
+                            f"({excluded.get('key')})")
+                continue
             # 2) Already io-limited (auto) -- skip so we advance to the next heavy user.
             #    Checked under every id the candidate can appear as: this runs *before* the
             #    cgroup resolution below, so the id in hand is the sample's, while the
@@ -1894,6 +2163,9 @@ class DynamicBalancer:
                     app_id = resolved_id
 
             rates = self.get_limited_rates(priority or "undefined")
+            # On the candidate, not the return tuple: the apply path only needs it to
+            # report the priority to the UI.
+            app_info['resolved_priority'] = (priority or "undefined")
             io_rates = (rates or {}).get('disk_io_rate') or {}
             logger.info(
                 f"[disk-io] SELECTED {cand} -> cap {app_id!r} at "
@@ -2033,6 +2305,9 @@ class DynamicBalancer:
                 resolved_id = self._resolve_controlled_target(app_info, controlled_data)
                 if resolved_id:
                     app_id = resolved_id
+            # On the candidate, not the return tuple: the apply path only needs it to
+            # report the priority to the UI.
+            app_info['resolved_priority'] = (priority or "undefined")
             return True, is_controlled, app_id, self.get_limited_rates(priority or "undefined")
 
         self._critical_counter += 1
@@ -2050,7 +2325,8 @@ class DynamicBalancer:
 
         return False, False, None, None
 
-    def _restore_entry(self, entry: "LimitedApp", notify: bool) -> bool:
+    def _restore_entry(self, entry: "LimitedApp", notify: bool,
+                       notify_status: str = "app_closed_limit_restored") -> bool:
         """Fully restore one already-removed limited app's cgroups.
 
         Shared restore path for the shutdown sweep
@@ -2061,8 +2337,9 @@ class DynamicBalancer:
         cgroups, never the registry, so it is safe to run outside the lock.
 
         When ``notify`` is True and the restore succeeds, emits the
-        app-status "running" callback plus a "notify" callback so the UI can
-        tell the user the app closed and its limit was lifted.
+        app-status "running" callback plus a "notify" callback carrying
+        *notify_status* so the UI can explain why the limit was lifted (the
+        app closed, or the user asked for it).
         """
         cgroups = entry.cgroups or [entry.public_app_id]
         key = cgroups[0]
@@ -2114,11 +2391,11 @@ class DynamicBalancer:
                 'status': next_status,
                 'purpose': "app"
             }, False)
-            # Tell the UI the app closed and we lifted its (now-stale) limit.
+            # Tell the UI why the limit is gone (app closed / user restored it).
             app_utils.callback_manager.send_callback_notification({
                 'app_id': entry.public_app_id,
                 'app_name': app_name,
-                'status': "app_closed_limit_restored",
+                'status': notify_status,
                 'purpose': "notify"
             }, False)
 
@@ -2772,6 +3049,9 @@ class DynamicBalancer:
                     limit_rates=limit_rates,
                     limit_parts={'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
                     state=None,
+                    priority=(priority or "undefined"),
+                    # Manual limits always come from the UI acting on a controlled app.
+                    is_controlled=True,
                     cgroups=[effective_app_id] + list(extra_effective_ids),
                     pids=selected_scope_pids,
                     limited_at=time.time(),
@@ -2890,6 +3170,102 @@ class DynamicBalancer:
                 "limit_parts": dict(entry.limit_parts or {}),
                 "limited_at": entry.limited_at or None,
             }
+
+    def get_auto_limited_apps(self) -> dict:
+        """Every app the pressure loop currently holds a limit on, for the UI.
+
+        Manual (UI-initiated) limits are excluded: they already show on the controlled
+        app's own row.
+
+        No restore deadline is reported. Auto restore is not a timer: pressure has to fall
+        back to medium/low, hold for the stability window, and then the limits go in
+        stages, so any "restores in N seconds" number would be fiction.
+
+        The current levels ride along so the UI can paint them on first render without a
+        second request; after that :meth:`_on_pressure_level_changed` keeps them fresh.
+        """
+        with self.all_limits.lock:
+            rows = []
+            for key, entry in self.all_limits.apps.items():
+                if entry.source != "auto":
+                    continue
+                rows.append({
+                    "app_id": entry.public_app_id,
+                    "effective_app_id": key,
+                    "app_name": entry.app_name,
+                    "priority": entry.priority or "undefined",
+                    "is_controlled": bool(entry.is_controlled),
+                    "status": ("partially_restored"
+                               if entry.state == "partially_restored" else "limited"),
+                    "limit_reason": entry.limit_reason or "system_pressure",
+                    "pressure_level": entry.pressure_level or "critical",
+                    "limited_at": entry.limited_at or None,
+                    "limit_parts": dict(entry.limit_parts or {}),
+                    "cgroups": list(entry.cgroups or []),
+                })
+
+        try:
+            sys_level = self.control_manager.current_level or "low"
+            disk_level = (self.control_manager.get_disk_io_stress() or {}).get("level") or "low"
+        except Exception as exc:
+            logger.error("Failed to read current pressure levels: %s", exc)
+            sys_level, disk_level = "", ""
+
+        return {
+            "apps": rows,
+            "sys_pressure_level": sys_level,
+            "disk_pressure_level": disk_level,
+        }
+
+    def restore_auto_limited(self, app_id: str, exclude: bool = True) -> "tuple[bool, str]":
+        """Restore an auto-limited app on the user's request.
+
+        Unlike :meth:`set_restore_resource`, which only targets manual limits, this also
+        takes the app out of the auto-limit candidate pool (*exclude*) -- otherwise the
+        next critical tick would re-limit the app the user just freed.
+
+        :returns: ``(ok, message)`` -- *message* names the failure for the REST layer.
+        """
+        with self.all_limits.lock:
+            found = (self.all_limits.by_public_id(app_id, source="auto")
+                     or self.all_limits.by_any_id(app_id, source="auto"))
+            if found is None:
+                return False, "No auto-limited app found for this id"
+            key, entry = found
+            self.all_limits.apps.pop(key, None)
+            self.all_limits.manual_limit_baseline.pop(key, None)
+            record = self.all_limits.add_exclusion(entry) if exclude else None
+
+        if record is not None:
+            logger.info(
+                "User restored auto-limited app %r (%s); excluded from auto-limit as %s",
+                entry.app_name, entry.public_app_id, record["key"],
+            )
+
+        restored = self._restore_entry(
+            entry, notify=True, notify_status="auto_limit_restored_by_user")
+        if not restored:
+            return False, "Failed to restore resources for this app"
+
+        # Mirrors the manual restore path: the app we were discounting PSI for is no
+        # longer limited, so the dominant-app flag must not outlive it.
+        self.control_manager.set_limited_app_dominant(False)
+        return True, "Restored"
+
+    def get_auto_limit_exclusions(self) -> list:
+        """Apps the user has taken out of the auto-limit candidate pool."""
+        with self.all_limits.lock:
+            return self.all_limits.list_exclusions()
+
+    def remove_auto_limit_exclusion(self, ident: str) -> bool:
+        """Put an excluded app back into the auto-limit candidate pool."""
+        with self.all_limits.lock:
+            record = self.all_limits.remove_exclusion(ident)
+        if record is None:
+            return False
+        logger.info("Auto-limit exclusion removed for %r (%s); app is a candidate again",
+                    record.get("app_name"), record.get("key"))
+        return True
 
     def shutdown(self):
         """

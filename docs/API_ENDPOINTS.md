@@ -70,6 +70,10 @@ All endpoints return a standardized JSON structure:
 | App | `/app/resource_limit` | POST | Set resource limit | cgroup-based, overridable |
 | App | `/app/resource_limit_profile` | POST | Get limit profile | Defaults + bounds for UI |
 | App | `/app/resource_restore` | POST | Restore resources | Remove limits by app_id |
+| App | `/app/auto_limited_apps` | POST | List pressure-driven limits | Rows + live pressure levels |
+| App | `/app/auto_limit_restore` | POST | Release one auto limit | Also excludes the app |
+| App | `/app/auto_limit_exclusions` | POST | List excluded apps | Runtime only, cleared on restart |
+| App | `/app/auto_limit_exclusion_remove` | POST | Undo an exclusion | By key or app_id |
 | App | `/app/events` | GET | SSE event stream | Real-time status push |
 
 ### Part 2: System Monitor
@@ -751,6 +755,156 @@ Or query by name:
 
 ---
 
+#### POST /app/auto_limited_apps
+
+**Purpose:** List the apps the balancer is currently limiting on its own because system or disk I/O pressure hit critical. Manual limits set from the UI are not included — they show on the controlled app's own row.
+
+**Request:** No parameters (empty body).
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Found 1 auto-limited apps",
+  "data": {
+    "apps": [
+      {
+        "app_id": "com.example.app",
+        "effective_app_id": "app-com.example.app.scope",
+        "app_name": "example",
+        "priority": "medium",
+        "is_controlled": true,
+        "status": "limited",
+        "limit_reason": "system_pressure",
+        "pressure_level": "critical",
+        "limited_at": 1755764400.12,
+        "limit_parts": {"cpu_mem_limited": true, "io_limited": false},
+        "cgroups": ["app-com.example.app.scope"]
+      }
+    ],
+    "sys_pressure_level": "high",
+    "disk_pressure_level": "low"
+  }
+}
+```
+
+**Row fields:**
+
+| Field | Format | Description |
+|-------|--------|-------------|
+| app_id | string | Public app id; empty for an app that is not under control |
+| effective_app_id | string | Registry key (the primary cgroup) — pass this to `/app/auto_limit_restore` |
+| app_name | string | Display name |
+| priority | string | `critical`/`high`/`medium`/`low`, or `undefined` for uncontrolled apps |
+| is_controlled | bool | Whether the app is under Smartune control |
+| status | string | `limited`, or `partially_restored` once the first restore stage has run |
+| limit_reason | string | `system_pressure` or `disk_pressure` |
+| pressure_level | string | Level at the moment the limit was applied (a snapshot, not the current level) |
+| limited_at | float | Unix timestamp of the first limit on this app |
+| limit_parts | object | `cpu_mem_limited` / `io_limited` — which caps are in place |
+| cgroups | array | Cgroups the limit is written to |
+
+**Notes:**
+- `sys_pressure_level` / `disk_pressure_level` are the *current* levels, sent along so the UI can render without a second request. They stay fresh through the `pressure_level_changed` SSE event.
+- No restore deadline is reported. Auto restore is not a timer: pressure has to fall back to medium/low, hold there for the stability window, and then the limits are lifted in stages.
+- On error the same shape is returned with an empty `apps` list.
+
+---
+
+#### POST /app/auto_limit_restore
+
+**Purpose:** Lift one auto limit immediately at the user's request, and take the app out of the auto-limit candidate pool so the next critical tick does not simply re-limit it. Use `/app/resource_restore` for manual limits — it does not touch auto limits.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | app_id | Yes | string | `effective_app_id` or `app_id` from `/app/auto_limited_apps` |
+
+**Request Example:**
+```json
+{
+  "app_id": "app-com.example.app.scope"
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Restored",
+  "data": {}
+}
+```
+
+**Notes:**
+- Returns `RetCode.OPERATING_ERROR` with `No auto-limited app found for this id` when the id matches nothing, or `Failed to restore resources for this app` when the cgroup write fails.
+- Emits an `auto_limit_restored_by_user` notify event on `/app/events`.
+
+---
+
+#### POST /app/auto_limit_exclusions
+
+**Purpose:** List the apps the user has excluded from auto-limiting.
+
+**Request:** No parameters (empty body).
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Found 1 auto-limit exclusions",
+  "data": [
+    {
+      "key": "app:com.example.app",
+      "kind": "app",
+      "app_id": "com.example.app",
+      "app_name": "example",
+      "priority": "medium",
+      "cgroups": ["app-com.example.app.scope"],
+      "excluded_at": 1755764500.44
+    }
+  ]
+}
+```
+
+**Notes:**
+- `kind` is `app` for a controlled app (keyed `app:<app_id>`, covers every instance) or `instance` for an uncontrolled one (keyed `instance:<cgroup>`, covers that instance only).
+- Exclusions live in memory. Restarting the balancer clears them.
+
+---
+
+#### POST /app/auto_limit_exclusion_remove
+
+**Purpose:** Put an excluded app back into the auto-limit candidate pool.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | key | No* | string | Exclusion key from `/app/auto_limit_exclusions` |
+| Body | app_id | No* | string | App id or cgroup, if the key is not at hand |
+
+\* One of the two is required; `key` wins when both are sent.
+
+**Request Example:**
+```json
+{
+  "key": "app:com.example.app"
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Auto-limit exclusion removed",
+  "data": {}
+}
+```
+
+---
+
 #### GET /app/events
 
 **Purpose:** Server-Sent Events (SSE) stream for real-time app status changes.
@@ -773,6 +927,8 @@ data: {"type": "connected"}
 
 data: {"app_id": "com.example.app", "app_name": "example", "status": "running", "purpose": "app"}
 
+data: {"app_id": "", "app_name": "", "status": "pressure_level_changed", "sys_level": "high", "disk_level": "low", "purpose": "notify"}
+
 : heartbeat
 ```
 
@@ -781,6 +937,15 @@ data: {"app_id": "com.example.app", "app_name": "example", "status": "running", 
 - Heartbeat comments (`: heartbeat`) sent every 30 seconds when idle
 - Events are JSON-encoded app status updates
 - Connection remains open until client disconnects
+
+**`purpose: "notify"` events used by the auto-limit UI:**
+
+| status | Extra fields | Meaning |
+|--------|--------------|---------|
+| `pressure_level_changed` | `sys_level`, `disk_level` | Either level changed. `app_id`/`app_name` are empty — this is a system event |
+| `auto_limit_changed` | `detail` | The auto-limited list changed in a way no app event covers (a staged restore step, or a failed one). `detail` names the step |
+| `auto_limit_restored_by_user` | — | A limit was lifted through `/app/auto_limit_restore` |
+| `app_closed_limit_restored` | — | The app exited and its limit was dropped with it |
 
 ---
 
@@ -1564,3 +1729,4 @@ The `/app/events` endpoint maintains a persistent connection:
 - Sends a `{"type": "connected"}` event on connection
 - Sends heartbeat comments every 30 seconds during idle periods
 - App status change events include: `app_id`, `app_name`, `status`, `purpose`
+- `purpose: "notify"` events may carry extra keys (`sys_level`, `disk_level`, `detail`) — see the `/app/events` table above. The Balancer tab relies on them instead of polling: it loads the auto-limited list once and then updates it from these events

@@ -34,6 +34,14 @@ class ControlManager:
         """
         self.system_pressure_monitor.register_critical_state_listener(callback)
 
+    def register_level_change_listener(self, callback) -> None:
+        """Register a callback invoked on every system/disk-IO pressure level change.
+
+        Forwarded to the underlying SystemPressureMonitor.  See
+        SystemPressureMonitor.register_level_change_listener for details.
+        """
+        self.system_pressure_monitor.register_level_change_listener(callback)
+
     def set_limited_app_dominant(self, is_dominant: bool, dominant_cgroup: str = None):
         """ Set whether the limited app is dominant, and its cgroup path for PSI discounting. """
         self.system_pressure_monitor.set_limited_app_dominant(is_dominant, dominant_cgroup)

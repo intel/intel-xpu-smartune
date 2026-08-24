@@ -181,6 +181,50 @@ export interface ProcessDetailData {
 
 export type AppListData = AppInfo[]
 
+// Which channel drove an auto limit. The combined policy caps both off one signal,
+// so everything it limits reports 'system_pressure'.
+export type AutoLimitReason = 'system_pressure' | 'disk_pressure'
+
+// One app the balancer is auto-limiting. No restore deadline: recovery waits for
+// pressure to ease and then runs in stages.
+export interface AutoLimitedApp {
+  app_id: string
+  effective_app_id: string
+  app_name: string
+  priority: string
+  is_controlled: boolean
+  status: 'limited' | 'partially_restored'
+  limit_reason: AutoLimitReason
+  // The channel's level when the limit landed. The UI shows the current level instead
+  // (pushed over SSE) and falls back to this before the first push.
+  pressure_level: string
+  limited_at: number | null
+  limit_parts: { cpu_mem_limited?: boolean; io_limited?: boolean }
+  cgroups: string[]
+}
+
+// List + current levels in one response, so the tab needs a single request on open.
+export interface AutoLimitedAppsData {
+  apps: AutoLimitedApp[]
+  sys_pressure_level: string
+  disk_pressure_level: string
+}
+
+// An app the user restored by hand and thereby opted out of auto-limiting. 'app' covers
+// every instance of a controlled app; 'instance' covers one cgroup, so siblings of the
+// same name stay throttleable. Cleared when the service restarts.
+export interface AutoLimitExclusion {
+  key: string
+  kind: 'app' | 'instance'
+  app_id: string
+  app_name: string
+  priority: string
+  cgroups: string[]
+  excluded_at: number
+}
+
+export type AutoLimitExclusionsData = AutoLimitExclusion[]
+
 export interface SetControlPayload {
   app_id: string
   app_name: string

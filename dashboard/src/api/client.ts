@@ -9,6 +9,8 @@ import type {
   ProcessListData,
   ProcessDetailData,
   AppListData,
+  AutoLimitedAppsData,
+  AutoLimitExclusionsData,
   StaticInfoData,
   DynamicInfoData,
   HistoryData,
@@ -276,6 +278,14 @@ export const api = {
     post<ResourceLimitProfileData>('/app/resource_limit_profile', payload),
   resourceRestore: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<void>('/app/resource_restore', payload),
+  getAutoLimitedApps: () => post<AutoLimitedAppsData>('/app/auto_limited_apps'),
+  // Lifts a pressure-driven limit and excludes the app from future ones. Not the same as
+  // resourceRestore, which only handles manual limits.
+  autoLimitRestore: (payload: Pick<AppIdPayload, 'app_id'>) =>
+    post<void>('/app/auto_limit_restore', payload),
+  getAutoLimitExclusions: () => post<AutoLimitExclusionsData>('/app/auto_limit_exclusions'),
+  removeAutoLimitExclusion: (key: string) =>
+    post<void>('/app/auto_limit_exclusion_remove', { key }),
   getWeightsTop: () => get<WeightsTopData>('/monitor/config/weights_top'),
   updateWeightsTop: (
     weights: { cpu?: number; memory?: number; gpu?: number },

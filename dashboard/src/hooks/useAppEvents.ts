@@ -10,6 +10,11 @@ export interface AppStatusEvent {
   status: string
   purpose: 'app' | 'notify' | string
   message?: string
+  /** 'pressure_level_changed' only: the levels as of this transition. */
+  sys_level?: string
+  disk_level?: string
+  /** 'auto_limit_changed' only: which staged-restore step fired, for debugging. */
+  detail?: string
 }
 
 type EventCallback = (event: AppStatusEvent) => void

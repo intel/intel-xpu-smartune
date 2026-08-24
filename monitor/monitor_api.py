@@ -614,6 +614,9 @@ class SystemPressureMonitor:
         # Listeners notified when the system transitions into or out of the
         # "critical" pressure level.  Each entry is a callable(is_critical: bool).
         self._critical_state_listeners: list[Callable[[bool], None]] = []
+        # Notified whenever either level changes, critical or not.
+        # Each entry is a callable(sys_level: str, disk_level: str).
+        self._level_change_listeners: list[Callable[[str, str], None]] = []
 
         self._start_auto_refresh()
 
@@ -626,6 +629,16 @@ class SystemPressureMonitor:
         thread, so they must be thread-safe and non-blocking.
         """
         self._critical_state_listeners.append(callback)
+
+    def register_level_change_listener(self, callback) -> None:
+        """Register a ``callback(sys_level, disk_level)`` for every level change.
+
+        Unlike :meth:`register_critical_state_listener` this fires on any transition
+        (low -> medium, high -> low, ...), which is what a UI needs to show a live
+        level. Steady levels emit nothing. Runs on the auto-refresh thread, so the
+        callback must be thread-safe and non-blocking.
+        """
+        self._level_change_listeners.append(callback)
 
     def set_limited_app_dominant(self, is_dominant: bool, dominant_cgroups=None):
         """Set whether any rate-limited app is currently dominant, and (when so) the cgroup
@@ -653,17 +666,19 @@ class SystemPressureMonitor:
             try:
                 new_level, score, disk_io_stressed, disk_io_stress = self._update_pressure_level()
                 old_level = self._current_level
+                old_disk_level = self._current_disk_level
                 self._current_level = new_level
                 self.score = score
                 self.is_current_disk_io_stressed = disk_io_stressed
                 self._disk_io_stress = disk_io_stress
-                self._current_disk_level = disk_io_stress.get("level") or "low"
+                new_disk_level = disk_io_stress.get("level") or "low"
+                self._current_disk_level = new_disk_level
                 # Peak latch: only raise the peak, never lower it.  The balancer
                 # resets the peak via consume_peak_pressure_level().
                 if _LEVEL_ORDER.get(new_level, -1) > _LEVEL_ORDER.get(self._peak_level, -1):
                     self._peak_level = new_level
-                if _LEVEL_ORDER.get(self._current_disk_level, -1) > _LEVEL_ORDER.get(self._peak_disk_level, -1):
-                    self._peak_disk_level = self._current_disk_level
+                if _LEVEL_ORDER.get(new_disk_level, -1) > _LEVEL_ORDER.get(self._peak_disk_level, -1):
+                    self._peak_disk_level = new_disk_level
             finally:
                 self._update_lock.release()
 
@@ -678,6 +693,15 @@ class SystemPressureMonitor:
                         cb(is_critical)
                     except Exception as exc:
                         logger.error("Critical state listener raised an error: %s", exc)
+
+            # Push every transition, not just in/out of critical, so the UI can show
+            # a live level without polling.
+            if old_level != new_level or old_disk_level != new_disk_level:
+                for cb in self._level_change_listeners:
+                    try:
+                        cb(new_level, new_disk_level)
+                    except Exception as exc:
+                        logger.error("Level change listener raised an error: %s", exc)
 
     def _update_pressure_level(self) -> tuple[str, float, bool, dict]:
         """Recompute the current pressure level using internal state."""

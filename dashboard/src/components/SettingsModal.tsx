@@ -28,10 +28,16 @@ import {
   ReloadOutlined,
   MonitorOutlined,
   ControlOutlined,
+  DashboardOutlined,
+  HddOutlined,
+  GlobalOutlined,
+  ApiOutlined,
+  StopOutlined,
   QuestionCircleOutlined,
   RightOutlined,
   DownOutlined,
   DeleteOutlined,
+  ExperimentOutlined,
 } from '@ant-design/icons'
 import { api } from '../api/client'
 import type {
@@ -77,62 +83,77 @@ function formatTimestamp(ts: number | undefined | null): string {
   return new Date(ts * 1000).toLocaleString()
 }
 
-// Reuses the slot the required asterisk used to occupy, for something the user can
-// actually act on: which knobs are ordinary settings and which are calibrated model
-// coefficients best left alone. The tag carries its own tooltip, so no legend is needed.
 const ADVANCED_TIP =
-  'Advanced option — changing it is not recommended. The shipped value is calibrated; '
+  'Advanced options — changing them is not recommended. The shipped values are calibrated; '
   + 'a guess here degrades detection or throttling instead of tuning it.'
 
-function AdvancedTag() {
-  return (
-    <Tooltip title={ADVANCED_TIP}>
-      <Tag
-        bordered={false}
-        color="orange"
-        style={{ fontSize: 10, lineHeight: '16px', padding: '0 4px', marginInlineStart: 6, marginInlineEnd: 0 }}
-      >
-        ADV
-      </Tag>
-    </Tooltip>
-  )
-}
-
-// Field label carrying the advanced marker, for single knobs that sit outside a section.
-function advancedLabel(text: string) {
-  return (
-    <span>
-      {text}
-      <AdvancedTag />
-    </span>
-  )
-}
+// Warning amber, carried over from the ADV tag this section replaced: it is what tells the
+// row apart from an ordinary collapsed group. Not COLORS.orange — that one is the red-ish
+// pressure colour, and reusing it here would read as an error rather than as "careful".
+const ADVANCED_COLOR = '#faad14'
 
 // Section divider label with a help tooltip. No required marker: every field in
 // this dialog already has a value loaded from the server, so a red asterisk marks
 // nothing the user has to supply — the field rules still reject empty/out-of-range
-// input on save. `advanced` marks a whole section whose fields are model coefficients.
-function SectionLabel({ text, tip, advanced }: { text: string; tip: string; advanced?: boolean }) {
+// input on save.
+function SectionLabel({ text, tip }: { text: string; tip: string }) {
   return (
     <span>
       {text}
       <Tooltip title={tip}>
         <QuestionCircleOutlined style={{ color: COLORS.textMuted, fontSize: 12, marginLeft: 6 }} />
       </Tooltip>
-      {advanced && <AdvancedTag />}
     </span>
   )
 }
 
-// ---------------------------------------------------------------------------
-// One Save for the whole dialog: each card registers how to validate and
-// persist itself, and the footer button drives all of them.  A Save per card
-// meant editing three cards took three clicks, with no way to tell from the
-// dialog which ones were already written -- Reset stays per card, since
-// reloading one card's server values is genuinely a per-card action.
+// Calibrated model coefficients, folded away instead of tagged in place. Marking each one
+// ADV still left them sitting between the settings people do come here to change; behind a
+// collapsed toggle the card opens on the ordinary knobs, and everything inside is advanced
+// by construction, so no per-field marker is needed once it is open.
 //
-// Cards are registered only while mounted, and the Tabs below drop hidden tabs,
-// so the footer only ever saves what the user can actually see.
+// Fields inside keep their values while collapsed (antd `preserve`), and the save paths read
+// the whole form store rather than the mounted fields, so a collapsed block is still written.
+function AdvancedSection({ children }: { children: React.ReactNode }) {
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <div style={{ marginTop: 8 }}>
+      <Space size={4} align="center">
+        <Button
+          size="small"
+          type="text"
+          onClick={() => setExpanded((open) => !open)}
+          icon={expanded
+            ? <DownOutlined style={{ color: ADVANCED_COLOR, fontSize: 12 }} />
+            : <RightOutlined style={{ color: ADVANCED_COLOR, fontSize: 12 }} />}
+          aria-label="Toggle advanced settings"
+        />
+        <ExperimentOutlined style={{ color: ADVANCED_COLOR, fontSize: 12 }} />
+        <Text strong style={{ color: ADVANCED_COLOR }}>Advanced</Text>
+        <Tooltip title={ADVANCED_TIP}>
+          <QuestionCircleOutlined style={{ color: COLORS.textMuted, fontSize: 12 }} />
+        </Tooltip>
+      </Space>
+      {expanded && (
+        <div style={{ marginTop: 12, marginLeft: 14, paddingLeft: 12, borderLeft: `2px solid ${COLORS.border}` }}>
+          {children}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Saving is driven by the dialog footer: each card registers how to validate
+// and persist itself, and the footer buttons drive them.  A Save per card meant
+// editing three cards took three clicks, with no way to tell from the dialog
+// which ones were already written -- Reset stays per card, since reloading one
+// card's server values is genuinely a per-card action.
+//
+// Each card is now a tab of its own, so a handle also records which tab owns it:
+// "Save" writes the tab in view, "Save all" writes every tab the user has
+// touched. Panes are kept mounted once visited (see the Tabs below), so an edit
+// left behind on another tab survives the switch and is still saved.
 // ---------------------------------------------------------------------------
 type SaveOutcome = 'ok' | 'conflict' | 'error'
 
@@ -147,26 +168,38 @@ interface SaveHandle {
 }
 
 interface SaveRegistry {
-  register: (id: string, handle: SaveHandle) => () => void
+  register: (id: string, tabKey: string, handle: SaveHandle) => () => void
+  // Cards ping this when their edit state may have changed, so the dialog can
+  // re-read isDirty() and mark the tab. Cheap: one call per handle, no polling.
+  notifyDirty: () => void
 }
 
 const SettingsSaveContext = React.createContext<SaveRegistry | null>(null)
+// Which tab the surrounding panel belongs to; wrapped around each panel in the items list.
+const SettingsTabContext = React.createContext<string>('')
 
 // Registers *handle* for as long as the calling card is mounted. The registry
 // stores a stable wrapper that reads the newest closure, so a re-render with
 // fresh form state never leaves a stale handler behind.
 function useRegisterSave(id: string, handle: SaveHandle) {
   const registry = useContext(SettingsSaveContext)
+  const tabKey = useContext(SettingsTabContext)
   const latest = useRef(handle)
   latest.current = handle
   useEffect(
-    () => registry?.register(id, {
+    () => registry?.register(id, tabKey, {
       validate: () => Promise.resolve(latest.current.validate?.() ?? true),
       isDirty: () => latest.current.isDirty?.() ?? true,
       save: () => latest.current.save(),
     }),
-    [registry, id],
+    [registry, id, tabKey],
   )
+}
+
+// Lets a card report "my edit state changed" without threading props through it.
+function useNotifyDirty() {
+  const registry = useContext(SettingsSaveContext)
+  return useCallback(() => registry?.notifyDirty(), [registry])
 }
 
 // ---------------------------------------------------------------------------
@@ -190,16 +223,35 @@ interface FormCardProps {
 function FormCard({ title, description, scope, load, save, currentToValues, children }: FormCardProps) {
   const [form] = Form.useForm()
   const { publishNotice } = useGlobalConfigNotices()
+  const notifyDirty = useNotifyDirty()
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [updatedAt, setUpdatedAt] = useState<number | undefined>(undefined)
+
+  // Edited-since-load flag, kept here rather than read from form.isFieldsTouched(): a field
+  // that is collapsed again (Advanced settings) unmounts and takes its touched flag with it,
+  // which would make an edited card look clean and have Save skip it.
+  const dirty = useRef(false)
+  const markDirty = useCallback(() => {
+    dirty.current = true
+    notifyDirty()
+  }, [notifyDirty])
+  // Nothing is pending once the card holds server values again (saved, or reloaded from
+  // the server after a cross-client conflict).
+  const clearDirty = useCallback(() => {
+    dirty.current = false
+    notifyDirty()
+  }, [notifyDirty])
 
   const doLoad = useCallback(async () => {
     setLoading(true)
     try {
       const { values, updatedAt: ts } = await load()
+      form.resetFields()
       form.setFieldsValue(values)
       setUpdatedAt(ts)
+      dirty.current = false
+      notifyDirty()
     } catch (error) {
       message.error(`Failed to load ${title}`)
       console.error(error)
@@ -207,19 +259,23 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
       setLoading(false)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [form])
+  }, [form, notifyDirty])
 
   useEffect(() => {
     void doLoad()
   }, [doLoad])
 
   const onSave = async (): Promise<SaveOutcome> => {
-    let values: Record<string, unknown>
     try {
-      values = await form.validateFields()
+      await form.validateFields()
     } catch {
       return 'error'
     }
+    // Validate the mounted fields, but send the whole store: `validateFields()` resolves
+    // with the *mounted* entities only, so a collapsed section (Advanced settings, a
+    // switched-off channel) would drop its keys from the PUT and wipe them server-side.
+    // Unmounted fields keep their loaded values in the store (antd `preserve`).
+    const values = form.getFieldsValue(true) as Record<string, unknown>
     setSaving(true)
     try {
       const result = await save(values, updatedAt)
@@ -239,6 +295,7 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
           onOk: () => {
             form.setFieldsValue(currentToValues(current))
             setUpdatedAt(current.updated_at as number | undefined)
+            clearDirty()
             publishNotice({
               title: `${title} updated`,
               description: `Another client changed ${title} at ${tsLabel}. Your form has been reloaded.`,
@@ -253,6 +310,7 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
       const data = result.data
       if (data.success) {
         setUpdatedAt(data.updated_at)
+        clearDirty()
         return 'ok'
       }
       message.error(`Failed to update ${title}`)
@@ -276,7 +334,7 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
     }
   }
 
-  useRegisterSave(scope, { validate, isDirty: () => form.isFieldsTouched(), save: onSave })
+  useRegisterSave(scope, { validate, isDirty: () => dirty.current, save: onSave })
 
   return (
     <Card size="small" title={title} style={{ marginBottom: 16 }}>
@@ -286,7 +344,7 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
         </div>
       )}
       <Spin spinning={loading}>
-        <Form form={form} layout="vertical">
+        <Form form={form} layout="vertical" onFieldsChange={markDirty}>
           {children}
         </Form>
         <Text type="secondary" style={{ fontSize: 12 }}>
@@ -308,10 +366,12 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
 }
 
 // ---------------------------------------------------------------------------
-// Monitored dynamic sections (custom checkbox UI).
+// System Overview tab: which resource sections the collector samples, which is
+// also what the main System Overview tab can show (custom checkbox UI).
 // ---------------------------------------------------------------------------
 function MonitoredSectionsCard() {
   const { publishNotice } = useGlobalConfigNotices()
+  const notifyDirty = useNotifyDirty()
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [allSections, setAllSections] = useState<string[]>([])
@@ -325,7 +385,8 @@ function MonitoredSectionsCard() {
     setSelected(data.sections ?? [])
     setUpdatedAt(data.updated_at)
     setDirty(false)
-  }, [])
+    notifyDirty()
+  }, [notifyDirty])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -391,12 +452,13 @@ function MonitoredSectionsCard() {
   useRegisterSave('monitored_sections', { isDirty: () => dirty, save: handleSave })
 
   return (
-    <Card size="small" title="Monitored sections" style={{ marginBottom: 16 }}>
+    <Card size="small" title="System Overview" style={{ marginBottom: 16 }}>
       <div style={{ marginBottom: 12 }}>
         <Text type="secondary">
-          Which hardware sections the background collector continuously monitors. Monitored
-          sections feed the live dashboard and history; unselected sections are only collected
-          on demand.
+          Which hardware sections appear on the main <b>System Overview</b> tab. A selected
+          section is sampled continuously by the background collector, so it is shown live
+          there and recorded to History. Unselected sections are hidden from that tab and are
+          only sampled on demand (for example when a per-app view asks for them).
         </Text>
       </div>
       <Spin spinning={loading}>
@@ -414,6 +476,7 @@ function MonitoredSectionsCard() {
           onChange={(vals) => {
             setSelected(vals as string[])
             setDirty(true)
+            notifyDirty()
           }}
           style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 24px' }}
         >
@@ -448,25 +511,25 @@ interface DiskPressureConfig {
   updated_at?: number
 }
 
-// ---------------------------------------------------------------------------
-// Monitor tab: sections + collection cadence + pressure detection params.
-// ---------------------------------------------------------------------------
-function MonitorPanel() {
-  const toPercentageThresholds = (thresholds: Record<string, number>) =>
-    Object.fromEntries(Object.entries(thresholds).map(([level, value]) => [level, Math.round(value * 100)]))
-  const toRatioThresholds = (thresholds: Record<string, number>) =>
-    Object.fromEntries(Object.entries(thresholds).map(([level, value]) => [level, value / 100]))
-  const diskPressureToValues = (d: DiskPressureConfig) => ({
-    disk_thresholds: toPercentageThresholds(d.disk_thresholds ?? {}),
-    sub_weights: d.disk_pressure_model?.sub_weights,
-    sigmoid_k: d.disk_pressure_model?.sigmoid_k,
-    max_p_weight: d.disk_pressure_model?.max_p_weight,
-  })
+// Thresholds are ratios in config.yaml and percentages in the form; every pressure card
+// converts them the same way, so the helpers live next to the type instead of inside a card.
+const toPercentageThresholds = (thresholds: Record<string, number>) =>
+  Object.fromEntries(Object.entries(thresholds).map(([level, value]) => [level, Math.round(value * 100)]))
+const toRatioThresholds = (thresholds: Record<string, number>) =>
+  Object.fromEntries(Object.entries(thresholds).map(([level, value]) => [level, value / 100]))
+const diskPressureToValues = (d: DiskPressureConfig) => ({
+  disk_thresholds: toPercentageThresholds(d.disk_thresholds ?? {}),
+  sub_weights: d.disk_pressure_model?.sub_weights,
+  sigmoid_k: d.disk_pressure_model?.sigmoid_k,
+  max_p_weight: d.disk_pressure_model?.max_p_weight,
+})
 
+// ---------------------------------------------------------------------------
+// System pressure tab: how the overall score is computed and graded.
+// ---------------------------------------------------------------------------
+function SystemPressurePanel() {
   return (
     <>
-      <MonitoredSectionsCard />
-
       <FormCard
         title="System pressure"
         description="How the overall system-pressure score is computed and graded. Weights set each resource's relative importance; thresholds map the score to low / medium / high / critical."
@@ -541,65 +604,75 @@ function MonitorPanel() {
           ))}
         </Row>
 
-        <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
-          <SectionLabel
-            text="Resource weights"
-            tip="Relative importance of each resource when combining them into the overall pressure score. Larger weight means that resource contributes more; the values are normalised against their sum."
-            advanced
-          />
-        </Divider>
-        <Row gutter={16}>
-          {(['cpu', 'memory', 'io'] as const).map((k) => (
-            <Col span={8} key={k}>
+        <AdvancedSection>
+          <Divider orientation="left" orientationMargin={0} plain style={{ margin: '0 0 12px' }}>
+            <SectionLabel
+              text="Resource weights"
+              tip="Relative importance of each resource when combining them into the overall pressure score. Larger weight means that resource contributes more; the values are normalised against their sum."
+            />
+          </Divider>
+          <Row gutter={16}>
+            {(['cpu', 'memory', 'io'] as const).map((k) => (
+              <Col span={8} key={k}>
+                <Form.Item
+                  label={k === 'io' ? 'I/O' : k[0].toUpperCase() + k.slice(1)}
+                  name={['weights', k]}
+                  required={false}
+                  rules={[{ required: true, type: 'integer', min: 0 }]}
+                >
+                  <InputNumber style={{ width: '100%' }} min={0} step={1} />
+                </Form.Item>
+              </Col>
+            ))}
+          </Row>
+
+          <Row gutter={16}>
+            <Col span={8}>
               <Form.Item
-                label={k === 'io' ? 'I/O' : k[0].toUpperCase() + k.slice(1)}
-                name={['weights', k]}
+                label="Memory gate steepness"
+                name="mem_gate_steepness"
+                tooltip="Steepness of the memory-discount sigmoid gate: larger makes the transition around the memory busy point sharper."
                 required={false}
-                rules={[{ required: true, type: 'integer', min: 0 }]}
+                rules={[{ required: true, type: 'number', min: 1, max: 50 }]}
               >
-                <InputNumber style={{ width: '100%' }} min={0} step={1} />
+                <InputNumber style={{ width: '100%' }} min={1} max={50} step={0.5} />
               </Form.Item>
             </Col>
-          ))}
-        </Row>
-
-        <Row gutter={16}>
-          <Col span={8}>
-            <Form.Item
-              label={advancedLabel('Memory gate steepness')}
-              name="mem_gate_steepness"
-              tooltip="Steepness of the memory-discount sigmoid gate: larger makes the transition around the memory busy point sharper."
-              required={false}
-              rules={[{ required: true, type: 'number', min: 1, max: 50 }]}
-            >
-              <InputNumber style={{ width: '100%' }} min={1} max={50} step={0.5} />
-            </Form.Item>
-          </Col>
-          <Col span={8}>
-            <Form.Item
-              label={advancedLabel('Memory busy threshold (%)')}
-              name="memory_busy_threshold"
-              tooltip="Memory usage percentage where memory pressure starts to be treated as busy."
-              required={false}
-              rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
-            >
-              <InputNumber style={{ width: '100%' }} min={0} max={100} step={1} />
-            </Form.Item>
-          </Col>
-          <Col span={8}>
-            <Form.Item
-              label={advancedLabel('CPU busy threshold (%)')}
-              name="cpu_busy_threshold"
-              tooltip="CPU usage percentage where CPU pressure starts to be treated as busy."
-              required={false}
-              rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
-            >
-              <InputNumber style={{ width: '100%' }} min={0} max={100} step={1} />
-            </Form.Item>
-          </Col>
-        </Row>
+            <Col span={8}>
+              <Form.Item
+                label="Memory busy threshold (%)"
+                name="memory_busy_threshold"
+                tooltip="Memory usage percentage where memory pressure starts to be treated as busy."
+                required={false}
+                rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
+              >
+                <InputNumber style={{ width: '100%' }} min={0} max={100} step={1} />
+              </Form.Item>
+            </Col>
+            <Col span={8}>
+              <Form.Item
+                label="CPU busy threshold (%)"
+                name="cpu_busy_threshold"
+                tooltip="CPU usage percentage where CPU pressure starts to be treated as busy."
+                required={false}
+                rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
+              >
+                <InputNumber style={{ width: '100%' }} min={0} max={100} step={1} />
+              </Form.Item>
+            </Col>
+          </Row>
+        </AdvancedSection>
       </FormCard>
+    </>
+  )
+}
 
+// ---------------------------------------------------------------------------
+// Disk I/O pressure tab: the disk channel's own scoring model and bands.
+// ---------------------------------------------------------------------------
+function DiskPressurePanel() {
+  return (
+    <>
       <FormCard
         title="Disk I/O pressure"
         description="A channel of its own: each disk is scored from its latency, queue depth and utilisation (normalised against what its media class can sustain), the disks are combined, and the I/O PSI decides how much of that saturation counts. Critical on this channel is what authorises an io.max cap — it never feeds the system pressure score above."
@@ -641,60 +714,71 @@ function MonitorPanel() {
           ))}
         </Row>
 
-        <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
-          <SectionLabel
-            text="Per-disk sub-signal weights (sum ≤ 1)"
-            tip="How much each USE sub-signal contributes to a single disk's pressure. Latency dominates because it is what users feel; utilisation is only a tie-breaker, since a parallel device sits at 100% with headroom to spare."
-            advanced
-          />
-        </Divider>
-        <Row gutter={16}>
-          {([
-            ['latency', 'Latency (await)'],
-            ['queue', 'Queue depth'],
-            ['util', 'Utilisation'],
-          ] as const).map(([key, label]) => (
-            <Col span={8} key={key}>
+        <AdvancedSection>
+          <Divider orientation="left" orientationMargin={0} plain style={{ margin: '0 0 12px' }}>
+            <SectionLabel
+              text="Per-disk sub-signal weights (sum ≤ 1)"
+              tip="How much each USE sub-signal contributes to a single disk's pressure. Latency dominates because it is what users feel; utilisation is only a tie-breaker, since a parallel device sits at 100% with headroom to spare."
+            />
+          </Divider>
+          <Row gutter={16}>
+            {([
+              ['latency', 'Latency (await)'],
+              ['queue', 'Queue depth'],
+              ['util', 'Utilisation'],
+            ] as const).map(([key, label]) => (
+              <Col span={8} key={key}>
+                <Form.Item
+                  label={label}
+                  name={['sub_weights', key]}
+                  required={false}
+                  rules={[{ required: true, type: 'number', min: 0, max: 1 }]}
+                >
+                  <InputNumber style={{ width: '100%' }} min={0} max={1} step={0.05} />
+                </Form.Item>
+              </Col>
+            ))}
+          </Row>
+
+          <Row gutter={16}>
+            <Col span={8}>
               <Form.Item
-                label={label}
-                name={['sub_weights', key]}
+                label="Sigmoid steepness"
+                name="sigmoid_k"
+                tooltip="Steepness of the curve that squashes each sub-signal around its media-specific half-point: larger is more switch-like, smaller is a gentler ramp."
+                required={false}
+                rules={[{ required: true, type: 'number', min: 1, max: 50 }]}
+              >
+                <InputNumber style={{ width: '100%' }} min={1} max={50} step={0.5} />
+              </Form.Item>
+            </Col>
+            <Col span={8}>
+              <Form.Item
+                label="Worst-disk weight"
+                name="max_p_weight"
+                tooltip="How strongly the single busiest disk carries the aggregate: 0 is a plain mean (one hammered disk among many is averaged away), 1 lets the worst disk decide on its own."
                 required={false}
                 rules={[{ required: true, type: 'number', min: 0, max: 1 }]}
               >
                 <InputNumber style={{ width: '100%' }} min={0} max={1} step={0.05} />
               </Form.Item>
             </Col>
-          ))}
-        </Row>
-
-        <Row gutter={16}>
-          <Col span={8}>
-            <Form.Item
-              label={advancedLabel('Sigmoid steepness')}
-              name="sigmoid_k"
-              tooltip="Steepness of the curve that squashes each sub-signal around its media-specific half-point: larger is more switch-like, smaller is a gentler ramp."
-              required={false}
-              rules={[{ required: true, type: 'number', min: 1, max: 50 }]}
-            >
-              <InputNumber style={{ width: '100%' }} min={1} max={50} step={0.5} />
-            </Form.Item>
-          </Col>
-          <Col span={8}>
-            <Form.Item
-              label={advancedLabel('Worst-disk weight')}
-              name="max_p_weight"
-              tooltip="How strongly the single busiest disk carries the aggregate: 0 is a plain mean (one hammered disk among many is averaged away), 1 lets the worst disk decide on its own."
-              required={false}
-              rules={[{ required: true, type: 'number', min: 0, max: 1 }]}
-            >
-              <InputNumber style={{ width: '100%' }} min={0} max={1} step={0.05} />
-            </Form.Item>
-          </Col>
-        </Row>
+          </Row>
+        </AdvancedSection>
       </FormCard>
+    </>
+  )
+}
 
+// ---------------------------------------------------------------------------
+// Network I/O pressure tab: utilisation bands for the network channel.
+// ---------------------------------------------------------------------------
+function NetworkPressurePanel() {
+  return (
+    <>
       <FormCard
         title="Network I/O pressure"
+        description="Bands for the network channel: the utilisation of the monitored interfaces is graded against these thresholds, and the level drives the pressure-based bandwidth shaping in Network Control."
         scope="network_pressure"
         load={async () => {
           const d = await api.getConfig<{ network_thresholds: Record<string, number>; updated_at?: number }>('network_pressure')
@@ -876,6 +960,7 @@ function DiskFloorMatrix({ disabled }: { disabled?: boolean }) {
 function AutoControlPanel() {
   const [form] = Form.useForm()
   const { publishNotice } = useGlobalConfigNotices()
+  const notifyDirty = useNotifyDirty()
   const [policyExpanded, setPolicyExpanded] = useState(false)
   const [diskExpanded, setDiskExpanded] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -886,12 +971,24 @@ function AutoControlPanel() {
   const diskEnabled = (Form.useWatch(['disk_io', 'enabled'], form) ?? false) as boolean
   const toPercentageRates = (resource: LimitPolicyData['cpu']) => ({
     ...resource,
-    rate: Object.fromEntries(Object.entries(resource.rate).map(([priority, rate]) => [priority, Math.round(Number(rate) * 100)])),
+    rate: Object.fromEntries(Object.entries(resource?.rate ?? {}).map(([priority, rate]) => [priority, Math.round(Number(rate) * 100)])),
   })
   const toRatioRates = (resource: LimitPolicyData['cpu']) => ({
     ...resource,
-    rate: Object.fromEntries(Object.entries(resource.rate).map(([priority, rate]) => [priority, Number(rate) / 100])),
+    rate: Object.fromEntries(Object.entries(resource?.rate ?? {}).map(([priority, rate]) => [priority, Number(rate) / 100])),
   })
+
+  // Same flag and the same reason as FormCard: the disk knobs inside Advanced settings
+  // unmount when collapsed, so a touched-based check would lose the edit.
+  const dirty = useRef(false)
+  const markDirty = useCallback(() => {
+    dirty.current = true
+    notifyDirty()
+  }, [notifyDirty])
+  const clearDirty = useCallback(() => {
+    dirty.current = false
+    notifyDirty()
+  }, [notifyDirty])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -900,6 +997,7 @@ function AutoControlPanel() {
         api.getPassiveControl(),
         api.getConfig<LimitPolicyData>('limit_policy'),
       ])
+      form.resetFields()
       form.setFieldsValue({
         enabled: pc.enabled,
         policy: lp.policy,
@@ -911,25 +1009,31 @@ function AutoControlPanel() {
       setDiskExpanded(Boolean(lp.disk_io?.enabled))
       setEnabledTs(pc.updated_at)
       setLimitTs(lp.updated_at)
+      dirty.current = false
+      notifyDirty()
     } catch (error) {
       message.error('Failed to load Smartune control settings')
       console.error(error)
     } finally {
       setLoading(false)
     }
-  }, [form])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form, notifyDirty])
 
   useEffect(() => {
     void load()
   }, [load])
 
   const onSave = async (): Promise<SaveOutcome> => {
-    let values: Record<string, unknown>
     try {
-      values = await form.validateFields()
+      await form.validateFields()
     } catch {
       return 'error'
     }
+    // Whole store, not just the mounted fields: with auto control off (or the disk section
+    // collapsed) `validateFields()` returns only `enabled`, which used to leave cpu/memory
+    // undefined here. See the same note in FormCard.onSave.
+    const values = form.getFieldsValue(true) as Record<string, unknown>
     setSaving(true)
     try {
       const policyValues = values as unknown as LimitPolicyData
@@ -973,6 +1077,7 @@ function AutoControlPanel() {
       }
 
       if (r1.data.success && r2.data.success) {
+        clearDirty()
         return 'ok'
       }
       message.error('Failed to update Smartune control settings')
@@ -996,7 +1101,7 @@ function AutoControlPanel() {
     }
   }
 
-  useRegisterSave('auto_control', { validate, isDirty: () => form.isFieldsTouched(), save: onSave })
+  useRegisterSave('auto_control', { validate, isDirty: () => dirty.current, save: onSave })
 
   const resetButton = (
     <Button icon={<ReloadOutlined />} onClick={load} disabled={saving} style={{ marginTop: 12 }}>
@@ -1010,7 +1115,7 @@ function AutoControlPanel() {
           per-channel sections are one config section server-side, so they are saved and
           reset together. The switch and the policy mode sit on the outer card because
           they govern both channels, not just CPU/memory. */}
-      <Form form={form} layout="vertical">
+      <Form form={form} layout="vertical" onFieldsChange={markDirty}>
         <Card size="small" title="Smartune Control" style={{ marginBottom: 16 }}>
           <Form.Item
             label={
@@ -1103,23 +1208,23 @@ function AutoControlPanel() {
                   <div style={{ marginTop: 12 }}>
                     <DiskRateMatrix disabled={!autoEnabled} />
 
-                    <Divider orientation="left" orientationMargin={0} plain style={{ margin: '12px 0 8px' }}>
-                      <SectionLabel
-                        text="Per-disk adjustment"
-                        tip="The rates above are calibrated for NVMe. The cap written to a disk is rate x this factor, so a priority means the same fraction of what that device can actually do instead of the same absolute MB/s."
-                        advanced
-                      />
-                    </Divider>
-                    <DiskScaleMatrix disabled={!autoEnabled} />
+                    <AdvancedSection>
+                      <Divider orientation="left" orientationMargin={0} plain style={{ margin: '0 0 8px' }}>
+                        <SectionLabel
+                          text="Per-disk adjustment"
+                          tip="The rates above are calibrated for NVMe. The cap written to a disk is rate x this factor, so a priority means the same fraction of what that device can actually do instead of the same absolute MB/s."
+                        />
+                      </Divider>
+                      <DiskScaleMatrix disabled={!autoEnabled} />
 
-                    <Divider orientation="left" orientationMargin={0} plain style={{ margin: '16px 0 8px' }}>
-                      <SectionLabel
-                        text="Minimum app I/O worth throttling"
-                        tip="Not how hard to cap, but whether capping helps at all: an app must already be doing at least this much on a disk of that media before it is considered a throttle candidate. Below it, capping cannot relieve the device, so the app is skipped and the next-heaviest consumer is considered. Either bandwidth or IOPS clearing the bar qualifies, because a small-block random workload moves few MB but still saturates the device."
-                        advanced
-                      />
-                    </Divider>
-                    <DiskFloorMatrix disabled={!autoEnabled} />
+                      <Divider orientation="left" orientationMargin={0} plain style={{ margin: '16px 0 8px' }}>
+                        <SectionLabel
+                          text="Minimum app I/O worth throttling"
+                          tip="Not how hard to cap, but whether capping helps at all: an app must already be doing at least this much on a disk of that media before it is considered a throttle candidate. Below it, capping cannot relieve the device, so the app is skipped and the next-heaviest consumer is considered. Either bandwidth or IOPS clearing the bar qualifies, because a small-block random workload moves few MB but still saturates the device."
+                        />
+                      </Divider>
+                      <DiskFloorMatrix disabled={!autoEnabled} />
+                    </AdvancedSection>
                   </div>
                 )}
               </Card>
@@ -1562,85 +1667,234 @@ function AutoLimitExclusionsCard() {
   )
 }
 
-function ReservedPanel({ title, description }: { title: string; description: string }) {
-  return <Alert type="info" showIcon message={title} description={description} style={{ marginTop: 8 }} />
+// ---------------------------------------------------------------------------
+// One config section per tab. Each tab used to hold four cards, so opening the
+// dialog fired four requests at once and the page had to be scrolled to find
+// anything; a tab per section loads exactly what is being looked at.
+//
+// `group` only draws a heading in the left rail (a disabled, unselectable item).
+// ---------------------------------------------------------------------------
+interface SettingsTabDef {
+  key: string
+  title: string
+  icon: React.ReactNode
+  panel: React.ReactNode
+  // Balancer-only sections: in monitor-only mode (`-m`) the balancer is not
+  // running, so they are omitted entirely, matching the hidden Balancer tab in App.tsx.
+  balancerOnly?: boolean
+  group?: string
+}
+
+const SETTINGS_TABS: SettingsTabDef[] = [
+  {
+    key: 'overview',
+    title: 'System Overview',
+    icon: <DashboardOutlined />,
+    panel: <MonitoredSectionsCard />,
+    group: 'Monitor',
+  },
+  { key: 'system_pressure', title: 'System Pressure', icon: <MonitorOutlined />, panel: <SystemPressurePanel /> },
+  { key: 'disk_pressure', title: 'Disk I/O Pressure', icon: <HddOutlined />, panel: <DiskPressurePanel /> },
+  { key: 'network_pressure', title: 'Network I/O Pressure', icon: <GlobalOutlined />, panel: <NetworkPressurePanel /> },
+  {
+    key: 'auto_control',
+    title: 'Auto Control',
+    icon: <ControlOutlined />,
+    panel: <AutoControlPanel />,
+    balancerOnly: true,
+    group: 'Control',
+  },
+  {
+    key: 'network_control',
+    title: 'Network Control',
+    icon: <ApiOutlined />,
+    panel: <NetworkPanel />,
+    balancerOnly: true,
+  },
+  {
+    key: 'exclusions',
+    title: 'Auto-limit Exclusions',
+    icon: <StopOutlined />,
+    panel: <AutoLimitExclusionsCard />,
+    balancerOnly: true,
+  },
+]
+
+// Heading of a group in the left rail. Larger and brighter than the tabs under it (which
+// are muted until selected) plus a gap above the second group: as small uppercase muted
+// text it read as *less* important than its own children.
+function TabGroupLabel({ text, first }: { text: string; first?: boolean }) {
+  return (
+    <span
+      style={{
+        display: 'block',
+        fontSize: 13,
+        fontWeight: 600,
+        color: COLORS.text,
+        marginTop: first ? 0 : 12,
+      }}
+    >
+      {text}
+    </span>
+  )
+}
+
+// A tab whose card holds edits that have not been written yet.
+function UnsavedDot() {
+  return (
+    <Tooltip title="Unsaved changes on this page">
+      <span
+        style={{
+          display: 'inline-block',
+          width: 6,
+          height: 6,
+          borderRadius: 3,
+          background: COLORS.accent,
+        }}
+      />
+    </Tooltip>
+  )
 }
 
 export default function SettingsModal({ visible, onClose, balancerEnabled }: Props) {
-  // Cards register here while mounted; hidden tabs are destroyed, so this only
-  // ever holds the cards the user is looking at.
-  const handles = useRef(new Map<string, SaveHandle>())
+  const tabs = SETTINGS_TABS.filter((tab) => balancerEnabled || !tab.balancerOnly)
+  const firstTabKey = tabs[0].key
+  // Cards register here while mounted. Panes stay mounted once visited, so this
+  // holds every section the user has opened -- which is what lets Save all write
+  // edits left behind on another tab.
+  const handles = useRef(new Map<string, { tabKey: string; handle: SaveHandle }>())
   const [saving, setSaving] = useState(false)
-  const register = useCallback<SaveRegistry['register']>((id, handle) => {
-    handles.current.set(id, handle)
-    return () => {
-      handles.current.delete(id)
-    }
+  const [activeTab, setActiveTab] = useState(firstTabKey)
+  const [dirtyTabs, setDirtyTabs] = useState<string[]>([])
+
+  const refreshDirty = useCallback(() => {
+    const next = [...new Set(
+      [...handles.current.values()]
+        .filter(({ handle }) => handle.isDirty?.() ?? true)
+        .map(({ tabKey }) => tabKey),
+    )].sort()
+    // Same set -> same array, so a keystroke in an already-dirty card does not
+    // re-render the whole dialog.
+    setDirtyTabs((prev) => (
+      prev.length === next.length && prev.every((key, i) => key === next[i]) ? prev : next
+    ))
   }, [])
 
-  const saveAll = async () => {
-    const pending = [...handles.current.values()].filter((handle) => handle.isDirty?.() ?? true)
+  const registry = React.useMemo<SaveRegistry>(() => ({
+    register: (id, tabKey, handle) => {
+      handles.current.set(id, { tabKey, handle })
+      return () => {
+        handles.current.delete(id)
+      }
+    },
+    notifyDirty: refreshDirty,
+  }), [refreshDirty])
+
+  // Reopening starts from the first tab with no stale markers: the panes were
+  // destroyed on close (destroyOnClose), so their handles are gone too.
+  useEffect(() => {
+    if (!visible) return
+    setActiveTab(firstTabKey)
+    setDirtyTabs([])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible])
+
+  const dirtyHandles = () => [...handles.current.values()].filter(({ handle }) => handle.isDirty?.() ?? true)
+
+  const runSave = async (pending: Array<{ tabKey: string; handle: SaveHandle }>, closeOnSuccess: boolean) => {
+    setSaving(true)
+    try {
+      // Validate everything first: a half-written save (one card written, the
+      // next rejected for a bad number) is worse than saving nothing.
+      for (const { handle } of pending) {
+        if (!(await handle.validate?.() ?? true)) return
+      }
+      const outcomes: SaveOutcome[] = []
+      for (const { handle } of pending) {
+        outcomes.push(await handle.save())
+      }
+      // Each card reports its own failure; a conflict opens its own reload
+      // dialog. Either way the dialog stays open so the user can act on it.
+      if (outcomes.every((outcome) => outcome === 'ok')) {
+        message.success('Settings saved')
+        if (closeOnSuccess) onClose()
+      }
+    } finally {
+      setSaving(false)
+      refreshDirty()
+    }
+  }
+
+  // Save writes the page in view and stays open, so a multi-tab edit can be
+  // committed one page at a time; Save all writes every touched page at once
+  // and closes, which is the "edit a few tabs, then leave" path.
+  const savePage = () => {
+    const pending = dirtyHandles().filter(({ tabKey }) => tabKey === activeTab)
+    if (pending.length === 0) {
+      message.info('No unsaved changes on this page')
+      return
+    }
+    void runSave(pending, false)
+  }
+
+  const saveAll = () => {
+    const pending = dirtyHandles()
     if (pending.length === 0) {
       onClose()
       return
     }
-    setSaving(true)
-    try {
-      // Validate everything first: a half-written tab (one card saved, the next
-      // rejected for a bad number) is worse than saving nothing.
-      for (const handle of pending) {
-        if (!(await handle.validate?.() ?? true)) return
-      }
-      const outcomes: SaveOutcome[] = []
-      for (const handle of pending) {
-        outcomes.push(await handle.save())
-      }
-      // Each card reports its own failure; a conflict opens its own reload
-      // dialog. Either way the modal stays open so the user can act on it.
-      if (outcomes.every((outcome) => outcome === 'ok')) {
-        message.success('Settings saved')
-        onClose()
-      }
-    } finally {
-      setSaving(false)
-    }
+    void runSave(pending, true)
   }
 
-  const items = [
+  const titleFor = (key: string) => tabs.find((tab) => tab.key === key)?.title ?? key
+
+  const requestClose = () => {
+    if (dirtyTabs.length === 0) {
+      onClose()
+      return
+    }
+    Modal.confirm({
+      title: 'Discard unsaved changes?',
+      content: (
+        <p>
+          Unsaved changes on: <b>{dirtyTabs.map(titleFor).join(', ')}</b>. Closing now throws
+          them away — use <b>Save all</b> to write every page first.
+        </p>
+      ),
+      okText: 'Discard and close',
+      okButtonProps: { danger: true },
+      cancelText: 'Keep editing',
+      onOk: onClose,
+    })
+  }
+
+  // Only the second group onwards gets a gap above it; the first sits right under the header.
+  const firstGroupKey = tabs.find((tab) => tab.group)?.key
+
+  const items = tabs.flatMap((tab) => [
+    // Heading rows are items so they sit in the rail's flow; disabled makes them
+    // unselectable rather than a tab that looks broken when clicked.
+    ...(tab.group
+      ? [{
+        key: `group:${tab.group}`,
+        label: <TabGroupLabel text={tab.group} first={tab.key === firstGroupKey} />,
+        disabled: true,
+        children: null,
+      }]
+      : []),
     {
-      key: 'monitor',
+      key: tab.key,
+      // Indented under its group heading, so the rail reads as heading > pages.
       label: (
-        <Space>
-          <MonitorOutlined />
-          Monitor
+        <Space size={6} style={{ paddingLeft: 10 }}>
+          {tab.icon}
+          <span>{tab.title}</span>
+          {dirtyTabs.includes(tab.key) && <UnsavedDot />}
         </Space>
       ),
-      children: <MonitorPanel />,
+      children: <SettingsTabContext.Provider value={tab.key}>{tab.panel}</SettingsTabContext.Provider>,
     },
-    // The Control tab configures the balancer; in monitor-only mode the
-    // balancer is not running, so these tabs are omitted entirely (matching how
-    // the main Balancer tab is hidden in App.tsx).
-    ...(balancerEnabled
-      ? [
-          {
-            key: 'autocontrol',
-            label: (
-              <Space>
-                <ControlOutlined />
-                Control
-              </Space>
-            ),
-            children: (
-              <>
-                <AutoControlPanel />
-                <NetworkPanel />
-                <AutoLimitExclusionsCard />
-              </>
-            ),
-          },
-        ]
-      : []),
-  ]
+  ])
 
   return (
     <Modal
@@ -1651,22 +1905,71 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
         </Space>
       }
       open={visible}
-      onCancel={onClose}
+      onCancel={requestClose}
       destroyOnClose
-      footer={[
-        <Button key="save" type="primary" icon={<SaveOutlined />} loading={saving} onClick={saveAll}>
-          Save
-        </Button>,
-        <Button key="close" onClick={onClose} disabled={saving}>
-          Close
-        </Button>,
-      ]}
+      // Two save buttons rather than one, because a per-section dialog makes the
+      // two intents different: commit every page that was touched and leave (the
+      // wider action, so it leads), or commit the page in view and carry on.
+      // Primary is given to whichever is currently actionable rather than fixed to
+      // one of them, so the blue button always marks a save that would do something.
+      // The tooltips sit on a span because a disabled antd button swallows mouse
+      // events, and Space keeps the gaps that the footer's default button-sibling
+      // margin would otherwise lose.
+      footer={
+        <Space>
+          <Tooltip
+            title={dirtyTabs.length === 0
+              ? 'Nothing to save'
+              : `Save ${dirtyTabs.map(titleFor).join(', ')} and close`}
+          >
+            <span>
+              <Button
+                type={dirtyTabs.length > 0 ? 'primary' : 'default'}
+                icon={<SaveOutlined />}
+                loading={saving}
+                disabled={dirtyTabs.length === 0}
+                onClick={saveAll}
+              >
+                {dirtyTabs.length > 1 ? `Save all (${dirtyTabs.length} pages)` : 'Save all'}
+              </Button>
+            </span>
+          </Tooltip>
+          <Tooltip title={dirtyTabs.includes(activeTab) ? 'Save this page and keep editing' : 'No unsaved changes on this page'}>
+            <span>
+              <Button
+                type={dirtyTabs.includes(activeTab) ? 'primary' : 'default'}
+                icon={<SaveOutlined />}
+                loading={saving}
+                disabled={!dirtyTabs.includes(activeTab)}
+                onClick={savePage}
+              >
+                Save page
+              </Button>
+            </span>
+          </Tooltip>
+          <Button onClick={requestClose} disabled={saving}>
+            Close
+          </Button>
+        </Space>
+      }
       width={1140}
       // The default header margin leaves the title almost touching the first tab label.
       styles={{ header: { marginBottom: 20 }, body: { maxHeight: '72vh', overflowY: 'auto' } }}
     >
-      <SettingsSaveContext.Provider value={{ register }}>
-        <Tabs tabPosition="left" items={items} style={{ minHeight: 440 }} destroyOnHidden />
+      <SettingsSaveContext.Provider value={registry}>
+        {/* No destroyOnHidden: a visited pane stays mounted, so switching tabs keeps
+            both the edits and the save handle of the page left behind. Panes are still
+            created lazily, so only the tab in view has loaded its config. */}
+        <Tabs
+          tabPosition="left"
+          items={items}
+          activeKey={activeTab}
+          onChange={(key) => {
+            setActiveTab(key)
+            refreshDirty()
+          }}
+          style={{ minHeight: 440 }}
+        />
       </SettingsSaveContext.Provider>
     </Modal>
   )

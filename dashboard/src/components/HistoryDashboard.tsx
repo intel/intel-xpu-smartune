@@ -556,9 +556,9 @@ function buildPressureTrendPoints(items: HistorySnapshotItem[]): PressureTrendPo
     // Disk pressure: busy-disk ratio from _compute_disk_pressure (busy_disks/total_disks × 100)
     const diskBusyPct = (dynamic?.disk as Record<string, unknown> | undefined)?.busy_pct
     const diskPressure = isNumber(diskBusyPct as number | null) ? (diskBusyPct as number) : null
-    // Network pressure: busy-NIC ratio from _compute_network_pressure (busy_nics/total_nics × 100)
-    const netBusyPct = (dynamic?.pressure as Record<string, unknown> | undefined)?.network_busy_pct
-    const networkPressure = isNumber(netBusyPct as number | null) ? (netBusyPct as number) : null
+    // Network pressure: worst fused RX/TX score across monitored NICs.
+    const netPressurePct = (dynamic?.pressure as Record<string, unknown> | undefined)?.network_pressure_pct
+    const networkPressure = isNumber(netPressurePct as number | null) ? (netPressurePct as number) : null
     return {
       timestamp: label,
       ts,
@@ -703,23 +703,48 @@ function buildNetworkTrendPoints(items: HistorySnapshotItem[]): { points: Networ
 
     const network = dynamic?.network as (DynamicInfoData['network'] & {
       per_nic?: Record<string, { util?: number | null; rx_mbps?: number | null; tx_mbps?: number | null; rx?: number | null; tx?: number | null; speed_mbps?: number | null } | number | null>
+      interfaces?: Record<string, { rx_bytes_per_sec?: number | null; tx_bytes_per_sec?: number | null }>
+      pressure_interfaces?: DynamicInfoData['pressure']['network_interfaces']
     }) | undefined
-    const perNic = network?.per_nic
+    const pressureInterfaces = dynamic?.pressure?.network_interfaces ?? network?.pressure_interfaces
+    const perNic = network?.per_nic ?? (network?.interfaces
+      ? Object.fromEntries(Object.entries(network.interfaces).map(([name, value]) => [name, {
+          rx_mbps: toNumber(value?.rx_bytes_per_sec) != null ? (value.rx_bytes_per_sec as number) / 1_000_000 : null,
+          tx_mbps: toNumber(value?.tx_bytes_per_sec) != null ? (value.tx_bytes_per_sec as number) / 1_000_000 : null,
+        }]))
+      : undefined)
     if (perNic && typeof perNic === 'object') {
       for (const [name, val] of Object.entries(perNic)) {
         nicNameSet.add(name)
         if (val && typeof val === 'object') {
-          const rxTxMax = val.rx != null || val.tx != null ? Math.max(val.rx ?? 0, val.tx ?? 0) : null
-          point[`${name}:util`] = toNumber(val.util) ?? normalizePressureFraction(rxTxMax)
+          const speed = toNumber(val.speed_mbps)
+          const rxMbps = toNumber(val.rx_mbps)
+          const txMbps = toNumber(val.tx_mbps)
+          point[`${name}:rxUtil`] = speed && speed > 0 && rxMbps != null
+            ? Math.min(rxMbps / speed * 100, 100)
+            : null
+          point[`${name}:txUtil`] = speed && speed > 0 && txMbps != null
+            ? Math.min(txMbps / speed * 100, 100)
+            : null
           point[`${name}:rx`] = toNumber(val.rx_mbps) ?? null
           point[`${name}:tx`] = toNumber(val.tx_mbps) ?? null
+          const pressure = pressureInterfaces?.[name]
+          point[`${name}:rxLoss`] = toNumber(pressure?.rx?.drop_ratio_pct)
+          point[`${name}:rxCongestion`] = toNumber(pressure?.rx?.distress_pct)
+          point[`${name}:txLoss`] = toNumber(pressure?.tx?.drop_ratio_pct)
+          point[`${name}:txCongestion`] = toNumber(pressure?.tx?.distress_pct)
           const sp = toNumber(val.speed_mbps)
           if (sp != null && sp > 0) speedMap[name] = sp
         } else {
           // Old format: single utilization number
-          point[`${name}:util`] = typeof val === 'number' ? normalizePercent(val) : null
+          point[`${name}:rxUtil`] = null
+          point[`${name}:txUtil`] = null
           point[`${name}:rx`] = null
           point[`${name}:tx`] = null
+          point[`${name}:rxLoss`] = null
+          point[`${name}:rxCongestion`] = null
+          point[`${name}:txLoss`] = null
+          point[`${name}:txCongestion`] = null
         }
       }
     } else {
@@ -727,9 +752,15 @@ function buildNetworkTrendPoints(items: HistorySnapshotItem[]): { points: Networ
       const aggUtil = toNumber((network as DynamicInfoData['network'] & HistoryNetworkExtra)?.utilization_percent)
       if (aggUtil != null) {
         nicNameSet.add('total')
-        point['total:util'] = aggUtil
+        // The legacy aggregate has no direction split; do not present it as RX.
+        point['total:rxUtil'] = null
+        point['total:txUtil'] = null
         point['total:rx'] = null
         point['total:tx'] = null
+        point['total:rxLoss'] = null
+        point['total:rxCongestion'] = null
+        point['total:txLoss'] = null
+        point['total:txCongestion'] = null
       }
     }
     return point
@@ -2623,9 +2654,14 @@ export default function HistoryDashboard({ active }: Props) {
       {/* Network — Utilization & Bandwidth per NIC */}
       {visibleSections.includes('network') && !loading && nicNames.length > 0 && nicNames.map((nicName) => {
         const nicLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string }> = [
-          { key: `${nicName}:util`, name: 'Util %', color: METRIC_COLORS.util, yAxisId: 'util' },
-          { key: `${nicName}:rx`, name: 'RX Mbps', color: METRIC_COLORS.rx, yAxisId: 'bw' },
-          { key: `${nicName}:tx`, name: 'TX Mbps', color: METRIC_COLORS.tx, yAxisId: 'bw' },
+          { key: `${nicName}:rxUtil`, name: 'Receive (RX) Util %', color: METRIC_COLORS.rx, yAxisId: 'util' },
+          { key: `${nicName}:txUtil`, name: 'Send (TX) Util %', color: METRIC_COLORS.tx, yAxisId: 'util' },
+          { key: `${nicName}:rx`, name: 'Receive (RX) Mbps', color: METRIC_COLORS.rx, yAxisId: 'bw' },
+          { key: `${nicName}:tx`, name: 'Send (TX) Mbps', color: METRIC_COLORS.tx, yAxisId: 'bw' },
+          { key: `${nicName}:rxLoss`, name: 'Receive (RX) Packet Loss %', color: '#f59e0b', dasharray: '5 3', yAxisId: 'util' },
+          { key: `${nicName}:rxCongestion`, name: 'Receive (RX) Congestion %', color: '#fb7185', dasharray: '2 2', yAxisId: 'util' },
+          { key: `${nicName}:txLoss`, name: 'Send (TX) Packet Loss %', color: '#a78bfa', dasharray: '5 3', yAxisId: 'util' },
+          { key: `${nicName}:txCongestion`, name: 'Send (TX) Congestion %', color: '#f97316', dasharray: '2 2', yAxisId: 'util' },
         ]
         return (
         <Card

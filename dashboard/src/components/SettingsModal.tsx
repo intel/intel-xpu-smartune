@@ -781,20 +781,36 @@ function NetworkPressurePanel() {
         description="Bands for the network channel: the utilisation of the monitored interfaces is graded against these thresholds, and the level drives the pressure-based bandwidth shaping in Network Control."
         scope="network_pressure"
         load={async () => {
-          const d = await api.getConfig<{ network_thresholds: Record<string, number>; updated_at?: number }>('network_pressure')
-          return { values: { network_thresholds: toPercentageThresholds(d.network_thresholds) }, updatedAt: d.updated_at }
+          const d = await api.getConfig<{
+            network_thresholds: Record<string, number>
+            network_pressure_model?: { rx_drop_weight?: number }
+            updated_at?: number
+          }>('network_pressure')
+          return {
+            values: {
+              network_thresholds: toPercentageThresholds(d.network_thresholds),
+              network_pressure_model_rx_drop_weight: Number(d.network_pressure_model?.rx_drop_weight ?? 0.5),
+            },
+            updatedAt: d.updated_at,
+          }
         }}
         save={(values, ts) => api.updateConfig('network_pressure', {
           network_thresholds: toRatioThresholds(values.network_thresholds as Record<string, number>),
+          network_pressure_model: {
+            rx_drop_weight: Number(values.network_pressure_model_rx_drop_weight),
+          },
         }, ts)}
         currentToValues={(c) => ({
           network_thresholds: toPercentageThresholds(c.network_thresholds as Record<string, number>),
+          network_pressure_model_rx_drop_weight: Number(
+            ((c.network_pressure_model as { rx_drop_weight?: number } | undefined)?.rx_drop_weight) ?? 0.5,
+          ),
         })}
       >
         <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
           <SectionLabel
-            text="Utilisation thresholds (%, ordered)"
-            tip="Maps overall network utilisation to low, medium, high, and critical. Thresholds must increase in that order."
+            text="Network pressure thresholds (%, ordered)"
+            tip="Maps the fused network pressure score to low, medium, high, and critical. The score combines near-saturation utilisation with congestion distress such as drops, FIFO overflow, and softnet pressure. Thresholds must increase in that order."
           />
         </Divider>
         <Row gutter={16}>
@@ -811,6 +827,22 @@ function NetworkPressurePanel() {
             </Col>
           ))}
         </Row>
+
+        <AdvancedSection>
+          <Row gutter={16}>
+            <Col span={8}>
+              <Form.Item
+                label="RX drop weight"
+                name="network_pressure_model_rx_drop_weight"
+                tooltip="Weight of generic rx_dropped distress in RX pressure scoring. Lower values make RX drops contribute less to pressure; valid range is 0 to 1."
+                required={false}
+                rules={[{ required: true, type: 'number', min: 0, max: 1 }]}
+              >
+                <InputNumber style={{ width: '100%' }} min={0} max={1} step={0.05} />
+              </Form.Item>
+            </Col>
+          </Row>
+        </AdvancedSection>
       </FormCard>
     </>
   )
@@ -1260,6 +1292,8 @@ function NetworkPanel() {
         const d = await api.getConfig<{
           enable_network_control: boolean
           enable_network_pressure_shaping: boolean
+          enable_app_pps_police: boolean
+          network_pps_policy: { app_pps_high: number; pps_cap_rate: number; pps_cap_burst: number }
           available_network_interfaces: Array<{ name: string; speed_mbps: number }>
           selected_network_interfaces: string[]
           config_network_bw: Record<string, { min: number; max: number }>
@@ -1271,6 +1305,8 @@ function NetworkPanel() {
           values: {
             enable_network_control: Boolean(d.enable_network_control),
             enable_network_pressure_shaping: Boolean(d.enable_network_pressure_shaping ?? true),
+            enable_app_pps_police: Boolean(d.enable_app_pps_police),
+            network_pps_policy: d.network_pps_policy,
             available_network_interfaces: d.available_network_interfaces ?? [],
             selected_network_interfaces: d.selected_network_interfaces ?? [],
             config_network_bw: toPercentages(d.config_network_bw),
@@ -1283,6 +1319,8 @@ function NetworkPanel() {
         api.updateConfig('network_control', {
           enable_network_control: Boolean(values.enable_network_control),
           enable_network_pressure_shaping: Boolean(values.enable_network_pressure_shaping),
+          enable_app_pps_police: Boolean(values.enable_app_pps_police),
+          network_pps_policy: values.network_pps_policy,
           ...(Boolean(values.enable_network_control)
             ? { selected_network_interfaces: values.selected_network_interfaces }
             : {}),
@@ -1299,6 +1337,8 @@ function NetworkPanel() {
       currentToValues={(c) => ({
         enable_network_control: Boolean(c.enable_network_control),
         enable_network_pressure_shaping: Boolean(c.enable_network_pressure_shaping ?? true),
+        enable_app_pps_police: Boolean(c.enable_app_pps_police),
+        network_pps_policy: c.network_pps_policy,
         available_network_interfaces: c.available_network_interfaces,
         selected_network_interfaces: c.selected_network_interfaces,
         config_network_bw: toPercentages(c.config_network_bw as Record<string, { min: number; max: number }> | undefined),
@@ -1308,6 +1348,8 @@ function NetworkPanel() {
       <Form.Item noStyle shouldUpdate>
         {({ getFieldValue, setFieldsValue }) => {
           const networkControlEnabled = Boolean(getFieldValue('enable_network_control'))
+          const pressureShapingEnabled = Boolean(getFieldValue('enable_network_pressure_shaping'))
+          const packetFloodProtectionEnabled = Boolean(getFieldValue('enable_app_pps_police'))
           const availableNetworkInterfaces = (
             getFieldValue('available_network_interfaces') as Array<{ name: string; speed_mbps: number }> | undefined
           ) ?? []
@@ -1386,7 +1428,72 @@ function NetworkPanel() {
                         />
                       </Form.Item>
                     </Col>
+                    <Col span={14}>
+                      <Form.Item
+                        label="Per-app packet flood protection"
+                        name="enable_app_pps_police"
+                        valuePropName="checked"
+                        tooltip="Caps lower-priority outbound applications only when fused TX pressure indicates a small-packet flood. Requires automatic network control."
+                      >
+                        <Switch
+                          checkedChildren="On"
+                          unCheckedChildren="Off"
+                          disabled={!networkControlEnabled || !pressureShapingEnabled}
+                        />
+                      </Form.Item>
+                    </Col>
                   </Row>
+
+                  <AdvancedSection>
+                    <Divider orientation="left" orientationMargin={0} plain style={{ margin: '0 0 12px' }}>
+                      <SectionLabel
+                        text="Packet flood policy"
+                        tip="Tune the outbound small-packet flood candidate threshold and the per-app packet-rate cap. Changes apply when packet flood protection is enabled."
+                      />
+                    </Divider>
+                    <Row gutter={12}>
+                      <Col span={8}>
+                        <Form.Item
+                          label="Candidate threshold (PPS)"
+                          name={['network_pps_policy', 'app_pps_high']}
+                          tooltip="A lower-priority app must exceed this outbound packet rate, while causing network harm, before packet flood protection can select it for limiting. Use it as the upper reference when setting the per-app cap."
+                          rules={[{ required: true, type: 'integer', min: 1 }]}
+                        >
+                          <InputNumber style={{ width: '100%' }} min={1} step={1000} disabled={!networkControlEnabled || !pressureShapingEnabled || !packetFloodProtectionEnabled} />
+                        </Form.Item>
+                      </Col>
+                      <Col span={8}>
+                        <Form.Item
+                          label="Per-app cap (PPS)"
+                          name={['network_pps_policy', 'pps_cap_rate']}
+                          tooltip="The sustained packet-rate limit applied after an app exceeds the candidate threshold and is selected for protection. Packets above this rate are dropped after its burst allowance is used."
+                          dependencies={[['network_pps_policy', 'app_pps_high']]}
+                          rules={[
+                            { required: true, type: 'integer', min: 1 },
+                            ({ getFieldValue }) => ({
+                              validator(_, value) {
+                                const threshold = getFieldValue(['network_pps_policy', 'app_pps_high'])
+                                return value <= threshold
+                                  ? Promise.resolve()
+                                  : Promise.reject(new Error('Cap cannot exceed candidate threshold'))
+                              },
+                            }),
+                          ]}
+                        >
+                          <InputNumber style={{ width: '100%' }} min={1} step={1000} disabled={!networkControlEnabled || !pressureShapingEnabled || !packetFloodProtectionEnabled} />
+                        </Form.Item>
+                      </Col>
+                      <Col span={8}>
+                        <Form.Item
+                          label="Burst (packets)"
+                          name={['network_pps_policy', 'pps_cap_burst']}
+                          rules={[{ required: true, type: 'integer', min: 1 }]}
+                        >
+                          <InputNumber style={{ width: '100%' }} min={1} step={100} disabled={!networkControlEnabled || !pressureShapingEnabled || !packetFloodProtectionEnabled} />
+                        </Form.Item>
+                      </Col>
+                    </Row>
+                  </AdvancedSection>
 
                   <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
                     <SectionLabel

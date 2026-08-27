@@ -54,6 +54,15 @@ class Config:
     # monitor_idle_check_interval so detection latency stays short.
     limit_reap_interval: float = 2
     network_thresholds: dict = None
+    # Calibration knobs for the NIC pressure model (NetworkMonitor._model): EMA smoothing,
+    # distress decay, per-core pps budget, and drop/fifo/softnet half-points. Optional and
+    # partially overridable -- anything absent uses the module default in monitor/network.py.
+    network_pressure_model: dict = None
+    # Small-packet flood policy used by the network controller. Optional; controller
+    # fills missing keys with conservative defaults.
+    network_pps_policy: dict = None
+    # Optional TC-only per-application packet flood protection.
+    enable_app_pps_police: bool = False
     network_interfaces: list = None
     enable_network_control: bool = False
     enable_network_pressure_shaping: bool = True
@@ -763,6 +772,8 @@ class Config:
         Supported updates:
           * enable_network_control: bool
           * enable_network_pressure_shaping: bool
+          * enable_app_pps_police: bool
+          * network_pps_policy: {app_pps_high, pps_cap_rate, pps_cap_burst}
           * config_network_bw: {priority: {min: ratio, max: ratio}}
 
         Ratios are expected in [0, 1]. Only changed leaves are patched in YAML.
@@ -789,6 +800,26 @@ class Config:
                     self.enable_network_pressure_shaping = shaping_enabled
                     yaml_updates[("enable_network_pressure_shaping",)] = shaping_enabled
                     modified = True
+
+            if "enable_app_pps_police" in updates:
+                enabled = bool(updates["enable_app_pps_police"])
+                if getattr(self, "enable_app_pps_police", False) != enabled:
+                    self.enable_app_pps_police = enabled
+                    yaml_updates[("enable_app_pps_police",)] = enabled
+                    modified = True
+
+            pps_updates = updates.get("network_pps_policy")
+            if isinstance(pps_updates, dict):
+                current_policy = self.network_pps_policy if isinstance(self.network_pps_policy, dict) else {}
+                for key in ("app_pps_high", "pps_cap_rate", "pps_cap_burst"):
+                    if key not in pps_updates:
+                        continue
+                    value = int(pps_updates[key])
+                    if current_policy.get(key) != value:
+                        current_policy[key] = value
+                        yaml_updates[("network_pps_policy", key)] = value
+                        modified = True
+                self.network_pps_policy = current_policy
 
             bw_updates = updates.get("config_network_bw")
             if isinstance(bw_updates, dict):

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import glob
+import re
 # [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments
 # with shell=False (default). No untrusted shell execution or string
 # concatenation is performed. All inputs are internally validated.
@@ -11,6 +13,7 @@ import time
 from utils.logger import logger
 from config.config import b_config
 from monitor import NetworkMonitor
+from monitor.network_pressure import publish_network_pressure_snapshot
 from monitor.system_info import _get_network_static_info
 from utils import app_utils
 
@@ -27,6 +30,31 @@ NETWORK_PRIORITIES = ("critical", "high", "low", "system")
 # we pick r2q per NIC from its total bandwidth rather than hard-coding it — this
 # keeps quantum in range whether the link is 100Mbit or 10Gbit.
 _TARGET_HTB_QUANTUM_BYTES = 100000
+
+_DEFAULT_NETWORK_PPS_POLICY = {
+    "enable_fq_codel": True,
+    "enable_rps_escalation": True,
+    "enable_netdev_budget_bump": False,
+    "collective_harm_threshold": 0.5,
+    "pps_window_sec": 5.0,
+}
+
+_PPS_POLICY_BOOL_KEYS = {
+    "enable_fq_codel",
+    "enable_rps_escalation",
+    "enable_netdev_budget_bump",
+}
+
+_PPS_POLICY_FLOAT_KEYS = {
+    "app_pps_high",
+    "collective_harm_threshold",
+    "pps_window_sec",
+}
+
+_PPS_POLICY_INT_KEYS = {
+    "pps_cap_rate",
+    "pps_cap_burst",
+}
 
 
 def compute_r2q(total_bw_kbit):
@@ -50,17 +78,25 @@ class _NicShaper:
 
     Each controlled interface owns an independent tc tree: the physical device
     plus a paired IFB device (for ingress shaping), a unique tc handle, its own
-    bandwidth budget and NetworkMonitor, and per-direction throttle stages and
-    class ids. Holding one of these per NIC is what makes multi-NIC support
-    possible — the controller simply iterates over a list of shapers.
+    bandwidth budget, a reference to its NIC's NetworkMonitor (owned by the
+    monitoring layer), and per-direction throttle stages and class ids. Holding
+    one of these per NIC is what makes multi-NIC support possible — the
+    controller simply iterates over a list of shapers.
+
+    A shaper is built only for NICs with a known link speed; monitoring runs for
+    every usable NIC regardless (see NetworkController.monitors).
     """
 
-    def __init__(self, dev, ifb_dev, handle_id, total_bw):
+    def __init__(self, dev, ifb_dev, handle_id, total_bw, monitor):
         self.dev = dev
         self.ifb_dev = ifb_dev
         self.handle_id = handle_id
         self.total_bw = total_bw
-        self.monitor = NetworkMonitor(dev, total_bw)
+        # Shared with NetworkController.monitors[dev]: the monitor is owned by the
+        # monitoring layer (built for every usable NIC) and merely referenced here so
+        # tc-class-stats collection can reuse the same sampling object. A shaper never
+        # constructs its own monitor -- monitoring must run even for un-shapeable NICs.
+        self.monitor = monitor
         # Per-direction throttle stage (0 == unlimited) and cooldown timestamps.
         self.tx_limit_stage = 0
         self.rx_limit_stage = 0
@@ -85,6 +121,14 @@ class NetworkController:
         self.mark_pool = set(hex(i) for i in range(0x1000, 0x2000))
         self.app_mark_map = {}
         self.app_filter_info = {}
+        self.app_pps_samples = {}
+        self.app_pps_rates = {}
+        self.app_pps_caps = {}
+        self._app_pps_police_supported = None
+        self._rx_escalation_state = {}
+        # Last TX pps-gate outcome we logged, so a sustained flood logs on transitions
+        # instead of every eval cycle.
+        self._last_pps_gate_signature = None
         # Set when the API persists new network config; the monitor thread picks
         # this up at the top of its next cycle and rebuilds, so all tc mutations
         # stay on a single thread (no locking around live tc operations).
@@ -92,9 +136,12 @@ class NetworkController:
 
         self._load_config_state()
 
-        # Build one shaper per existing configured interface.
+        # Monitoring is built for every usable NIC; shaping only for the subset with a
+        # known link speed. Monitors must exist before shapers -- each shaper references
+        # its NIC's monitor from self.monitors.
+        self.monitors = self._build_monitors()
         self.shapers = self._build_shapers()
-        if not self.shapers:
+        if not self.monitors:
             logger.warning("No usable network interface found; disable network sampling/control.")
             self.enable_network_control = False
 
@@ -124,7 +171,7 @@ class NetworkController:
             config_network_bw = {
                 "critical": {"min": 0.6, "max": 0.9},
                 "high": {"min": 0.3, "max": 0.8},
-                "low": {"min": 0.1, "max": 0.3},
+                "low": {"min": 0.1, "max": 1.0},
                 "system": {"min": 0.05, "max": 0.1},
             }
         burst_map = getattr(self.config, "network_burst_map", None)
@@ -137,6 +184,32 @@ class NetworkController:
             }
         self.config_network_bw = config_network_bw
         self.network_burst_map = burst_map
+        self.network_pps_policy = self._normalized_pps_policy(
+            getattr(self.config, "network_pps_policy", None)
+        )
+        self.enable_app_pps_police = bool(
+            getattr(self.config, "enable_app_pps_police", False)
+        )
+
+    def _normalized_pps_policy(self, raw_policy):
+        policy = dict(_DEFAULT_NETWORK_PPS_POLICY)
+        if not isinstance(raw_policy, dict):
+            return policy
+
+        for key, value in raw_policy.items():
+            if key in _PPS_POLICY_BOOL_KEYS:
+                policy[key] = bool(value)
+            elif key in _PPS_POLICY_FLOAT_KEYS:
+                try:
+                    policy[key] = float(value)
+                except (TypeError, ValueError):
+                    continue
+            elif key in _PPS_POLICY_INT_KEYS:
+                try:
+                    policy[key] = max(1, int(value))
+                except (TypeError, ValueError):
+                    continue
+        return policy
 
     def request_reload(self):
         """Signal the monitor thread to rebuild network shaping from current config.
@@ -163,26 +236,35 @@ class NetworkController:
         # Reset per-app and mark state; apps get re-added on the next cycle.
         self.app_mark_map = {}
         self.app_filter_info = {}
+        self.app_pps_samples = {}
+        self.app_pps_rates = {}
+        self.app_pps_caps = {}
+        self._app_pps_police_supported = None
+        self._last_pps_gate_signature = None
         self.mark_pool = set(hex(i) for i in range(0x1000, 0x2000))
 
         # Re-read config and re-detect interfaces.
         self._load_config_state()
+        self.monitors = self._build_monitors()
         self.shapers = self._build_shapers()
-        if not self.shapers:
+        if not self.monitors:
             logger.warning("No usable network interface found after reload; network control disabled.")
             self.enable_network_control = False
             return
-        self.setup_tc_classes_and_filters()
-        logger.info("Network configuration reload complete (%d interface(s) active).", len(self.shapers))
+        if self.shapers:
+            self.setup_tc_classes_and_filters()
+        logger.info("Network configuration reload complete (%d monitored, %d shaped).",
+                    len(self.monitors), len(self.shapers))
 
     # ------------------------------------------------------------------ config
 
     def _resolve_nic_specs(self):
         """Return the NICs to shape as a list of (name,) tuples.
 
-        A configured ``network_interfaces`` list is the user's explicit
-        selection. When no selection has ever been saved, all usable physical
-        NICs are selected automatically. Bandwidth is always system-detected.
+        A configured ``network_interfaces`` list is the user's explicit TC
+        selection. When TC is disabled and that list is empty, all usable
+        physical NICs are sampled for pressure monitoring only. Bandwidth is
+        always system-detected.
         """
         nics = getattr(self.config, "network_interfaces", None)
         if nics is not None:
@@ -199,7 +281,9 @@ class NetworkController:
                     continue
                 seen.add(name)
                 specs.append((name, None))
-            return specs
+            if specs or self.enable_network_control:
+                return specs
+            logger.info("No TC interface selected; auto-detecting NICs for network pressure monitoring.")
 
         detected = _get_network_static_info().get("valid_nics", [])
         names = [nic.get("name") for nic in detected if isinstance(nic, dict) and nic.get("name")]
@@ -225,31 +309,84 @@ class NetworkController:
     def _bandwidth_for(self, iface):
         """Detect the bandwidth (kbit/s) for a given interface.
 
-        Returns the link speed read from sysfs. Returns 0 when the speed can't
-        be determined (link down, WiFi/virtual driver). The caller treats 0 as
-        "not shapeable" and skips the NIC — bandwidth is never user-configured.
+        Prefer the sysfs speed, then fall back to the static network inventory
+        used by the About and Network views. This keeps pressure monitoring
+        available when a driver exposes its speed through psutil but not the
+        sysfs speed file. Returns 0 only when neither source knows the speed.
         """
         detected = self._detect_link_speed_kbit(iface)
         if detected:
             logger.info("Interface '%s': detected link speed %d kbit/s.", iface, detected)
-        return detected
+            return detected
 
-    def _build_shapers(self):
-        shapers = []
-        idx = 0
+        valid_nics = _get_network_static_info().get("valid_nics", [])
+        for nic in valid_nics:
+            if not isinstance(nic, dict) or nic.get("name") != iface:
+                continue
+            try:
+                speed_mbps = int(nic.get("speed_mbps", 0))
+            except (TypeError, ValueError):
+                break
+            if speed_mbps > 0:
+                fallback = speed_mbps * 1000
+                logger.info(
+                    "Interface '%s': using static inventory speed %d kbit/s for pressure monitoring.",
+                    iface, fallback,
+                )
+                return fallback
+            break
+        return 0
+
+    def _build_monitors(self):
+        """One NetworkMonitor per *usable* NIC, keyed by device name.
+
+        Monitoring is independent of shaping: a NIC is monitored as long as it exists
+        and is not a bond/bridge slave. Link speed is NOT required -- NetworkMonitor
+        accepts ``bandwidth_kbit=0`` and scores pps/congestion only, so a NIC whose
+        speed the driver never reports still produces a live pressure snapshot for the
+        dashboard. Bandwidth only gates *shaping* (see :meth:`_build_shapers`).
+        """
+        monitors = {}
         for iface, _unused in self._resolve_nic_specs():
             if not os.path.exists(f"/sys/class/net/{iface}"):
                 logger.warning(f"Network interface '{iface}' does not exist; skipping.")
                 continue
+            # Enslaved NICs (bond/team slaves, bridge ports) expose a `master` symlink; the
+            # master carries the traffic, so both shaping and pressure attribution belong to
+            # the master. Skip even if explicitly configured (auto-detect already filters
+            # these via _is_candidate_interface).
+            if os.path.islink(f"/sys/class/net/{iface}/master"):
+                master = os.path.basename(os.readlink(f"/sys/class/net/{iface}/master"))
+                logger.warning(
+                    "Skipping interface '%s': it is enslaved to '%s' (bond/bridge). "
+                    "Configure the master interface instead.", iface, master)
+                continue
+            if iface in monitors:
+                continue
+            total_bw = self._bandwidth_for(iface)
+            monitors[iface] = NetworkMonitor(iface, total_bw)
+            logger.info("Network pressure monitoring enabled on '%s' (bandwidth=%s).",
+                        iface, f"{total_bw} kbit/s" if total_bw > 0 else "unknown")
+        return monitors
+
+    def _build_shapers(self):
+        """One _NicShaper per *shapeable* NIC (subset of self.monitors with a known link
+        speed). Bandwidth-unknown NICs are monitored but not shaped -- TC needs the link
+        rate to size classes. Each shaper references its NIC's monitor from self.monitors.
+        """
+        shapers = []
+        idx = 0
+        for iface, monitor in self.monitors.items():
             total_bw = self._bandwidth_for(iface)
             if total_bw <= 0:
                 logger.warning(
-                    "Skipping interface '%s': link speed unavailable "
-                    "(link down or driver does not report speed).", iface)
+                    "Interface '%s': link speed unavailable "
+                    "(link down or driver does not report speed); "
+                    "monitoring only, no traffic shaping.", iface)
                 continue
             handle_id = self.base_handle_id + 2 * idx
             ifb_dev = f"ifb{idx}"
-            shapers.append(_NicShaper(iface, ifb_dev, handle_id, total_bw))
+            shapers.append(_NicShaper(iface, ifb_dev, handle_id, total_bw, monitor))
             logger.info(f"Network shaping enabled on '{iface}' (ifb={ifb_dev}, "
                         f"handle={handle_id}, bandwidth={total_bw} kbit/s)")
             idx += 1
@@ -373,6 +510,7 @@ class NetworkController:
         info = self.app_filter_info.get(app_id)
         if not info:
             return
+        self._clear_app_pps_cap(app_id)
         mark = info.get("mark")
         cgroup_paths = info.get("cgroup_paths") or []
         if isinstance(cgroup_paths, str):
@@ -447,6 +585,8 @@ class NetworkController:
 
                 classid_egress = self._get_classid(handle_id, key)
                 subprocess.run(["tc", "class", "add", "dev", dev, "parent", f"{handle_id}:1", "classid", classid_egress, "htb", "rate", f"{min_bw}kbit", "ceil", f"{max_bw}kbit", "burst", burst, "cburst", burst], check=False)
+                if self.network_pps_policy.get("enable_fq_codel", True):
+                    subprocess.run(["tc", "qdisc", "add", "dev", dev, "parent", classid_egress, "handle", self._fq_codel_handle(handle_id, key), "fq_codel"], check=False)
 
                 classid_ifb = self._get_classid(handle_id + 1, key)
                 subprocess.run(["tc", "class", "add", "dev", IFB_DEV, "parent", f"{handle_id+1}:1", "classid", classid_ifb, "htb", "rate", f"{min_bw}kbit", "ceil", f"{max_bw}kbit", "burst", burst, "cburst", burst], check=False)
@@ -501,6 +641,10 @@ class NetworkController:
         mapping = {"critical": 10, "high": 20, "low": 30, "system": 5}
         num = mapping[normalize_net_priority(priority)]
         return f"{handle}:{num}"
+
+    def _fq_codel_handle(self, handle, priority):
+        mapping = {"critical": 10, "high": 20, "low": 30, "system": 5}
+        return f"{handle}{mapping[normalize_net_priority(priority)]:02d}:"
 
     def _get_class_bandwidth(self, priority, total_bw):
         # Tiers are stored as ratios (0..1) of total_bw; convert to kbit/s here.
@@ -637,18 +781,303 @@ class NetworkController:
         time_since_recover = time.time() - last_recover_time
         return time_since_limit > cooldown and time_since_recover > cooldown
 
+    def _tier_rank(self, priority):
+        return {"low": 1, "high": 2, "critical": 3, "system": 4}.get(
+            normalize_net_priority(priority), 1
+        )
+
+    def _read_app_mark_packet_counts(self):
+        result = subprocess.run(
+            ["iptables", "-t", "mangle", "-nvxL", "OUTPUT"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if getattr(result, "returncode", 0) != 0:
+            return {}
+
+        counts_by_mark = {}
+        for line in getattr(result, "stdout", "").splitlines():
+            parts = line.split()
+            if len(parts) < 2 or not parts[0].isdigit():
+                continue
+            match = re.search(r"MARK\s+set\s+(0x[0-9a-fA-F]+|\d+)", line)
+            if not match:
+                continue
+            mark_value = int(match.group(1), 0)
+            counts_by_mark[mark_value] = counts_by_mark.get(mark_value, 0) + int(parts[0])
+        return counts_by_mark
+
+    def _sample_app_pps(self):
+        now = time.time()
+        counts_by_mark = self._read_app_mark_packet_counts()
+        pps_rates = {}
+        max_window = max(0.1, float(self.network_pps_policy.get("pps_window_sec", 5.0)))
+
+        for app_id, info in self.app_filter_info.items():
+            mark = info.get("mark")
+            if not mark:
+                continue
+            mark_value = int(mark, 16) if isinstance(mark, str) else int(mark)
+            packets = counts_by_mark.get(mark_value)
+            if packets is None:
+                continue
+            previous = self.app_pps_samples.get(app_id)
+            if previous:
+                previous_packets, previous_time = previous
+                elapsed = max(0.001, now - previous_time)
+                if elapsed <= max_window * 2:
+                    pps_rates[app_id] = max(0.0, packets - previous_packets) / elapsed
+            self.app_pps_samples[app_id] = (packets, now)
+
+        active_ids = set(self.app_filter_info.keys())
+        self.app_pps_samples = {
+            app_id: sample for app_id, sample in self.app_pps_samples.items()
+            if app_id in active_ids
+        }
+        self.app_pps_rates.update(pps_rates)
+        return pps_rates
+
+    def _evaluate_tx_pps_gate(self, network_data):
+        # Harm is either the egress byte-path (tx_fifo) or the softirq commons (softnet): a
+        # small-packet flood burns softirq without producing tx_fifo drops, so both count.
+        tx_harm = float(network_data.get("tx_collective_harm", 0.0) or 0.0)
+        softirq_harm = float(network_data.get("softirq_harm", 0.0) or 0.0)
+        harm = max(tx_harm, softirq_harm)
+        threshold = float(self.network_pps_policy.get("collective_harm_threshold", 0.5))
+        if harm < threshold:
+            return []
+
+        pps_rates = self._sample_app_pps()
+        pps_high = float(self.network_pps_policy.get("app_pps_high", 50000.0))
+        ranked_apps = {
+            app_id: self._tier_rank(info.get("priority", "low"))
+            for app_id, info in self.app_filter_info.items()
+            if info.get("mark")
+        }
+        if not ranked_apps:
+            if self._last_pps_gate_signature != "no_marked_apps":
+                logger.info("TX pps gate: collective harm %.3f but no marked apps are available", harm)
+                self._last_pps_gate_signature = "no_marked_apps"
+            return []
+
+        top_rank = max(ranked_apps.values())
+        candidates = []
+        for app_id, pps in pps_rates.items():
+            app_rank = ranked_apps.get(app_id, 1)
+            if pps >= pps_high and app_rank < top_rank:
+                candidates.append({
+                    "app_id": app_id,
+                    "pps": pps,
+                    "priority": self.app_filter_info[app_id].get("priority", "low"),
+                })
+
+        # Log on transitions only: a sustained flood keeps the same candidate set every
+        # eval cycle, and re-logging it each time is noise.
+        signature = ("hit", tuple(sorted(c["app_id"] for c in candidates))) if candidates else "miss"
+        if signature != self._last_pps_gate_signature:
+            if candidates:
+                logger.info(
+                    "TX pps gate: harm=%.3f (tx_fifo=%.3f softirq=%.3f) threshold=%.3f candidates=%s",
+                    harm,
+                    tx_harm,
+                    softirq_harm,
+                    threshold,
+                    ", ".join(f"{c['app_id']}:{c['priority']}:{c['pps']:.0f}pps" for c in candidates),
+                )
+            else:
+                logger.info(
+                    "TX pps gate: harm=%.3f (tx_fifo=%.3f softirq=%.3f) but no lower-priority app exceeded %.0fpps",
+                    harm,
+                    tx_harm,
+                    softirq_harm,
+                    pps_high,
+                )
+            self._last_pps_gate_signature = signature
+        return candidates
+
+    def _kernel_supports_pkt_police(self):
+        if self._app_pps_police_supported is not None:
+            return self._app_pps_police_supported
+        try:
+            result = subprocess.run(["uname", "-r"], capture_output=True, text=True, check=False)
+            version = getattr(result, "stdout", "").split("-", 1)[0]
+            major_minor = version.split(".")[:2]
+            major, minor = int(major_minor[0]), int(major_minor[1])
+            supported = (major, minor) >= (5, 17)
+        except (IndexError, TypeError, ValueError):
+            supported = False
+        self._app_pps_police_supported = supported
+        if not supported:
+            logger.warning("Per-app pps police requested but kernel support could not be confirmed")
+        return supported
+
+    def _apply_app_pps_cap(self, shaper, app_id):
+        if not self.enable_app_pps_police:
+            return False
+        if not self._kernel_supports_pkt_police():
+            return False
+
+        info = self.app_filter_info.get(app_id)
+        if not info or not info.get("mark"):
+            return False
+        dev_caps = self.app_pps_caps.setdefault(app_id, {})
+        if shaper.dev in dev_caps:
+            return True
+
+        prio = 3000 + len(self.app_pps_caps) * 10 + len(dev_caps)
+        mark_int = str(int(info["mark"], 16))
+        classid = info.get("nics", {}).get(shaper.dev, {}).get("classid_egress")
+        if not classid:
+            return False
+        subprocess.run(
+            [
+                "tc", "filter", "add", "dev", shaper.dev, "parent", f"{shaper.handle_id}:",
+                "protocol", "ip", "prio", str(prio), "u32", "match", "mark", mark_int,
+                "0xffffffff", "flowid", classid, "action", "police",
+                "pkts_rate", str(int(self.network_pps_policy.get("pps_cap_rate", 10000))),
+                "pkts_burst", str(int(self.network_pps_policy.get("pps_cap_burst", 2000))),
+                "conform-exceed", "drop",
+            ],
+            check=False,
+        )
+        dev_caps[shaper.dev] = {"prio": prio, "handle_id": shaper.handle_id}
+        logger.info("Applied TX pps cap to app %s on %s", app_id, shaper.dev)
+        return True
+
+    def _clear_app_pps_cap(self, app_id=None):
+        app_ids = [app_id] if app_id else list(self.app_pps_caps.keys())
+        for capped_app_id in app_ids:
+            for dev, cap in list(self.app_pps_caps.get(capped_app_id, {}).items()):
+                subprocess.run(
+                    [
+                        "tc", "filter", "del", "dev", dev, "parent", f"{cap['handle_id']}:",
+                        "protocol", "ip", "prio", str(cap["prio"]),
+                    ],
+                    check=False,
+                )
+                logger.info("Cleared TX pps cap for app %s on %s", capped_app_id, dev)
+            self.app_pps_caps.pop(capped_app_id, None)
+
+    def _cpu_mask(self):
+        # rps_cpus is a CPU bitmask. For >32 CPUs the kernel expects comma-separated
+        # 32-bit words, most-significant first (e.g. "000000ff,ffffffff"); for <=32 it
+        # accepts a single compact hex value (e.g. 4 CPUs -> "f").
+        cpus = max(1, os.cpu_count() or 1)
+        mask = (1 << cpus) - 1
+        if cpus <= 32:
+            return format(mask, "x")
+        words = []
+        while mask > 0:
+            words.append(format(mask & 0xffffffff, "08x"))
+            mask >>= 32
+        return ",".join(reversed(words))
+
+    def _escalate_rx(self, shaper):
+        state = self._rx_escalation_state.setdefault(shaper.dev, {"rps": {}, "sysctl": {}, "active": False})
+        # Apply once per activation: while the flood persists this is called every eval
+        # cycle, but re-writing the same RPS mask / re-logging each time is just noise.
+        if state.get("active"):
+            return
+        if self.network_pps_policy.get("enable_rps_escalation", True):
+            mask = self._cpu_mask()
+            for path in glob.glob(f"/sys/class/net/{shaper.dev}/queues/rx-*/rps_cpus"):
+                if path not in state["rps"]:
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            state["rps"][path] = f.read().strip()
+                    except OSError:
+                        state["rps"][path] = "0"
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(mask)
+                except OSError as e:
+                    logger.warning("Failed to set RPS mask for %s: %s", path, str(e))
+
+        if self.network_pps_policy.get("enable_netdev_budget_bump", False):
+            for path, value in (
+                ("/proc/sys/net/core/netdev_max_backlog", "50000"),
+                ("/proc/sys/net/core/netdev_budget", "600"),
+            ):
+                if path not in state["sysctl"]:
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            state["sysctl"][path] = f.read().strip()
+                    except OSError:
+                        continue
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(value)
+                except OSError as e:
+                    logger.warning("Failed to bump %s: %s", path, str(e))
+
+        state["active"] = True
+        logger.info("RX escalation active for %s", shaper.dev)
+
+    def _restore_rx(self, shaper):
+        state = self._rx_escalation_state.pop(shaper.dev, None)
+        if not state:
+            return
+        for path, value in state.get("rps", {}).items():
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(value)
+            except OSError as e:
+                logger.warning("Failed to restore RPS mask for %s: %s", path, str(e))
+        for path, value in state.get("sysctl", {}).items():
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(value)
+            except OSError as e:
+                logger.warning("Failed to restore %s: %s", path, str(e))
+        logger.info("RX escalation restored for %s", shaper.dev)
+
     def handle_network_pressure(self, shaper, tx_pressure, rx_pressure, ingress_rates, egress_rates, network_data):
         config_total_rate = shaper.total_bw
         tx_total_bw = shaper.total_bw * network_data['tx']
         rx_total_bw = shaper.total_bw * network_data['rx']
+        tx_collective_harm = float(network_data.get("tx_collective_harm", 0.0) or 0.0)
+        rx_collective_harm = float(network_data.get("rx_collective_harm", 0.0) or 0.0)
+        softirq_harm = float(network_data.get("softirq_harm", 0.0) or 0.0)
+        harm_threshold = float(self.network_pps_policy.get("collective_harm_threshold", 0.5))
+        # The per-app pps remedy (egress police, never byte shaping) fires on either TX
+        # byte-path harm (tx_pressure critical AND tx_fifo harm) or softirq-commons harm (a
+        # small-packet flood burning the receive softirq without lifting tx_pressure). The
+        # offender is always gated by priority in _evaluate_tx_pps_gate, so only a
+        # lower-priority flooder is ever capped.
+        tx_pps_gate_active = (
+            (tx_pressure == "critical" and tx_collective_harm >= harm_threshold)
+            or softirq_harm >= harm_threshold
+        )
         # TX throttle
-        if tx_pressure == "critical" and self._can_switch(self.limit_cooldown, shaper.tx_last_limit_time, shaper.tx_last_recover_time):
+        if tx_pps_gate_active:
+            candidates = self._evaluate_tx_pps_gate(network_data)
+            applied = False
+            for candidate in candidates:
+                if self._apply_app_pps_cap(shaper, candidate["app_id"]):
+                    applied = True
+            # Only advance the cooldown clock when a cap was actually installed; with police
+            # disabled (default) this branch is alert-only and must not gate later restore.
+            if applied:
+                shaper.tx_last_limit_time = time.time()
+        elif tx_pressure == "critical" and self._can_switch(self.limit_cooldown, shaper.tx_last_limit_time, shaper.tx_last_recover_time):
             self._apply_bandwidth_limit(shaper, shaper.tx_limit_stage, "egress", egress_rates, "tx_limit_stage")
             shaper.tx_last_limit_time = time.time()
+        elif tx_pressure != "critical":
+            self._clear_app_pps_cap()
         # RX throttle
-        if rx_pressure == "critical" and self._can_switch(self.limit_cooldown, shaper.rx_last_limit_time, shaper.rx_last_recover_time):
+        if rx_pressure == "critical" and rx_collective_harm >= harm_threshold:
+            self._escalate_rx(shaper)
+            shaper.rx_last_limit_time = time.time()
+        elif rx_pressure == "critical" and self._can_switch(self.limit_cooldown, shaper.rx_last_limit_time, shaper.rx_last_recover_time):
             self._apply_bandwidth_limit(shaper, shaper.rx_limit_stage, "ingress", ingress_rates, "rx_limit_stage")
             shaper.rx_last_limit_time = time.time()
+        elif (rx_pressure != "critical" and shaper.dev in self._rx_escalation_state
+              and self._can_switch(self.recover_cooldown, shaper.rx_last_limit_time, shaper.rx_last_recover_time)):
+            # Restore RX escalation only after a cooldown, so a score hovering at the critical
+            # edge does not flap the RPS masks on/off every eval cycle.
+            self._restore_rx(shaper)
+            shaper.rx_last_recover_time = time.time()
         # TX pressure restore
         if tx_pressure != "critical" and shaper.tx_limit_stage > 0 and self._can_switch(self.recover_cooldown, shaper.tx_last_limit_time, shaper.tx_last_recover_time):
             self._recover_network_pressure(
@@ -685,11 +1114,24 @@ class NetworkController:
         sampling and stats collection happen every iteration.
         """
         # Apply a pending hot reload first, on this (monitor) thread, before any
-        # per-cycle tc work. Checked even when shapers is empty so a controller
+        # per-cycle tc work. Checked even when monitors is empty so a controller
         # that started with no usable NIC can recover once config is fixed.
         if self._reload_pending.is_set():
             self._reload_pending.clear()
             self.reload()
+
+        # --- monitoring pass (independent of control): sample every usable NIC and
+        # publish the snapshot the dashboard reads. Runs even with no shapers, so the
+        # UI always shows live pressure rather than "NO DATA".
+        pressure_snapshot = {}
+        for dev, monitor in self.monitors.items():
+            try:
+                monitor.sample_network_pressure()
+                pressure_snapshot[dev] = monitor.get_current_pressure()
+            except Exception as e:
+                logger.error("Network pressure sampling failed for interface '%s': %s",
+                             dev, str(e), exc_info=True)
+        publish_network_pressure_snapshot(pressure_snapshot)
 
         if not self.shapers:
             return
@@ -697,8 +1139,8 @@ class NetworkController:
         if self.enable_network_control:
             self.update_app_network_control()
 
-        # Isolate failures per NIC: a tc/parsing error on one interface must not
-        # skip the remaining interfaces' sampling and shaping for this cycle.
+        # --- shaping pass: only shapeable NICs. Isolate failures per NIC so a
+        # tc/parsing error on one interface doesn't skip the rest this cycle.
         for shaper in self.shapers:
             try:
                 self._process_shaper_cycle(shaper, control_manager, do_pressure_eval)
@@ -714,18 +1156,22 @@ class NetworkController:
             shaper.monitor.get_tc_class_stats(shaper.dev, shaper.handle_id,
                                               classids=shaper.egress_classids,
                                               direction="egress")
-        shaper.monitor.sample_network_pressure()
+        # The monitor was already sampled this cycle by the monitoring pass; read the
+        # current fused score without re-sampling (a second sample this tick would halve
+        # the EMA/window dt and skew the score).
+        network_data = shaper.monitor.get_current_pressure()
 
         if not do_pressure_eval:
-            return
+            return network_data
 
-        network_data = shaper.monitor.get_current_pressure()
         tx_pressure, rx_pressure, *_ = control_manager.update_network_pressure_level(network_data)
         tx_total_bw = shaper.total_bw * network_data['tx']
         rx_total_bw = shaper.total_bw * network_data['rx']
         logger.debug(
             f"NetworkMonitor {shaper.dev} TX level: {tx_pressure} (pressure: {network_data['tx']:.2f}),"
             f" RX level: {rx_pressure} (pressure: {network_data['rx']:.2f})")
+        if not (self.enable_network_control and self.enable_network_pressure_shaping):
+            return network_data
         if self.enable_network_control and self.enable_network_pressure_shaping:
             ingress_rates = shaper.monitor.get_tc_class_stats_rate_ingress()
             egress_rates = shaper.monitor.get_tc_class_stats_rate_egress()
@@ -736,6 +1182,7 @@ class NetworkController:
                 f" RX_total_BW={rx_total_bw:,.2f}kbit/s (App Class BW: System - {rates['ingress_system']:,.2f},"
                 f" Critical - {rates['ingress_critical']:,.2f} , High - {rates['ingress_high']:,.2f}, Low - {rates['ingress_low']:,.2f})")
             self.handle_network_pressure(shaper, tx_pressure, rx_pressure, ingress_rates, egress_rates, network_data)
+            return network_data
 
     def _teardown_all(self):
         """Remove every tc qdisc, IFB device, and iptables mark rule we created.

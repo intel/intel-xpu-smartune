@@ -7,23 +7,28 @@ How SmarTune turns raw kernel signals into a **pressure score** and a
 **pressure level** (`low / medium / high / critical`) that drives auto-throttling
 and staged restore.
 
-There are **two independent channels**, each with its own score, bands and level state:
-the **system** channel, driven mostly by memory, and the **disk-IO** channel, which
-decides `io.max` throttling on its own. They share the input plumbing, the
-self-inflicted discount and the smoothing machinery — nothing else. That split is
+There are **three independent channels**, each with its own score, bands and level state:
+the **system** channel, driven mostly by memory; the **disk-IO** channel, which decides
+`io.max` throttling on its own; and the **network** channel, which decides per-direction
+bandwidth shaping. The system and disk channels share the input plumbing, the
+self-inflicted discount and the smoothing machinery; the network channel is more
+self-contained — it does its own signal-level smoothing (EMA + a distress capacitor) and
+maps straight to `network_thresholds`, without the §4 score→level filter. That split is
 what this document is organised around:
 
 | | |
 |---|---|
-| [**Part I — Shared machinery**](#part-i--shared-machinery) | the pipeline, the inputs, the self-inflicted discount, and the score → level filter that both channels run |
+| [**Part I — Shared machinery**](#part-i--shared-machinery) | the pipeline, the inputs, the self-inflicted discount, and the score → level filter that the system and disk channels run |
 | [**Part II — The system channel**](#part-ii--the-system-channel) | the memory sigmoid, the weighted average, and why memory alone can reach `critical` |
 | [**Part III — The disk-IO channel**](#part-iii--the-disk-io-channel) | the per-disk USE model, the noisy-OR, the PSI gate, and what a `critical` disk level does |
+| [**Part IV — The network channel**](#part-iv--the-network-channel) | the utilisation saturation gate, the drop/queue distress signal, and why a busy-but-clean link is not pressure |
 | [**Appendix — Parameter reference**](#appendix--parameter-reference) | every knob, which direction moves it, and a tuning cheat-sheet |
 
 Where the code lives:
 
-- Score math, both channels: [`monitor/pressure.py`](../monitor/pressure.py) (`PressureAnalyzer`)
+- Score math, system & disk channels: [`monitor/pressure.py`](../monitor/pressure.py) (`PressureAnalyzer`)
 - Per-disk USE model: [`monitor/disk_pressure.py`](../monitor/disk_pressure.py) (`DiskIOMonitor`)
+- Network channel (signals, smoothing, score): [`monitor/network.py`](../monitor/network.py) (`NetworkMonitor`)
 - Signal collection & attribution: [`monitor/psi.py`](../monitor/psi.py) (`PSIMonitor`)
 - Orchestration / refresh cadence: [`monitor/monitor_api.py`](../monitor/monitor_api.py) (`SystemPressureMonitor`)
 
@@ -640,6 +645,301 @@ allowed at all.
 
 ---
 
+# Part IV — The network channel
+
+## 16. Why network needs its own channel
+
+Network pressure lives entirely outside the system and disk channels: there is no NIC term
+in the system `load`, and the balancer's traffic shaper needs a **per-direction** trigger
+(egress and ingress are throttled independently, on different qdiscs). So the network
+channel is a third parallel pipeline with its own model, its own bands (`network_thresholds`,
+never the system `thresholds`), and — unlike the other two — its own **signal-level**
+smoothing instead of the §4 score→level filter.
+
+It also answers a question the other channels never face: **is "busy" the same as "under
+pressure"?** For a disk, high utilisation with low latency is genuinely fine. For a link it
+is subtler — a NIC at 95 % of line rate with zero loss is merely busy, while a NIC dropping
+packets at 60 % (because the CPU cannot drain the softirq backlog) is in real trouble. The
+old model scored on utilisation alone and got this exactly backwards. The rule now:
+
+> **Distress (drops / queue backlog) is the pressure. Utilisation only counts once it is
+> genuinely near line rate.**
+
+```mermaid
+flowchart TD
+    A["/sys/class/net/&lt;if&gt;/statistics<br/>bytes, packets, dropped, fifo+missed+over"] --> U
+    A --> R
+    P["/proc/net/softnet_stat<br/>processed, squeeze, drop (system-wide × pkt-share)"] --> R
+    U["ema_bw_util, ema_pps_util<br/>(dt-aware EMA)"] --> B["base_load = max(bw, pps)"]
+    B --> G["util_sat = σ(base_load)<br/>steep gate ~0.96"]
+    R["drop / fifo / softnet ratios<br/>(window-diff, rate-relative)"] --> D["distress = noisy-OR of _sat(ratio)"]
+    D --> C["capacitor: max(decay·prev, distress)"]
+    G --> S["score = noisy-OR(util_sat, distress)"]
+    C --> S
+    S --> O["per-direction level via network_thresholds<br/>tx critical ⇒ egress shape · rx critical ⇒ ingress shape"]
+```
+
+Everything below is per interface and per direction (`rx`, `tx`), producing a score in
+`[0, 1]`. `softnet_stat` is the one exception — it is a system-wide receive-path signal, so
+it is read once and attributed to the **rx** direction only.
+
+---
+
+## 17. Utilisation — dt-aware EMA, two ceilings
+
+Two utilisation ratios are computed each sample and smoothed, then combined by `max`:
+
+$$
+\text{base\_load} = \max(\text{ema\_bw\_util},\ \text{ema\_pps\_util})
+$$
+
+| Ratio | Numerator | Denominator |
+|---|---|---|
+| `bw_util` | Δbytes · 8 / Δt (bit/s) | link bandwidth (`bandwidth_kbit`) |
+| `pps_util` | Δpackets / Δt (pkt/s) | `min(physical_max_pps, cpu_pps)` |
+
+- **Two ceilings for pps.** `physical_max_pps = speed_gbps · 1 488 095` (64-byte-frame line
+  rate) catches a **small-packet flood** that a NIC hits well before its byte bandwidth;
+  `cpu_pps = cores · cpu_pps_per_core` (default 1.5 M/core) caps it at what the host can
+  actually service in softirq. The lower of the two wins.
+- **`bandwidth_kbit = 0` means "unknown"** (virtual / bond / wifi interfaces report `-1` for
+  speed). In that case the byte term is dropped — the channel scores on pps and distress
+  only, rather than pretending a 1 Gbit link and pinning `bw_util` at 100 %.
+- **The EMA is dt-aware.** The balancer samples cheaply every tick but classifies only every
+  few seconds, so the smoothing constant is converted to the real gap:
+  $\alpha_{\text{eff}} = 1 - (1-\alpha)^{\Delta t}$. This gives the same time constant
+  whether the gap is 1 s or 5 s — a plain fixed-$\alpha$ EMA (or the old count-mean sliding
+  window) is biased by the irregular cadence. Utilisation is a continuous quantity, so EMA is
+  the right smoother: recency-weighted, no window drop-out sawtooth.
+
+---
+
+## 18. Distress — rate-relative, window-diff ratios
+
+Drops and queue events are **sparse and bursty**, so they are handled differently from
+utilisation: as **ratios over a 5 s window** (`WindowDiffHistory`), not an EMA of a raw
+count. A ratio needs a denominator accumulated over a window; an EMA of "packets dropped
+this tick" would be meaningless.
+
+Each ratio is squashed into `[0, 1)` by a saturating map, where `half` is the ratio that
+reads ~0.63 — the "starts to hurt" point:
+
+$$
+\text{sat}(r) = 1 - e^{-r / r_{1/2}}
+$$
+
+| Signal | Ratio | `half` (default) | Max weight | Direction |
+|---|---|---|---:|---|
+| generic RX drops | Δrx_dropped / Δrx_packets | built-in `5e-2` | 0.3 (configured) | rx |
+| TX packet drops | Δtx_dropped / Δtx_packets | `drop_half = 1e-3` | 1.0 | tx |
+| hardware overflow | Δ(fifo+missed+over) / Δpackets | `fifo_half = 1e-4` | 1.0 | rx (fifo only for tx) |
+| softnet squeeze | Δtime_squeeze / Δprocessed · share | `softnet_half = 1e-3` | 0.5 (built-in) | **rx only** |
+| softnet backlog drop | Δdropped / Δprocessed · share | `softnet_half = 1e-3` | 1.0 | **rx only** |
+
+The terms are fused with a noisy-OR (§12), so any one strong signal lifts `distress`
+without a single one pinning it:
+
+$$
+\text{distress} = 1 - \!\!\prod_{\text{terms}}\!\! \bigl(1 - \text{sat}(r_i)\bigr)
+$$
+
+- **Generic RX drops ramp more slowly than TX drops.** `rx_dropped` has driver/stack-specific
+  semantics and is capped at half-strength, so its 5% half-point distinguishes moderate loss
+  from catastrophic loss instead of making both immediately read as 50% pressure.
+- **`fifo_half` is 10× tighter than `drop_half`.** A ring-buffer overflow is a harder failure
+  than a software drop, so a smaller ratio should already read as pressure.
+- **The hardware-overflow ratio sums `rx_fifo_errors + rx_missed_errors + rx_over_errors`.**
+  The same "NIC couldn't hand the packet to the host in time" failure lands in different
+  fields across drivers — on many Intel NICs (igb/ixgbe/e1000e) the ran-out-of-descriptors
+  drop is counted in `rx_missed_errors` while `rx_fifo_errors` stays 0, so reading fifo alone
+  would miss it. tx has no sysfs equivalent, so tx keeps `tx_fifo_errors` alone.
+- **softnet is rx-only** because `/proc/net/softnet_stat` measures the *receive* softirq path
+  (budget exhausted, backlog full). It is the signal that catches "the CPU cannot keep up
+  with inbound packets" — which pure byte/packet rate never sees.
+- **softnet squeeze is capped at half-strength per NIC.** It says the kernel exhausted a
+  receive-softirq budget, a strong warning but not proof of loss. `softnet dropped` remains
+  full-strength because it proves the backlog filled and packets were discarded. The separate
+  system-wide `softirq_harm` signal used by the TX PPS gate remains full-strength so it still
+  catches a harmful egress small-packet flood.
+- **softnet is attributed to this NIC by packet share.** `softnet_stat` is system-wide (every
+  interface shares the rx softirq path), so its two terms are scaled by
+  `share = Δrx_packets / Δsoftnet_processed` before entering the noisy-OR. A single-NIC box
+  has `share ≈ 1` (unchanged), but on a machine where another NIC — or loopback/bridge
+  traffic — drives the softirq load, this NIC no longer inherits that pressure and trips an
+  ineffective ingress shape. Per-queue sysfs (`queues/rx-*`) exposes no drop/squeeze
+  counters, so packet share is the attribution available without per-driver `ethtool -S`.
+
+### The distress capacitor
+
+A raw 5 s window makes a burst vanish abruptly the moment it ages out. Instead, distress is
+held through a **dt-aware decaying-max** so it cools smoothly:
+
+$$
+\text{distress}_t = \max\bigl(\text{distress}_{t-1}\cdot \text{decay}^{\,\Delta t},\ \ \text{distress}_{\text{instant}}\bigr)
+$$
+
+`decay_rate` (default `0.7`) is the fraction retained per second, so a spike to 1.0 decays to
+~0.7 after 1 s, ~0.24 after 4 s — long enough to survive the gap between classifications,
+short enough to clear once the drops stop.
+
+### The activity gate — don't trust a ratio without a denominator
+
+A ratio is only meaningful once its denominator is real. On a **near-idle** direction the
+window's packet/processed count is tiny, so a handful of stray drops — or system-wide softnet
+squeeze bleeding in from a busy *other* path (a TX small-packet flood is the canonical case) —
+inflates the ratio to ~1 and trips a **false `critical`**. So each direction's distress is
+scaled by an activity gate:
+
+$$
+\text{act}_d = \min\!\Bigl(1,\ \frac{\text{pps}_d}{\text{min\_pps\_activity}}\Bigr),
+\qquad \text{distress}_d \mathrel{{\times}{=}} \text{act}_d
+$$
+
+`min_pps_activity` (default **2000** pkt/s) is the rate below which loss is not trusted: an
+idle direction reads ~0 distress no matter how large the ratio, while a genuine high-pps flood
+(`act ≈ 1`) still registers its real loss. This is what stops a TX flood — which drives
+system-wide softnet squeeze — from tripping a bogus rx `critical` on an otherwise idle receive
+path. The raw pre-gate ratios are still surfaced for diagnostics (the Network card shows the
+actual drop/overflow/softnet rate behind a reading), and the **ungated** softnet saturation is
+kept separately as `softirq_harm` — the commons signal §21 uses, precisely because it must
+survive the rx gate to catch an idle-rx TX flood.
+
+---
+
+## 19. The score — a saturation gate, then noisy-OR
+
+Utilisation must **not** reach the throttle band on its own until the link is genuinely near
+line rate. So `base_load` is passed through a steep logistic gate before it can contribute:
+
+$$
+\text{util\_sat} = \sigma(\text{base\_load}) = \frac{1}{1 + e^{-k(\text{base\_load} - h)}},
+\qquad h = 0.96,\ k = 120
+$$
+
+$$
+\boxed{\ \text{score} = 1 - (1 - \text{util\_sat})(1 - \text{distress})\ }
+$$
+
+With the shipped gate, clean-link utilisation maps like this (`distress = 0`):
+
+| `base_load` | `util_sat` = score | reading |
+|---|---|---|
+| ≤ 0.90 | ≈ 0.00 | busy, not pressure |
+| 0.95 | **0.23** | below the `high` band (0.7) |
+| 0.96 | 0.50 | the half-point |
+| 0.98 | **0.92** | near saturation → `critical` |
+| 1.00 | 0.99 | pegged → `critical` |
+
+And distress drives the score regardless of utilisation:
+
+| `base_load` | `distress` | score | who drives |
+|---|---|---|---|
+| 0.30 | 0.00 | 0.00 | idle, clean |
+| 0.30 | 0.95 | **0.95** | **drops → `critical` at 30 % util** |
+| 0.98 | 0.00 | 0.92 | genuine saturation |
+| 0.60 | 0.60 | 0.84 | both contribute |
+
+The row that captures the whole redesign is **`0.30` util + drops → `0.95`**: a lightly
+loaded link that is losing packets is `critical`, while a clean link at 95 % is not even
+`high`.
+
+---
+
+## 20. What the level drives
+
+The per-direction scores go straight into `network_thresholds` via
+`PressureAnalyzer.get_pressure_level` (§4's classifier, but *without* the EWMA/hysteresis
+wrapper — the smoothing already happened at the signal level). `update_network_pressure_level`
+returns a level for each direction:
+
+| level | shaper behaviour (per direction) |
+|---|---|
+| `low` / `medium` / `high` | if currently throttled, **recover** one bandwidth stage (staged restore) |
+| `critical` | **throttle** one bandwidth stage — `tx critical` shapes egress, `rx critical` shapes ingress (on the IFB device) |
+
+Throttle and recovery each have their own cooldown, and the two directions run fully
+independent state machines. Because a clean-but-busy link no longer reaches `critical`
+(§19), utilisation alone will not trip shaping — only genuine saturation or a distress
+signal will.
+
+`get_current_pressure()` returns the two scores plus diagnostics — `rx_util` / `tx_util`
+(raw `base_load`, "how busy") and `rx_distress` / `tx_distress` (the congestion term, "how
+much it hurts") — so a log or the UI can show *why* a direction is or isn't under pressure.
+It also returns the **distress breakdown** (`rx_distress_drop/hw/softnet_squeeze/softnet_drop`,
+`tx_distress_drop/fifo`) and two **collective-harm** rollups
+(`rx_collective_harm`, `tx_collective_harm`) that §21 uses to pick the right remedy.
+
+---
+
+## 21. Relieving network pressure — matching the lever to the failure mode
+
+A high score says a direction is *under pressure*; it does **not** say *how to relieve it*.
+The score fuses two very different failure modes, and they need different levers:
+
+| Failure mode | Symptom | Right lever | Wrong lever |
+|---|---|---|---|
+| **byte / bandwidth saturation** | byte-rate at line rate, `*_util` high, distress low | HTB bandwidth shaping (the tier `ceil`) | — |
+| **packet-rate / CPU saturation** (small-packet flood) | pps high, `*_collective_harm` high (softnet/fifo/missed drops), bandwidth *low* | per-app **pps** limiting (egress) / softirq spreading (ingress) | HTB bandwidth shaping |
+
+HTB caps **bytes/s** at **tier-class** granularity. For a small-packet flood that is the
+wrong unit (bytes, not packets) at the wrong granularity (a whole priority tier, not the one
+offending app) — and on ingress it sits *downstream* of where the flood's drops happen
+(NIC ring / softirq), so it cannot relieve them at all.
+
+### The gate — `harm × attribution × priority`
+
+This is the network analog of the disk channel's `saturation × stall` (§13) and the model's
+"busy ≠ pressure" rule (§19). A high-pps app is only acted upon when **all three** hold:
+
+1. **attribution** — a specific app's pps is genuinely high (per-app accounting, below);
+2. **collective harm** — harm is over threshold, i.e. the flood is actually causing drops /
+   starving the softirq path, not just keeping the NIC busy. Harm is
+   `max(tx_collective_harm, softirq_harm)`: the TX byte-path signal (`tx_fifo`) **or** the
+   system-wide receive-softirq signal (`softirq_harm`, the ungated softnet saturation of
+   §18). The second is what catches a small-packet egress flood that burns the softirq
+   without ever producing a `tx_fifo` drop or lifting `tx_pressure` — so the TX pps gate
+   fires on softirq harm alone, `tx_pressure critical` is **not** required for this path;
+3. **priority** — the offender's tier rank is **below** a victim's. Priority decides who
+   yields: a `low` app harming a `high` app is throttled; a `critical` app is not (it is
+   supposed to win). Equal priority falls back to fairness (fq_codel, below).
+
+A flood that harms nobody stays untouched — that is the whole point of gating on *harm*, not
+on *volume*.
+
+### The three execution layers
+
+1. **Egress fairness (always on) — `fq_codel` leaf qdisc.** A per-flow-fair leaf under each
+   egress tier class means one flow cannot starve another's egress, with no per-app
+   accounting and no identification of an offender. Cheapest protection; handles the
+   equal-priority case. Egress only (fair-queueing already-admitted *inbound* packets does
+   nothing for a flood and adds redirect cost).
+2. **Egress targeting — per-app pps police (default OFF).** When the gate fires, a
+   packet-rate `police` action is attached to the offending app's own tc filter
+   (`tc filter replace … action police pkts_rate N pkts_burst M`), capping *that app's*
+   pps only. Reversible. Off by default because it drops packets and needs kernel ≥ 5.17.
+3. **Ingress escalation — RPS → (budget).** `tc` cannot relieve an inbound flood, so
+   harm-driven RX escalates instead of shaping: spread the receive softirq across cores via
+   **RPS** (`/sys/class/net/<if>/queues/rx-*/rps_cpus`, reversible; the primary action),
+  optionally raise `netdev_max_backlog`/`netdev_budget` (system-wide, opt-in). RX is about
+  protecting the **commons**,
+   not per-app arbitration — the byte-saturation RX case still uses the HTB ingress path.
+
+### Per-app attribution
+
+Each managed app already carries a unique `iptables … MARK`; its per-app **packet** counters
+come from `iptables -t mangle -nvxL OUTPUT` (keyed by cgroup path), turned into a windowed
+pps via `WindowDiffHistory`. This is what lets the gate name the offender — the aggregate
+per-NIC score cannot.
+
+### The honest RX limit
+
+Even with RPS, an inbound small-packet flood is only *mitigated*, not *shaped*: hardware
+ring drops (`rx_missed`/`rx_over`) happen before any software sees the packet, and the tc
+ingress hook runs *inside* the very softirq that is the bottleneck. RPS spreads the processing
+cost; a bandwidth cap never relieves that cost.
+
+---
+
 # Appendix — Parameter reference
 
 System channel and shared machinery:
@@ -673,6 +973,34 @@ Disk channel (Part III) — all under `config.yaml`, re-read every tick, no rest
 | `disk_pressure_model.activity_util_pct` | `20` % | more util required before await/queue count | idle-disk noise counts sooner |
 | `disk_pressure_model.max_p_weight` | `0.8` | the single worst disk dominates the aggregate | the mean dominates — **and caps `C`; below `1 − 0.2N/(N−1)` an N-disk box can never reach `critical`, so 0.8 is the safe floor** (§12) |
 
+Network channel (Part IV) — all under `config.yaml`, re-read every sample, no restart needed:
+
+| Parameter | Shipped | Increase it → | Decrease it → |
+|---|---|---|---|
+| `network_thresholds.{low,medium,high,critical}` | `0.3/0.5/0.7/0.9` | levels harder to reach | easier to reach |
+| `network_pressure_model.ema_alpha` | `0.3` | faster / noisier utilisation | smoother / laggier |
+| `network_pressure_model.decay_rate` | `0.7` | distress lingers longer after a burst | clears faster |
+| `network_pressure_model.cpu_pps_per_core` | `1 500 000` | pps ceiling rises (small-packet load reads as less pressure) | small-packet floods trip sooner |
+| `network_pressure_model.min_pps_activity` | `2 000` | a direction must be busier before its drop/softnet distress is trusted (fewer near-idle false positives, but a real low-rate loss registers later) | idle-link ratios count sooner (risk of low-denominator false `critical`) |
+| `network_pressure_model.{drop_half,fifo_half,softnet_half}` | `1e-3 / 1e-4 / 1e-3` | the same signal reads as **less** distress | as more distress |
+| `network_pressure_model.util_sat_half` | `0.96` | utilisation must be closer to line rate before it counts | busy links read as pressure sooner |
+| `network_pressure_model.util_sat_k` | `120` | sharper, more switch-like near saturation | gentler ramp (less line-rate jitter, but a wider "busy" grey zone) |
+
+Small-packet-flood policy (§21). `enable_app_pps_police` is the only user-facing switch in
+`config.yaml`; other safeguards use conservative controller defaults. State-mutating actions
+(`police`, sysctl) ship **OFF**:
+
+| Parameter | Shipped | Meaning |
+|---|---|---|
+| `enable_fq_codel` | `true` | per-flow-fair `fq_codel` leaf on egress tier classes (§21 layer 1) |
+| `enable_app_pps_police` | `false` | attach a per-app packet-rate `police` to the offending app (layer 2). Drops packets; needs kernel ≥ 5.17 (auto-disabled if unsupported) |
+| `enable_rps_escalation` | `true` | on RX collective harm, widen `rps_cpus` to spread the receive softirq (layer 3, primary) |
+| `enable_netdev_budget_bump` | `false` | also raise `netdev_max_backlog`/`netdev_budget` on RX harm. **System-wide**, hence opt-in |
+| `app_pps_high` | `50000` | per-app pps above which an app is a flood candidate. Raise → floods trip later |
+| `collective_harm_threshold` | `0.5` | `*_collective_harm` needed to act. Raise → only worse floods act |
+| `pps_cap_rate` / `pps_cap_burst` | `10000` / `2000` | the `police pkts_rate`/`pkts_burst` applied to a capped app |
+| `pps_window_sec` | `5` | window for the per-app pps rate |
+
 ## Tuning cheat-sheet
 
 - **"CPU-heavy jobs shouldn't trigger throttling"** — already handled by the normalized
@@ -701,3 +1029,27 @@ Disk channel (Part III) — all under `config.yaml`, re-read every tick, no rest
 - **"A USB disk / an HDD reads as permanently saturated"** — check `disk_type` in the
   `[disk-level]` line first (misdetected media applies the wrong half-points), then the
   half-points for that class.
+- **"A busy but healthy link keeps getting throttled"** — that was the old utilisation-only
+  behaviour; confirm `rx_distress` / `tx_distress` are ~0 and the score is coming from
+  `util_sat`. Raise `network_pressure_model.util_sat_half` (0.96 → 0.98) so only near-line-rate
+  utilisation counts.
+- **"Packet loss isn't triggering pressure"** — read `rx_distress` / `tx_distress`. If TX loss
+  is real but distress stays low, lower the relevant `*_half` (TX drops → `drop_half`, ring
+  overflow → `fifo_half`, inbound softirq backlog → `softnet_half`); a smaller half-point
+  makes the same loss ratio read as more pressure. Generic RX-drop sensitivity is deliberately
+  built into the model because its driver/stack-specific semantics cannot be safely tuned as a
+  universal deployment setting.
+- **"Small-packet flood pins the link but score is low"** — the byte term is near zero; check
+  whether pps is hitting its ceiling. Lower `network_pressure_model.cpu_pps_per_core` if the
+  host saturates softirq before the advertised line-rate pps.
+- **"Network level flaps near line rate"** — the saturation gate is too steep for a link that
+  hovers at ~0.96; lower `network_pressure_model.util_sat_k` (120 → 60) for a gentler ramp, or
+  raise `ema_alpha`'s smoothing by lowering it.
+- **"A small-packet flood is critical but nothing throttles it"** — that is §21 working, not a
+  bug: a bandwidth cap is the wrong lever. On TX enable `enable_app_pps_police`
+  (kernel ≥ 5.17) to cap the offending app's pps; on RX rely on RPS. Read
+  `tx_collective_harm` / `rx_collective_harm` — if they are ~0 the flood is
+  not actually hurting anyone (the gate deliberately holds off).
+- **"The flood's app isn't being singled out"** — the gate needs per-app attribution and a
+  higher-priority victim. Check the app's pps against `network_pps_policy.app_pps_high` and that a
+  higher-priority app is present; equal-priority contention is handled by `fq_codel`, not policing.

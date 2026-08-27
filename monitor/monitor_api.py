@@ -24,6 +24,10 @@ from monitor.app_discovery import is_noise_process
 # by it, so it is imported rather than restated -- a copy would drift the moment a class is
 # added there.
 from monitor.disk_pressure import MEDIA_CLASSES as _DISK_MEDIA_CLASSES
+from monitor.network_pressure import (
+    start_network_pressure_collector,
+    stop_network_pressure_collector,
+)
 from utils.app_utils import get_cgroup_path_by_pid
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
@@ -162,6 +166,10 @@ def _start_dynamic_info_auto_refresh() -> None:
     lazily by the full endpoint as a dev/test self-start fallback.
     """
     global _dynamic_info_refresh_started, _dynamic_info_collector_thread
+    # In monitor-only mode there is no balancer network loop to feed
+    # network-pressure snapshots, so start the monitor-side sampler here.
+    if _network_config_reload_notifier is None:
+        start_network_pressure_collector()
     with _dynamic_info_refresh_start_lock:
         if _dynamic_info_refresh_started or not _get_monitored_sections():
             return
@@ -180,11 +188,15 @@ def stop_dynamic_info_collector() -> None:
     global _dynamic_info_refresh_started
     with _dynamic_info_refresh_start_lock:
         if not _dynamic_info_refresh_started:
+            # Even without a dynamic-info thread, a monitor-only service may
+            # still have the network-pressure sampler running.
+            stop_network_pressure_collector()
             return
         _dynamic_info_refresh_started = False
     _dynamic_info_stop_event.set()
     if _dynamic_info_collector_thread is not None:
         _dynamic_info_collector_thread.join(timeout=2)
+    stop_network_pressure_collector()
 
 
 def _start_app_stats_auto_refresh() -> None:
@@ -823,6 +835,11 @@ class SystemPressureMonitor:
         try:
             tx_level = self.analyzer.get_pressure_level(network_data['tx'], self.config.network_thresholds)
             rx_level = self.analyzer.get_pressure_level(network_data['rx'], self.config.network_thresholds)
+            # Generic drops and squeeze show pressure, not necessarily an RX
+            # capacity failure that ingress control can correct. Reserve RX critical
+            # for hardware/ring or softnet-backlog exhaustion.
+            if rx_level == "critical" and not network_data.get("rx_capacity_exhausted", False):
+                rx_level = "high"
             return tx_level, rx_level, network_data['tx'], network_data['rx']
         except Exception as e:
             logger.error("Failed to update network pressure level: %s", str(e))
@@ -2168,31 +2185,63 @@ def _write_disk_pressure_config(updates):
 
 # --- network_pressure: network utilisation level cut-offs --------------------
 def _get_network_pressure_config():
-    return {"network_thresholds": dict(_cfg().network_thresholds or {})}
+    model = getattr(_cfg(), "network_pressure_model", None)
+    model_dict = model if isinstance(model, dict) else {}
+    return {
+        "network_thresholds": dict(_cfg().network_thresholds or {}),
+        "network_pressure_model": {
+            "rx_drop_weight": float(model_dict.get("rx_drop_weight", 0.5)),
+        },
+    }
 
 
 def _validate_network_pressure_config(body):
-    thresholds_body = body.get("network_thresholds")
-    if not isinstance(thresholds_body, dict):
-        raise ValueError("network_thresholds must be an object")
+    updates = {}
 
-    thresholds = {}
-    for key in _THRESHOLD_KEYS:
-        if key in thresholds_body and thresholds_body[key] is not None:
-            value = float(thresholds_body[key])
-            if not (0 < value <= 1):
-                raise ValueError(f"network threshold {key} must be within (0, 1]")
-            thresholds[key] = value
+    if "network_thresholds" in body:
+        thresholds_body = body.get("network_thresholds")
+        if not isinstance(thresholds_body, dict):
+            raise ValueError("network_thresholds must be an object")
 
-    merged = {**(_cfg().network_thresholds or {}), **thresholds}
-    ordered = [merged[key] for key in _THRESHOLD_KEYS if merged.get(key) is not None]
-    if len(ordered) != len(_THRESHOLD_KEYS) or ordered != sorted(ordered):
-        raise ValueError("network_thresholds must be ordered low <= medium <= high <= critical")
-    return {"network_thresholds": thresholds}
+        thresholds = {}
+        for key in _THRESHOLD_KEYS:
+            if key in thresholds_body and thresholds_body[key] is not None:
+                value = float(thresholds_body[key])
+                if not (0 < value <= 1):
+                    raise ValueError(f"network threshold {key} must be within (0, 1]")
+                thresholds[key] = value
+
+        merged = {**(_cfg().network_thresholds or {}), **thresholds}
+        ordered = [merged[key] for key in _THRESHOLD_KEYS if merged.get(key) is not None]
+        if len(ordered) != len(_THRESHOLD_KEYS) or ordered != sorted(ordered):
+            raise ValueError("network_thresholds must be ordered low <= medium <= high <= critical")
+        updates["network_thresholds"] = thresholds
+
+    if "network_pressure_model" in body:
+        model_body = body.get("network_pressure_model")
+        if not isinstance(model_body, dict):
+            raise ValueError("network_pressure_model must be an object")
+        model_updates = {}
+        if "rx_drop_weight" in model_body and model_body["rx_drop_weight"] is not None:
+            value = float(model_body["rx_drop_weight"])
+            if not (0 <= value <= 1):
+                raise ValueError("network_pressure_model.rx_drop_weight must be within [0, 1]")
+            model_updates["rx_drop_weight"] = value
+        if model_updates:
+            updates["network_pressure_model"] = model_updates
+
+    if not updates:
+        raise ValueError("No valid network_pressure updates provided")
+    return updates
 
 
 def _write_network_pressure_config(updates):
-    return _cfg().update_config_section("network_thresholds", updates["network_thresholds"])
+    modified = False
+    if "network_thresholds" in updates:
+        modified = _cfg().update_config_section("network_thresholds", updates["network_thresholds"]) or modified
+    if "network_pressure_model" in updates:
+        modified = _cfg().update_config_section("network_pressure_model", updates["network_pressure_model"]) or modified
+    return modified
 
 
 # --- limit_policy: full nested policy + per-resource enable/rate --------------
@@ -2346,9 +2395,17 @@ def _get_network_control_config():
         }
         for key in _NETWORK_PRIORITIES
     }
+    raw_pps_policy = getattr(cfg, "network_pps_policy", None)
+    pps_policy = raw_pps_policy if isinstance(raw_pps_policy, dict) else {}
     return {
         "enable_network_control": bool(getattr(cfg, "enable_network_control", False)),
         "enable_network_pressure_shaping": bool(getattr(cfg, "enable_network_pressure_shaping", True)),
+        "enable_app_pps_police": bool(getattr(cfg, "enable_app_pps_police", False)),
+        "network_pps_policy": {
+            "app_pps_high": int(pps_policy.get("app_pps_high", 50000)),
+            "pps_cap_rate": int(pps_policy.get("pps_cap_rate", 10000)),
+            "pps_cap_burst": int(pps_policy.get("pps_cap_burst", 2000)),
+        },
         "available_network_interfaces": available_nics,
         "selected_network_interfaces": selected_nics,
         "config_network_bw": class_bw,
@@ -2371,6 +2428,37 @@ def _validate_network_control_config(body):
 
     if "enable_network_pressure_shaping" in body:
         updates["enable_network_pressure_shaping"] = bool(body.get("enable_network_pressure_shaping"))
+
+    if "enable_app_pps_police" in body:
+        updates["enable_app_pps_police"] = bool(body.get("enable_app_pps_police"))
+
+    pps_body = body.get("network_pps_policy")
+    if pps_body is not None:
+        if not isinstance(pps_body, dict):
+            raise ValueError("network_pps_policy must be an object")
+        pps_updates = {}
+        for key in ("app_pps_high", "pps_cap_rate", "pps_cap_burst"):
+            if key not in pps_body or pps_body[key] is None:
+                continue
+            try:
+                value = int(pps_body[key])
+            except (TypeError, ValueError):
+                raise ValueError(f"network_pps_policy.{key} must be a positive integer")
+            if value <= 0:
+                raise ValueError(f"network_pps_policy.{key} must be a positive integer")
+            pps_updates[key] = value
+        if pps_updates:
+            current_policy = getattr(_cfg(), "network_pps_policy", None)
+            merged_policy = {
+                "app_pps_high": 50000,
+                "pps_cap_rate": 10000,
+                "pps_cap_burst": 2000,
+                **(current_policy if isinstance(current_policy, dict) else {}),
+                **pps_updates,
+            }
+            if merged_policy["pps_cap_rate"] > merged_policy["app_pps_high"]:
+                raise ValueError("network_pps_policy.pps_cap_rate must not exceed app_pps_high")
+            updates["network_pps_policy"] = pps_updates
 
     if "selected_network_interfaces" in body and not disabling_network_control:
         from monitor.system_info import _get_network_static_info

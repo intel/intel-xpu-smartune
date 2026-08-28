@@ -39,6 +39,7 @@ import type {
   GpuUsageDevice,
   GpuUsageFreq,
   DiskDeviceData,
+  NetworkInterfacePressure,
 } from '../api/types'
 import { usePolling } from '../hooks/usePolling'
 import { useDocumentVisible } from '../hooks/useDocumentVisible'
@@ -1520,6 +1521,45 @@ function DetailItem({
   )
 }
 
+/** Critical-reason banner for the Network card: only when a direction is CRITICAL. */
+function networkPressureAlert(
+  pressure: NetworkInterfacePressure | null | undefined,
+): { text: string; color: string } | undefined {
+  if (!pressure) return undefined
+  const parts: string[] = []
+  if ((pressure.rx?.level || '').toUpperCase() === 'CRITICAL') {
+    parts.push(`Receive (RX) critical: ${pressure.rx?.reason || 'congestion'}`)
+  }
+  if ((pressure.tx?.level || '').toUpperCase() === 'CRITICAL') {
+    parts.push(`Send (TX) critical: ${pressure.tx?.reason || 'congestion'}`)
+  }
+  if (!parts.length) return undefined
+  return { text: parts.join('   ·   '), color: COLORS.red }
+}
+
+type DetailRow = { label: string; value: string; source?: DataSourceKind; divider?: boolean }
+
+/** Per-direction Network-card metrics expose throughput, delivery loss, and buffer pressure. */
+function networkPressureDetails(
+  pressure: NetworkInterfacePressure | null | undefined,
+  rxRate: number | null,
+  txRate: number | null,
+): DetailRow[] {
+  const pct = (v?: number) => (isNumber(v) ? `${v.toFixed(2)}%` : '—')
+  const rx = pressure?.rx || {}
+  const tx = pressure?.tx || {}
+  return [
+    { label: 'Receive (RX)', value: '', divider: true },
+    { label: 'Bandwidth', value: formatMetric(toMbps(rxRate), 'Mb/s', 2), source: 'dynamic' },
+    { label: 'Packet Loss', value: pct(rx.drop_ratio_pct), source: 'dynamic' },
+    { label: 'Buffer Overflow', value: pct(rx.hw_overflow_ratio_pct), source: 'dynamic' },
+    { label: 'Send (TX)', value: '', divider: true },
+    { label: 'Bandwidth', value: formatMetric(toMbps(txRate), 'Mb/s', 2), source: 'dynamic' },
+    { label: 'Packet Loss', value: pct(tx.drop_ratio_pct), source: 'dynamic' },
+    { label: 'Buffer Overflow', value: pct(tx.fifo_ratio_pct), source: 'dynamic' },
+  ]
+}
+
 function TrendPanel({
   title,
   accent,
@@ -1546,6 +1586,7 @@ function TrendPanel({
   secondaryChartGap = 10,
   detailTopMargin = 12,
   primaryChartLabel,
+  alert,
 }: {
   title: string
   accent: string
@@ -1572,6 +1613,7 @@ function TrendPanel({
   secondaryChartGap?: number
   detailTopMargin?: number
   primaryChartLabel?: string
+  alert?: { text: string; color: string }
 }) {
   const gaugeValue = isNumber(value) ? Math.max(0, Math.min(value, 100)) : 0
   const hasValue = isNumber(value)
@@ -1604,6 +1646,23 @@ function TrendPanel({
           )}
         </Space>
       </div>
+      {alert && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: '6px 10px',
+            borderRadius: 6,
+            border: `1px solid ${alert.color}`,
+            background: `${alert.color}1a`,
+            color: alert.color,
+            fontSize: 11,
+            fontWeight: 600,
+            lineHeight: 1.4,
+          }}
+        >
+          {alert.text}
+        </div>
+      )}
       <div className={`perf-trend-body ${hasSplitBars ? 'perf-trend-body--split' : ''} ${centerBody ? 'perf-trend-body--center' : ''}`}>
         <div className="perf-trend-main">
           <div className="perf-insight-metric">
@@ -2754,12 +2813,12 @@ export default function SystemOverview({ active }: Props) {
     const txBwKey = nicName ? `bw:network:${nicName}:tx_mbps` : 'bw:network:tx_mbps'
 
     const utilSeries = [
-      { key: `${nicName || 'net'}-rx-util`, label: 'RX Util %', data: getSeries(rxUtilKey), stroke: PERF_COLORS.network },
-      { key: `${nicName || 'net'}-tx-util`, label: 'TX Util %', data: getSeries(txUtilKey), stroke: PERF_COLORS.gpu },
+      { key: `${nicName || 'net'}-rx-util`, label: 'Receive (RX) Util %', data: getSeries(rxUtilKey), stroke: PERF_COLORS.network },
+      { key: `${nicName || 'net'}-tx-util`, label: 'Send (TX) Util %', data: getSeries(txUtilKey), stroke: PERF_COLORS.gpu },
     ]
     const bwSeries = [
-      { key: `${nicName || 'net'}-rx-bw-kbps`, label: 'RX BW Kb/s', data: getSeries(rxBwKey).map((v) => (isNumber(v) ? v * 1000 : null)), stroke: PERF_COLORS.network },
-      { key: `${nicName || 'net'}-tx-bw-kbps`, label: 'TX BW Kb/s', data: getSeries(txBwKey).map((v) => (isNumber(v) ? v * 1000 : null)), stroke: PERF_COLORS.gpu },
+      { key: `${nicName || 'net'}-rx-bw-kbps`, label: 'Receive (RX) BW Kb/s', data: getSeries(rxBwKey).map((v) => (isNumber(v) ? v * 1000 : null)), stroke: PERF_COLORS.network },
+      { key: `${nicName || 'net'}-tx-bw-kbps`, label: 'Send (TX) BW Kb/s', data: getSeries(txBwKey).map((v) => (isNumber(v) ? v * 1000 : null)), stroke: PERF_COLORS.gpu },
     ]
     const bwValues = [...bwSeries[0].data, ...bwSeries[1].data].filter(isNumber)
     const bwMax = bwValues.length ? Math.max(...bwValues) : 0
@@ -2930,7 +2989,8 @@ export default function SystemOverview({ active }: Props) {
       const txUtil = isNumber(txMbps) && isNumber(bandwidth) && bandwidth > 0 ? Math.min(txMbps / bandwidth * 100, 100) : null
       const utilValues = [rxUtil, txUtil].filter(isNumber)
       const utilMax = utilValues.length ? Math.max(...utilValues) : null
-      return { nicName, bandwidth, rxRate, txRate, rxUtil, txUtil, utilMax }
+      const pressure = dynamicInfo?.pressure?.network_interfaces?.[nicName] ?? null
+      return { nicName, bandwidth, rxRate, txRate, rxUtil, txUtil, utilMax, pressure }
     })
   }, [validNics, dynamicInfo])
 
@@ -3018,12 +3078,22 @@ export default function SystemOverview({ active }: Props) {
   // when severity is unavailable (USE-only path with no pressure tick).
   const diskPressurePct = dynamicInfo?.disk?.pressure_pct ?? diskBusyPct
 
-  // Network pressure: read pre-computed values from backend
+  // Network pressure is the worst fused RX/TX score across controlled NICs;
+  // busy-NIC count separately describes how broadly the pressure is spread.
   const networkBusyNics = dynamicInfo?.pressure?.network_busy_nics ?? []
   const networkTotalCount = dynamicInfo?.pressure?.network_total_nics ?? 0
   const networkBusyCount = networkBusyNics.length
-  const networkPressurePct = dynamicInfo?.pressure?.network_busy_pct ?? null
-  const networkBusyLevelLabel = dynamicInfo?.pressure?.network_busy_level ?? 'NO DATA'
+  const networkPressurePct = dynamicInfo?.pressure?.network_pressure_pct ?? null
+  const networkPressureLevelLabel = dynamicInfo?.pressure?.network_pressure_level ?? 'NO DATA'
+  const networkWorstNic = dynamicInfo?.pressure?.network_worst_nic ?? null
+  const networkWorstDirection = dynamicInfo?.pressure?.network_worst_direction ?? null
+  // Short "why" for the overview gauge when it turns critical, pulled from the worst NIC's
+  // worst direction so the summary card is self-explanatory without opening the NIC card.
+  const networkWorstReason = (() => {
+    if (!networkWorstNic || !networkWorstDirection) return null
+    const dir = networkWorstDirection.toLowerCase() === 'tx' ? 'tx' : 'rx'
+    return dynamicInfo?.pressure?.network_interfaces?.[networkWorstNic]?.[dir]?.reason ?? null
+  })()
 
   const npuSmiRaw = dynamicInfo?.npu?.npu_smi?.raw
   const npuParsed = useMemo(() => parseNpuRaw(npuSmiRaw), [npuSmiRaw])
@@ -3272,18 +3342,20 @@ export default function SystemOverview({ active }: Props) {
             </>
           )}
 
-          {/* Network IO Pressure: fraction of busy NICs based on actual link speed */}
+          {/* Network pressure: worst fused NIC/direction, with busy-NIC breadth below. */}
           {showNetworkPressureCard && (
             <Col xs={24} md={showPressureSection ? 8 : 12}>
               <PressurePointerGauge
-                title="Network IO Pressure"
+                title="Network Pressure"
                 valuePct={networkPressurePct}
-                levelLabel={networkBusyLevelLabel}
+                levelLabel={networkPressureLevelLabel}
                 subtitle={[
-                  networkBusyCount > 0 ? `Busy: ${networkBusyNics.join(', ')}` : null,
+                  networkPressureLevelLabel === 'CRITICAL' && networkWorstReason
+                    ? `${networkWorstNic || ''}${networkWorstDirection ? ` (${networkWorstDirection})` : ''}: ${networkWorstReason}`
+                    : (networkBusyCount > 0 && networkWorstNic ? `Busy: ${networkWorstNic}${networkWorstDirection ? ` (${networkWorstDirection})` : ''}` : null),
                   networkTotalCount > 0 ? `${networkBusyCount}/${networkTotalCount} NICs busy` : null,
                 ].filter(Boolean).join(' | ')}
-                description="Fraction of busy NICs based on actual link speed"
+                description="Worst fused RX/TX pressure; subtitle shows the reason when critical, else affected NICs"
               />
             </Col>
           )}
@@ -3410,14 +3482,14 @@ export default function SystemOverview({ active }: Props) {
                 statusColor={isNumber(nic.utilMax) && nic.utilMax >= 80 ? COLORS.red : PERF_COLORS.network}
                 series={getSeries(`util:network:${nic.nicName}`)}
                 splitBars={[
-                  { key: 'rx-bar', label: 'RX', value: nic.rxUtil, color: PERF_COLORS.network, sublabel: `${formatBytesRate(nic.rxRate)}` },
-                  { key: 'tx-bar', label: 'TX', value: nic.txUtil, color: PERF_COLORS.gpu, sublabel: `${formatBytesRate(nic.txRate)}` },
+                  { key: 'rx-bar', label: 'Receive (RX)', value: nic.rxUtil, color: PERF_COLORS.network, sublabel: `${formatBytesRate(nic.rxRate)}` },
+                  { key: 'tx-bar', label: 'Send (TX)', value: nic.txUtil, color: PERF_COLORS.gpu, sublabel: `${formatBytesRate(nic.txRate)}` },
                 ]}
                 subtitle={`Peak BW: ${formatNetworkSpeed(nic.bandwidth)}`}
+                alert={networkPressureAlert(nic.pressure)}
                 details={[
                   { label: 'Util', value: formatPercent(nic.utilMax), source: 'dynamic' },
-                  { label: 'RX BW', value: formatMetric(toMbps(nic.rxRate), 'Mb/s', 2), source: 'dynamic' },
-                  { label: 'TX BW', value: formatMetric(toMbps(nic.txRate), 'Mb/s', 2), source: 'dynamic' },
+                  ...networkPressureDetails(nic.pressure, nic.rxRate, nic.txRate),
                 ]}
                 secondaryChart={(
                   <div>
@@ -3470,8 +3542,8 @@ export default function SystemOverview({ active }: Props) {
               statusColor={isNumber(networkUtilMax) && networkUtilMax >= 80 ? COLORS.red : PERF_COLORS.network}
               series={getSeries(networkNicCards.length === 1 ? `util:network:${networkNicCards[0].nicName}` : 'util:network')}
               splitBars={[
-                { key: 'rx-bar', label: 'RX', value: networkNicCards.length === 1 ? networkNicCards[0].rxUtil : fallbackRxUtil, color: PERF_COLORS.network, sublabel: formatBytesRate(networkNicCards.length === 1 ? networkNicCards[0].rxRate : fallbackRxRate) },
-                { key: 'tx-bar', label: 'TX', value: networkNicCards.length === 1 ? networkNicCards[0].txUtil : fallbackTxUtil, color: PERF_COLORS.gpu, sublabel: formatBytesRate(networkNicCards.length === 1 ? networkNicCards[0].txRate : fallbackTxRate) },
+                { key: 'rx-bar', label: 'Receive (RX)', value: networkNicCards.length === 1 ? networkNicCards[0].rxUtil : fallbackRxUtil, color: PERF_COLORS.network, sublabel: formatBytesRate(networkNicCards.length === 1 ? networkNicCards[0].rxRate : fallbackRxRate) },
+                { key: 'tx-bar', label: 'Send (TX)', value: networkNicCards.length === 1 ? networkNicCards[0].txUtil : fallbackTxUtil, color: PERF_COLORS.gpu, sublabel: formatBytesRate(networkNicCards.length === 1 ? networkNicCards[0].txRate : fallbackTxRate) },
               ]}
               subtitle={networkNicCards.length === 1
                 ? `Peak BW: ${formatNetworkSpeed(networkNicCards[0].bandwidth)}`
@@ -3482,10 +3554,14 @@ export default function SystemOverview({ active }: Props) {
                     ].filter(Boolean).join(' | ')
                   : 'No data'
               }
+              alert={networkNicCards.length === 1 ? networkPressureAlert(networkNicCards[0].pressure) : undefined}
               details={[
                 { label: 'Util', value: formatPercent(networkNicCards.length === 1 ? networkNicCards[0].utilMax : fallbackUtilMax), source: 'dynamic' },
-                { label: 'RX BW', value: formatMetric(toMbps(networkNicCards.length === 1 ? networkNicCards[0].rxRate : fallbackRxRate), 'Mb/s', 2), source: 'dynamic' },
-                { label: 'TX BW', value: formatMetric(toMbps(networkNicCards.length === 1 ? networkNicCards[0].txRate : fallbackTxRate), 'Mb/s', 2), source: 'dynamic' },
+                ...networkPressureDetails(
+                  networkNicCards.length === 1 ? networkNicCards[0].pressure : null,
+                  networkNicCards.length === 1 ? networkNicCards[0].rxRate : fallbackRxRate,
+                  networkNicCards.length === 1 ? networkNicCards[0].txRate : fallbackTxRate,
+                ),
               ]}
               secondaryChart={(
                 <div>

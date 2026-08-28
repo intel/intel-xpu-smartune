@@ -283,6 +283,12 @@ def _build_network_history(network: Dict[str, Any]) -> Dict[str, Any]:
 
     utilization_percent = max(all_nic_utils) if all_nic_utils else None
 
+    # Per-NIC, per-direction pressure diagnostics (packet loss / congestion).
+    # Kept alongside the network section so a network-only monitored set still
+    # persists loss/congestion history; the UI reads it as a fallback when the
+    # pressure section is not present.
+    pressure_interfaces = network.get("pressure_interfaces") if isinstance(network, dict) else None
+
     return {
         "total": {
             "rx_bytes_per_sec": rx_bytes,
@@ -291,6 +297,7 @@ def _build_network_history(network: Dict[str, Any]) -> Dict[str, Any]:
         "total_mbps": round(total_mbps, 3) if total_mbps is not None else None,
         "utilization_percent": round(utilization_percent, 3) if utilization_percent is not None else None,
         "per_nic": per_nic,
+        "pressure_interfaces": pressure_interfaces if isinstance(pressure_interfaces, dict) else {},
     }
 
 
@@ -339,7 +346,16 @@ def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
             "network_total_nics": pressure.get("network_total_nics"),
             "network_busy_ratio": to_float(pressure.get("network_busy_ratio")),
             "network_busy_pct": to_float(pressure.get("network_busy_pct")),
-            "network_busy_level": pressure.get("network_busy_level"),
+            "network_pressure_level": pressure.get("network_pressure_level"),
+            "network_pressure_pct": to_float(pressure.get("network_pressure_pct")),
+            "network_worst_nic": pressure.get("network_worst_nic"),
+            "network_worst_direction": pressure.get("network_worst_direction"),
+            # Per-NIC, per-direction diagnostics (drop_ratio_pct = packet loss,
+            # distress_pct = congestion). Persisted verbatim so the history
+            # Network chart can plot the same loss/congestion series the live
+            # card shows; without this the chart's loss/congestion lines are
+            # empty because the source data was dropped before storage.
+            "network_interfaces": pressure.get("network_interfaces") or {},
         }
 
     if "disk" in data:

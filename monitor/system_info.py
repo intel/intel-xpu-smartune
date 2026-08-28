@@ -60,6 +60,11 @@ from monitor.metrics.history import (
     persist_dynamic_snapshot_if_due,
 )
 from monitor.disk_pressure import compute_disk_pressure
+from monitor.network_pressure import (
+    _get_network_pressure_snapshot,
+    _compute_fused_network_pressure,
+    _build_network_interface_pressure,
+)
 from utils.logger import logger
 
 _STATIC_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
@@ -336,64 +341,6 @@ def _get_network_runtime_bw() -> Dict[str, Any]:
     }
 
 
-_NETWORK_BUSY_THRESHOLD_PCT = 80  # NIC is "busy" when max(rxUtil, txUtil) >= 80%
-
-
-def _compute_network_pressure(network_bw: Dict[str, Any], net_static: Dict[str, Any]) -> Dict[str, Any]:
-    """Compute per-NIC busy ratio based on actual link speed.
-
-    Returns a dict with busy_nics, total_nics, busy_ratio, busy_pct, busy_level
-    matching the disk IO pressure pattern.
-    """
-    interfaces = network_bw.get("interfaces") or {}
-    valid_nics = net_static.get("valid_nics") or []
-    nic_speeds = {nic["name"]: nic["speed_mbps"] for nic in valid_nics if isinstance(nic, dict) and nic.get("speed_mbps", 0) > 0}
-
-    busy_nics: List[str] = []
-    total_nics = 0
-
-    for nic_name, speed_mbps in nic_speeds.items():
-        nic_data = interfaces.get(nic_name)
-        if not isinstance(nic_data, dict):
-            continue
-        total_nics += 1
-        rx_bytes = nic_data.get("rx_bytes_per_sec", 0.0)
-        tx_bytes = nic_data.get("tx_bytes_per_sec", 0.0)
-        rx_mbps = rx_bytes * 8.0 / 1_000_000.0
-        tx_mbps = tx_bytes * 8.0 / 1_000_000.0
-        rx_util = min(rx_mbps / speed_mbps * 100.0, 100.0) if speed_mbps > 0 else 0.0
-        tx_util = min(tx_mbps / speed_mbps * 100.0, 100.0) if speed_mbps > 0 else 0.0
-        if max(rx_util, tx_util) >= _NETWORK_BUSY_THRESHOLD_PCT:
-            busy_nics.append(nic_name)
-
-    busy_count = len(busy_nics)
-    busy_ratio = busy_count / total_nics if total_nics > 0 else None
-    busy_pct = busy_ratio * 100.0 if busy_ratio is not None else None
-
-    _nth = b_config.network_thresholds or {}
-    _nth_low = _nth.get("low", 0.4)
-    _nth_medium = _nth.get("medium", 0.6)
-    _nth_high = _nth.get("high", 0.8)
-    if total_nics == 0 or busy_ratio is None:
-        busy_level = "NO DATA"
-    elif busy_ratio < _nth_low:
-        busy_level = "LOW"
-    elif busy_ratio < _nth_medium:
-        busy_level = "MEDIUM"
-    elif busy_ratio < _nth_high:
-        busy_level = "HIGH"
-    else:
-        busy_level = "CRITICAL"
-
-    return {
-        "busy_nics": busy_nics,
-        "total_nics": total_nics,
-        "busy_ratio": round(busy_ratio, 4) if busy_ratio is not None else None,
-        "busy_pct": round(busy_pct, 2) if busy_pct is not None else None,
-        "busy_level": busy_level,
-    }
-
-
 def _is_physical_nic_candidate(name: str) -> bool:
     """True for interfaces that can be a real shaping target.
 
@@ -455,6 +402,12 @@ def _get_network_static_info() -> Dict[str, Any]:
         if lower == "lo" or lower.startswith("docker") or lower.startswith("veth"):
             return False
         if lower.startswith("br-") or lower.startswith("virbr"):
+            return False
+        # Skip enslaved interfaces (bond/team slaves, bridge ports). An enslaved NIC
+        # exposes a /sys/class/net/<if>/master symlink; the *master* (e.g. bond0) is the
+        # one that carries and should shape the traffic. Shaping a slave directly would
+        # double-shape the same physical link and fight the master's qdisc.
+        if os.path.islink(f"/sys/class/net/{name}/master"):
             return False
         return True
 
@@ -715,7 +668,15 @@ class _DynamicInfoCollector:
         return get_memory_dynamic()
 
     def network(self) -> Dict[str, Any]:
-        return self._network_bw_runtime()
+        network = self._network_bw_runtime()
+        # Keep network pressure diagnostics with the network section so a
+        # network-only monitored set still persists loss/congestion history.
+        try:
+            snapshot = _get_network_pressure_snapshot()
+            network['pressure_interfaces'] = _build_network_interface_pressure(snapshot)
+        except Exception as e:
+            logger.debug(f"Network pressure diagnostics unavailable: {e}")
+        return network
 
     def disk(self) -> Dict[str, Any]:
         disk_stats: Dict[str, Any] = {}
@@ -794,18 +755,20 @@ class _DynamicInfoCollector:
         except Exception as e:
             logger.debug(f"PSIMonitor unavailable for raw pressure: {e}")
 
-        # Network pressure: per-NIC busy ratio based on actual link speed.
-        # Reuses the memoized runtime bandwidth so a full snapshot does not
-        # sample the NICs twice for the network and pressure sections.
+        # Network pressure: use the same per-NIC fused scores the controller
+        # sampled for shaping.
         try:
-            network_bw = self._network_bw_runtime()
-            net_static = _get_network_static_info()
-            net_pressure_result = _compute_network_pressure(network_bw, net_static)
+            net_snapshot = _get_network_pressure_snapshot()
+            net_pressure_result = _compute_fused_network_pressure(net_snapshot)
+            pressure_extra['network_interfaces'] = _build_network_interface_pressure(net_snapshot)
             pressure_extra['network_busy_nics'] = net_pressure_result['busy_nics']
             pressure_extra['network_total_nics'] = net_pressure_result['total_nics']
             pressure_extra['network_busy_ratio'] = net_pressure_result['busy_ratio']
             pressure_extra['network_busy_pct'] = net_pressure_result['busy_pct']
-            pressure_extra['network_busy_level'] = net_pressure_result['busy_level']
+            pressure_extra['network_pressure_level'] = net_pressure_result['level']
+            pressure_extra['network_pressure_pct'] = net_pressure_result['pressure_pct']
+            pressure_extra['network_worst_nic'] = net_pressure_result['worst_nic']
+            pressure_extra['network_worst_direction'] = net_pressure_result['worst_direction']
         except Exception as e:
             logger.debug(f"Network pressure calculation unavailable: {e}")
 

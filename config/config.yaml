@@ -262,13 +262,27 @@ limit_policy: # Default resource limit ratios for apps at different priority lev
       unknown:           # same as nvme
         mb_s: 30
         iops: 2000
-enable_network_control: false # Whether to enable network traffic control
-enable_network_pressure_shaping: false  # Whether to enable pressure-driven dynamic throttle/recover within network classes
+# Network control switches. All are disabled by default.
+enable_network_control: false  #Create and apply TC traffic classes to selected NICs.
+enable_network_pressure_shaping: false  #Adjust TC bandwidth limits when fused network pressure changes.
+enable_app_pps_police: false  #During a TX small-packet flood, cap lower-priority apps by packet rate.
+# Small-packet flood policy. An app exceeding app_pps_high is capped at
+# pps_cap_rate with the specified short burst when collective harm is detected.
+network_pps_policy:
+  app_pps_high: 50000    # PPS threshold for a lower-priority flood candidate
+  pps_cap_rate: 10000    # Sustained PPS cap applied to a selected app
+  pps_cap_burst: 2000    # Packets allowed above the sustained cap in a short burst
 network_thresholds:
   low: 0.3
   medium: 0.5
   high: 0.7
   critical: 0.9
+# NIC pressure calibration. Generic rx_dropped is driver/stack-specific, so it
+# contributes only half-strength. Hardware receive overflow and softnet backlog drops
+# remain full-strength capacity signals.
+# Values are re-read by the monitor each sample; valid range is 0.0 to 1.0.
+network_pressure_model:
+  rx_drop_weight: 0.3
 config_network_bw:  # ratio [0, 1] of NIC link bandwidth per network class
   system:
     min: 0.05
@@ -281,7 +295,7 @@ config_network_bw:  # ratio [0, 1] of NIC link bandwidth per network class
     max: 0.80
   low:
     min: 0.10
-    max: 0.80
+    max: 1.00
 network_burst_map:
   critical: "64k"
   high: "32k"

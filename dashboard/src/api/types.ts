@@ -42,7 +42,33 @@ export interface PressureData {
   network_total_nics?: number
   network_busy_ratio?: number | null
   network_busy_pct?: number | null
-  network_busy_level?: string
+  network_pressure_level?: string
+  network_pressure_pct?: number | null
+  network_worst_nic?: string | null
+  network_worst_direction?: string | null
+  // Per-NIC, per-direction pressure diagnostics (why a direction is under pressure).
+  network_interfaces?: Record<string, NetworkInterfacePressure>
+}
+
+// One direction's (rx or tx) pressure breakdown, all percent-scaled. Fields specific to
+// a direction (hw_overflow/softnet on rx, fifo on tx) are optional so the other omits them.
+export interface NetworkDirectionPressure {
+  util_pct?: number
+  distress_pct?: number
+  score_pct?: number
+  drop_ratio_pct?: number
+  hw_overflow_ratio_pct?: number
+  softnet_squeeze_ratio_pct?: number
+  softnet_drop_ratio_pct?: number
+  fifo_ratio_pct?: number
+  collective_harm_pct?: number
+  level?: string
+  reason?: string | null
+}
+
+export interface NetworkInterfacePressure {
+  rx?: NetworkDirectionPressure
+  tx?: NetworkDirectionPressure
 }
 
 export interface AppInfo {

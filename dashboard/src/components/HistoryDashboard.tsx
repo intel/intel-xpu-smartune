@@ -553,9 +553,17 @@ function buildPressureTrendPoints(items: HistorySnapshotItem[]): PressureTrendPo
     const systemPressure = isNumber(scoreRaw as number | null)
       ? Math.round((scoreRaw as number) * 100)
       : getPressurePeak(dynamic)
-    // Disk pressure: busy-disk ratio from _compute_disk_pressure (busy_disks/total_disks × 100)
-    const diskBusyPct = (dynamic?.disk as Record<string, unknown> | undefined)?.busy_pct
-    const diskPressure = isNumber(diskBusyPct as number | null) ? (diskBusyPct as number) : null
+    // Disk pressure: match the System Overview gauge — PSI-gated severity
+    // (pressure_pct), falling back to the busy-disk ratio (busy_pct) when the
+    // severity is unavailable (USE-only path with no pressure tick).
+    const diskData = dynamic?.disk as Record<string, unknown> | undefined
+    const diskPressurePctRaw = diskData?.pressure_pct
+    const diskBusyPct = diskData?.busy_pct
+    const diskPressure = isNumber(diskPressurePctRaw as number | null)
+      ? (diskPressurePctRaw as number)
+      : isNumber(diskBusyPct as number | null)
+        ? (diskBusyPct as number)
+        : null
     // Network pressure: worst fused RX/TX score across monitored NICs.
     const netPressurePct = (dynamic?.pressure as Record<string, unknown> | undefined)?.network_pressure_pct
     const networkPressure = isNumber(netPressurePct as number | null) ? (netPressurePct as number) : null

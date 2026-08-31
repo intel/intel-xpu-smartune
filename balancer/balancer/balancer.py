@@ -1088,6 +1088,8 @@ class DynamicBalancer:
             top_cgroups = set()
             if app_info.get('cgroup'):
                 top_cgroups.add(os.path.basename(app_info['cgroup']))
+            if app_info.get('cgroup_id'):
+                top_cgroups.add(app_info['cgroup_id'])
             for extra in app_info.get('extra_cgroups', []) or []:
                 top_cgroups.add(os.path.basename(extra))
 
@@ -1547,7 +1549,11 @@ class DynamicBalancer:
         reason is "system_pressure" even for the io.max part -- there is no separate disk
         level under this policy to attribute it to.
         """
-        app_name = target.get('process', {}).get('name') or ''
+        app_name = (
+            (target.get('app') or {}).get('name')
+            or target.get('process', {}).get('name')
+            or app_id
+        )
         total_mem = self.resource_monitor.get_total_memory()
         logger.info(f"Adjusting resources for app: {app_id}")
         extra_cgroup_ids = target.get('extra_cgroups', [])
@@ -1887,7 +1893,11 @@ class DynamicBalancer:
         *pressure_level* is the level of the channel that triggered this limit; it is
         recorded on the registry entry so the UI can say *why* the app was limited.
         """
-        app_name = target_app.get('process', {}).get('name') or ''
+        app_name = (
+            (target_app.get('app') or {}).get('name')
+            or target_app.get('process', {}).get('name')
+            or app_id
+        )
         total_mem = self.resource_monitor.get_total_memory()
         logger.info(f"Adjusting resources for app: {app_id}")
 
@@ -2111,6 +2121,7 @@ class DynamicBalancer:
             app_id = app_info['app'].get('id') if app_info.get('app') else None
             if not app_id:
                 continue
+            sampled_cgroup = (app_info.get('cgroup_id') or '').strip()
             proc = app_info.get('process', {})
             app_name = (proc.get('name') or '').lower()
             cand_mb = (proc.get('io_read_rate') or 0.0) + (proc.get('io_write_rate') or 0.0)
@@ -2129,9 +2140,12 @@ class DynamicBalancer:
                 continue
             # 1b) Excluded by a user restore. Checked again here because this arm holds
             #     its batch across ticks while the disk sits at "high".
+            candidate_cgroups = list(app_info.get('extra_cgroups') or [])
+            if sampled_cgroup and sampled_cgroup not in candidate_cgroups:
+                candidate_cgroups.append(sampled_cgroup)
             with self.all_limits.lock:  # the REST thread can add/remove entries mid-walk
                 excluded = self.all_limits.is_excluded(
-                    app_id, app_name, app_info.get('extra_cgroups') or [])
+                    app_id, app_name, candidate_cgroups)
             if excluded is not None:
                 logger.info(f"[disk-io] skip {cand}: excluded from auto-limit "
                             f"({excluded.get('key')})")
@@ -2142,7 +2156,7 @@ class DynamicBalancer:
             #    registry entry was keyed by the resolved cgroup. Matching only one of them
             #    would re-cap the same app on every critical tick and never reach the
             #    second-heaviest consumer.
-            known_ids = [i for i in (app_id, (controlled_data or {}).get('app_id')) if i]
+            known_ids = [i for i in (app_id, sampled_cgroup, (controlled_data or {}).get('app_id')) if i]
             existing = next(
                 (e for e in (self.all_limits.by_any_id(i, source="auto") for i in known_ids)
                  if e and e[1].limit_parts.get('io_limited')), None)
@@ -2161,6 +2175,10 @@ class DynamicBalancer:
                 resolved_id = self._resolve_controlled_target(app_info, controlled_data)
                 if resolved_id:
                     app_id = resolved_id
+            elif sampled_cgroup:
+                # Disk-IO throttling writes cgroup io.max. Keep display identity from
+                # process naming, but target the sampled cgroup basename for writes.
+                app_id = sampled_cgroup
 
             rates = self.get_limited_rates(priority or "undefined")
             # On the candidate, not the return tuple: the apply path only needs it to

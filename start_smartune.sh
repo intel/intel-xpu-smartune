@@ -59,10 +59,25 @@ fi
 
 PYTHON_BIN="$(command -v python3)"
 
+# Refuse to start a second instance. If SmarTune is already running, leave the
+# existing service untouched and exit *before* installing the cleanup trap, so
+# this aborted start never signals the process that is already serving.
+if pgrep -f "$SCRIPT_DIR/smartune.py" >/dev/null 2>&1; then
+    echo "SmarTune is already running; refusing to start another instance." >&2
+    echo "Stop the running service first (it keeps serving on port 9001)." >&2
+    exit 1
+fi
+
+CHILD_PID=""
 cleanup() {
     echo "Clean up..."
-    sudo pkill -f "smartune.py" 2>/dev/null
-    wait
+    if [ -n "$CHILD_PID" ]; then
+        # Only terminate the service this script started (and its children),
+        # never other SmarTune instances.
+        sudo pkill -P "$CHILD_PID" 2>/dev/null || true
+        sudo kill "$CHILD_PID" 2>/dev/null || true
+    fi
+    wait 2>/dev/null
     stty sane 2>/dev/null || true
     echo "Service stopped."
 }
@@ -70,8 +85,10 @@ trap cleanup INT TERM EXIT
 
 if [ "$MODE" = "monitor" ]; then
     echo "Starting monitor only..."
-    sudo -E "$PYTHON_BIN" "$SCRIPT_DIR/smartune.py" -m
+    sudo -E "$PYTHON_BIN" "$SCRIPT_DIR/smartune.py" -m &
 else
     echo "Starting balancer + monitor..."
-    sudo -E "$PYTHON_BIN" "$SCRIPT_DIR/smartune.py" -a
+    sudo -E "$PYTHON_BIN" "$SCRIPT_DIR/smartune.py" -a &
 fi
+CHILD_PID=$!
+wait "$CHILD_PID"

@@ -300,6 +300,20 @@ class RegisteredAppMatchTests(unittest.TestCase):
              'cgroup': '/system.slice/lo2-io.scope'})
         self.assertEqual(result['id'], 'lo2-io.scope')
 
+    def test_session_scope_fallback_prefers_script_identity_over_interpreter(self):
+        mon = self._monitor([self._app("lo-io.scope", "fio_lo", "/tmp/fio_lo")])
+        result = mon.try_match_app(
+            {
+                'dominant_name': 'python3',
+                'dominant_cmdline': 'python3 /opt/workloads/fio_runner.py --name lo',
+                'names': {'python3'},
+                'exe': '/usr/bin/python3',
+                'cgroup': '/user.slice/session-12.scope',
+            }
+        )
+        self.assertEqual(result['id'], 'fio_runner.py')
+        self.assertEqual(result['name'], 'fio_runner.py')
+
 
 class RepresentativeCgroupTests(unittest.TestCase):
     """Which cgroup an app's matched PIDs are taken to live in.

@@ -367,6 +367,10 @@ def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
             "busy_ratio": to_float(disk.get("busy_ratio")),
             "busy_pct": to_float(disk.get("busy_pct")),
             "busy_level": disk.get("busy_level"),
+            # PSI-gated severity (distinct from busy_pct breadth). Persisted so the
+            # history Disk Pressure chart plots the same value the live Disk IO
+            # Pressure gauge shows; without this the chart falls back to busy_pct.
+            "pressure_pct": to_float(disk.get("pressure_pct")),
         }
 
     if "network" in data:

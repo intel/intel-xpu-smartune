@@ -3,6 +3,7 @@
 
 import os
 import re
+import shlex
 # [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments
 # with shell=False (default). No untrusted shell execution or string
 # concatenation is performed. All inputs are internally validated.
@@ -1129,6 +1130,21 @@ class ResourceMonitor:
                 scope_name,
             ):
                 dominant_name = process_info.get('dominant_name', '')
+                # Prefer the same commandline-aware identity rule used by app discovery:
+                # interpreter launches (python3 foo.py) should surface foo.py, not python3.
+                dominant_cmdline = (process_info.get('dominant_cmdline') or '').strip()
+                if dominant_name and dominant_cmdline:
+                    try:
+                        cmd_tokens = shlex.split(dominant_cmdline)
+                    except ValueError:
+                        cmd_tokens = dominant_cmdline.split()
+                    resolved = derived_process_identity({
+                        'name': dominant_name,
+                        'exe': process_info.get('exe') or '',
+                        'cmdline': cmd_tokens,
+                    }).strip()
+                    if resolved:
+                        dominant_name = resolved
                 if dominant_name:
                     return {
                         'type': 'process',
@@ -1253,6 +1269,9 @@ class ResourceMonitor:
                     'io_per_disk': process.get('io_per_disk', {}),
                 },
                 'app': app_info,
+                # Primary sampled cgroup basename. Disk-IO throttling targets io.max,
+                # which is cgroup-scoped even when app identity/display is process-scoped.
+                'cgroup_id': os.path.basename(process.get('cgroup') or ''),
                 # Full PID list (see get_top_resource_consumers) for close-detection.
                 'pids': list(process['pids']),
                 'extra_cgroups': [

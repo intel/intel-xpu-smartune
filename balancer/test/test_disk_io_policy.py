@@ -257,8 +257,9 @@ class ConfigSurfaceTests(unittest.TestCase):
                     f"{media}.{field}")
 
 
-def _consumer(app_id, mb=500.0, iops=5000.0, name='fio'):
+def _consumer(app_id, mb=500.0, iops=5000.0, name='fio', cgroup_id=''):
     return {'app': {'id': app_id},
+            'cgroup_id': cgroup_id,
             'process': {'name': name, 'io_read_rate': 0.0, 'io_write_rate': mb,
                         'io_read_iops': 0.0, 'io_write_iops': iops}}
 
@@ -329,6 +330,22 @@ class AlreadyLimitedTests(unittest.TestCase):
         b = self._b(_limited('lo-io.scope', 'lo-app', ['lo-io.scope'], io_limited=False))
         app_id, _ = self._select(b, [_consumer('lo-io.scope')])
         self.assertEqual(app_id, 'lo-io.scope')
+
+    def test_uncontrolled_process_identity_uses_sampled_cgroup_as_throttle_key(self):
+        b = self._b()
+        app_id, _ = self._select(
+            b,
+            [_consumer('fio_runner.py', cgroup_id='session-12.scope', name='fio_runner.py')]
+        )
+        self.assertEqual(app_id, 'session-12.scope')
+
+    def test_already_limited_match_checks_sampled_cgroup_identity(self):
+        b = self._b(_limited('session-12.scope', 'session-12.scope', ['session-12.scope']))
+        app_id, _ = self._select(
+            b,
+            [_consumer('fio_runner.py', cgroup_id='session-12.scope', name='fio_runner.py')]
+        )
+        self.assertIsNone(app_id)
 
 
 class PublicIdTests(unittest.TestCase):

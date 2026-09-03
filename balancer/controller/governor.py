@@ -14,8 +14,8 @@ class GovernorController:
 
     def __get_governor(self):
         try:
-            base_cmd = ["cpupower", "frequency-info", "-p"]
-            cmd = ["sudo", *base_cmd] if getattr(self.config, "vendor", "") == "generic" else base_cmd
+            # smartune runs as root; reading cpupower info needs no sudo.
+            cmd = ["cpupower", "frequency-info", "-p"]
             result = subprocess.run(
                 cmd,
                 capture_output = True,

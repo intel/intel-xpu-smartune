@@ -27,30 +27,31 @@ _controlled_apps_snapshot: Optional[List[Dict[str, Any]]] = None
 _controlled_apps_epoch: int = -1
 
 
-def build_sudo_cmd(base_cmd: List[str]) -> List[str]:
-    """
-    Build command with or without sudo based on vendor configuration.
-
-    :param base_cmd: The base command as a list
-    :return: Command list with sudo prepended if vendor is "generic", otherwise original command
-    """
-    if getattr(b_config, "vendor", "generic") == "generic":
-        return ["sudo"] + base_cmd
-    return base_cmd
+def _default_cgroup_root() -> str:
+    """The configured cgroup mount, defaulting to the standard v2 location."""
+    return getattr(b_config, "cgroup_mount", None) or "/sys/fs/cgroup"
 
 
-def build_sudo_shell_redirect(content: str, target_file: str) -> List[str]:
-    """
-    Build a shell redirection command with or without sudo based on vendor configuration.
+def write_cgroup_file(content: str, target_file: str, allowed_roots=None) -> None:
+    """Write *content* to a cgroup control file without invoking a shell.
 
-    :param content: The content to write (e.g., "+io", "100")
-    :param target_file: The target file path
-    :return: Command list for shell redirection
+    The real path of *target_file* (after resolving symlinks and ``..``) must
+    fall inside one of *allowed_roots* -- the configured cgroup mount by
+    default -- otherwise a ``PermissionError`` is raised and nothing is written.
+
+    This is defence-in-depth: today every caller passes an internally-built
+    path, but because this process runs as root the guard makes sure a future
+    caller that forwards a tainted path (``../../etc/...``) cannot clobber an
+    arbitrary file. ``PermissionError`` subclasses ``OSError``, so callers that
+    already treat a failed write as an ``OSError`` handle a refusal unchanged.
     """
-    shell_cmd = f"echo '{content}' > {target_file}"
-    if getattr(b_config, "vendor", "generic") == "generic":
-        return ["sudo", "sh", "-c", shell_cmd]
-    return ["sh", "-c", shell_cmd]
+    roots = tuple(allowed_roots) if allowed_roots is not None else (_default_cgroup_root(),)
+    real_path = os.path.realpath(target_file)
+    real_roots = [os.path.realpath(root) for root in roots]
+    if not any(real_path == root or real_path.startswith(root + os.sep) for root in real_roots):
+        raise PermissionError(f"Refusing to write outside {roots}: {target_file!r} -> {real_path}")
+    with open(real_path, "w", encoding="utf-8") as target:
+        target.write(f"{content}\n")
 
 class ClientCallbackManager:
     """Manages global state and operations for client-side callbacks."""
@@ -740,16 +741,13 @@ def adjust_oom_priority(
                 target_value = "-1000"
                 action = "Setting"
 
-            # Update oom_score_adj
+            # Update oom_score_adj. smartune runs as root (see smartune.service),
+            # so write /proc/<pid>/oom_score_adj directly instead of shelling out
+            # to `sudo tee` -- same shell-free path as write_cgroup_file().
             logger.debug(f"{action} OOM priority for PID {pid} to {target_value}")
-            base_cmd = ["tee", oom_file]
-            cmd = ["sudo", *base_cmd] if getattr(b_config, "vendor", "") == "generic" else base_cmd
-            subprocess.run(
-                cmd,
-                input=target_value,
-                text=True,
-                check=True,
-            )
+            # oom_file is /proc/<pid>/oom_score_adj (pid comes from pgrep, so
+            # always numeric); allow the /proc tree for this one write.
+            write_cgroup_file(str(target_value), oom_file, allowed_roots=("/proc",))
 
         _update_app_oom_score_adj(app_id, int(target_value))
         logger.info(f"OOM priority updated for {app_name} (PID(s): {', '.join(pids)})")
@@ -981,19 +979,28 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
         return {}
 
 
-def get_dbus_address():
-    """Dynamically retrieve the current user's DBus session bus address."""
-    uid = os.getuid()
+def get_dbus_address(uid=None):
+    """Dynamically retrieve the DBus session bus address for ``uid``.
+
+    When ``uid`` is None the current process uid is used. Callers that run as
+    root but need to reach a desktop user's ``systemd --user`` session must pass
+    that user's uid, otherwise the root session bus (``/run/user/0/bus``) is
+    resolved and ``systemctl --user`` talks to the wrong session.
+    """
+    if uid is None:
+        uid = os.getuid()
 
     # Method 1: check the standard socket path
     standard_path = f"/run/user/{uid}/bus"
     if os.path.exists(standard_path):
         return f"unix:path={standard_path}"
 
-    # Method 2: retrieve from process environment
+    # Method 2: retrieve from a process owned by the target uid
     try:
-        for proc in psutil.process_iter(['environ']):
+        for proc in psutil.process_iter(['uids', 'environ']):
             try:
+                if proc.uids().real != uid:
+                    continue
                 env = proc.environ()
                 if 'DBUS_SESSION_BUS_ADDRESS' in env:
                     return env['DBUS_SESSION_BUS_ADDRESS']

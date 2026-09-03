@@ -3,13 +3,10 @@
 
 import os
 from controller.base import ControllerBase
-# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
-# with shell=False (default). No untrusted shell execution or string 
-# concatenation is performed. All inputs are internally validated.
-import subprocess # nosec
+import subprocess
 
 from utils.logger import logger
-from utils.app_utils import build_sudo_cmd, build_sudo_shell_redirect
+from utils.app_utils import write_cgroup_file
 from config.config import b_config
 
 # Reserved
@@ -24,11 +21,11 @@ class MemoryController(ControllerBase):
     def set_managed_oom_pressure(self, user_service: str = "user@1000.service", oom_pressure: str = "auto") -> bool:
         """Control of systemd OOM will take over in the Balancer, so set the default value from kill to auto"""
         try:
-            cmd_base = [
+            # smartune runs as root, so call systemctl directly (no sudo prefix).
+            cmd = [
                 'systemctl', 'set-property', '--runtime',
                 user_service, f'ManagedOOMMemoryPressure={oom_pressure}'
             ]
-            cmd = build_sudo_cmd(cmd_base)
 
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
@@ -43,10 +40,9 @@ class MemoryController(ControllerBase):
         try:
             path = os.path.join(self.get_full_path(cgroup), param)
             logger.debug(f"mem set_parameter path = {path}")
-            cmd = build_sudo_shell_redirect(value, path)
-            subprocess.run(cmd, capture_output=True)
+            write_cgroup_file(value, path)
             return True
-        except (FileNotFoundError, PermissionError) as e:
+        except OSError as e:
             logger.error(f"Failed to set {param}={value}: {e}")
             return False
 

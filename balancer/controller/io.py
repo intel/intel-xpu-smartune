@@ -2,14 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
-# with shell=False (default). No untrusted shell execution or string 
-# concatenation is performed. All inputs are internally validated.
-import subprocess # nosec
+import re
+import subprocess
 from typing import Optional, List, Dict, Union
 from config.config import b_config
 from utils.logger import logger
-from utils.app_utils import build_sudo_shell_redirect
+from utils.app_utils import write_cgroup_file
+
+# A cgroup/unit name as it appears on disk: scope/service/slice names, digits,
+# and the delimiters systemd uses. Deliberately excludes '/', whitespace and
+# the glob metacharacters ('*', '?', '[') that `find -name` would interpret,
+# so a tainted id can neither traverse paths nor widen the match.
+_CGROUP_ID_RE = re.compile(r'^[A-Za-z0-9._@:-]+$')
+
 
 class IOController:
     def __init__(self):
@@ -31,15 +36,14 @@ class IOController:
             logger.error(f"Failed to get active user slices: {e}")
         return "0"
 
-    def _run_cmd(self, cmd, check: bool = True, log_on_fail: bool = True) -> bool:
-        """Execute a shell command and return True on success."""
+    def _write_cgroup_file(self, content: str, target_file: str, log_on_fail: bool = True) -> bool:
+        """Write one cgroup control value and return whether it succeeded."""
         try:
-            subprocess.run(cmd, shell=False, check=check, capture_output=True)
+            write_cgroup_file(content, target_file)
             return True
-        except subprocess.CalledProcessError as e:
+        except OSError as error:
             if log_on_fail:
-                cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
-                logger.error(f"Command failed: {cmd_str}\nError: {e.stderr.decode().strip()}")
+                logger.error("Failed to write cgroup file %s: %s", target_file, error)
             return False
 
     def _check_file_exists(self, path: str) -> bool:
@@ -66,8 +70,7 @@ class IOController:
                 success = False
                 continue
 
-            cmd = build_sudo_shell_redirect("+io", path)
-            if not self._run_cmd(cmd):
+            if not self._write_cgroup_file("+io", path):
                 success = False
 
         return success
@@ -167,9 +170,8 @@ class IOController:
                     if 'io' in f.read().split():
                         continue
 
-                cmd = build_sudo_shell_redirect("+io", control_file)
                 logger.info(f"Enabling IO controller at {control_file}")
-                if not self._run_cmd(cmd):
+                if not self._write_cgroup_file("+io", control_file):
                     logger.info(f"Failed to enable IO at {control_file}")
                     return False
 
@@ -181,6 +183,11 @@ class IOController:
 
     def _get_full_cgroup_path(self, cgroup_id: str, file: str) -> Optional[str]:
         """Locate the full cgroup directory path for cgroup_id and return the path to file."""
+        if not cgroup_id or not _CGROUP_ID_RE.match(cgroup_id):
+            # Reject anything that isn't a plain unit name before it reaches
+            # `find -name` (glob) or gets joined into a write path.
+            logger.warning(f"Rejecting invalid cgroup_id for path lookup: {cgroup_id!r}")
+            return None
         try:
             result = subprocess.run(
                 ["find", self.cgroup_mount, "-name", cgroup_id, "-type", "d"],
@@ -275,7 +282,6 @@ class IOController:
                     success = False
                     continue
 
-                cmd = build_sudo_shell_redirect(f"{disk_id} {limit_str}", io_max_path)
                 logger.info(f"Setting IO limits for cgroup: {cgroup_id} in disk {disk_name}({disk_id}): {limit_str}")
 
                 # Any `systemctl set-property` elsewhere (e.g. CPU/mem restore) can
@@ -284,8 +290,10 @@ class IOController:
                 # has no IO constraints once CPUQuota=/MemoryHigh= are cleared. The
                 # write then returns EACCES even though our pre-flight check passed.
                 # Re-run _ensure_io_enabled (re-adds +io) and retry once.
-                if not self._run_cmd(cmd, log_on_fail=False):
-                    if self._ensure_io_enabled(io_max_path) and self._run_cmd(cmd):
+                if not self._write_cgroup_file(f"{disk_id} {limit_str}", io_max_path, log_on_fail=False):
+                    if self._ensure_io_enabled(io_max_path) and self._write_cgroup_file(
+                        f"{disk_id} {limit_str}", io_max_path
+                    ):
                         continue
                     logger.error(
                         f"Failed to write io.max for cgroup {cgroup_id} (disk {disk_name}) "
@@ -341,8 +349,7 @@ class IOController:
             return False
 
         logger.info(f"Setting IO weight to {weight} for cgroup {cgroup_id}")
-        cmd = build_sudo_shell_redirect(str(weight), io_weight_path)
-        return self._run_cmd(cmd)
+        return self._write_cgroup_file(str(weight), io_weight_path)
 
     def get_current_io_limits(self, cgroup_id: str) -> Optional[tuple[int, int, int, int]]:
         """

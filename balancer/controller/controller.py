@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import pwd
 import subprocess # nosec
 import time
 from subprocess import check_output # nosec
@@ -137,11 +138,11 @@ class Controller:
     def restore_cpu_throttle(self):
         scopes = self.get_user_scopes()
         services = self.get_app_services()
-        cmd_prefix = ['sudo'] if getattr(self.config, "vendor", "") == "generic" else []
 
         logger.debug(f"restore_cpu_throttle scopes = {scopes}, services = {services}")
         for scope in scopes:
-            cmd = [*cmd_prefix, 'systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=100%']
+            # smartune runs as root; system scopes need no sudo.
+            cmd = ['systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=100%']
             result = subprocess.run(cmd,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
@@ -153,16 +154,40 @@ class Controller:
     def high_cpu_throttle(self):
         scopes = self.get_user_scopes()
         services = self.get_app_services()
-        cmd_prefix = ['sudo'] if getattr(self.config, "vendor", "") == "generic" else []
 
         logger.debug(f"high_cpu_throttle scopes = {scopes}, services = {services}")
         for scope in scopes:
-            result = subprocess.run([*cmd_prefix, 'systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=60%'],
+            # smartune runs as root; system scopes need no sudo.
+            result = subprocess.run(['systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=60%'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
         for service in services:
             result = subprocess.run(['systemctl', '--user', 'set-property', '--runtime', '%s' % service, 'CPUQuota=60%'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+
+    def _resolve_session_user(self) -> Optional[str]:
+        """Return the desktop user whose ``systemd --user`` session we target.
+
+        Under interactive ``sudo -E`` startup, ``SUDO_USER`` names the invoking
+        user.  Under the systemd service (``User=root``, no controlling tty)
+        ``SUDO_USER`` is unset and ``os.getlogin()`` raises ``OSError``, so fall
+        back to the owner of an active ``/run/user/<uid>`` runtime directory,
+        skipping root's own.  Returns ``None`` when no desktop session is found.
+        """
+        user = os.getenv('SUDO_USER')
+        if user:
+            return user
+        try:
+            return os.getlogin()
+        except OSError:
+            pass
+        try:
+            for entry in sorted(os.listdir('/run/user')):
+                if entry.isdigit() and int(entry) != 0:
+                    return pwd.getpwuid(int(entry)).pw_name
+        except (OSError, KeyError):
+            pass
+        return None
 
     def _is_system_service(self, unit_name: str) -> bool:
         """Return True if *unit_name* lives under /sys/fs/cgroup/system.slice.
@@ -268,28 +293,41 @@ class Controller:
         # Execute command with up to _MAX_RETRIES retries to handle transient dbus timeout issues
         _MAX_RETRIES = 3
         try:
-            dbus_address = app_utils.get_dbus_address()
-            if not dbus_address:
-                raise Exception("Failed to retrieve DBus session address")
-
-            if getattr(self.config, "vendor", "") == "generic":
-                # scope and system_service both use "sudo systemctl" (no --user);
-                # user-space .service units go through the D-Bus session bus.
-                cmd_base = (
-                    ['sudo', 'systemctl', 'set-property', '--runtime', matching_app]
-                    if unit_type in ('scope', 'system_service') else
-                    [
-                        'sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(),
-                        f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',
-                        'systemctl', '--user', 'set-property', '--runtime', matching_app
-                    ]
-                )
+            dbus_address = None
+            if getattr(self.config, "vendor", "") == "generic" and unit_type not in ('scope', 'system_service'):
+                # User-space .service unit: smartune is root, so drop to the
+                # desktop user to reach their `systemd --user` session bus.
+                session_user = self._resolve_session_user()
+                if not session_user:
+                    raise Exception("Cannot resolve desktop user for user-scope systemctl")
+                # Derive the DBus address from the *resolved* user's uid, not the
+                # current (root) uid, otherwise systemctl --user would target the
+                # wrong session bus (/run/user/0/bus).
+                try:
+                    session_uid = pwd.getpwnam(session_user).pw_uid
+                except KeyError:
+                    raise Exception(f"Cannot resolve uid for desktop user {session_user}")
+                dbus_address = app_utils.get_dbus_address(session_uid)
+                if not dbus_address:
+                    raise Exception("Failed to retrieve DBus session address")
+                cmd_base = [
+                    'sudo', '-u', session_user,
+                    f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',
+                    'systemctl', '--user', 'set-property', '--runtime', matching_app
+                ]
             else:
-                cmd_base = (
-                    ['systemctl', 'set-property', '--runtime', matching_app]
-                )
+                # System scopes/services (and non-generic vendors): smartune
+                # already runs as root, so no sudo prefix is needed.
+                cmd_base = ['systemctl', 'set-property', '--runtime', matching_app]
 
             cmd = cmd_base + properties
+
+            # Merge the DBus address into the existing environment rather than
+            # replacing it, so PATH/locale (needed to resolve sudo/systemctl)
+            # are preserved.
+            run_env = os.environ.copy()
+            if dbus_address:
+                run_env["DBUS_SESSION_BUS_ADDRESS"] = dbus_address
 
             logger.debug(f"Executing command: {' '.join(cmd)}")
             for attempt in range(1, _MAX_RETRIES + 1):
@@ -300,7 +338,7 @@ class Controller:
                         stderr=subprocess.PIPE,
                         text=True,
                         check=True,
-                        env={"DBUS_SESSION_BUS_ADDRESS": dbus_address} if dbus_address else None
+                        env=run_env
                     )
                     logger.debug(f"Executed result: {result}")
                     return True

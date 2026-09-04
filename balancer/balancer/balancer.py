@@ -85,7 +85,9 @@ class LimitedApp:
     cgroups: list = field(default_factory=list)
     limit_disks: list = field(default_factory=list)
     pids: set = field(default_factory=set)
+    representative_pid: Optional[int] = None
     limited_at: float = 0.0                   # epoch seconds when the limit was applied
+    adopted_from_auto: bool = False           # retain the auto-limit cgroup scope in Manual Control
 
 
 class LimitRegistry:
@@ -106,10 +108,15 @@ class LimitRegistry:
       * is_limited_app_dominant — True when the current top process is
             one we already limited; the pressure loop reads this so it
             doesn't count its own throttled traffic as fresh pressure.
-      * auto_limit_exclusions — {key: exclusion dict} for apps the user
-            restored by hand and therefore does not want auto-limited
-            again.  Process-lifetime only (never persisted): the semantics
-            are "leave it alone for this run of the service".
+      * auto_limit_exclusions — {key: exclusion dict} for apps the auto
+            engine must not touch.  Each record carries a ``reason``:
+              - "user_restore": the user hand-restored an auto limit and does
+                not want it auto-limited again this run.
+              - "manual_limit": the user set (or took over as) a manual limit;
+                auto must not re-limit an app the user has claimed.  Cleared
+                when the manual limit is restored or the app closes.
+            Process-lifetime only (never persisted): the semantics are
+            "leave it alone for this run of the service".
       * lock — guards every mutation of ``apps`` and
             ``auto_limit_exclusions`` so the reaper thread and the REST
             manual limit/restore calls never race.
@@ -216,13 +223,20 @@ class LimitRegistry:
             return f"app:{public_app_id}"
         return f"instance:{primary_cgroup or public_app_id}"
 
-    def add_exclusion(self, entry: "LimitedApp") -> dict:
-        """Record *entry*'s app as excluded from future auto-limiting."""
+    def add_exclusion(self, entry: "LimitedApp", reason: str = "user_restore") -> dict:
+        """Record *entry*'s app as excluded from future auto-limiting.
+
+        *reason* is why the app is exempt: "user_restore" (the user hand-restored an
+        auto limit) or "manual_limit" (the user owns it via a manual limit). It is stored
+        on the record so the UI can tell the two apart and the manual-limit exemption can
+        be cleared on restore/close without disturbing user-restore exemptions.
+        """
         primary_cgroup = (entry.cgroups or [entry.public_app_id])[0]
         key = self.exclusion_key(entry.is_controlled, entry.public_app_id, primary_cgroup)
         record = {
             "key": key,
             "kind": "app" if key.startswith("app:") else "instance",
+            "reason": reason,
             "app_id": entry.public_app_id,
             "app_name": entry.app_name,
             "priority": entry.priority,
@@ -291,6 +305,7 @@ class _MonitorLoopState:
     critical_since: Optional[float] = None        # timestamp critical was first entered (sustained-recheck timer)
     last_sustained_recheck_time: float = 0.0      # last time a sustained-critical background recheck fired
     prev_pressure: Optional[str] = None
+    prev_passive_enabled: Optional[bool] = None   # passive switch on the previous iteration (falling-edge -> lock-to-manual)
     # Disk-IO top-consumer prefetch state (separated policy only), mirroring the
     # pressure fields above but tracked independently so the two channels never
     # perturb each other's rising-edge / sustained-recheck timers.
@@ -806,6 +821,20 @@ class DynamicBalancer:
                 _prc = self.config.passive_resource_control or {}
                 passive_enabled = bool(_prc.get('enabled', True))
 
+                # Falling edge (enabled -> disabled): hand every auto-limited app to the
+                # operator as a manual limit WITHOUT releasing any cgroup. Releasing all
+                # caps at once under high pressure would let the suppressed load stampede
+                # back and crush the box -- the same crash window "lock to manual" exists
+                # to close. So disabling passive control means zero release, full handoff.
+                # None on first tick means "no transition", so a boot with passive already
+                # off never triggers a spurious sweep.
+                if (state.prev_passive_enabled is True and not passive_enabled):
+                    try:
+                        self.lock_all_auto_to_manual()
+                    except Exception as exc:
+                        logger.error("Failed to lock auto-limited apps to manual on passive disable: %s", exc)
+                state.prev_passive_enabled = passive_enabled
+
                 # With auto-limiting off, nothing we did is inflating PSI, so drop any
                 # stale dominant state to fall back to raw (undiscounted) pressure.
                 if not passive_enabled and self.all_limits.is_limited_app_dominant:
@@ -1038,10 +1067,24 @@ class DynamicBalancer:
             kept = []
             for candidate in apps:
                 app_meta = candidate.get('app') or {}
+                # Match against the candidate's own primary cgroup too, not just its
+                # extra cgroups. An exclusion (user_restore *or* manual_limit) is keyed
+                # by the resolved cgroup the limit sits on, which is this sample's
+                # cgroup_id; omitting it lets an excluded app -- e.g. one just adopted
+                # into manual control -- slip back into the auto pool and get re-limited
+                # (which then clobbers the manual entry). Mirrors the disk-io arm.
+                candidate_cgroups = list(candidate.get('extra_cgroups') or [])
+                sampled_cgroup = (
+                    os.path.basename((candidate.get('cgroup') or '').rstrip('/'))
+                    or candidate.get('cgroup_id')
+                    or ''
+                ).strip()
+                if sampled_cgroup and sampled_cgroup not in candidate_cgroups:
+                    candidate_cgroups.append(sampled_cgroup)
                 excluded = self.all_limits.is_excluded(
                     app_meta.get('id') or '',
                     candidate.get('process', {}).get('name') or '',
-                    candidate.get('extra_cgroups') or [],
+                    candidate_cgroups,
                 )
                 if excluded is None:
                     kept.append(candidate)
@@ -1137,14 +1180,6 @@ class DynamicBalancer:
         not throttled.
         """
         is_disk_io_stressed = disk_level in ("high", "critical")
-        if is_disk_io_stressed or state.prev_disk_level in ("high", "critical"):
-            logger.info(
-                "[disk-io] tick: disk_level=%s (prev=%s) pressure=%s passive=%s "
-                "candidates_held=%d limited=%s",
-                disk_level, state.prev_disk_level, pressure, passive_enabled,
-                len(state.top_consume_apps or []),
-                [k for k, v in self.all_limits.apps.items() if v.limit_parts.get('io_limited')],
-            )
         if passive_enabled and (pressure == "critical" or is_disk_io_stressed):
             state.restore_pending = False
 
@@ -1471,7 +1506,7 @@ class DynamicBalancer:
     def _upsert_auto_limited(self, app_id, public_id, app_name, limit_rates,
                              resource_limited, io_limited, priority, is_controlled,
                              limit_reason, pressure_level, cgroups,
-                             limit_disks=None, pids=None) -> None:
+                             limit_disks=None, pids=None, representative_pid=None) -> None:
         """Record -- or refresh -- the registry entry of an auto-limited app.
 
         Under sustained critical pressure the same app can be limited again, or capped on
@@ -1515,6 +1550,7 @@ class DynamicBalancer:
             cgroups = list(dict.fromkeys(list(prev.cgroups) + cgroups))
             limit_disks = list(dict.fromkeys(list(prev.limit_disks) + limit_disks))
             pids |= set(prev.pids)
+            representative_pid = representative_pid or prev.representative_pid
 
         self.all_limits.apps[app_id] = LimitedApp(
             public_app_id=public_id,
@@ -1531,6 +1567,7 @@ class DynamicBalancer:
             cgroups=cgroups,
             limit_disks=limit_disks,
             pids=pids,
+            representative_pid=representative_pid,
             limited_at=limited_at,
         )
 
@@ -1632,6 +1669,7 @@ class DynamicBalancer:
                 pressure_level=pressure_level,
                 cgroups=[app_id] + list(extra_cgroup_ids),
                 pids=target.get('pids'),
+                representative_pid=(target.get('process') or {}).get('pid'),
             )
 
             if is_controlled:
@@ -1989,6 +2027,7 @@ class DynamicBalancer:
                 cgroups=[app_id] + list(extra_cgroup_ids),
                 limit_disks=limited_disks,
                 pids=target_app.get('pids'),
+                representative_pid=(target_app.get('process') or {}).get('pid'),
             )
 
             if is_controlled:
@@ -2121,7 +2160,11 @@ class DynamicBalancer:
             app_id = app_info['app'].get('id') if app_info.get('app') else None
             if not app_id:
                 continue
-            sampled_cgroup = (app_info.get('cgroup_id') or '').strip()
+            sampled_cgroup = (
+                os.path.basename((app_info.get('cgroup') or '').rstrip('/'))
+                or app_info.get('cgroup_id')
+                or ''
+            ).strip()
             proc = app_info.get('process', {})
             app_name = (proc.get('name') or '').lower()
             cand_mb = (proc.get('io_read_rate') or 0.0) + (proc.get('io_write_rate') or 0.0)
@@ -2570,6 +2613,9 @@ class DynamicBalancer:
                 if self._is_app_closed(entry):
                     self.all_limits.apps.pop(key, None)
                     self.all_limits.manual_limit_baseline.pop(key, None)
+                    # A closed app must not linger as an exemption: its id/cgroup can be
+                    # reused by a different workload that should be eligible again.
+                    self.all_limits.remove_exclusion(key)
                     closed.append(entry)
 
         for entry in closed:
@@ -3091,6 +3137,13 @@ class DynamicBalancer:
                     "per_cgroup_mem": per_cg_mem,
                     "per_cgroup_cpu_delta": per_cg_cpu_delta,
                 }
+                # A user-owned manual limit must be off-limits to the pressure loop:
+                # without this the app can still surface as a top consumer and be
+                # re-limited as "auto", clobbering the user's rate and baseline. Cleared
+                # again on manual restore (set_restore_resource) or when the app closes
+                # (the reaper).
+                self.all_limits.add_exclusion(
+                    self.all_limits.apps[effective_app_id], reason="manual_limit")
                 logger.info(f"Recorded resource limits for {app_name}")
                 return True
 
@@ -3118,6 +3171,9 @@ class DynamicBalancer:
                 app_name = entry.app_name
                 limit_parts = entry.limit_parts
                 self.all_limits.apps.pop(effective_app_id, None)
+                # The user gave the app back; drop the "manual_limit" exemption so the
+                # pressure loop may manage it again.
+                self.all_limits.remove_exclusion(effective_app_id)
             else:
                 # Fallback: treat app_id itself as the effective cgroup id,
                 # matching the previous default when no mapping existed.
@@ -3162,6 +3218,52 @@ class DynamicBalancer:
             time.sleep(self.config.regular_update_sys_pressure_time)
             self.control_manager.set_limited_app_dominant(False)
 
+    @staticmethod
+    def _entry_control_view(entry: "LimitedApp") -> dict:
+        """Derive the UI control contract (status + effective + auto detail) from an entry.
+
+        Shared by ``get_limit_snapshot`` (controlled-app rows) and
+        ``get_auto_limited_apps`` so both surfaces report the same shape.
+
+        ``control_status`` is the coarse enum that drives interaction (tag colour +
+        button gating): ``MANUAL_LIMITED`` / ``AUTO_LIMITED``.  The finer "partially
+        restored" middle state is *not* an enum value -- it rides along under
+        ``auto_detail.partial_parts`` for display only, since an auto limit that is
+        half-relaxed is still auto-owned and its buttons stay locked.
+
+        ``effective`` keeps the limit multi-dimensional on purpose (never collapsed to
+        a single percent): CPU/memory travel together under one part, disk-IO is its
+        own channel with the exact disk set it was written to (empty = every disk).
+        """
+        rates = entry.limit_rates or {}
+        effective = {
+            "cpu_mem": {
+                "limited": bool(entry.limit_parts.get("cpu_mem_limited")),
+                "cpu_rate": rates.get("cpu_rate"),
+                "mem_rate": rates.get("mem_rate"),
+            },
+            "disk_io": {
+                "limited": bool(entry.limit_parts.get("io_limited")),
+                "disks": list(entry.limit_disks or []),
+                "read_mb_s": (rates.get("disk_io_rate") or {}).get("read"),
+                "write_mb_s": (rates.get("disk_io_rate") or {}).get("write"),
+                "read_iops": (rates.get("disk_io_rate") or {}).get("read_iops"),
+                "write_iops": (rates.get("disk_io_rate") or {}).get("write_iops"),
+            },
+        }
+        auto_detail = None
+        if entry.source == "auto":
+            auto_detail = {
+                "limit_reason": entry.limit_reason or "system_pressure",
+                "pressure_level": entry.pressure_level or "critical",
+                "partial_parts": dict(entry.partial_parts or {}),
+            }
+        return {
+            "control_status": "AUTO_LIMITED" if entry.source == "auto" else "MANUAL_LIMITED",
+            "effective": effective,
+            "auto_detail": auto_detail,
+        }
+
     def get_limit_snapshot(self, app_id: str) -> dict:
         """Return a lightweight runtime snapshot for a limited app.
 
@@ -3174,12 +3276,13 @@ class DynamicBalancer:
                 return {
                     "limited": False,
                     "source": None,
+                    "control_status": "NORMAL",
                     "pids": [],
                     "cgroups": [],
                 }
 
             effective_app_id, entry = found
-            return {
+            snapshot = {
                 "limited": True,
                 "effective_app_id": effective_app_id,
                 "source": entry.source,
@@ -3187,7 +3290,10 @@ class DynamicBalancer:
                 "cgroups": list(entry.cgroups),
                 "limit_parts": dict(entry.limit_parts or {}),
                 "limited_at": entry.limited_at or None,
+                "adopted_from_auto": entry.adopted_from_auto,
             }
+            snapshot.update(self._entry_control_view(entry))
+            return snapshot
 
     def get_auto_limited_apps(self) -> dict:
         """Every app the pressure loop currently holds a limit on, for the UI.
@@ -3207,7 +3313,7 @@ class DynamicBalancer:
             for key, entry in self.all_limits.apps.items():
                 if entry.source != "auto":
                     continue
-                rows.append({
+                row = {
                     "app_id": entry.public_app_id,
                     "effective_app_id": key,
                     "app_name": entry.app_name,
@@ -3220,7 +3326,11 @@ class DynamicBalancer:
                     "limited_at": entry.limited_at or None,
                     "limit_parts": dict(entry.limit_parts or {}),
                     "cgroups": list(entry.cgroups or []),
-                })
+                    "pids": sorted(int(pid) for pid in entry.pids),
+                    "representative_pid": entry.representative_pid,
+                }
+                row.update(self._entry_control_view(entry))
+                rows.append(row)
 
         try:
             sys_level = self.control_manager.current_level or "low"
@@ -3269,6 +3379,165 @@ class DynamicBalancer:
         # longer limited, so the dominant-app flag must not outlive it.
         self.control_manager.set_limited_app_dominant(False)
         return True, "Restored"
+
+    def lock_to_manual(self, app_id: str) -> "tuple[bool, str]":
+        """Take an auto-limited app over as a manual limit WITHOUT touching cgroup.
+
+        The "safe handoff": the kernel cgroup caps stay exactly where the pressure
+        engine left them (e.g. CPU=20%); only ownership flips from auto to manual.
+        This eliminates the crash window a restore-then-relimit would open under
+        sustained pressure -- the app never leaves its safe throttled water line.
+        Afterwards the app is MANUAL_LIMITED and the UI's Limit/Restore/Edit buttons
+        unlock, so the operator can act at leisure (restore, or edit to 40%, once the
+        real fix has landed).
+
+        No cgroup write, no override snapshot: Restore reads the flipped registry
+        entry's ``limit_parts``/``cgroups`` and Edit reloads a fresh profile, so
+        neither depends on a persisted template. Manual limits are process-lifetime
+        anyway (lost on service restart), so lock-to-manual inherits that semantics.
+
+        :returns: ``(ok, message)`` -- *message* names the failure for the REST layer.
+        """
+        with self.all_limits.lock:
+            found = (self.all_limits.by_public_id(app_id, source="auto")
+                     or self.all_limits.by_any_id(app_id, source="auto"))
+            if found is None:
+                return False, "No auto-limited app found for this id"
+            _key, entry = found
+            # A manual limit only lives on a *controlled* app: the UI surfaces manual
+            # limits via the controlled-app row, and the restore/edit paths key off the
+            # DB entry. Locking a genuinely uncontrolled instance to manual would drop it
+            # out of both the auto list and the controlled list -- invisible while still
+            # throttled. So refuse; the operator must Take Control (adopt) it first.
+            #
+            # But entry.is_controlled is stamped once, when the limit *fired*, from the
+            # sampled process identity. An app that was auto-limited before its
+            # process_names matched (or before it was taken under control) carries a stale
+            # False here even though it now has a DB row and is presented as a controlled
+            # AUTO_LIMITED row -- which is exactly what routes the UI here (lock_to_manual)
+            # instead of adopt_auto_limit. Re-check the *current* control state: if the app
+            # is controlled now, reconcile the entry in place (the same lightweight re-tag
+            # adopt does) and proceed. Only refuse when there is still no DB identity to
+            # keep it visible under Manual Control.
+            if not entry.is_controlled:
+                current_controlled, _ = app_utils.get_app_control_info(app_id)
+                if not current_controlled:
+                    return False, "Take this app under control first, then lock it to manual"
+                entry.is_controlled = True
+                entry.public_app_id = app_id
+            # Flip ownership in place; the cgroup caps are deliberately untouched.
+            entry.source = "manual"
+            entry.state = None
+            entry.adopted_from_auto = True
+            # Keep it out of the auto candidate pool for this run of the service, so
+            # the pressure loop never re-grabs an app the operator now owns.
+            record = self.all_limits.add_exclusion(entry, reason="manual_limit")
+            public_id = entry.public_app_id
+            app_name = entry.app_name
+
+        app_utils.update_app_status(public_id, "a_limited")
+        app_utils.callback_manager.send_callback_notification({
+            'app_id': public_id,
+            'app_name': app_name,
+            'status': "locked_to_manual",
+            'purpose': "notify",
+        }, False)
+        logger.info(
+            "Locked auto-limited app %r (%s) to manual; cgroup untouched, excluded as %s",
+            app_name, public_id, record["key"],
+        )
+        return True, "Locked to manual"
+
+    def lock_all_auto_to_manual(self) -> int:
+        """Batch lock-to-manual over every currently auto-limited app.
+
+        This is the safe meaning of disabling the global passive switch: rather than
+        releasing every cgroup at once -- which under high pressure would let the
+        suppressed load stampede back and crush the box -- we hand sovereignty to the
+        operator with zero release. Every *controlled* ``source=auto`` entry flips to
+        ``manual`` with its caps intact; the operator then restores each at their own pace.
+
+        Uncontrolled auto entries are skipped: they have no DB row to become a manual
+        limit on (see :meth:`lock_to_manual`). With passive control now off, the staged
+        restore path lifts them as pressure eases -- or the operator can Take Control of
+        one first to keep its cap.
+
+        :returns: number of apps converted.
+        """
+        with self.all_limits.lock:
+            auto_ids = [e.public_app_id for e in self.all_limits.apps.values()
+                        if e.source == "auto" and e.is_controlled]
+        converted = 0
+        for app_id in auto_ids:
+            ok, _msg = self.lock_to_manual(app_id)
+            if ok:
+                converted += 1
+        if converted:
+            # The apps we were discounting PSI for are now operator-owned, not auto;
+            # the dominant-app flag must not outlive the auto ownership.
+            self.control_manager.set_limited_app_dominant(False)
+            logger.info("Passive control disabled: locked %d auto-limited app(s) to manual", converted)
+        return converted
+
+    def adopt_auto_limit(self, effective_app_id: str, new_app_id: str,
+                         new_app_name: str = "", priority: str = "") -> "tuple[bool, str]":
+        """Adopt a running auto-limit into a newly-controlled app identity.
+
+        When the operator takes an auto-limited but *unmanaged* process under control
+        (the "Take Control" action), the live limit must follow it -- otherwise the new
+        controlled row shows NORMAL while the kernel still throttles the process, and the
+        old uncontrolled entry lingers as a duplicate row. So instead of releasing and
+        re-applying (which would open a crash window), we re-tag the existing entry in
+        place: mark it controlled and point its public id at the new DB app_id. The
+        cgroup caps and the registry key (the cgroup) are untouched, so staged restore
+        and a later manual Restore still target the right cgroup.
+
+        Take Control also performs the manual handoff in the same step: the entry flips
+        ``source: auto -> manual`` and is added to the exclusion list (exactly what
+        :meth:`lock_to_manual` does). So the app lands as a single MANUAL_LIMITED managed
+        row with Limit/Restore/Edit already unlocked -- the operator does *not* need a
+        second Lock to Manual click, and the pressure loop never re-grabs it. The cgroup
+        caps are carried over untouched, so there is no release / crash window.
+        (This supersedes the earlier "entry stays source=auto" design.)
+
+        :returns: ``(ok, message)`` -- *message* names the failure for the REST layer.
+        """
+        with self.all_limits.lock:
+            found = (self.all_limits.apps.get(effective_app_id)
+                     and (effective_app_id, self.all_limits.apps[effective_app_id])) \
+                or self.all_limits.by_any_id(effective_app_id, source="auto")
+            if found is None:
+                return False, "No auto-limited entry found for this instance"
+            key, entry = found
+            if entry.source != "auto":
+                return False, "This instance is no longer auto-limited"
+            entry.is_controlled = True
+            entry.public_app_id = new_app_id
+            if new_app_name:
+                entry.app_name = new_app_name
+            if priority:
+                entry.priority = priority
+            # Hand ownership to manual in the same atomic step (see docstring): flip the
+            # source and exclude it from the auto candidate pool. add_exclusion keys off
+            # is_controlled/public_app_id, so it must run after the re-tag above.
+            entry.source = "manual"
+            entry.state = None
+            entry.adopted_from_auto = True
+            self.all_limits.add_exclusion(entry, reason="manual_limit")
+
+        app_utils.update_app_status(new_app_id, "a_limited")
+        app_utils.callback_manager.send_callback_notification({
+            'app_id': new_app_id,
+            'app_name': new_app_name or entry.app_name,
+            'status': "a_limited",
+            'purpose': "app",
+        }, False)
+        logger.info(
+            "Adopted auto-limit %r into controlled app %s as a manual limit; "
+            "cgroup and key untouched, excluded from auto",
+            key, new_app_id,
+        )
+        return True, "Adopted"
 
     def get_auto_limit_exclusions(self) -> list:
         """Apps the user has taken out of the auto-limit candidate pool."""

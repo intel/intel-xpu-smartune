@@ -71,6 +71,35 @@ export interface NetworkInterfacePressure {
   tx?: NetworkDirectionPressure
 }
 
+// Coarse control state that drives the unified management table's interaction
+// (tag colour + button gating). The "partially restored" middle state is NOT an
+// enum value -- it rides along under EffectiveControl / auto_detail for display
+// only, since a half-relaxed auto limit is still auto-owned and stays locked.
+export type ControlStatus = 'NORMAL' | 'MANUAL_LIMITED' | 'AUTO_LIMITED'
+
+// The limit kept multi-dimensional on purpose (never collapsed to one percent):
+// CPU/memory travel together; disk-IO is its own channel with the exact disk set
+// it was written to (empty = every disk).
+export interface EffectiveControl {
+  cpu_mem: { limited: boolean; cpu_rate?: number | null; mem_rate?: number | null }
+  disk_io: {
+    limited: boolean
+    disks: string[]
+    read_mb_s?: number | null
+    write_mb_s?: number | null
+    read_iops?: number | null
+    write_iops?: number | null
+  }
+}
+
+// Pressure detail attached only to AUTO_LIMITED rows, for the drawer.
+export interface AutoControlDetail {
+  limit_reason: AutoLimitReason
+  pressure_level: string
+  // Which channel already had its staged relaxation. sys=CPU/mem, disk_io=IO.
+  partial_parts: { sys?: boolean; disk_io?: boolean }
+}
+
 export interface AppInfo {
   app_id: string
   app_name: string
@@ -86,6 +115,7 @@ export interface AppInfo {
   cmdline?: string
   cgroup?: string
   process_names?: string[]
+  bpf_name?: string[]
   is_running?: boolean
   is_pending?: boolean
   // Known to the database but no longer listed in config.yaml's controlled_apps
@@ -95,6 +125,13 @@ export interface AppInfo {
   app_summary_status?: 'Limited' | 'Partial Limited' | 'Not Limited' | 'No Running Process'
   runtime_hint?: 'Running' | 'Stopped' | 'Pending'
   process_status_rows?: ProcessStatusRow[]
+  // Unified control contract (see backend get_controlled_app / _entry_control_view).
+  control_status?: ControlStatus
+  effective?: EffectiveControl | null
+  auto_detail?: AutoControlDetail | null
+  // Cgroups recorded when the active limit was applied. Unlike process_status_rows,
+  // this remains available when a live process scan cannot find the process yet.
+  limited_scopes?: string[]
 }
 
 export interface ProcessStatusRow {
@@ -102,11 +139,18 @@ export interface ProcessStatusRow {
   pid?: number | null
   process_name: string
   cmdline?: string
+  scope_processes?: ScopeProcess[]
   cgroup?: string
   runtime_status: 'Running' | 'Stopped' | 'Pending'
   limit_status: 'Limited' | 'Not Limited' | 'N/A'
   applied_at?: number | null
   note?: string
+}
+
+export interface ScopeProcess {
+  pid: number
+  process_name: string
+  cmdline?: string
 }
 
 export interface AppResourceEntry {
@@ -227,6 +271,13 @@ export interface AutoLimitedApp {
   limited_at: number | null
   limit_parts: { cpu_mem_limited?: boolean; io_limited?: boolean }
   cgroups: string[]
+  pids: number[]
+  representative_pid?: number | null
+  // Unified control contract, aligned with AppInfo so the merged table renders
+  // both sources through one code path. Always 'AUTO_LIMITED' for these rows.
+  control_status?: ControlStatus
+  effective?: EffectiveControl | null
+  auto_detail?: AutoControlDetail | null
 }
 
 // List + current levels in one response, so the tab needs a single request on open.
@@ -242,6 +293,10 @@ export interface AutoLimitedAppsData {
 export interface AutoLimitExclusion {
   key: string
   kind: 'app' | 'instance'
+  // Why the app is exempt: hand-restored from an auto limit ("user_restore"), or
+  // claimed by a manual limit ("manual_limit"). The Excluded tab shows only the former;
+  // manual-limit exemptions are represented by their row under Manual Control.
+  reason: 'user_restore' | 'manual_limit'
   app_id: string
   app_name: string
   priority: string

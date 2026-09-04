@@ -18,6 +18,9 @@ import {
   Checkbox,
   InputNumber,
   Popconfirm,
+  Tabs,
+  Drawer,
+  Descriptions,
 } from 'antd'
 import {
   PlusOutlined,
@@ -26,14 +29,16 @@ import {
   ThunderboltOutlined,
   CloseOutlined,
   HeartOutlined,
-  SaveOutlined,
   DatabaseOutlined,
   ReloadOutlined,
   QuestionCircleOutlined,
+  InfoCircleOutlined,
   SearchOutlined,
   RightOutlined,
   DownOutlined,
   RollbackOutlined,
+  LockOutlined,
+  EditOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
@@ -42,6 +47,8 @@ import type {
   AppInfo,
   AutoLimitedApp,
   AutoLimitedAppsData,
+  AutoLimitExclusion,
+  ControlStatus,
   ResourceLimitProfileData,
   PassiveControlData,
   ProcessStatusRow,
@@ -49,6 +56,7 @@ import type {
 import { useAppEvents } from '../hooks/useAppEvents'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 import { AddAppWizard } from './AddAppWizard'
+import { EditAppProcessesModal } from './EditAppProcessesModal'
 
 const { Text } = Typography
 const { Option } = Select
@@ -264,6 +272,112 @@ function formatPassiveControlTimestamp(ts: number | undefined | null): string {
   return new Date(ts * 1000).toLocaleString()
 }
 
+const EXCLUDED_APPS_TOOLTIP =
+  'Apps restored by hand are never auto-limited under critical pressure. Remove one to make ' +
+  'it eligible again. This list lives in memory only and is cleared when Smartune restarts.'
+
+// The "⛔ Excluded" tab body: apps the user hand-restored from an auto limit, which the
+// pressure loop leaves alone for the rest of this service run. Manual-limit exemptions are
+// intentionally NOT shown here — they already appear under Manual Control, so listing them
+// again would double-count the same app. Presentational only; the parent owns the data and
+// the remove call so the tab count stays in sync.
+function ExcludedAppsTable({
+  rows,
+  loading,
+  onRemove,
+}: {
+  rows: AutoLimitExclusion[]
+  loading: boolean
+  onRemove: (row: AutoLimitExclusion) => Promise<void>
+}) {
+  const [removing, setRemoving] = useState<Record<string, boolean>>({})
+
+  const remove = async (row: AutoLimitExclusion) => {
+    setRemoving((prev) => ({ ...prev, [row.key]: true }))
+    try {
+      await onRemove(row)
+    } finally {
+      setRemoving((prev) => ({ ...prev, [row.key]: false }))
+    }
+  }
+
+  const columns: ColumnsType<AutoLimitExclusion> = [
+    {
+      title: 'App',
+      dataIndex: 'app_name',
+      key: 'app_name',
+      width: 460,
+      render: (name: string, row) => (
+        <Tooltip title={row.cgroups?.length ? row.cgroups.join(', ') : row.app_id}>
+          <Text>{name || row.app_id}</Text>
+        </Tooltip>
+      ),
+    },
+    {
+      title: 'Scope',
+      dataIndex: 'kind',
+      key: 'kind',
+      width: 150,
+      render: (kind: AutoLimitExclusion['kind']) =>
+        kind === 'app' ? (
+          <Tooltip title="Controlled app: every instance of it is excluded.">
+            <Tag color="blue">All instances</Tag>
+          </Tooltip>
+        ) : (
+          <Tooltip title="Only this process instance (this cgroup) is excluded — other processes with the same name are still eligible.">
+            <Tag>This instance</Tag>
+          </Tooltip>
+        ),
+    },
+    {
+      title: 'Excluded At',
+      dataIndex: 'excluded_at',
+      key: 'excluded_at',
+      width: 190,
+      render: (ts: number) => <Text type="secondary">{formatPassiveControlTimestamp(ts)}</Text>,
+    },
+    {
+      title: '',
+      key: 'actions',
+      width: 110,
+      align: 'right' as const,
+      render: (_: unknown, row) => (
+        <Popconfirm
+          title="Allow auto-limiting again?"
+          description="The balancer may throttle this app the next time pressure reaches critical."
+          okText="Remove"
+          cancelText="Cancel"
+          onConfirm={() => remove(row)}
+        >
+          <Button size="small" danger icon={<DeleteOutlined />} loading={removing[row.key]}>
+            Remove
+          </Button>
+        </Popconfirm>
+      ),
+    },
+  ]
+
+  return (
+    <div style={{ maxWidth: 960, padding: '10px 16px 12px' }}>
+      <Table
+        columns={columns}
+        dataSource={rows.map((row) => ({ ...row, key: row.key }))}
+        size="small"
+        loading={loading}
+        pagination={false}
+        tableLayout="fixed"
+        locale={{
+          emptyText: (
+            <div style={{ padding: 30, color: COLORS.textMuted, textAlign: 'center' }}>
+              No apps are excluded from auto-limiting.
+            </div>
+          ),
+        }}
+      />
+    </div>
+  )
+}
+
 // Elapsed time, not a countdown: auto restore waits for pressure to ease and then runs
 // in stages, so there is no deadline to count down to. sinceMs comes from
 // limitedSinceRef, which the frontend owns (see below).
@@ -292,10 +406,22 @@ const PRESSURE_LEVEL_TAG_COLOR: Record<string, string> = {
 
 // Shared wording so the tooltip, the confirm prompt and the toast all promise the
 // same thing about what Restore does.
+// A row in the unified management table. Controlled apps come through as plain AppInfo;
+// an app the pressure engine throttled but that was never taken under management is folded
+// in as a synthetic row carrying its original AutoLimitedApp under __auto (so its actions
+// can Take Control / Restore it). controlled === false marks the synthetic ones.
+type ControlRow = AppInfo & { __auto?: AutoLimitedApp; key?: string }
+
 const AUTO_LIMIT_EXCLUSION_HINT =
-  'Apps you restore here are no longer auto-limited under critical pressure — the balancer ' +
-  'limits the next heaviest app instead. To make an app eligible again, remove it under ' +
-  'Settings → Control → Auto-limit exclusions (the list is also cleared when Smartune restarts).'
+  'Restored apps stay excluded from auto-limiting until you clear them under ' +
+  'Balancer → Application Control Center → Excluded (also cleared on Smartune restart).'
+
+// Shown on the manual buttons while the pressure engine owns a row's cgroup. Tells the
+// operator how to take over safely instead of racing the auto-limit writer.
+const AUTO_LOCK_TOOLTIP =
+  'System pressure is high and automatic circuit-breaking has taken over. To control this ' +
+  'app by hand, click "Take Control" on this row to move it to manual control (its limit is ' +
+  'kept in place), or turn off the global passive-control switch at the top right.'
 
 function deriveDisplayProcessName(row: ProcessStatusRow): string {
   const rawName = (row.process_name || '').trim()
@@ -304,13 +430,22 @@ function deriveDisplayProcessName(row: ProcessStatusRow): string {
 
   // Strip common wrappers so we can show the actual target process/script.
   const withoutSudo = cmdline.replace(/^sudo\s+/, '')
-  const pythonScriptMatch = withoutSudo.match(/^(?:python\d*(?:\.\d+)?)\s+([^\s]+)/i)
-  if (pythonScriptMatch?.[1]) {
-    const script = pythonScriptMatch[1].split('/').pop()
+  const tokens = withoutSudo.split(/\s+/).filter(Boolean)
+  const executable = (tokens[0] || '').split('/').pop()?.toLowerCase() || ''
+  if (/^(?:python\d*(?:\.\d+)?|node(?:js)?)$/.test(executable)) {
+    const script = tokens.slice(1).find((token) => !token.startsWith('-'))?.split('/').pop()
     if (script) return script
   }
 
-  if (rawName && !['sudo', 'python', 'python2', 'python3'].includes(rawName.toLowerCase())) {
+  if (/^(?:bash|sh|dash|zsh|fish)$/.test(executable)) {
+    const scriptFlag = tokens.findIndex((token) => ['--init-file', '--rcfile', '--file'].includes(token))
+    const flaggedScript = scriptFlag >= 0 ? tokens[scriptFlag + 1] : undefined
+    const positionalScript = tokens.slice(1).find((token) => !token.startsWith('-'))
+    const script = (flaggedScript || positionalScript)?.split('/').pop()
+    if (script) return script
+  }
+
+  if (rawName && !['sudo', 'python', 'python2', 'python3', 'node', 'nodejs', 'bash', 'sh', 'dash', 'zsh', 'fish'].includes(rawName.toLowerCase())) {
     return rawName
   }
 
@@ -406,6 +541,16 @@ function PassiveControlPanel({ active }: PassiveControlPanelProps) {
             ? 'Passive resource control enabled'
             : 'Passive resource control disabled'
         )
+        if (!response.enabled) {
+          // Disabling does NOT slam every cgroup open — that would let the suppressed
+          // load stampede back under pressure. Instead every auto-limited app is handed
+          // to you as a manual limit with its caps intact; restore each when it's safe.
+          message.info({
+            content: 'Auto-limited apps are being converted to manual locks (limits kept in '
+              + 'place). Restore them from the table when it is safe.',
+            duration: 8,
+          })
+        }
       } else {
         message.error('Failed to update passive control state')
       }
@@ -642,17 +787,26 @@ export default function Balance({
   const [messageApi, contextHolder] = message.useMessage()
 
   // Add app form state
-  const [selectedAppId, setSelectedAppId] = useState<string>('')
-  const [addPriority, setAddPriority] = useState<string>('medium')
-  const [remark, setRemark] = useState('')
-  const [adding, setAdding] = useState(false)
   const [wizardOpen, setWizardOpen] = useState(false)
-  // Keyword the wizard was opened with from inside this tab (an Auto Limited row).
+  // Keyword the wizard was opened with from inside this tab.
   // Kept apart from the `registerKeyword` prop, which comes from the Processes tab.
   const [wizardKeyword, setWizardKeyword] = useState<string | null>(null)
   const [expandedProcessRows, setExpandedProcessRows] = useState<React.Key[]>([])
   const [selectedTargetCgroups, setSelectedTargetCgroups] = useState<Record<string, string[]>>({})
-
+  // Status quick-filter over the unified management table. 'auto' = apps the pressure
+  // engine currently holds; 'manual' = every other controlled app (normal + manual limit);
+  // 'excluded' = apps hand-restored from an auto limit that the engine now leaves alone.
+  const [controlTab, setControlTab] = useState<'auto' | 'manual' | 'excluded'>('manual')
+  // Apps exempt from auto-limiting (see ExcludedAppsTable). Loaded with the rest of the tab
+  // data; the "⛔ Excluded" tab shows only the user_restore subset.
+  const [exclusions, setExclusions] = useState<AutoLimitExclusion[]>([])
+  // The app whose control breakdown the right-side detail drawer is showing (null = closed).
+  const [detailApp, setDetailApp] = useState<AppInfo | null>(null)
+  // The controlled app whose process-identity editor is open (null = closed). Lets the
+  // operator widen an app's name-based identity so it controls more processes/cgroups.
+  const [editApp, setEditApp] = useState<AppInfo | null>(null)
+  // Row briefly flashed after a duplicate-add attempt scrolls it into view.
+  const [highlightAppId, setHighlightAppId] = useState<string | null>(null)
   // Opened from the Processes tab: pop the Add-App wizard pre-filled.
   useEffect(() => {
     if (registerKeyword) {
@@ -661,8 +815,6 @@ export default function Balance({
     }
   }, [registerKeyword])
 
-  // Per-row priority edit state
-  const [rowPriorities, setRowPriorities] = useState<Record<string, string>>({})
   const [networkControlEnabled, setNetworkControlEnabled] = useState(true)
   const [networkBandwidthRanges, setNetworkBandwidthRanges] = useState<Record<NetworkClassKey, { min: number; max: number }>>(
     DEFAULT_NETWORK_BW_RANGES
@@ -728,14 +880,6 @@ export default function Balance({
 
   const applyControlled = useCallback((ctrl: AppInfo[]) => {
     setControlledApps(ctrl)
-    const priorities: Record<string, string> = {}
-    ctrl.forEach((a: AppInfo) => {
-      // Normalise to lowercase so comparisons are case-insensitive.
-      // The Python Streamlit side stores "Critical"/"High"/… (title-case);
-      // the dashboard stores "critical"/"high"/… (lowercase).
-      priorities[a.app_id] = (a.priority ?? 'medium').toLowerCase()
-    })
-    setRowPriorities((prev) => ({ ...prev, ...priorities }))
   }, [])
 
   // Narrow refreshes used by the SSE handler. This tab has no polling fallback, so an
@@ -764,13 +908,32 @@ export default function Balance({
     }
   }, [])
 
+  const refreshExclusions = useCallback(async () => {
+    try {
+      setExclusions((await api.getAutoLimitExclusions()) ?? [])
+    } catch (e: unknown) {
+      console.error('[Balance] exclusions refresh failed:', e)
+    }
+  }, [])
+
+  const handleRemoveExclusion = useCallback(async (row: AutoLimitExclusion) => {
+    try {
+      await api.removeAutoLimitExclusion(row.key)
+      setExclusions((prev) => prev.filter((item) => item.key !== row.key))
+      messageApi.success(`${row.app_name || row.app_id} can be auto-limited again`)
+    } catch (error) {
+      messageApi.error(error instanceof Error ? error.message : 'Failed to remove exclusion')
+    }
+  }, [messageApi])
+
   const fetchData = useCallback(async () => {
     try {
-      const [apps, controlled, pending, autoLimited, networkControl] = await Promise.allSettled([
+      const [apps, controlled, pending, autoLimited, exclusionRows, networkControl] = await Promise.allSettled([
         api.getApps(),
         api.getControlledApps(),
         api.getPendingApps(),
         api.getAutoLimitedApps(),
+        api.getAutoLimitExclusions(),
         api.getConfig<{
           enable_network_control: boolean
           config_network_bw?: Record<string, { min?: number; max?: number }>
@@ -781,6 +944,7 @@ export default function Balance({
       if (controlled.status === 'fulfilled') applyControlled(controlled.value ?? [])
       if (pending.status === 'fulfilled') setPendingApps(pending.value ?? [])
       if (autoLimited.status === 'fulfilled') applyAutoLimited(autoLimited.value)
+      if (exclusionRows.status === 'fulfilled') setExclusions(exclusionRows.value ?? [])
       if (networkControl.status === 'fulfilled') {
         setNetworkControlEnabled(Boolean(networkControl.value.enable_network_control))
         setNetworkBandwidthRanges(sanitizeNetworkBandwidthRanges(networkControl.value.config_network_bw))
@@ -841,7 +1005,13 @@ export default function Balance({
 
         const existing = prev[app.app_id]
         if (!existing || existing.length === 0) {
-          next[app.app_id] = available
+          const limited = (app.process_status_rows ?? [])
+            .filter((row) => row.runtime_status === 'Running' && row.limit_status === 'Limited')
+            .map((row) => (row.cgroup || '').trim())
+            .filter(Boolean)
+          next[app.app_id] = app.control_status === 'MANUAL_LIMITED' && limited.length > 0
+            ? Array.from(new Set(limited))
+            : available
           continue
         }
 
@@ -852,12 +1022,15 @@ export default function Balance({
     })
   }, [controlledApps])
 
-  // No periodic sync. One fetch when the tab becomes active (above); after that the
-  // server pushes app status events, 'auto_limit_changed' for staged restores and
-  // 'pressure_level_changed' for the live level, and each one refreshes only the slice
-  // it affects. What this gives up is per-instance churn within one status (a second
-  // copy of a running app starting emits no event), so the expanded per-process table
-  // is refreshed when the user expands a row instead of on a timer.
+  // App-level SSE events do not report a process scope exiting while another configured
+  // process remains alive. Refresh the per-scope snapshot while this tab is visible.
+  useEffect(() => {
+    if (!active) return
+    const timer = window.setInterval(() => {
+      refreshControlled()
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [active, refreshControlled])
 
   // Advance the "Limited For" column. Local only, no request, and only while there is
   // something to count, so an idle tab does no work.
@@ -972,54 +1145,25 @@ export default function Balance({
     }
   }
 
-  const handleAdd = async () => {
-    if (!selectedAppId) {
-      messageApi.warning('Please select an application')
-      return
-    }
-    const app = allApps.find((a) => a.app_id === selectedAppId)
-    if (!app) return
-
-    setAdding(true)
-    try {
-      await api.setToControl({
-        app_id: app.app_id,
-        app_name: app.app_name,
-        priority: addPriority,
-        network_priority: addPriority,
-        controlled: true,
-        remark,
-        cmdline: app.cmdline ?? '',
-        cgroup: 'user',
-      })
-      messageApi.success(`Added ${app.app_name} to control`)
-      setSelectedAppId('')
-      setRemark('')
-      await fetchData()
-    } catch (e: unknown) {
-      messageApi.error(e instanceof Error ? e.message : 'Failed to add app')
-    } finally {
-      setAdding(false)
-    }
-  }
-
-  const handleUncontrol = (app: AppInfo) =>
-    withLoading(`uncontrol-${app.app_id}`, async () => {
-      await api.removeFromControl({ app_id: app.app_id, app_name: app.app_name })
-      messageApi.success(`Uncontrolled ${app.app_name}`)
-    })()
+  // Scroll a management-table row into view and flash it — used when a duplicate add is
+  // rejected so the user is shown the existing row instead of getting an error.
+  const focusControlledRow = useCallback((appId: string, controlStatus?: ControlStatus) => {
+    // Jump to the tab that actually contains the row: auto-limited apps live under
+    // "Auto Control", everything else under "Manual Control".
+    setControlTab(controlStatus === 'AUTO_LIMITED' ? 'auto' : 'manual')
+    setHighlightAppId(appId)
+    window.setTimeout(() => {
+      document
+        .querySelector(`.ant-table-row[data-row-key="${appId}"]`)
+        ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }, 0)
+    window.setTimeout(() => setHighlightAppId((cur) => (cur === appId ? null : cur)), 2400)
+  }, [])
 
   const handleDelete = (app: AppInfo) =>
     withLoading(`delete-${app.app_id}`, async () => {
       await api.purgeControlledApp(app.app_id)
       messageApi.success(`Deleted ${app.app_name}`)
-    })()
-
-  const handleUpdatePriority = (app: AppInfo) =>
-    withLoading(`priority-${app.app_id}`, async () => {
-      const p = rowPriorities[app.app_id] ?? app.priority ?? 'medium'
-      await api.setPriority({ app_id: app.app_id, priority: p })
-      messageApi.success(`Priority updated for ${app.app_name}`)
     })()
 
   function applyLimitProfile(profile: ResourceLimitProfileData, defaultNetworkPriority: string) {
@@ -1067,7 +1211,7 @@ export default function Balance({
     setResourceSectionExpanded(true)
     setNetworkSectionExpanded(true)
     try {
-      const priority = rowPriorities[app.app_id] ?? app.priority ?? 'medium'
+      const priority = app.priority ?? 'medium'
       const defaultNetworkPriority = normalizeNetworkPriority(app.network_priority ?? app.priority ?? priority)
       const profile = await api.getResourceLimitProfile({
         app_id: app.app_id,
@@ -1088,7 +1232,7 @@ export default function Balance({
 
     setLimitDialog((prev) => ({ ...prev, submitting: true }))
     try {
-      const priority = rowPriorities[limitDialog.app.app_id] ?? limitDialog.app.priority ?? 'medium'
+      const priority = limitDialog.app.priority ?? 'medium'
       const networkPriority = normalizeNetworkPriority(limitForm.networkPriority)
       const shouldApplyResourceLimit = Boolean(limitForm.applyResourceLimit)
       const shouldUpdateNetworkPriority = networkControlEnabled
@@ -1183,30 +1327,138 @@ export default function Balance({
       messageApi.success(`Relaunch cancelled for ${app.app_name}`)
     })()
 
-  // Restoring by hand also opts the app out of auto-limiting, so the row is gone for good
-  // (until the exclusion is removed in Settings, or the service restarts). Dropping it
-  // locally keeps the table honest in the moment before the refetch lands.
-  const handleAutoLimitRestore = (row: AutoLimitedApp) =>
-    withLoading(`autolimit-restore-${row.effective_app_id}`, async () => {
+  // Restoring by hand also opts the app out of auto-limiting until the exclusion is removed
+  // or the service restarts. Registered apps return to Manual Control; new discoveries leave
+  // the table entirely, so refresh both sources after the restore.
+  const handleAutoLimitRestore = (row: { app_id: string; app_name?: string; effective_app_id?: string }) =>
+    withLoading(`autolimit-restore-${row.effective_app_id ?? row.app_id}`, async () => {
       await api.autoLimitRestore({ app_id: row.app_id })
       setAutoLimitedApps((prev) =>
-        prev.filter((item) => item.effective_app_id !== row.effective_app_id)
+        prev.filter((item) => item.effective_app_id !== (row.effective_app_id ?? row.app_id))
       )
       // Forget the elapsed-time base too: if this app is ever auto-limited again it
       // must start counting from zero, not from the limit the user just lifted.
-      delete limitedSinceRef.current[row.effective_app_id]
+      delete limitedSinceRef.current[row.effective_app_id ?? row.app_id]
       messageApi.success(`Resources restored for ${row.app_name || row.app_id}`)
       messageApi.warning({ content: AUTO_LIMIT_EXCLUSION_HINT, duration: 8 })
+      await Promise.allSettled([refreshAutoLimited(), refreshControlled()])
     })()
 
-  // Uncontrolled apps can be taken under control straight from the Auto Limited card:
-  // pre-fill the wizard with the app name we already know.
-  const handleAddAutoLimitedToControl = (row: AutoLimitedApp) => {
-    setWizardKeyword(row.app_name || row.app_id)
-    setWizardOpen(true)
-  }
+  // Take Control (controlled auto-limited row): flip an auto-limited app to a manual limit
+  // WITHOUT releasing its cgroup caps. The app stays at its safe throttled water line while
+  // ownership moves to the operator, so no crash window opens. It leaves Auto Control and
+  // lands under Manual Control with the manual Limit/Restore/Edit buttons unlocked — no extra
+  // step. Accepts either an AutoLimitedApp row or a controlled AppInfo row.
+  const handleTakeControl = (row: { app_id: string; app_name?: string; effective_app_id?: string }) =>
+    withLoading(`lock-manual-${row.effective_app_id ?? row.app_id}`, async () => {
+      await api.lockToManual({ app_id: row.app_id })
+      messageApi.success(
+        `${row.app_name || row.app_id} moved to manual control — limit kept in place, manual controls unlocked`,
+      )
+      await Promise.allSettled([refreshAutoLimited(), refreshControlled()])
+    })()
 
-  const controlledColumns: ColumnsType<AppInfo> = [
+  // An unmanaged auto-limited row has no persistent identity yet. Extract stable identity
+  // fields from the limited PID snapshot, then register it (or enable its existing config
+  // entry) before adopting the live cgroup limit.
+  const handleAddAutoLimitedToControl = (row: AutoLimitedApp) =>
+    withLoading(`take-control-${row.effective_app_id}`, async () => {
+      const appName = row.app_name || row.app_id
+      const knownApp = allApps.find((app) =>
+        app.app_id === row.app_id
+        || app.app_name.trim().toLowerCase() === appName.trim().toLowerCase(),
+      )
+      if (knownApp) {
+        await api.setToControl({
+          app_id: knownApp.app_id,
+          app_name: knownApp.app_name,
+          priority: row.priority || 'medium',
+          network_priority: row.priority || 'medium',
+          controlled: true,
+          remark: knownApp.remark || '',
+          cmdline: knownApp.cmdline || '',
+          cgroup: knownApp.cgroup || 'user',
+        })
+        await api.adoptAutoLimit({
+          effective_app_id: row.effective_app_id,
+          app_id: knownApp.app_id,
+          app_name: knownApp.app_name,
+          priority: row.priority,
+        })
+        setControlTab('manual')
+        messageApi.success(
+          `${knownApp.app_name} is now managed as a manual limit — its caps were carried over`,
+        )
+        await Promise.allSettled([refreshAutoLimited(), refreshControlled()])
+        return
+      }
+
+      const representativePid = row.representative_pid
+      if (!representativePid) {
+        throw new Error('The limited process is no longer running, so it cannot be added to manual control')
+      }
+      const extracted = await api.discoverExtract([representativePid], appName)
+      if (!extracted.id_suggestion || !extracted.process_names.length) {
+        throw new Error('Could not derive a stable application identity from the limited process')
+      }
+      const registrationName = extracted.process_names[0]
+      const registration = await api.newControlledApp({
+        name: registrationName,
+        id: extracted.id_suggestion,
+        priority: row.priority || 'medium',
+        remark: '',
+        commandline: extracted.commandline[0] || '',
+        bpf_name: extracted.bpf_name,
+        process_names: extracted.process_names,
+      })
+      let controlledAppId: string
+      let controlledAppName: string
+      let createdControl = false
+      if (registration.status === 'ok') {
+        controlledAppId = registration.data.id
+        controlledAppName = registration.data.name
+        createdControl = true
+      } else if (registration.status === 'conflict' && registration.withId) {
+        controlledAppId = registration.withId
+        controlledAppName = registration.withName || registrationName
+        await api.setToControl({
+          app_id: controlledAppId,
+          app_name: controlledAppName,
+          priority: row.priority || 'medium',
+          network_priority: row.priority || 'medium',
+          controlled: true,
+          remark: '',
+          cmdline: extracted.commandline[0] || '',
+          cgroup: 'user',
+        })
+      } else {
+        throw new Error(registration.message || 'Failed to persist the application for manual control')
+      }
+      try {
+        await api.adoptAutoLimit({
+          effective_app_id: row.effective_app_id,
+          app_id: controlledAppId,
+          app_name: controlledAppName,
+          priority: row.priority,
+        })
+      } catch (error) {
+        if (createdControl) {
+          try {
+            await api.purgeControlledApp(controlledAppId)
+          } catch (rollbackError) {
+            console.error('[Balance] Take Control rollback failed:', rollbackError)
+          }
+        }
+        throw error
+      }
+      setControlTab('manual')
+      messageApi.success(
+        `${row.app_name || row.app_id} is now managed as a manual limit — its caps were carried over, and you can edit or restore it directly`,
+      )
+      await Promise.allSettled([refreshAutoLimited(), refreshControlled()])
+    })()
+
+  const controlledColumns: ColumnsType<ControlRow> = [
     {
       title: 'App Name',
       dataIndex: 'app_name',
@@ -1215,11 +1467,24 @@ export default function Balance({
       render: (name: string, record) => {
         const displayName = name || record.app_id
         const tooltipContent = record.remark ? `${displayName} — ${record.remark}` : displayName
+        const isAutoLimited = record.control_status === 'AUTO_LIMITED'
+        const isManagedAuto = isAutoLimited && record.controlled !== false
         return (
           <Space direction="vertical" size={2} style={{ lineHeight: 1.25 }}>
-            <Tooltip title={tooltipContent}>
-              <div style={{ color: COLORS.accent, fontWeight: 500 }}>{displayName}</div>
-            </Tooltip>
+            <Space size={6} wrap>
+              <Tooltip title={tooltipContent}>
+                <div style={{ color: COLORS.accent, fontWeight: 500 }}>{displayName}</div>
+              </Tooltip>
+              {isAutoLimited && (
+                <Tooltip title={isManagedAuto
+                  ? 'Already registered for Manual Control. When automatic recovery releases this limit, it returns to Manual Control.'
+                  : 'Newly discovered, unregistered instance. When automatic recovery releases this limit, it disappears from Auto Control.'}>
+                  <Tag color={isManagedAuto ? 'processing' : 'gold'} style={{ marginInlineEnd: 0 }}>
+                    {isManagedAuto ? 'Registered' : 'New discovery'}
+                  </Tag>
+                </Tooltip>
+              )}
+            </Space>
           </Space>
         )
       },
@@ -1228,31 +1493,7 @@ export default function Balance({
       title: 'Priority',
       key: 'priority',
       width: 150,
-      render: (_: unknown, record: AppInfo) => (
-        <Space size={12} wrap={false}>
-          <Select
-            value={rowPriorities[record.app_id] ?? record.priority ?? 'medium'}
-            onChange={(v) => setRowPriorities((prev) => ({ ...prev, [record.app_id]: v }))}
-            size="small"
-            style={{ width: 120 }}
-            styles={{ popup: { root: { background: COLORS.panelBg } } }}
-          >
-            {PRIORITY_OPTIONS.map((opt) => (
-              <Option key={opt.value} value={opt.value}>
-                <span style={{ color: opt.color }}>{opt.label}</span>
-              </Option>
-            ))}
-          </Select>
-          <Tooltip title="Save Priority">
-            <Button
-              size="small"
-              icon={<SaveOutlined />}
-              onClick={() => handleUpdatePriority(record)}
-              style={{ borderColor: COLORS.accent, color: COLORS.accent }}
-            />
-          </Tooltip>
-        </Space>
-      ),
+      render: (_: unknown, record: ControlRow) => <PriorityTag priority={record.priority} />,
     },
     {
       title: 'Status',
@@ -1290,13 +1531,118 @@ export default function Balance({
       ),
     },
     {
+      title: 'Details',
+      key: 'details',
+      width: 100,
+      align: 'center',
+      render: (_: unknown, record: ControlRow) => (
+        <Tooltip title="View current limits, trigger, and recovery state">
+          <Button
+            size="small"
+            icon={<InfoCircleOutlined />}
+            aria-label={`View control details for ${record.app_name || record.app_id}`}
+            onClick={() => setDetailApp(record)}
+          >
+            Details
+          </Button>
+        </Tooltip>
+      ),
+    },
+    {
       title: 'Actions',
       key: 'actions',
       width: 160,
       align: 'center',
-      render: (_: unknown, record: AppInfo) => {
-        const isRunning = record.status === APP_STATUS.RUNNING
-        const isCritical = (rowPriorities[record.app_id] ?? record.priority ?? '').toLowerCase() === 'critical'
+      render: (_: unknown, record: ControlRow) => {
+        // Unmanaged auto-limited row: it has no DB entry, so the managed actions (Edit /
+        // Delete / Keep-Alive) don't apply yet. Offer exactly
+        // two paths — take it under management (its live limit follows it, then the full
+        // managed toolset unlocks), or release the limit now.
+        if (record.controlled === false && record.__auto) {
+          const auto = record.__auto
+          return (
+            <Space size={4} wrap={false}>
+              <Tooltip title="Take this app under management — its current limit is kept in place and handed to you as a manual limit (no release, no crash window). It moves to Manual Control, where you can edit or restore it right away.">
+                <Button
+                  size="small"
+                  type="primary"
+                  ghost
+                  icon={<LockOutlined />}
+                  loading={actionLoading[`take-control-${auto.effective_app_id}`]}
+                  onClick={() => handleAddAutoLimitedToControl(auto)}
+                >
+                  Take Control
+                </Button>
+              </Tooltip>
+              <Popconfirm
+                title="Restore now?"
+                description={<div style={{ maxWidth: 320 }}>{AUTO_LIMIT_EXCLUSION_HINT}</div>}
+                okText="Restore"
+                cancelText="Cancel"
+                onConfirm={() => handleAutoLimitRestore(auto)}
+              >
+                <Tooltip title="Release this limit immediately">
+                  <Button
+                    size="small"
+                    danger
+                    icon={<RollbackOutlined />}
+                    loading={actionLoading[`autolimit-restore-${auto.effective_app_id}`]}
+                  >
+                    Restore
+                  </Button>
+                </Tooltip>
+              </Popconfirm>
+            </Space>
+          )
+        }
+
+        const isAuto = record.control_status === 'AUTO_LIMITED'
+        if (isAuto) {
+          return (
+            <Space size={4} wrap={false}>
+              <Tooltip title="Take control: move this app to Manual Control with its current limit kept in place. It leaves Auto Control with no cgroup release, and manual actions unlock.">
+                <Button
+                  size="small"
+                  type="primary"
+                  ghost
+                  icon={<LockOutlined />}
+                  loading={actionLoading[`lock-manual-${record.app_id}`]}
+                  onClick={() => handleTakeControl(record)}
+                >
+                  Take Control
+                </Button>
+              </Tooltip>
+              <Popconfirm
+                title="Restore now?"
+                description={<div style={{ maxWidth: 320 }}>{AUTO_LIMIT_EXCLUSION_HINT}</div>}
+                okText="Restore"
+                cancelText="Cancel"
+                onConfirm={() => handleAutoLimitRestore(record)}
+              >
+                <Tooltip title="Release this automatic limit now">
+                  <Button
+                    size="small"
+                    danger
+                    icon={<RollbackOutlined />}
+                    loading={actionLoading[`autolimit-restore-${record.app_id}`]}
+                  >
+                    Restore
+                  </Button>
+                </Tooltip>
+              </Popconfirm>
+            </Space>
+          )
+        }
+
+        const isRunning = record.runtime_hint === 'Running'
+          || record.status?.toLowerCase() === APP_STATUS.RUNNING
+        const selectedCgroups = selectedTargetCgroups[record.app_id]
+        const hasSelectedRunningCgroup = selectedCgroups === undefined
+          ? (record.process_status_rows ?? []).some(
+              (row) => row.runtime_status === 'Running' && Boolean((row.cgroup || '').trim()),
+            )
+          : selectedCgroups.length > 0
+        const isCritical = (record.priority ?? '').toLowerCase() === 'critical'
         const isLimited = record.status === APP_STATUS.LIMITED || record.status === APP_STATUS.A_LIMITED
 
         return (
@@ -1314,11 +1660,11 @@ export default function Balance({
                 </Button>
               </Tooltip>
             ) : (
-              <Tooltip title="Apply Resource Limit">
+              <Tooltip title={hasSelectedRunningCgroup ? 'Apply Resource Limit' : 'Select at least one running process scope first'}>
                 <Button
                   size="small"
                   icon={<DatabaseOutlined />}
-                  disabled={!isRunning}
+                  disabled={!isRunning || !hasSelectedRunningCgroup}
                   loading={limitDialog.loadingProfile && limitDialog.app?.app_id === record.app_id}
                   onClick={() => handleResourceLimit(record)}
                   style={isRunning ? { borderColor: COLORS.accent, color: COLORS.accent } : {}}
@@ -1327,6 +1673,17 @@ export default function Balance({
                 </Button>
               </Tooltip>
             )}
+
+            <Tooltip title="Edit application priority and process identities. Add or remove the program names that decide which processes and cgroups this app controls (currently-limited names are locked).">
+              <Button
+                size="small"
+                icon={<EditOutlined />}
+                onClick={() => setEditApp(record)}
+                style={{ borderColor: COLORS.accent, color: COLORS.accent }}
+              >
+                Edit
+              </Button>
+            </Tooltip>
 
             <Tooltip title={isCritical && isRunning ? 'Keep Alive (OOM protect)' : 'Only available for Critical apps that are Running'}>
               <Button
@@ -1341,41 +1698,22 @@ export default function Balance({
               </Button>
             </Tooltip>
 
-            <Tooltip title="Uncontrol (config kept; re-add from dropdown)">
-              <Button
-                size="small"
-                icon={<DeleteOutlined />}
-                loading={actionLoading[`uncontrol-${record.app_id}`]}
-                onClick={() => {
-                  Modal.confirm({
-                    title: `Uncontrol ${record.app_name}?`,
-                    content:
-                      'This will stop monitoring the app. The configuration is kept, '
-                      + 'so you can re-add it later from the Application dropdown above '
-                      + 'without going through the wizard again.',
-                    okText: 'Uncontrol',
-                    onOk: () => handleUncontrol(record),
-                  })
-                }}
-                style={{ borderColor: COLORS.accent, color: COLORS.accent }}
-              >
-                Uncontrol
-              </Button>
-            </Tooltip>
-
-            <Tooltip title="Delete completely (purges config + DB; needs the wizard to re-add)">
+            <Tooltip title={isAuto ? AUTO_LOCK_TOOLTIP : 'Delete completely (purges config + DB; needs the wizard to re-add)'}>
               <Button
                 size="small"
                 danger
-                icon={<DeleteFilled />}
+                icon={isAuto ? <LockOutlined /> : <DeleteFilled />}
+                disabled={isAuto}
                 loading={actionLoading[`delete-${record.app_id}`]}
                 onClick={() => {
                   Modal.confirm({
                     title: `Delete ${record.app_name} completely?`,
                     content:
-                      'This permanently removes the entry from config.yaml and the database. '
+                      'This first restores any active manual resource limit, then permanently removes '
+                      + 'the entry from config.yaml and the database. If resources cannot be restored, '
+                      + 'the app is not deleted. '
                       + 'To control this app again you will need to re-add it through the '
-                      + 'wizard. Use Uncontrol instead if you want to keep the configuration.',
+                      + 'wizard.',
                     okText: 'Delete',
                     okType: 'danger',
                     onOk: () => handleDelete(record),
@@ -1417,145 +1755,6 @@ export default function Balance({
     },
   ]
 
-  const autoLimitedColumns: ColumnsType<AutoLimitedApp> = [
-    {
-      title: 'App Name',
-      dataIndex: 'app_name',
-      key: 'app_name',
-      width: 220,
-      render: (name: string, row) => {
-        const label = name || row.app_id
-        // Uncontrolled apps are identified by their scope, which is what tells two
-        // same-named processes apart — worth surfacing on hover.
-        const tooltip = row.cgroups?.length ? `${label} — ${row.cgroups.join(', ')}` : label
-        return (
-          <Tooltip title={tooltip}>
-            <Text style={{ color: COLORS.accent, fontWeight: 500 }}>{label}</Text>
-          </Tooltip>
-        )
-      },
-    },
-    {
-      title: 'Priority',
-      dataIndex: 'priority',
-      key: 'priority',
-      width: 110,
-      render: (p: string) => <PriorityTag priority={p} />,
-    },
-    {
-      title: 'Status',
-      dataIndex: 'status',
-      key: 'status',
-      width: 160,
-      render: (status: string) =>
-        status === 'partially_restored' ? (
-          <Tooltip title="The balancer has already relaxed this limit by one stage; the rest is released once pressure stays low.">
-            <Tag color="processing" style={{ marginInlineEnd: 0 }}>Partially restored</Tag>
-          </Tooltip>
-        ) : (
-          <Tag color="warning" style={{ marginInlineEnd: 0 }}>Limited</Tag>
-        ),
-    },
-    {
-      title: 'Limited Reason',
-      dataIndex: 'limit_reason',
-      key: 'limit_reason',
-      width: 160,
-      render: (reason: string) => (
-        <Text style={{ color: COLORS.text, fontSize: 12 }}>
-          {AUTO_LIMIT_REASON_LABEL[reason] ?? reason ?? '—'}
-        </Text>
-      ),
-    },
-    {
-      // The *current* level of the channel that limited this app, not the level at
-      // limit time — that is the number that tells the user whether the limit is
-      // about to be released. Pushed by the server on every transition.
-      title: 'Current Pressure Level',
-      key: 'pressure_level',
-      width: 180,
-      render: (_: unknown, row: AutoLimitedApp) => {
-        const live = row.limit_reason === 'disk_pressure' ? pressureLevels.disk : pressureLevels.sys
-        // Before the first push arrives, fall back to the level recorded at limit time.
-        const level = live || row.pressure_level
-        const channel = row.limit_reason === 'disk_pressure' ? 'Disk I/O' : 'System'
-        return level ? (
-          <Tooltip title={`${channel} pressure right now. Staged restore starts once it stays at medium or below.`}>
-            <Tag
-              color={PRESSURE_LEVEL_TAG_COLOR[level.toLowerCase()] ?? 'default'}
-              style={{ marginInlineEnd: 0, textTransform: 'capitalize' }}
-            >
-              {level}
-            </Tag>
-          </Tooltip>
-        ) : (
-          <Text style={{ color: COLORS.textMuted }}>—</Text>
-        )
-      },
-    },
-    {
-      title: 'Limited For',
-      key: 'limited_for',
-      width: 130,
-      render: (_: unknown, row: AutoLimitedApp) => {
-        const since = limitedSinceRef.current[row.effective_app_id]
-        return (
-          <Tooltip
-            title={
-              since
-                ? `Counted by the dashboard since ${new Date(since).toLocaleString()} · released in stages once pressure eases`
-                : 'Release happens in stages once pressure eases'
-            }
-          >
-            <Text style={{ color: COLORS.textMuted, fontSize: 12, fontFamily: 'monospace' }}>
-              {formatElapsed(since, nowMs)}
-            </Text>
-          </Tooltip>
-        )
-      },
-    },
-    {
-      title: 'Actions',
-      key: 'actions',
-      width: 200,
-      align: 'center',
-      render: (_: unknown, row: AutoLimitedApp) => (
-        <Space size={4}>
-          {!row.is_controlled && (
-            <Tooltip title="Add this app to Smartune control so you can set its priority and limits">
-              <Button
-                size="small"
-                type="primary"
-                ghost
-                icon={<PlusOutlined />}
-                onClick={() => handleAddAutoLimitedToControl(row)}
-              >
-                Control
-              </Button>
-            </Tooltip>
-          )}
-          <Popconfirm
-            title="Restore now?"
-            description={<div style={{ maxWidth: 320 }}>{AUTO_LIMIT_EXCLUSION_HINT}</div>}
-            okText="Restore"
-            cancelText="Cancel"
-            onConfirm={() => handleAutoLimitRestore(row)}
-          >
-            <Tooltip title="Release this limit immediately">
-              <Button
-                size="small"
-                danger
-                icon={<RollbackOutlined />}
-                loading={actionLoading[`autolimit-restore-${row.effective_app_id}`]}
-              >
-                Restore
-              </Button>
-            </Tooltip>
-          </Popconfirm>
-        </Space>
-      ),
-    },
-  ]
 
   const processStatusColumns: ColumnsType<ProcessStatusRow> = [
     {
@@ -1636,11 +1835,8 @@ export default function Balance({
     },
   ]
 
-  const uncontrolledApps = allApps.filter(
-    (a) => !controlledApps.some((c) => c.app_id === a.app_id)
-  )
   const limitDialogPriority = limitDialog.app
-    ? (rowPriorities[limitDialog.app.app_id] ?? limitDialog.app.priority ?? 'medium').toLowerCase()
+    ? (limitDialog.app.priority ?? 'medium').toLowerCase()
     : 'medium'
   const currentNetworkPriority = normalizeNetworkPriority(
     limitDialog.app?.network_priority ?? limitDialog.app?.priority ?? limitDialogPriority
@@ -1668,7 +1864,7 @@ export default function Balance({
     if (!appId) return []
 
     const preferred = selectedTargetCgroups[appId]
-    if (preferred && preferred.length > 0) return preferred
+    if (preferred !== undefined) return preferred
 
     const runningFromRows = Array.from(new Set(
       (limitDialog.app?.process_status_rows ?? [])
@@ -1995,6 +2191,56 @@ export default function Balance({
     </>
   )
 
+  // Status quick-filter counts + rows for the unified management table. "Auto Control" holds
+  // the apps the pressure engine is currently throttling (control_status === 'AUTO_LIMITED');
+  // "Manual Control" holds every other controlled app (normal + manual limit).
+  const autoControlledCount = controlledApps.filter((a) => a.control_status === 'AUTO_LIMITED').length
+  const manualTabCount = controlledApps.filter((a) => a.control_status !== 'AUTO_LIMITED').length
+  // Only hand-restored exemptions belong here; manual-limit exemptions already show up under
+  // Manual Control, so listing them again would double-count the same app.
+  const userRestoredExclusions = exclusions.filter((e) => e.reason === 'user_restore')
+  const excludedTabCount = userRestoredExclusions.length
+  // Apps the engine throttled that were never taken under management. Folded into the one
+  // table as synthetic rows so "auto-limited" lives in exactly one place, not a second card.
+  // A cgroup can contain several processes: when one is a registered app, it already renders
+  // the shared Auto limit. Do not add a second "New discovery" row just because a different
+  // process in that same cgroup was the sampled IO leader.
+  const controlledAppIds = new Set(controlledApps.map((app) => app.app_id))
+  const uncontrolledAutoLimited = autoLimitedApps.filter(
+    (app) => !app.is_controlled
+      && !controlledAppIds.has(app.app_id)
+      && !controlledAppIds.has(app.effective_app_id),
+  )
+  const autoRowFor = (a: AutoLimitedApp): ControlRow => ({
+    app_id: a.app_id,
+    app_name: a.app_name,
+    cpu_usage: 0,
+    memory_mb: 0,
+    io_read_rate: 0,
+    priority: a.priority,
+    status: APP_STATUS.A_LIMITED,
+    controlled: false,
+    control_status: 'AUTO_LIMITED',
+    effective: a.effective,
+    auto_detail: a.auto_detail,
+    limited_scopes: a.cgroups,
+    __auto: a,
+    key: `auto:${a.effective_app_id}`,
+  })
+
+  const controlledMatchingTab = controlledApps.filter((a) =>
+    controlTab === 'auto'
+      ? a.control_status === 'AUTO_LIMITED'
+      : a.control_status !== 'AUTO_LIMITED'
+  )
+  // Unmanaged auto rows only make sense under "Auto Control": they have no DB identity yet.
+  const showUncontrolled = controlTab === 'auto'
+  const controlRows: ControlRow[] = [
+    ...controlledMatchingTab.map((a) => ({ ...a, key: a.app_id } as ControlRow)),
+    ...(showUncontrolled ? uncontrolledAutoLimited.map(autoRowFor) : []),
+  ]
+  const autoTabCount = autoControlledCount + uncontrolledAutoLimited.length
+
   if (!balancerEnabled) {
     return (
       <div style={{ padding: '16px 0' }}>
@@ -2022,17 +2268,11 @@ export default function Balance({
         />
       )}
 
-      {/* Add App Section — two paths:
-            (1) Discover new: open the wizard, scan /proc, auto-fill bpf_name
-                / process_names / commandline by inspecting running processes.
-            (2) Pick configured: choose from controlled_apps already declared
-                in config.yaml and just enable monitoring + set priority.
-          The wizard is the entry for apps not yet in the dropdown.  */}
       <Card
         title={
           <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
             <PlusOutlined style={{ marginRight: 8, color: COLORS.accent }} />
-            Add Application to Control
+            Add application
           </Text>
         }
         style={{
@@ -2044,149 +2284,24 @@ export default function Balance({
         headStyle={{ borderBottom: `1px solid ${COLORS.border}`, padding: '8px 16px', minHeight: 40 }}
         bodyStyle={{ padding: '16px' }}
       >
-        {/* Two parallel options shown side-by-side so the user can see both
-            paths at once.  Each option has a short heading describing what it
-            does, then a bordered box with the actual controls.  Stacks
-            vertically on small screens via the responsive Col breakpoints. */}
-        <Row gutter={[12, 12]}>
-          {/* (1) Discover new — opens the wizard which scans /proc and
-                auto-fills bpf_name / process_names by inspecting running
-                processes.  Use this when the app isn't already in the
-                Pick-from-list dropdown. */}
-          <Col xs={24} md={8}>
-            <div style={{ marginBottom: 6 }}>
-              <Text style={{ color: COLORS.textMuted, fontSize: 11, fontWeight: 600 }}>
-                Option 1 — Discover by running process
+        <Row gutter={[12, 12]} wrap>
+          <Col flex="auto" style={{ minWidth: 240 }}>
+            <Space direction="vertical" size={4}>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                Scan a running process, choose an application, then set its control policy.
               </Text>
-            </div>
-            <div
-              style={{
-                border: `1px solid ${COLORS.border}`,
-                borderRadius: 6,
-                padding: '16px',
-                height: 'calc(100% - 22px)',
-                display: 'flex',
-                flexDirection: 'column',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-              }}
-            >
-              <Text type="secondary" style={{ fontSize: 11, marginBottom: 12, textAlign: 'center' }}>
-                Scan running processes for an app that’s not in the list yet
-                — the wizard auto-fills the technical fields for you.
+              <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
+                1. Scan processes &nbsp;→&nbsp; 2. Choose application &nbsp;→&nbsp; 3. Configure limits
               </Text>
               <Button
                 type="primary"
                 icon={<SearchOutlined />}
                 onClick={() => setWizardOpen(true)}
-                style={{ width: '50%' }}
+                style={{ marginTop: 4, alignSelf: 'flex-start' }}
               >
-                Find new application
+                Scan running applications
               </Button>
-            </div>
-          </Col>
-
-          {/* (2) Pick configured — choose from controlled_apps already
-                declared in config.yaml and just enable monitoring + set
-                priority.  Also lists apps whose config.yaml entry was deleted
-                by hand but whose row survives ("previously managed"): enabling
-                one restores its config entry from the snapshot on that row, so
-                its priority and saved limits come back with it. */}
-          <Col xs={24} md={16}>
-            <div style={{ marginBottom: 6 }}>
-              <Text style={{ color: COLORS.textMuted, fontSize: 11, fontWeight: 600 }}>
-                Option 2 — Pick a configured or previously managed application
-              </Text>
-            </div>
-            <div
-              style={{
-                border: `1px solid ${COLORS.border}`,
-                borderRadius: 6,
-                padding: '16px',
-              }}
-            >
-              <Row gutter={[12, 12]} align="middle">
-                <Col xs={24} sm={6}>
-                  <div style={{ marginBottom: 4 }}>
-                    <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>Application</Text>
-                  </div>
-                  <Select
-                    value={selectedAppId || undefined}
-                    onChange={setSelectedAppId}
-                    placeholder={
-                      uncontrolledApps.length === 0
-                        ? 'No new apps to add — use the wizard'
-                        : 'Select application...'
-                    }
-                    style={{ width: '100%' }}
-                    showSearch
-                    filterOption={(input, option) =>
-                      String(option?.children ?? '').toLowerCase().includes(input.toLowerCase())
-                    }
-                    styles={{ popup: { root: { background: COLORS.panelBg } } }}
-                    notFoundContent={
-                      <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
-                        No new apps to add — register one via &ldquo;Find new application&rdquo;.
-                      </Text>
-                    }
-                  >
-                    {uncontrolledApps.map((app) => (
-                      <Option key={app.app_id} value={app.app_id}>
-                        {/* Kept a plain string: filterOption above searches option.children. */}
-                        {app.previously_managed
-                          ? `${app.app_name} (previously managed)`
-                          : app.app_name}
-                      </Option>
-                    ))}
-                  </Select>
-                </Col>
-
-                <Col xs={12} sm={4}>
-                  <div style={{ marginBottom: 4 }}>
-                    <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>Priority</Text>
-                  </div>
-                  <Select
-                    value={addPriority}
-                    onChange={setAddPriority}
-                    style={{ width: '100%' }}
-                    styles={{ popup: { root: { background: COLORS.panelBg } } }}
-                  >
-                    {PRIORITY_OPTIONS.map((opt) => (
-                      <Option key={opt.value} value={opt.value}>
-                        <span style={{ color: opt.color }}>{opt.label}</span>
-                      </Option>
-                    ))}
-                  </Select>
-                </Col>
-
-                <Col xs={24} sm={9}>
-                  <div style={{ marginBottom: 4 }}>
-                    <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>Remark</Text>
-                  </div>
-                  <Input
-                    value={remark}
-                    onChange={(e) => setRemark(e.target.value)}
-                    placeholder="Optional note..."
-                    style={{ background: COLORS.panelBg, borderColor: COLORS.border }}
-                  />
-                </Col>
-
-                <Col xs={12} sm={5}>
-                  <div style={{ marginBottom: 4, visibility: 'hidden' }}>
-                    <Text style={{ fontSize: 11 }}>action</Text>
-                  </div>
-                  <Button
-                    type="primary"
-                    icon={<PlusOutlined />}
-                    loading={adding}
-                    onClick={handleAdd}
-                    block
-                  >
-                    Add to Control
-                  </Button>
-                </Col>
-              </Row>
-            </div>
+            </Space>
           </Col>
         </Row>
       </Card>
@@ -2232,13 +2347,42 @@ export default function Balance({
         }}
       />
 
-      {/* Controlled Apps */}
+      <EditAppProcessesModal
+        open={editApp !== null}
+        app={editApp}
+        onClose={() => setEditApp(null)}
+        onSuccess={async () => {
+          messageApi.success(`Application updated for ${editApp?.app_name || editApp?.app_id}`)
+          await refreshControlled()
+        }}
+      />
+
+      {/* App Cgroup control center — the merged, entity-centric management table. */}
       <Card
         title={
-          <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
-            Controlled Applications
-            <Tag style={{ marginLeft: 8, fontSize: 11 }}>{controlledApps.length}</Tag>
-          </Text>
+          <Space size={8} wrap>
+            <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
+              Application Control Center
+            </Text>
+            <Tabs
+              size="small"
+              activeKey={controlTab}
+              onChange={(k) => setControlTab(k as 'auto' | 'manual' | 'excluded')}
+              style={{ marginBottom: -12 }}
+              items={[
+                { key: 'auto', label: `🔴 Auto Control (${autoTabCount})` },
+                { key: 'manual', label: `🟠 Manual Control (${manualTabCount})` },
+                {
+                  key: 'excluded',
+                  label: (
+                    <Tooltip title={EXCLUDED_APPS_TOOLTIP}>
+                      <span>{`⛔ Excluded (${excludedTabCount})`}</span>
+                    </Tooltip>
+                  ),
+                },
+              ]}
+            />
+          </Space>
         }
         style={{
           background: COLORS.panelBg,
@@ -2249,14 +2393,24 @@ export default function Balance({
         headStyle={{ borderBottom: `1px solid ${COLORS.border}`, padding: '8px 16px', minHeight: 40 }}
         bodyStyle={{ padding: '0' }}
       >
+        {controlTab === 'excluded' ? (
+          <ExcludedAppsTable
+            rows={userRestoredExclusions}
+            loading={loading}
+            onRemove={handleRemoveExclusion}
+          />
+        ) : (
         <Table
           columns={controlledColumns}
-          dataSource={controlledApps.map((a) => ({ ...a, key: a.app_id }))}
+          dataSource={controlRows}
           loading={loading}
           size="small"
           pagination={false}
           scroll={{ x: 'max-content' }}
-          rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
+          rowClassName={(record, idx) =>
+            [idx % 2 === 1 ? 'table-row-alt' : '', record.app_id === highlightAppId ? 'table-row-highlight' : '']
+              .filter(Boolean)
+              .join(' ')}
           expandable={{
             expandedRowKeys: expandedProcessRows,
             onExpandedRowsChange: (keys) => {
@@ -2311,71 +2465,125 @@ export default function Balance({
           locale={{
             emptyText: (
               <div style={{ padding: 30, color: COLORS.textMuted, textAlign: 'center' }}>
-                No apps under control. Add one above.
+                No applications are being controlled. Use “Find new application” above to start.
               </div>
             ),
           }}
         />
-      </Card>
-
-      {/* Auto Limited – apps the balancer throttled on its own when pressure hit critical.
-          Always shown so the empty state doubles as "nothing is being throttled right now". */}
-      <Card
-        title={
-          <Space size={8}>
-            <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
-              <DatabaseOutlined style={{ marginRight: 8, color: COLORS.orange }} />
-              Auto Limited
-              <Tag color={autoLimitedApps.length > 0 ? 'warning' : 'default'} style={{ marginLeft: 8 }}>
-                {autoLimitedApps.length}
-              </Tag>
-            </Text>
-            <Tooltip
-              // antd caps the bubble at 250px, which wraps this text into a very tall
-              // column — widen the overlay itself, not just the content.
-              overlayStyle={{ maxWidth: 680 }}
-              overlayInnerStyle={{ maxWidth: 680 }}
-              title={
-                <div style={{ maxWidth: 680 }}>
-                  <div>
-                    These apps were limited automatically because system or disk I/O pressure reached
-                    critical. The balancer releases each limit in stages once pressure drops back and
-                    holds there — there is no fixed timer, so the table shows how long the limit has
-                    been listed here instead.
-                  </div>
-                  <div style={{ marginTop: 6 }}>{AUTO_LIMIT_EXCLUSION_HINT}</div>
-                </div>
-              }
-            >
-              <QuestionCircleOutlined style={{ color: COLORS.textMuted }} />
-            </Tooltip>
-          </Space>
-        }
-        style={{
-          background: COLORS.panelBg,
-          border: `1px solid ${COLORS.orange}44`,
-          borderRadius: 6,
-          marginBottom: 12,
-        }}
-        headStyle={{ borderBottom: `1px solid ${COLORS.border}`, padding: '8px 16px', minHeight: 40 }}
-        bodyStyle={{ padding: '0' }}
-      >
-        {autoLimitedApps.length === 0 ? (
-          <div style={{ padding: 24, textAlign: 'center', color: COLORS.textMuted, fontStyle: 'italic' }}>
-            No apps are auto-limited right now
-          </div>
-        ) : (
-          <Table
-            columns={autoLimitedColumns}
-            dataSource={autoLimitedApps.map((a) => ({ ...a, key: a.effective_app_id }))}
-            size="small"
-            pagination={false}
-            rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
-          />
         )}
       </Card>
 
-      {/* Pending Queue – always shown so users can see the empty state (mirrors Python's pending_queue_holder) */}
+      {/* Right-side detail drawer: a plain-language breakdown of a row's active / passive /
+          effective limits, opened by clicking the row. Read-only; all actions stay in the row. */}
+      <Drawer
+        title={detailApp ? `${detailApp.app_name} — control detail` : 'Control detail'}
+        placement="right"
+        width={420}
+        open={detailApp !== null}
+        onClose={() => setDetailApp(null)}
+      >
+        {detailApp && (() => {
+          const cs = detailApp.control_status ?? 'NORMAL'
+          const eff = detailApp.effective
+          const auto = detailApp.auto_detail
+          const isManagedAuto = cs === 'AUTO_LIMITED' && detailApp.controlled !== false
+          const statusLabel =
+            cs === 'AUTO_LIMITED' ? '⚠️ Auto circuit-breaking'
+              : cs === 'MANUAL_LIMITED' ? '🟠 Manual limited'
+                : '🟢 Normal (not limited)'
+          const partial = auto?.partial_parts
+          const formatPercent = (rate: number | null | undefined) =>
+            rate == null ? '—' : `${Math.round(rate * 100)}%`
+          const formatIoLimit = (value: number | null | undefined, unit: string) =>
+            value == null ? null : `${value} ${unit}`
+          const scopeProcesses = (detailApp.process_status_rows ?? []).reduce<Record<string, ProcessStatusRow[]>>(
+            (scopes, process) => {
+              const cgroup = (process.cgroup || '').trim()
+              if (cgroup) {
+                ;(scopes[cgroup] ??= []).push(process)
+              }
+              return scopes
+            },
+            {},
+          )
+          const appScopes = Array.from(new Set([
+            ...Object.keys(scopeProcesses),
+            ...(detailApp.limited_scopes ?? []),
+          ].filter(Boolean)))
+          return (
+            <Descriptions column={1} size="small" bordered
+              labelStyle={{ width: 150 }}>
+              <Descriptions.Item label="Status">{statusLabel}</Descriptions.Item>
+              <Descriptions.Item label="Priority">
+                <PriorityTag priority={detailApp.priority} />
+              </Descriptions.Item>
+              <Descriptions.Item label="CPU / Memory">
+                {eff?.cpu_mem?.limited
+                  ? `CPU cap ${formatPercent(eff.cpu_mem.cpu_rate)}; Memory cap ${formatPercent(eff.cpu_mem.mem_rate)}`
+                  : 'Not limited'}
+              </Descriptions.Item>
+              <Descriptions.Item label="Disk I/O">
+                {eff?.disk_io?.limited
+                  ? (
+                    <Space direction="vertical" size={2}>
+                      <Text>{`Disks: ${eff.disk_io.disks.length ? eff.disk_io.disks.join(', ') : 'all disks'}`}</Text>
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        {[
+                          formatIoLimit(eff.disk_io.read_mb_s, 'MB/s read'),
+                          formatIoLimit(eff.disk_io.write_mb_s, 'MB/s write'),
+                          formatIoLimit(eff.disk_io.read_iops, 'read IOPS'),
+                          formatIoLimit(eff.disk_io.write_iops, 'write IOPS'),
+                        ].filter(Boolean).join('; ') || 'Device scope limited; no rate cap configured'}
+                      </Text>
+                    </Space>
+                  )
+                  : 'Not limited'}
+              </Descriptions.Item>
+              {cs === 'AUTO_LIMITED' && auto && (
+                <>
+                  <Descriptions.Item label="Limit Reason">
+                    {auto.limit_reason === 'disk_pressure' ? 'Disk I/O pressure' : 'System pressure'}
+                    {auto.pressure_level ? ` · level ${auto.pressure_level}` : ''}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="Staged recovery">
+                    {partial
+                      ? `CPU/Mem ${partial.sys ? 'partially released' : 'limit remains active'}; `
+                        + `Disk I/O ${partial.disk_io ? 'partially released' : 'limit remains active'}`
+                      : '—'}
+                  </Descriptions.Item>
+                </>
+              )}
+              <Descriptions.Item label="Scopes (cgroups)">
+                {appScopes.length > 0 ? (
+                  <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                    {appScopes.map((cgroup) => {
+                      const processes = (scopeProcesses[cgroup] ?? []).flatMap((scope) =>
+                        scope.scope_processes?.length ? scope.scope_processes.map((process) => ({ ...scope, ...process })) : [scope],
+                      )
+                      return (
+                      <div key={cgroup}>
+                        <Text code style={{ fontSize: 12, overflowWrap: 'anywhere' }}>{cgroup}</Text>
+                        <div style={{ color: COLORS.textMuted, fontSize: 12, marginTop: 3 }}>
+                          {processes.length > 0
+                            ? processes.map((process) => `${deriveDisplayProcessName(process)} (PID ${process.pid ?? '—'})`).join(', ')
+                            : 'No running process found in this scope'}
+                        </div>
+                      </div>
+                      )
+                    })}
+                  </Space>
+                ) : 'No process scopes found'}
+              </Descriptions.Item>
+            </Descriptions>
+          )
+        })()}
+      </Drawer>
+
+      {pendingApps.length === 0 ? (
+        <Text style={{ color: COLORS.textMuted, fontSize: 12, display: 'block', textAlign: 'right' }}>
+          Pending queue: empty
+        </Text>
+      ) : (
       <Card
         title={
           <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
@@ -2394,20 +2602,15 @@ export default function Balance({
         headStyle={{ borderBottom: `1px solid ${COLORS.border}`, padding: '8px 16px', minHeight: 40 }}
         bodyStyle={{ padding: '0' }}
       >
-        {pendingApps.length === 0 ? (
-          <div style={{ padding: 24, textAlign: 'center', color: COLORS.textMuted, fontStyle: 'italic' }}>
-            🕊️ Pending queue is empty
-          </div>
-        ) : (
-          <Table
-            columns={pendingColumns}
-            dataSource={pendingApps.map((a) => ({ ...a, key: a.app_id }))}
-            size="small"
-            pagination={false}
-            rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
-          />
-        )}
+        <Table
+          columns={pendingColumns}
+          dataSource={pendingApps.map((a) => ({ ...a, key: a.app_id }))}
+          size="small"
+          pagination={false}
+          rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
+        />
       </Card>
+      )}
 
       <Modal
         title={(
@@ -2474,6 +2677,9 @@ export default function Balance({
 
       <style>{`
         .table-row-alt td { background: ${COLORS.rowAlt} !important; }
+        .table-row-highlight td { background: ${COLORS.yellow}33 !important; transition: background 0.4s ease; }
+        .ant-table-tbody > tr.table-row-highlight:hover > td { background: ${COLORS.yellow}44 !important; }
+        .ant-table-row { cursor: pointer; }
         .ant-table { background: transparent !important; }
         .ant-table-thead > tr > th {
           background: ${COLORS.headerBg} !important;

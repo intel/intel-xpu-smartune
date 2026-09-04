@@ -17,7 +17,7 @@ from db.DatabaseModel import AIAppPriority, DBStatus, get_write_epoch
 from typing import List, Dict, Any, Optional
 from config.config import b_config
 
-_original_oom_scores: dict[str, str] = {}
+_original_oom_scores: dict[str, dict[str, str]] = {}
 
 # Snapshot of the controlled-apps table, kept in sync via the model's write
 # epoch.  See get_controlled_apps().  The epoch starts below zero so the first
@@ -350,10 +350,34 @@ def get_app_control_info(app_id: str = None, app_name: str = None):
     controlled_map = {app['app_id']: app for app in controlled_apps if app.get('app_id')}
     name_map = {app['app_name'].lower(): app for app in controlled_apps if app.get('app_name')}
 
-    is_controlled = app_id in controlled_map or (app_name and app_name.lower() in name_map)
+    # An app's identity is its process-name set, not just its display name: an app
+    # shown as "optimum" may actually run as "optimum-cli" (its configured
+    # process_names). The pressure loop samples the *process* name, so without also
+    # matching process_names the running process is judged uncontrolled and lands as a
+    # duplicate, undefined-priority auto-limited row instead of being attributed to the
+    # managed app. setdefault keeps the display-name mapping authoritative on collision.
+    for app in controlled_apps:
+        for pname in _get_app_process_names(app_id=app.get('app_id'), app_name=app.get('app_name')):
+            if pname:
+                name_map.setdefault(pname.lower(), app)
+
+    # Match BOTH identities the top-consumer sampler produces against process_names:
+    #   * app_name — the kernel comm (e.g. "python" for a python-launched script), and
+    #   * app_id   — the *derived* program identity ("optimum-cli", resolved from the
+    #                cmdline for a process living in a shared session/scope).
+    # For a script launched from an SSH shell the comm is "python" while the derived id
+    # is "optimum-cli"; only the latter equals the configured process_name, so matching
+    # app_name alone still misses it and the app splits into a duplicate uncontrolled row.
+    lname = app_name.lower() if app_name else None
+    aid = app_id.lower() if app_id else None
+    is_controlled = (app_id in controlled_map
+                     or bool(aid and aid in name_map)
+                     or bool(lname and lname in name_map))
     controlled_data = None
     if is_controlled:
-        controlled_data = controlled_map.get(app_id) or name_map.get(app_name.lower() if app_name else None)
+        controlled_data = (controlled_map.get(app_id)
+                           or (name_map.get(aid) if aid else None)
+                           or (name_map.get(lname) if lname else None))
 
     return is_controlled, controlled_data
 
@@ -436,25 +460,15 @@ def _get_controlled_app_entry(app_id: str = None, app_name: str = None) -> Optio
     return None
 
 
-def _filter_pids_by_cgroup_scope(
-    pids: List[int],
-    app_id: str = None,
-    app_name: str = None,
-) -> List[int]:
-    """Deprecated cgroup-scope filter — now a no-op passthrough.
-
-    An application's identity is its process *name* set, not the ephemeral
-    cgroup its instances happen to live in.  Filtering by ``cgroup_ids`` broke
-    monitoring whenever a process restarted into a new scope (e.g. a fresh
-    ``tmux-spawn-*.scope``).  The signature is kept so callers stay unchanged;
-    it now returns every matching PID, deduplicated and sorted.
-    """
-    return sorted({int(pid) for pid in pids})
-
-
 def get_app_processes_for_app(process_query: str, app_id: str = None, app_name: str = None) -> List[int]:
-    """Find app PIDs by name. Identity is name-based, so no cgroup scoping."""
-    return sorted({int(pid) for pid in get_app_processes(process_query)})
+    """Find controlled-app PIDs by their exact configured identity.
+
+    ``process_names`` comes from the discovery identity rule, so a fuzzy
+    command-line match can claim an SSH shell or launcher that merely mentions
+    the name. The optional app metadata is retained for callers' compatibility;
+    process identity itself is deliberately independent of cgroup placement.
+    """
+    return get_app_processes_by_exact_name(process_query)
 
 
 _DERIVE_PROCESS_NAME = None
@@ -693,15 +707,47 @@ def adjust_oom_priority(
     :param app_id:
     :param app_name:
     :param priority: only takes effect when the value is "critical"
-    :param app_cmdline: command line string used for pgrep matching
+    :param app_cmdline: command line string used for process matching
     :param restore: when True, restore the original oom_score_adj; otherwise set based on priority
     :return:
     """
     if not restore and priority.lower() != "critical":
         return  # skip non-critical apps unless restore=True is requested
 
-    target_value = 0
     try:
+        if restore:
+            original_scores = _original_oom_scores.get(app_id)
+            if not original_scores:
+                logger.debug(f"No OOM priority snapshot to restore for {app_name}.")
+                return
+
+            restored_pids = []
+            target_value = 0
+            for pid, original_score in list(original_scores.items()):
+                oom_file = f"/proc/{pid}/oom_score_adj"
+                if not os.path.exists(oom_file):
+                    logger.debug(f"PID {pid} exited before OOM priority could be restored.")
+                    del original_scores[pid]
+                    continue
+
+                logger.debug(f"Restoring OOM priority for PID {pid} to {original_score}")
+                write_cgroup_file(original_score, oom_file, allowed_roots=("/proc",))
+                del original_scores[pid]
+                restored_pids.append(pid)
+                target_value = int(original_score)
+
+            if not original_scores:
+                _original_oom_scores.pop(app_id, None)
+            if not restored_pids:
+                logger.debug(f"No live PID required OOM priority restoration for {app_name}.")
+                return
+
+            _update_app_oom_score_adj(app_id, target_value)
+            logger.info(
+                f"OOM priority restored for {app_name} (PID(s): {', '.join(restored_pids)})"
+            )
+            return
+
         # Prefer the first configured process_name (an exe basename pulled
         # straight from /proc/<pid>/exe, so always shell-safe) over
         # _get_executable_name() which derives a regex-y string from the
@@ -724,22 +770,17 @@ def adjust_oom_priority(
             return
 
         pids = [pid for pid in pgrep_result.stdout.strip().split("\n") if pid]
+        original_scores = _original_oom_scores.setdefault(app_id, {})
         for pid in pids:
             oom_file = f"/proc/{pid}/oom_score_adj"
 
-            if restore:
-                if pid not in _original_oom_scores:
-                    logger.warning(f"No original OOM score recorded for PID {pid}. Skipping.")
-                    continue
-                target_value = _original_oom_scores.pop(pid)
-                action = "Restoring"
-            else:
-                # Record the original value for this app
-                if pid not in _original_oom_scores:
-                    with open(oom_file, "r") as f:
-                        _original_oom_scores[pid] = f.read().strip()
-                target_value = "-1000"
-                action = "Setting"
+            # Record the original value for this app before setting the
+            # critical OOM score.  Restoration only uses this app's snapshot.
+            if pid not in original_scores:
+                with open(oom_file, "r") as f:
+                    original_scores[pid] = f.read().strip()
+            target_value = "-1000"
+            action = "Setting"
 
             # Update oom_score_adj. smartune runs as root (see smartune.service),
             # so write /proc/<pid>/oom_score_adj directly instead of shelling out
@@ -1126,6 +1167,7 @@ def fetch_all_apps():
             "app_id": app_id,
             "cmdline": app.get("commandline", ""),
             "process_names": app.get("process_names", []) or [],
+            "bpf_name": app.get("bpf_name", []) or [],
             "display_name": name,
         }
         app_list.append(app_data)
@@ -1223,6 +1265,10 @@ def fetch_unregistered_apps() -> List[Dict[str, Any]]:
                 "name": entry["name"],
                 "app_name": entry["name"],
                 "app_id": app_id,
+                "priority": getattr(row, "priority", None),
+                "network_priority": getattr(row, "network_priority", None),
+                "remark": getattr(row, "remark", "") or "",
+                "cgroup": getattr(row, "cgroup", "") or "",
                 "cmdline": entry["commandline"],
                 "process_names": entry["process_names"],
                 "display_name": entry["name"],

@@ -251,8 +251,6 @@ export const api = {
 
   setToControl: (payload: SetControlPayload) =>
     post<void>('/app/set_to_control', payload),
-  removeFromControl: (payload: AppIdPayload) =>
-    post<void>('/app/remove_from_control', payload),
   setPriority: (payload: SetPriorityPayload) =>
     post<void>('/app/set_priority', payload),
   setNetworkPriority: (payload: SetNetworkPriorityPayload) =>
@@ -283,6 +281,15 @@ export const api = {
   // resourceRestore, which only handles manual limits.
   autoLimitRestore: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<void>('/app/auto_limit_restore', payload),
+  // Safe handoff: flips an auto-limited app to a manual limit WITHOUT releasing its
+  // cgroup caps, so the manual buttons unlock with no crash window. See backend
+  // lock_to_manual.
+  lockToManual: (payload: Pick<AppIdPayload, 'app_id'>) =>
+    post<void>('/app/lock_to_manual', payload),
+  // "Take Control": adopt a running auto-limit into a newly-controlled app identity so the
+  // limit follows the app into management (no release, no duplicate row). See adopt_auto_limit.
+  adoptAutoLimit: (payload: { effective_app_id: string; app_id: string; app_name?: string; priority?: string }) =>
+    post<void>('/app/adopt_auto_limit', payload),
   getAutoLimitExclusions: () => post<AutoLimitExclusionsData>('/app/auto_limit_exclusions'),
   removeAutoLimitExclusion: (key: string) =>
     post<void>('/app/auto_limit_exclusion_remove', { key }),
@@ -336,6 +343,16 @@ export const api = {
     }
     return { status: 'error', message: res.data.retmsg }
   },
+  mergeControlledAppProcesses: (payload: Pick<WizardCommitPayload, 'id' | 'process_names' | 'bpf_name'>) =>
+    post<{ id: string; name: string; process_names: string[]; bpf_name: string[] }>(
+      '/app/merge_controlled_app_processes', payload,
+    ),
+  // Full replace (add + remove) of an app's identities. The server rejects (throws)
+  // when the caller tries to drop a program name that is currently under a live limit.
+  setControlledAppProcesses: (payload: Pick<WizardCommitPayload, 'id' | 'process_names' | 'bpf_name'>) =>
+    post<{ id: string; name: string; process_names: string[]; bpf_name: string[] }>(
+      '/app/set_controlled_app_processes', payload,
+    ),
   purgeControlledApp: (id: string) =>
     post<{ id: string; name: string }>('/app/purge_controlled_app', { id }),
 

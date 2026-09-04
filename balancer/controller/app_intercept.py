@@ -480,7 +480,7 @@ class AppIntercept(metaclass=SingletonMeta):
                 'app_name': app_name,
                 'status': "stopped",
                 'purpose': "app"
-            }, True)
+            }, store=True)
         del self.monitored_app_launched[pid]
 
         # Clean up pending_exit_events

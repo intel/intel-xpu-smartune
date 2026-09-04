@@ -61,7 +61,6 @@ All endpoints return a standardized JSON structure:
 | App | `/app/discover_extract` | POST | Wizard: extract fields | Derive bpf_name/id from PIDs |
 | App | `/app/new_controlled_app` | POST | Wizard: register new app | Config + DB + BPF in one step |
 | App | `/app/purge_controlled_app` | POST | Hard-delete app | Removes config + DB + BPF |
-| App | `/app/remove_from_control` | POST | Soft-remove from control | Flips controlled=false |
 | App | `/app/get_controlled_app` | POST | List controlled apps | Full metadata, status |
 | App | `/app/check_running_apps` | POST | Scan running processes | Detect pre-existing apps |
 | App | `/app/get_pending_app` | POST | List pending apps | Sorted by priority DESC |
@@ -433,7 +432,7 @@ Or query by name:
 
 #### POST /app/purge_controlled_app
 
-**Purpose:** Hard-delete an application from BOTH config.yaml and the DB. Unlike `/app/remove_from_control` (which only flips `controlled=false`), this completely wipes the entry: removes config, deletes the DB row, restores OOM score, and refreshes the BPF cache. Used when the user wants to re-add an app whose process_names overlap with an existing entry.
+**Purpose:** Hard-delete an application from BOTH config.yaml and the DB: this completely wipes the entry — an active manual resource limit is restored first, then config is removed, the DB row is deleted, the OOM score is restored, and the BPF cache is refreshed. If the active manual limit cannot be restored, the purge fails and leaves the application intact. Auto-limited apps must be restored or taken under manual control before deletion. Used when the user wants to re-add an app whose process_names overlap with an existing entry.
 
 **Request:**
 
@@ -456,42 +455,6 @@ Or query by name:
   "data": {
     "id": "heliconsearch.service",
     "name": "heliconSearch"
-  }
-}
-```
-
----
-
-#### POST /app/remove_from_control
-
-**Purpose:** Soft-remove an application from the control list (flips `controlled=false`) and restore its OOM score. The app remains in config so it can be re-enabled from the dropdown without reconfiguration.
-
-**Request:**
-
-| Type | Parameter | Required | Format | Description |
-|------|-----------|----------|--------|-------------|
-| Body | app_id | No* | string | Application identifier |
-| Body | app_name | No* | string | Application name |
-
-*At least one must be provided.
-
-**Request Example:**
-```json
-{
-  "app_id": "com.example.app",
-  "app_name": "example"
-}
-```
-
-**Response:**
-```json
-{
-  "retcode": 0,
-  "retmsg": "App removed from control successfully",
-  "data": {
-    "app_id": "com.example.app",
-    "app_name": "example",
-    "controlled": false
   }
 }
 ```

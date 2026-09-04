@@ -189,6 +189,51 @@ class Controller:
             pass
         return None
 
+    def _resolve_process_unit(self, app_id: str):
+        """Resolve a bare process name to the systemd unit it actually runs in.
+
+        A process started directly from a shell (e.g. ``optimum-cli``) is not a
+        systemd unit of its own; it lives inside its login session's scope
+        (``session-N.scope`` under user.slice) or a service under system.slice.
+        ``systemctl set-property`` needs that real unit name -- passing the bare
+        process name makes systemctl assume a ``<name>.service`` that does not
+        exist ("Unit optimum-cli.service not found").
+
+        Note: session scopes are shared by every process in that login session,
+        so limiting one affects the whole session -- this is the accepted
+        trade-off for controlling a plain, non-unit process.
+
+        Returns ``(unit_name, unit_type)`` or ``(None, None)`` when no running
+        process/controllable unit can be found.
+        """
+        pids = app_utils.get_app_processes(app_id)
+        if not pids:
+            logger.warning(f"No running process found for {app_id}; cannot resolve a systemd unit")
+            return None, None
+
+        cgroup_path, _ = app_utils.dominant_cgroup_by_pids(pids)
+        if not cgroup_path:
+            logger.warning(f"Cannot resolve cgroup for {app_id} (pids={pids})")
+            return None, None
+
+        unit_name = os.path.basename(cgroup_path.rstrip('/'))
+        if not (unit_name.endswith('.scope') or unit_name.endswith('.service')):
+            logger.warning(
+                f"Process {app_id} lives in '{cgroup_path}', which is not a "
+                f"controllable systemd unit (scope/service)"
+            )
+            return None, None
+
+        if '/system.slice/' in cgroup_path:
+            unit_type = 'system_service'
+        elif unit_name.endswith('.scope'):
+            unit_type = 'scope'
+        else:
+            unit_type = 'service'
+
+        logger.debug(f"Resolved process {app_id} -> unit {unit_name} ({unit_type})")
+        return unit_name, unit_type
+
     def _is_system_service(self, unit_name: str) -> bool:
         """Return True if *unit_name* lives under /sys/fs/cgroup/system.slice.
 
@@ -257,8 +302,11 @@ class Controller:
             )
             unit_type = 'scope' if matching_app in scopes else 'service'
         else:
-            matching_app = app_id
-            unit_type = 'scope'
+            # Bare process name (e.g. "optimum-cli"): not a systemd unit itself.
+            # Resolve it to the scope/service the process actually runs in so
+            # set-property has a real target instead of a bogus "<name>.service".
+            matching_app, resolved_type = self._resolve_process_unit(app_id)
+            unit_type = resolved_type or 'scope'
 
         logger.debug(f"matching_app: {matching_app} for app_id: {app_id}")
         if not matching_app:

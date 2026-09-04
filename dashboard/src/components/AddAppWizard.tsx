@@ -88,13 +88,13 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
   const [openLimitAfterAdd, setOpenLimitAfterAdd] = useState(false)
   const [committedApp, setCommittedApp] = useState<{ appId: string; appName: string } | null>(null)
   // Conflict state — set when the backend rejects with retcode CONFLICT.
-  // Holds the existing app's id so we can offer a "purge & re-add" button.
   const [conflict, setConflict] = useState<{
     kind: 'id' | 'name' | 'processes'
     withName: string
     withId: string
     message: string
   } | null>(null)
+  const [merging, setMerging] = useState(false)
   const [purging, setPurging] = useState(false)
 
   const reset = useCallback(() => {
@@ -119,6 +119,7 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
     setOpenLimitAfterAdd(false)
     setCommittedApp(null)
     setConflict(null)
+    setMerging(false)
     setPurging(false)
     if (searchTimer.current) {
       clearTimeout(searchTimer.current)
@@ -198,8 +199,6 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
       const res: DiscoverExtractData = await api.discoverExtract(selectedPids, appName.trim())
       setBpfNames(res.bpf_name ?? [])
       setProcessNames(res.process_names ?? [])
-      // cgroup_ids from discovery are intentionally ignored: app identity is
-      // name-based, so we never pin the app to specific (ephemeral) cgroups.
       const cmds = res.commandline ?? []
       setCommandline(cmds[0] ?? '')
       // Backend returns id_suggestion as either the shared systemd unit or
@@ -271,6 +270,27 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
       setPurging(false)
     }
   }, [conflict, commit, onSuccess])
+
+  const mergeProcesses = useCallback(async () => {
+    if (!conflict?.withId) return
+    setMerging(true)
+    setCommitError(null)
+    try {
+      const result = await api.mergeControlledAppProcesses({
+        id: conflict.withId,
+        process_names: processNames,
+        bpf_name: bpfNames,
+      })
+      setConflict(null)
+      setCommittedApp({ appId: result.id, appName: result.name || conflict.withName })
+      setCommitted(true)
+      setStep(STEP_DONE)
+    } catch (e) {
+      setCommitError(e instanceof Error ? e.message : 'Could not merge process identities')
+    } finally {
+      setMerging(false)
+    }
+  }, [bpfNames, conflict, processNames])
 
   // ---------- per-step validation ----------
   const step1Valid =
@@ -565,19 +585,28 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
                 <Space direction="vertical" size="small" style={{ width: '100%' }}>
                   <Text>{conflict.message}</Text>
                   <Text type="secondary" style={{ fontSize: 12 }}>
-                    Tip: if you only want to re-enable monitoring of an existing
-                    app, close this dialog and pick it from the Application
-                    dropdown above instead. Use Purge &amp; re-add only when you
-                    want to reconfigure it from scratch.
+                    Tip: Merge processes keeps the existing app's settings and
+                    current limits. Delete and recreate is only for a complete
+                    replacement.
                   </Text>
                   <Space>
+                    {conflict.kind !== 'name' && (
+                      <Button
+                        size="small"
+                        type="primary"
+                        loading={merging}
+                        onClick={mergeProcesses}
+                      >
+                        Merge processes
+                      </Button>
+                    )}
                     <Button
                       size="small"
                       danger
                       loading={purging}
                       onClick={purgeAndRetry}
                     >
-                      Purge &amp; re-add
+                      Delete and recreate
                     </Button>
                     <Button size="small" onClick={() => setConflict(null)}>
                       Dismiss

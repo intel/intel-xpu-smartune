@@ -86,6 +86,10 @@ class ExactProcessNameTests(unittest.TestCase):
         self.assertEqual(app_utils.get_app_processes_by_exact_name(''), [])
         self.assertEqual(app_utils.get_app_processes_by_exact_name(None), [])
 
+    def test_controlled_app_lookup_uses_exact_identity(self):
+        self.assertEqual(app_utils.get_app_processes_for_app('fio_lo2'), [2])
+        self.assertNotIn(4, app_utils.get_app_processes_for_app('fio_lo2'))
+
 
 class DerivedIdentityTests(unittest.TestCase):
     """The half of the match that exec-name comparison alone cannot do.
@@ -313,6 +317,19 @@ class RegisteredAppMatchTests(unittest.TestCase):
         )
         self.assertEqual(result['id'], 'fio_runner.py')
         self.assertEqual(result['name'], 'fio_runner.py')
+
+    def test_transient_scope_fallback_prefers_the_dominant_workload_identity(self):
+        mon = self._monitor([self._app("lo-io.scope", "fio_lo", "/tmp/fio_lo")])
+        result = mon.try_match_app(
+            {
+                'dominant_name': 'python',
+                'dominant_cmdline': '/usr/bin/python /opt/bin/optimum-cli export openvino',
+                'names': {'python', 'bash'},
+                'cgroup': '/user.slice/user-1000.slice/tmux-spawn-123.scope',
+            }
+        )
+        self.assertEqual(result['id'], 'optimum-cli')
+        self.assertEqual(result['name'], 'optimum-cli')
 
 
 class RepresentativeCgroupTests(unittest.TestCase):

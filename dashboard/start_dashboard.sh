@@ -178,11 +178,17 @@ if ! command -v npm &>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-# Install npm dependencies (reads dashboard/package.json)
+# Install npm dependencies only when they are absent or stale. npm writes its
+# resolved dependency tree to node_modules/.package-lock.json, so comparing it
+# with the source lockfile avoids a registry check on every dashboard launch.
 # ---------------------------------------------------------------------------
-echo "[INFO] Installing npm dependencies from package.json..."
-npm install
-echo "[INFO] Dependencies installed. ✓"
+if [ ! -f node_modules/.package-lock.json ] || [ package-lock.json -nt node_modules/.package-lock.json ]; then
+  echo "[INFO] Installing npm dependencies from package-lock.json..."
+  npm install --no-audit --no-fund
+  echo "[INFO] Dependencies installed. ✓"
+else
+  echo "[INFO] npm dependencies are current. Skipping installation. ✓"
+fi
 echo ""
 
 # ---------------------------------------------------------------------------

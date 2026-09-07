@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
@@ -207,6 +208,36 @@ class ReconcileTests(unittest.TestCase):
         )
 
 
+class OomPriorityTests(unittest.TestCase):
+    def setUp(self):
+        self._real_scores = app_utils._original_oom_scores
+        app_utils._original_oom_scores = {}
+        self.addCleanup(setattr, app_utils, "_original_oom_scores", self._real_scores)
+
+    def test_restore_only_writes_the_app_snapshot_pids(self):
+        app_utils._original_oom_scores = {
+            "optimum.scope": {"3747712": "125"},
+            "other.scope": {"4000000": "42"},
+        }
+        writes = []
+        updates = []
+
+        with (
+            mock.patch.object(app_utils.subprocess, "run", side_effect=AssertionError("pgrep must not run")),
+            mock.patch.object(app_utils.os.path, "exists", return_value=True),
+            mock.patch.object(app_utils, "write_cgroup_file", side_effect=lambda *args, **kwargs: writes.append(args)),
+            mock.patch.object(app_utils, "_update_app_oom_score_adj", side_effect=lambda *args: updates.append(args)),
+        ):
+            app_utils.adjust_oom_priority(
+                "optimum.scope", "optimum-cli", "critical", "/venv/bin/python /venv/bin/optimum-cli", restore=True
+            )
+
+        self.assertEqual(writes, [("125", "/proc/3747712/oom_score_adj")])
+        self.assertEqual(updates, [("optimum.scope", 125)])
+        self.assertNotIn("optimum.scope", app_utils._original_oom_scores)
+        self.assertEqual(app_utils._original_oom_scores["other.scope"], {"4000000": "42"})
+
+
 class ReEnableTests(unittest.TestCase):
     """Re-adding an app whose config entry the user deleted (Balancer "Option 2")."""
 
@@ -233,6 +264,17 @@ class ReEnableTests(unittest.TestCase):
         self.assertEqual([a["app_id"] for a in offered], ["gone.id"])
         self.assertTrue(offered[0]["previously_managed"])
         self.assertEqual(offered[0]["process_names"], ["gone"])
+
+    def test_uncontrolled_app_keeps_its_saved_priority(self):
+        entry = _entry("gone", "gone.id")
+        app_utils.b_config.controlled_apps = []
+        app_utils.AIAppPriority = _FakeModel([
+            _Row("gone.id", "gone", controlled=False, priority="critical", meta=_meta_of(entry)),
+        ])
+
+        offered = app_utils.fetch_unregistered_apps()
+
+        self.assertEqual(offered[0]["priority"], "critical")
 
     def test_re_enabling_writes_the_config_entry_back(self):
         """Without this the app would be controlled in the database but absent from

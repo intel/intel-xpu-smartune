@@ -90,6 +90,13 @@ class DynamicService:
     def restore_auto_limited(self, app_id):
         return self.balancer.restore_auto_limited(app_id)
 
+    def lock_to_manual(self, app_id):
+        return self.balancer.lock_to_manual(app_id)
+
+    def adopt_auto_limit(self, effective_app_id, new_app_id, new_app_name="", priority=""):
+        return self.balancer.adopt_auto_limit(
+            effective_app_id, new_app_id, new_app_name=new_app_name, priority=priority)
+
     def get_auto_limit_exclusions(self):
         return self.balancer.get_auto_limit_exclusions()
 
@@ -240,6 +247,19 @@ def _cgroup_for_pid(pid: int, fallback: str = "") -> str:
     return os.path.basename(path.rstrip("/")) or path
 
 
+def _exact_cgroup_member_pids(seed_pid: int, cgroup_id: str) -> list[int]:
+    """Read every direct member of *seed_pid*'s cgroup when it is *cgroup_id*."""
+    try:
+        cgroup_path = get_cgroup_path_by_pid(int(seed_pid))
+        if not cgroup_path or os.path.basename(cgroup_path.rstrip("/")) != cgroup_id:
+            return []
+        procs_file = os.path.join("/sys/fs/cgroup", cgroup_path.lstrip("/"), "cgroup.procs")
+        with open(procs_file, "r") as handle:
+            return [int(pid.strip()) for pid in handle if pid.strip().isdigit()]
+    except (OSError, ValueError):
+        return []
+
+
 def _build_process_scope_snapshot(
         app_id: str,
         app_name: str,
@@ -257,8 +277,9 @@ def _build_process_scope_snapshot(
     at read time, never from stale config).  Each distinct cgroup becomes one
     "instance" row, so two concurrent runs of the same program — even in fresh
     ``tmux-spawn-*.scope`` cgroups after a restart — show up as two rows and
-    each carries its own limit status.  A name with nothing running yields a
-    single Stopped/Pending placeholder row.
+    each carries its own limit status. Every configured name without a running
+    instance keeps its own Stopped/Pending placeholder row so it remains
+    visible and editable after the process exits.
     """
     configured_names = [str(x).strip() for x in (process_names or []) if str(x).strip()]
     limited_pids = {int(pid) for pid in (limited_pid_snapshot or []) if str(pid).isdigit()}
@@ -269,50 +290,10 @@ def _build_process_scope_snapshot(
 
     rows = []
 
-    def _emit_instance_rows(query_name: str, display_name: str) -> bool:
-        """Emit one row per live cgroup for *query_name*. Returns True if any
-        running instance was found."""
-        pids = sorted(set(get_app_processes_for_app(query_name, app_id=app_id, app_name=app_name)))
-        running_pids = [pid for pid in pids if _runtime_status_for_pid(pid) == "Running"]
-        if not running_pids:
-            return False
-
-        # Group running instances by their current cgroup so wrapper/child PIDs
-        # sharing a cgroup collapse into one row while genuinely separate runs
-        # (distinct cgroups) each get their own.
-        by_cgroup: dict[str, list[int]] = {}
-        for pid in running_pids:
-            cg = _cgroup_for_pid(pid, app_scope)
-            by_cgroup.setdefault(cg, []).append(pid)
-
-        for cgroup_id, cg_pids in sorted(by_cgroup.items()):
-            representative_pid = cg_pids[0]
-            if limited_pids:
-                is_limited = any(pid in limited_pids for pid in cg_pids)
-                note = "Applied" if is_limited else "Started after last limit"
-            elif limited_cgroups:
-                is_limited = cgroup_id in limited_cgroups
-                note = "Applied" if is_limited else "Started after last limit"
-            else:
-                is_limited = app_status_l in {"limited", "a_limited"}
-                note = "Applied" if is_limited else "-"
-            rows.append({
-                "key": f"{display_name}:{cgroup_id}",
-                "pid": representative_pid,
-                "process_name": display_name,
-                "cmdline": _cmdline_for_pid(representative_pid, app_cmdline),
-                "cgroup": cgroup_id,
-                "runtime_status": "Running",
-                "limit_status": "Limited" if is_limited else "Not Limited",
-                "applied_at": limited_at if is_limited else None,
-                "note": note,
-            })
-        return True
-
-    def _append_placeholder(display_name: str, key: str):
+    def _append_placeholder(display_name: str):
         runtime_status = "Pending" if app_status_l == "pending" else "Stopped"
         rows.append({
-            "key": key,
+            "key": f"{app_id}:na:{display_name}",
             "pid": None,
             "process_name": display_name,
             "cmdline": app_cmdline,
@@ -323,16 +304,65 @@ def _build_process_scope_snapshot(
             "note": "Awaiting relaunch" if runtime_status == "Pending" else "-",
         })
 
-    if configured_names:
-        for proc_name in configured_names:
-            if not _emit_instance_rows(proc_name, proc_name):
-                _append_placeholder(proc_name, f"{proc_name}:na")
-    else:
-        found = _emit_instance_rows(app_name, app_name)
-        if not found and app_id:
-            found = _emit_instance_rows(os.path.basename(app_id), app_name)
-        if not found:
-            _append_placeholder(app_name or app_id, f"{app_id}:na")
+    query_names = configured_names or [app_name, os.path.basename(app_id)]
+    by_cgroup: dict[str, list[int]] = {}
+    display_name_by_cgroup: dict[str, str] = {}
+    matched_names: set[str] = set()
+    for query_name in dict.fromkeys(name for name in query_names if name):
+        pids = get_app_processes_for_app(query_name, app_id=app_id, app_name=app_name)
+        for pid in sorted(set(pids)):
+            if _runtime_status_for_pid(pid) != "Running":
+                continue
+            matched_names.add(query_name.lower())
+            cgroup_id = _cgroup_for_pid(pid, app_scope)
+            by_cgroup.setdefault(cgroup_id, []).append(pid)
+            display_name_by_cgroup.setdefault(cgroup_id, query_name)
+
+    for cgroup_id, cg_pids in sorted(by_cgroup.items()):
+        # Preserve an identity-matched PID as the row representative. A session scope
+        # can also contain sshd, a shell and its launcher; sorting all scope members and
+        # picking the smallest PID would display sshd as the controlled application.
+        representative_pid = min(cg_pids)
+        scope_pids = sorted(set(cg_pids))
+        # Name matching identifies the app, but a scope can also contain its workers
+        # and child processes. Include every still-live process from this exact scope.
+        scope_member_pids = [
+            pid for pid in _exact_cgroup_member_pids(scope_pids[0], cgroup_id)
+            if _runtime_status_for_pid(pid) == "Running"
+            and _cgroup_for_pid(pid, app_scope) == cgroup_id
+        ]
+        scope_pids = sorted(set(cg_pids) | set(scope_member_pids))
+        if limited_pids:
+            is_limited = any(pid in limited_pids for pid in scope_pids)
+            note = "Applied" if is_limited else "Started after last limit"
+        elif limited_cgroups:
+            is_limited = cgroup_id in limited_cgroups
+            note = "Applied" if is_limited else "Started after last limit"
+        else:
+            is_limited = app_status_l in {"limited", "a_limited"}
+            note = "Applied" if is_limited else "-"
+        rows.append({
+            "key": f"{app_id}:{cgroup_id}",
+            "pid": representative_pid,
+            "process_name": display_name_by_cgroup[cgroup_id],
+            "cmdline": _cmdline_for_pid(representative_pid, app_cmdline),
+            "scope_processes": [{
+                "pid": pid,
+                "process_name": _process_name_for_pid(pid, display_name_by_cgroup[cgroup_id]),
+                "cmdline": _cmdline_for_pid(pid, app_cmdline),
+            } for pid in scope_pids],
+            "cgroup": cgroup_id,
+            "runtime_status": "Running",
+            "limit_status": "Limited" if is_limited else "Not Limited",
+            "applied_at": limited_at if is_limited else None,
+            "note": note,
+        })
+
+    for name in configured_names:
+        if name.lower() not in matched_names:
+            _append_placeholder(name)
+    if not rows:
+        _append_placeholder(app_name or app_id)
 
     running_rows = [r for r in rows if r.get("runtime_status") == "Running"]
     limited_running = [r for r in running_rows if r.get("limit_status") == "Limited"]
@@ -588,6 +618,10 @@ def set_to_control():
         # startup reconciliation would otherwise just un-control the app again.
         if controlled:
             restore_config_entry(app_id, app_name=app_name, cmdline=cmdline)
+            # A prior manual restore deliberately excludes the app from automatic
+            # limiting. Explicitly taking it under control supersedes that choice,
+            # so it must not remain in both Manual Control and Excluded.
+            _service.remove_auto_limit_exclusion(app_id)
 
         update_fields = dict(
             controlled=controlled,
@@ -914,6 +948,201 @@ def new_controlled_app():
         )
 
 
+@app.route('/app/merge_controlled_app_processes', methods=['POST'])
+def merge_controlled_app_processes():
+    """Add discovered process identities to an existing controlled app."""
+    try:
+        from config.config import b_config
+
+        data = request.get_json(silent=True) or {}
+        app_id = (data.get('id') or '').strip()
+        if not app_id:
+            return construct_response(
+                data={}, retcode=RetCode.ARGUMENT_ERROR, retmsg="'id' is required"
+            )
+
+        existing = [item for item in (getattr(b_config, "controlled_apps", None) or [])
+                    if isinstance(item, dict)]
+        target_index = next((index for index, item in enumerate(existing)
+                             if item.get("id") == app_id), None)
+        if target_index is None:
+            return construct_response(
+                data={}, retcode=RetCode.NOT_EXISTING,
+                retmsg=f"No controlled_apps entry with id '{app_id}'"
+            )
+
+        target = dict(existing[target_index])
+
+        def merge_names(current, incoming):
+            merged = []
+            seen = set()
+            for value in list(current or []) + list(incoming or []):
+                value = str(value).strip()
+                if value and value.lower() not in seen:
+                    seen.add(value.lower())
+                    merged.append(value)
+            return merged
+
+        target['process_names'] = merge_names(target.get('process_names'), data.get('process_names'))
+        target['bpf_name'] = merge_names(target.get('bpf_name'), data.get('bpf_name'))
+        existing[target_index] = target
+        if not b_config.set_list_section('controlled_apps', existing):
+            return construct_response(
+                data={}, retcode=RetCode.EXCEPTION_ERROR,
+                retmsg="Failed to update config.yaml"
+            )
+
+        meta = serialize_config_meta(target)
+        try:
+            AIAppPriority.update_record(id=app_id, config_meta_json=meta)
+        except Exception as db_exc:
+            logger.warning("merge_controlled_app_processes: DB metadata update failed: %s", db_exc)
+
+        _service.rebuild_controlled_map()
+        return construct_response(
+            data={"id": app_id, "name": target.get('name', ''),
+                  "process_names": target['process_names'], "bpf_name": target['bpf_name']},
+            retmsg=f"Process identities merged into '{target.get('name') or app_id}'"
+        )
+    except Exception as e:
+        logger.error(f"merge_controlled_app_processes failed: {str(e)}")
+        return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
+
+
+def _limited_process_names_for_app(app_id: str, cfg_entry: dict) -> set:
+    """Program names that currently have at least one instance under a live limit.
+
+    Used to guard identity edits: dropping such a name would strand the running
+    throttle behind an entry that no longer references it.  Reuses the same
+    per-instance snapshot the controlled-apps table is built from, so the
+    "which name is limited" answer matches exactly what the UI shows.
+    """
+    try:
+        snap = _service.get_limit_snapshot(app_id) or {}
+    except Exception:
+        return set()
+    if not snap.get('limited'):
+        return set()
+
+    try:
+        record = AIAppPriority.query().where(AIAppPriority.app_id == app_id).get()
+    except Exception:
+        record = None
+
+    app_name = (cfg_entry.get('name') or (record.name if record else '') or '')
+    cmdline = (record.cmdline if record else '') or cfg_entry.get('commandline', '') or ''
+    rows, _, _ = _build_process_scope_snapshot(
+        app_id=app_id,
+        app_name=app_name,
+        process_names=cfg_entry.get('process_names', []) or [],
+        app_status=(record.status if record else ''),
+        limited_pid_snapshot=snap.get('pids', []),
+        limited_cgroup_snapshot=snap.get('cgroups', []),
+        app_cmdline=cmdline,
+        limited_at=snap.get('limited_at'),
+    )
+    return {
+        (row.get('process_name') or '').strip()
+        for row in rows
+        if row.get('limit_status') == 'Limited' and (row.get('process_name') or '').strip()
+    }
+
+
+@app.route('/app/set_controlled_app_processes', methods=['POST'])
+def set_controlled_app_processes():
+    """Replace an existing app's process/BPF identities (add *and* remove).
+
+    Unlike /app/merge_controlled_app_processes (add-only), this overwrites the
+    lists with exactly what the caller sends, so the Edit dialog can prune stale
+    names.  Guard: a program name whose instance is currently under an active
+    manual limit may NOT be dropped -- doing so would leave the live cgroup
+    throttle referenced by nothing, so the UI could never restore it.  The
+    dashboard already locks those names in the Edit dialog; this is the
+    server-side safety net for direct callers and races.
+    """
+    try:
+        from config.config import b_config
+
+        data = request.get_json(silent=True) or {}
+        app_id = (data.get('id') or '').strip()
+        if not app_id:
+            return construct_response(
+                data={}, retcode=RetCode.ARGUMENT_ERROR, retmsg="'id' is required"
+            )
+
+        existing = [item for item in (getattr(b_config, "controlled_apps", None) or [])
+                    if isinstance(item, dict)]
+        target_index = next((index for index, item in enumerate(existing)
+                             if item.get("id") == app_id), None)
+        if target_index is None:
+            return construct_response(
+                data={}, retcode=RetCode.NOT_EXISTING,
+                retmsg=f"No controlled_apps entry with id '{app_id}'"
+            )
+
+        def clean_names(values):
+            cleaned = []
+            seen = set()
+            for value in (values or []):
+                value = str(value).strip()
+                if value and value.lower() not in seen:
+                    seen.add(value.lower())
+                    cleaned.append(value)
+            return cleaned
+
+        new_process_names = clean_names(data.get('process_names'))
+        new_bpf_name = clean_names(data.get('bpf_name'))
+
+        if not new_process_names:
+            return construct_response(
+                data={}, retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="At least one program name is required"
+            )
+
+        target = dict(existing[target_index])
+
+        # Safety net: refuse to drop a program name that currently owns a live limit.
+        limited_names = _limited_process_names_for_app(app_id, target)
+        keep = {name.lower() for name in new_process_names}
+        dropped_limited = sorted(
+            name for name in limited_names if name.lower() not in keep
+        )
+        if dropped_limited:
+            return construct_response(
+                data={"limited": dropped_limited},
+                retcode=RetCode.OPERATING_ERROR,
+                retmsg=(
+                    "Cannot remove process name(s) that are currently limited: "
+                    f"{', '.join(dropped_limited)}. Restore the limit first, then edit."
+                ),
+            )
+
+        target['process_names'] = new_process_names
+        target['bpf_name'] = new_bpf_name
+        existing[target_index] = target
+        if not b_config.set_list_section('controlled_apps', existing):
+            return construct_response(
+                data={}, retcode=RetCode.EXCEPTION_ERROR,
+                retmsg="Failed to update config.yaml"
+            )
+
+        meta = serialize_config_meta(target)
+        try:
+            AIAppPriority.update_record(id=app_id, config_meta_json=meta)
+        except Exception as db_exc:
+            logger.warning("set_controlled_app_processes: DB metadata update failed: %s", db_exc)
+
+        _service.rebuild_controlled_map()
+        return construct_response(
+            data={"id": app_id, "name": target.get('name', ''),
+                  "process_names": new_process_names, "bpf_name": new_bpf_name},
+            retmsg=f"Process identities updated for '{target.get('name') or app_id}'"
+        )
+    except Exception as e:
+        logger.error(f"set_controlled_app_processes failed: {str(e)}")
+        return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
+
+
 @app.route('/app/purge_controlled_app', methods=['POST'])
 def purge_controlled_app():
     """Hard-delete an app from both config.yaml and the DB."""
@@ -940,6 +1169,22 @@ def purge_controlled_app():
             )
 
         target_name = target.get("name") or ""
+
+        # Never remove the only UI/config reference to an active cgroup limit.
+        # Auto limits follow their own restore protocol and are not deletable from
+        # the UI; manual limits must be fully lifted before the app is purged.
+        limit_snapshot = _service.get_limit_snapshot(app_id)
+        if limit_snapshot.get('limited'):
+            if limit_snapshot.get('source') == 'auto':
+                return construct_response(
+                    data={}, retcode=RetCode.OPERATING_ERROR,
+                    retmsg="Restore the auto limit or take control before deleting this app"
+                )
+            if not _service.restore_resource(app_id):
+                return construct_response(
+                    data={}, retcode=RetCode.OPERATING_ERROR,
+                    retmsg="Could not restore active resource limits; the app was not deleted"
+                )
 
         # 1. Remove from config.yaml (preserves comments via the generic helper).
         removed_count = b_config.remove_from_list_section(
@@ -982,52 +1227,6 @@ def purge_controlled_app():
         )
     except Exception as e:
         logger.error(f"purge_controlled_app failed: {str(e)}")
-        return construct_response(
-            data={},
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
-
-
-@app.route('/app/remove_from_control', methods=['POST'])
-def remove_from_control():
-    """Remove an application from the control list."""
-    try:
-        data = request.get_json()
-        app_id = data.get('app_id', "")
-        app_name = data.get('app_name', "")
-
-        if not app_id and not app_name:
-            return construct_response(
-                data={},
-                retcode=RetCode.ARGUMENT_ERROR,
-                retmsg="Either app_id or app_name must be provided"
-            )
-
-        _service.remove_control(app_name if app_name else "")
-
-        app_info = AIAppPriority.query().filter(AIAppPriority.app_id == app_id).first()
-
-        logger.debug(f"remove_from_control: app_info: {app_info}")
-        # restore oom score
-        adjust_oom_priority(app_id, app_name, app_info.priority, app_info.cmdline, restore=True)
-
-        AIAppPriority.update_record(
-            id=app_id if app_id else "",
-            controlled=False
-        )
-
-        _service.rebuild_controlled_map()
-        return construct_response(
-            data={
-                "app_id": app_id,
-                "app_name": app_name,
-                "controlled": False
-            },
-            retmsg="App removed from control successfully"
-        )
-    except Exception as e:
-        logger.error(f"Remove control failed: {str(e)}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1087,11 +1286,22 @@ def get_controlled_app():
                 "cmdline": app.cmdline,
                 "cgroup": app.cgroup,
                 "process_names": cfg_app.get("process_names", []) or [],
+                "bpf_name": cfg_app.get("bpf_name", []) or [],
                 "remark": app.remark,
                 "status": app.status,
                 "app_summary_status": app_summary_status,
                 "runtime_hint": runtime_hint,
                 "process_status_rows": process_rows,
+                # Unified control contract for the merged management table:
+                # NORMAL when the app holds no runtime limit, else the snapshot's
+                # MANUAL_LIMITED / AUTO_LIMITED plus its multi-dimensional effective
+                # view and (auto-only) pressure detail.
+                "control_status": limit_snapshot.get("control_status", "NORMAL"),
+                "effective": limit_snapshot.get("effective"),
+                "auto_detail": limit_snapshot.get("auto_detail"),
+                # The limit registry is authoritative while process discovery is live
+                # data and may briefly find no matching process after a relaunch.
+                "limited_scopes": limit_snapshot.get("cgroups", []),
             })
 
         return construct_response(
@@ -1481,6 +1691,83 @@ def auto_limit_restore():
         )
     except Exception as e:
         logger.error(f"Restore auto-limited app failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/lock_to_manual', methods=['POST'])
+def lock_to_manual():
+    """Take an auto-limited app over as a manual limit without releasing its cgroup caps.
+
+    The "safe handoff": ownership flips auto->manual with the kernel throttle left
+    exactly in place, so no crash window opens under sustained pressure. After this
+    the app is MANUAL_LIMITED and the manual Limit/Restore/Edit buttons unlock.
+    """
+    try:
+        data = request.get_json() or {}
+        app_id = data.get('app_id', "")
+
+        if not app_id:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="app_id must be provided"
+            )
+
+        ok, msg = _service.lock_to_manual(app_id)
+        if ok:
+            return construct_response(data={}, retmsg=msg)
+        return construct_response(
+            data={},
+            retcode=RetCode.OPERATING_ERROR,
+            retmsg=msg
+        )
+    except Exception as e:
+        logger.error(f"Lock auto-limited app to manual failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/adopt_auto_limit', methods=['POST'])
+def adopt_auto_limit():
+    """Adopt a running auto-limit into a newly-controlled app identity ("Take Control").
+
+    Re-tags the live entry in place (controlled=True, public id -> new app_id) so the
+    limit follows the app into management with no cgroup release and no duplicate row.
+    """
+    try:
+        data = request.get_json() or {}
+        effective_app_id = data.get('effective_app_id', "")
+        new_app_id = data.get('app_id', "")
+
+        if not effective_app_id or not new_app_id:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="effective_app_id and app_id must be provided"
+            )
+
+        ok, msg = _service.adopt_auto_limit(
+            effective_app_id,
+            new_app_id,
+            new_app_name=data.get('app_name', "") or "",
+            priority=data.get('priority', "") or "",
+        )
+        if ok:
+            return construct_response(data={}, retmsg=msg)
+        return construct_response(
+            data={},
+            retcode=RetCode.OPERATING_ERROR,
+            retmsg=msg
+        )
+    except Exception as e:
+        logger.error(f"Adopt auto-limit failed: {str(e)}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,

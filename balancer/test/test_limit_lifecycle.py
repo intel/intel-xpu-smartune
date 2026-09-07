@@ -36,6 +36,10 @@ for path in (_REPO_ROOT, os.path.join(_REPO_ROOT, "balancer")):
         sys.path.insert(0, path)
 
 import balancer.balancer as balancer_mod  # noqa: E402
+import balance_service as balance_service_mod  # noqa: E402
+import controller.app_intercept as app_intercept_mod  # noqa: E402
+from controller.app_intercept import AppIntercept  # noqa: E402
+from monitor.res_monitor import ResourceMonitor  # noqa: E402
 from balancer.balancer import (  # noqa: E402
     DynamicBalancer,
     LimitedApp,
@@ -51,6 +55,23 @@ class _Cfg:
     passive_resource_control = {'enabled': True}
     cgroup_mount = '/sys/fs/cgroup'
     cooldown_time = 60
+
+
+class _MergeCfg:
+    def __init__(self):
+        self.controlled_apps = [{
+            'id': 'existing.scope',
+            'name': 'existing-app',
+            'commandline': '/usr/bin/existing-app',
+            'process_names': ['existing-app', 'shared-worker'],
+            'bpf_name': ['existing-app'],
+        }]
+        self.writes = []
+
+    def set_list_section(self, section, entries):
+        self.writes.append((section, entries))
+        self.controlled_apps = entries
+        return True
 
 
 class _Prefetcher:
@@ -281,6 +302,207 @@ class GoneTargetTests(unittest.TestCase):
             self.assertTrue(b._target_still_present(_candidate('x.scope'), 'x.scope'))
 
 
+class AutoToManualScopeTests(unittest.TestCase):
+    """Taking control must retain exactly the cgroups Auto Control limited."""
+
+    def test_disk_candidate_uses_the_dominant_pid_not_an_arbitrary_scope_member(self):
+        monitor = ResourceMonitor.__new__(ResourceMonitor)
+        monitor._get_top_processes = mock.Mock(return_value=[{
+            'pids': {101, 202},
+            'cgroup': '/user.slice/user-1000.slice/session-5383.scope',
+            'names': {'bash', 'MainThread'},
+            'cmdlines': {
+                '/bin/bash --init-file shellIntegration-bash.sh',
+                'node bootstrap-fork --type=extensionHost',
+            },
+            'dominant_pid': 202,
+            'dominant_name': 'MainThread',
+            'dominant_cmdline': 'node bootstrap-fork --type=extensionHost',
+            'score': 10,
+            'io_read_rate': 1,
+            'io_write_rate': 2,
+            'io_read_iops': 3,
+            'io_write_iops': 4,
+            'io_per_disk': {},
+            'extra_cgroups': [],
+        }])
+        monitor.try_match_app = mock.Mock(return_value={
+            'id': 'bootstrap-fork', 'name': 'bootstrap-fork',
+        })
+
+        candidate = monitor.get_top_disk_io_consumers()[0]
+
+        self.assertEqual(candidate['process']['pid'], 202)
+        self.assertEqual(candidate['process']['cmdline'], 'node bootstrap-fork --type=extensionHost')
+        self.assertEqual(candidate['cgroup'], '/user.slice/user-1000.slice/session-5383.scope')
+
+    def test_auto_limit_row_exposes_the_representative_process_pid(self):
+        b = _balancer()
+        b._upsert_auto_limited(
+            'tmux-spawn.scope', 'tmux-spawn.scope', 'Tmux Spawn', {'cpu_rate': 0.3},
+            resource_limited=True,
+            io_limited=False,
+            priority='low',
+            is_controlled=False,
+            limit_reason='system_pressure',
+            pressure_level='critical',
+            cgroups=['tmux-spawn.scope'],
+            pids=[101, 102],
+            representative_pid=101,
+        )
+
+        rows = b.get_auto_limited_apps()['apps']
+        self.assertEqual(rows[0]['representative_pid'], 101)
+
+    def test_bpf_exit_persists_stopped_status(self):
+        intercept = AppIntercept.__new__(AppIntercept)
+        intercept.handled_processes = {197}
+        intercept.app_live_pids = {'bench': {197}}
+        intercept.monitored_app_launched = {197: ('bench.scope', 'bench', '', '')}
+        intercept.pending_exit_events = {}
+        intercept.is_process_alive = mock.Mock(return_value=False)
+
+        with mock.patch.object(app_intercept_mod.app_utils.callback_manager,
+                               'send_callback_notification') as notify:
+            intercept.handle_exit_event(197, 'bench.scope', 'bench', '', '')
+
+        notify.assert_called_once_with({
+            'app_id': 'bench.scope',
+            'app_name': 'bench',
+            'status': 'stopped',
+            'purpose': 'app',
+        }, store=True)
+
+    def test_processes_in_one_cgroup_render_as_one_control_instance(self):
+        with mock.patch.object(
+                balance_service_mod, 'get_app_processes_for_app',
+                side_effect=lambda name, **_: {
+                    'bootstrap-fork': [101], 'server-main.js': [102],
+                }.get(name, [])), \
+                mock.patch.object(balance_service_mod, '_runtime_status_for_pid', return_value='Running'), \
+                mock.patch.object(balance_service_mod, '_cgroup_for_pid', return_value='session-5383.scope'), \
+                mock.patch.object(balance_service_mod, '_exact_cgroup_member_pids', return_value=[101, 102, 103]), \
+                mock.patch.object(balance_service_mod, '_process_name_for_pid',
+                                  side_effect=lambda pid, fallback: {101: 'bootstrap-fork', 102: 'server-main.js', 103: 'worker'}.get(pid, fallback)), \
+                mock.patch.object(balance_service_mod, '_cmdline_for_pid', return_value='bootstrap-fork'):
+            rows, summary, runtime = balance_service_mod._build_process_scope_snapshot(
+                app_id='bootstrap.id',
+                app_name='bootstrap',
+                process_names=['bootstrap-fork', 'server-main.js'],
+                app_status='a_limited',
+                limited_pid_snapshot=[101],
+                limited_cgroup_snapshot=['session-5383.scope'],
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['cgroup'], 'session-5383.scope')
+        self.assertEqual(rows[0]['process_name'], 'bootstrap-fork')
+        self.assertEqual(rows[0]['scope_processes'], [
+            {'pid': 101, 'process_name': 'bootstrap-fork', 'cmdline': 'bootstrap-fork'},
+            {'pid': 102, 'process_name': 'server-main.js', 'cmdline': 'bootstrap-fork'},
+            {'pid': 103, 'process_name': 'worker', 'cmdline': 'bootstrap-fork'},
+        ])
+        self.assertEqual(rows[0]['limit_status'], 'Limited')
+        self.assertEqual((summary, runtime), ('Limited', 'Running'))
+
+    def test_scope_member_with_an_older_pid_does_not_replace_matched_representative(self):
+        with mock.patch.object(
+                balance_service_mod, 'get_app_processes_for_app', return_value=[197]), \
+                mock.patch.object(balance_service_mod, '_runtime_status_for_pid', return_value='Running'), \
+                mock.patch.object(balance_service_mod, '_cgroup_for_pid', return_value='session-5613.scope'), \
+                mock.patch.object(balance_service_mod, '_exact_cgroup_member_pids', return_value=[104, 197]), \
+                mock.patch.object(balance_service_mod, '_cmdline_for_pid',
+                                  side_effect=lambda pid, fallback: 'benchmark_app --model model.xml' if pid == 197 else 'sshd: user [priv]'):
+            rows, _, _ = balance_service_mod._build_process_scope_snapshot(
+                app_id='session-5613.scope',
+                app_name='bench',
+                process_names=['benchmark_app'],
+                app_status='running',
+                limited_pid_snapshot=[],
+                limited_cgroup_snapshot=[],
+            )
+
+        self.assertEqual(rows[0]['pid'], 197)
+        self.assertEqual(rows[0]['cmdline'], 'benchmark_app --model model.xml')
+        self.assertEqual([process['pid'] for process in rows[0]['scope_processes']], [104, 197])
+
+    def test_later_matching_cgroup_stays_visible_without_inheriting_the_limit(self):
+        with mock.patch.object(
+                balance_service_mod, 'get_app_processes_for_app', return_value=[101, 102]), \
+                mock.patch.object(balance_service_mod, '_runtime_status_for_pid', return_value='Running'), \
+                mock.patch.object(
+                    balance_service_mod, '_cgroup_for_pid',
+                    side_effect=lambda pid, _fallback: {
+                        101: 'bootstrap-limited.scope', 102: 'bootstrap-new.scope',
+                    }[pid]), \
+                mock.patch.object(balance_service_mod, '_cmdline_for_pid', return_value='bootstrap-fork'):
+            rows, summary, runtime = balance_service_mod._build_process_scope_snapshot(
+                app_id='bootstrap.id',
+                app_name='bootstrap',
+                process_names=['bootstrap-fork'],
+                app_status='a_limited',
+                limited_pid_snapshot=[101],
+                limited_cgroup_snapshot=['bootstrap-limited.scope'],
+            )
+
+        self.assertEqual([row['cgroup'] for row in rows], [
+            'bootstrap-limited.scope', 'bootstrap-new.scope',
+        ])
+        self.assertEqual([row['limit_status'] for row in rows], ['Limited', 'Not Limited'])
+        self.assertEqual((summary, runtime), ('Partial Limited', 'Running'))
+
+    def test_stopped_configured_processes_remain_visible_for_identity_edits(self):
+        with mock.patch.object(balance_service_mod, 'get_app_processes_for_app', return_value=[]):
+            rows, summary, runtime = balance_service_mod._build_process_scope_snapshot(
+                app_id='bench.scope',
+                app_name='bench',
+                process_names=['benchmark_app', 'code-server'],
+                app_status='normal',
+                limited_pid_snapshot=[],
+                limited_cgroup_snapshot=[],
+                app_cmdline='benchmark_app --model model.xml',
+            )
+
+        self.assertEqual([row['process_name'] for row in rows], ['benchmark_app', 'code-server'])
+        self.assertTrue(all(row['runtime_status'] == 'Stopped' for row in rows))
+        self.assertTrue(all(row['cmdline'] == 'benchmark_app --model model.xml' for row in rows))
+        self.assertEqual((summary, runtime), ('No Running Process', 'Stopped'))
+
+    def test_lock_to_manual_marks_the_auto_cgroup_scope_for_the_dashboard(self):
+        b = _balancer()
+        entry = _limited('bootstrap-one.scope', cpu_mem=True, public_id='bootstrap.id')
+        entry.is_controlled = True
+        entry.cgroups = ['bootstrap-one.scope', 'bootstrap-two.scope']
+        b.all_limits.apps['bootstrap-one.scope'] = entry
+
+        with mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils, 'callback_manager'):
+            ok, message = b.lock_to_manual('bootstrap.id')
+
+        self.assertTrue(ok, message)
+        snapshot = b.get_limit_snapshot('bootstrap.id')
+        self.assertEqual(snapshot['control_status'], 'MANUAL_LIMITED')
+        self.assertTrue(snapshot['adopted_from_auto'])
+        self.assertEqual(snapshot['cgroups'], ['bootstrap-one.scope', 'bootstrap-two.scope'])
+
+    def test_adopt_auto_limit_marks_the_auto_cgroup_scope_for_the_dashboard(self):
+        b = _balancer()
+        entry = _limited('bootstrap-one.scope', cpu_mem=True)
+        entry.cgroups = ['bootstrap-one.scope', 'bootstrap-two.scope']
+        b.all_limits.apps['bootstrap-one.scope'] = entry
+
+        with mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils, 'callback_manager'):
+            ok, message = b.adopt_auto_limit(
+                'bootstrap-one.scope', 'bootstrap.id', 'bootstrap', 'low')
+
+        self.assertTrue(ok, message)
+        snapshot = b.get_limit_snapshot('bootstrap.id')
+        self.assertEqual(snapshot['control_status'], 'MANUAL_LIMITED')
+        self.assertTrue(snapshot['adopted_from_auto'])
+        self.assertEqual(snapshot['cgroups'], ['bootstrap-one.scope', 'bootstrap-two.scope'])
+
+
 class SeparatedRestoreChannelTests(unittest.TestCase):
     """Separated policy means separated recovery: one timer, one channel."""
 
@@ -406,6 +628,80 @@ class CombinedPolicyTests(unittest.TestCase):
                                   return_value=(True, False, 'sys-app.scope', {'cpu_rate': 0.3})):
             b._tick_combined_policy(state, "critical", True)
         apply_mock.assert_not_called()
+
+
+class EffectiveLimitDetailsTests(unittest.TestCase):
+    def test_snapshot_exposes_all_active_io_limit_values(self):
+        b = _balancer()
+        b.all_limits.apps['io.scope'] = _limited('io.scope', cpu_mem=True, io=True)
+
+        effective = b.get_limit_snapshot('io.scope')['effective']
+
+        self.assertEqual(effective['cpu_mem'], {
+            'limited': True, 'cpu_rate': 0.3, 'mem_rate': 0.1,
+        })
+        self.assertEqual(effective['disk_io'], {
+            'limited': True,
+            'disks': ['nvme0n1'],
+            'read_mb_s': 20,
+            'write_mb_s': 10,
+            'read_iops': 8000,
+            'write_iops': 1000,
+        })
+
+
+class MergeControlledAppProcessesTests(unittest.TestCase):
+    def test_merge_adds_only_new_process_identities(self):
+        cfg = _MergeCfg()
+        service = mock.Mock()
+        response_payload = {
+            'id': 'existing.scope',
+            'process_names': ['shared-worker', 'new-worker'],
+            'bpf_name': ['existing-app', 'new-worker'],
+        }
+
+        with (
+            mock.patch('config.config.b_config', cfg),
+            mock.patch('smartune_api._token_is_valid', return_value=True),
+            mock.patch.object(balance_service_mod, 'AIAppPriority') as db_model,
+            mock.patch.object(balance_service_mod, '_service', service),
+        ):
+            response = balance_service_mod.app.test_client().post(
+                '/app/merge_controlled_app_processes', json=response_payload,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['retcode'], 0)
+        self.assertEqual(len(cfg.controlled_apps), 1)
+        merged = cfg.controlled_apps[0]
+        self.assertEqual(merged['commandline'], '/usr/bin/existing-app')
+        self.assertEqual(merged['process_names'], ['existing-app', 'shared-worker', 'new-worker'])
+        self.assertEqual(merged['bpf_name'], ['existing-app', 'new-worker'])
+        db_model.update_record.assert_called_once()
+        service.rebuild_controlled_map.assert_called_once()
+
+
+class PurgeControlledAppTests(unittest.TestCase):
+    def test_purge_keeps_config_when_active_manual_limit_cannot_restore(self):
+        cfg = _MergeCfg()
+        service = mock.Mock()
+        service.get_limit_snapshot.return_value = {'limited': True, 'source': 'manual'}
+        service.restore_resource.return_value = False
+
+        with (
+            mock.patch('config.config.b_config', cfg),
+            mock.patch('smartune_api._token_is_valid', return_value=True),
+            mock.patch.object(balance_service_mod, '_service', service),
+        ):
+            response = balance_service_mod.app.test_client().post(
+                '/app/purge_controlled_app', json={'id': 'existing.scope'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotEqual(response.get_json()['retcode'], 0)
+        self.assertEqual(len(cfg.controlled_apps), 1)
+        self.assertEqual(cfg.writes, [])
+        service.restore_resource.assert_called_once_with('existing.scope')
 
 
 if __name__ == "__main__":

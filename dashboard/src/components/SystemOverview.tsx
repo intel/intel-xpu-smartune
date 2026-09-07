@@ -3433,6 +3433,19 @@ export default function SystemOverview({ active }: Props) {
               subtitle={diskSizeLookup[diskName] != null ? `${formatMetric(diskSizeLookup[diskName], 'GB', 1)}` : undefined}
               details={[
                 { label: 'Size', value: formatMetric(diskSizeLookup[diskName], 'GB', 2), source: 'static' },
+                {
+                  label: 'Used',
+                  value: (() => {
+                    if (isNumber(diskData.used_size_gb)) {
+                      const pct = isNumber(diskData.usage_percent)
+                        ? formatPercent(diskData.usage_percent)
+                        : 'N/A'
+                      return `${formatMetric(diskData.used_size_gb, 'GB', 2)} (${pct})`
+                    }
+                    return 'N/A'
+                  })(),
+                  source: 'dynamic',
+                },
                 { label: 'Read', value: formatMetric(diskData.read_kb_per_sec, 'KB/s', 1), source: 'dynamic' },
                 { label: 'Write', value: formatMetric(diskData.write_kb_per_sec, 'KB/s', 1), source: 'dynamic' },
                 { label: 'Read IOPS', value: formatMetric(diskData.read_iops, 'IOPS', 1), source: 'dynamic' },

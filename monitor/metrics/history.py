@@ -205,6 +205,8 @@ def _build_disk_history(disk: Dict[str, Any]) -> Dict[str, Optional[float]]:
             util = max(0.0, min(util, 100.0))
         r_kb = to_float(item.get("read_kb_per_sec"))
         w_kb = to_float(item.get("write_kb_per_sec"))
+        used_size_gb = to_float(item.get("used_size_gb"))
+        usage_percent = to_float(item.get("usage_percent"))
         max_tp: Optional[float] = None
         base_dev = disk_name.rstrip("0123456789") if not disk_name.startswith("nvme") else disk_name.split("p")[0] if "p" in disk_name else disk_name
         rotational_path = f"/sys/block/{base_dev}/queue/rotational"
@@ -224,6 +226,8 @@ def _build_disk_history(disk: Dict[str, Any]) -> Dict[str, Optional[float]]:
             "util": round(util, 2) if util is not None else None,
             "read_mb": round(r_kb / 1024.0, 3) if r_kb is not None else None,
             "write_mb": round(w_kb / 1024.0, 3) if w_kb is not None else None,
+            "used_size_gb": round(used_size_gb, 3) if used_size_gb is not None else None,
+            "usage_percent": round(max(0.0, min(usage_percent, 100.0)), 2) if usage_percent is not None else None,
             "max_throughput_mb": max_tp,
         }
 

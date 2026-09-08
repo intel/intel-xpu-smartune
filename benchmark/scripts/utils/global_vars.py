@@ -33,9 +33,13 @@ def load_global_vars(force_reload: bool = False) -> Dict[str, str]:
     if not global_vars_path.exists():
         raise FileNotFoundError(f"global_vars.sh not found at {global_vars_path}")
 
-    # Source the file and extract environment variables
+    # Source the file and extract environment variables.
+    # The path is passed as a positional arg ($1) and referenced quoted inside
+    # the script, so bash never word-splits or re-parses it. Interpolating the
+    # path straight into the command string (f'source {path} && env') would let
+    # a space or shell metacharacter in the checkout path inject commands.
     result = subprocess.run(
-        ['bash', '-c', f'source {global_vars_path} && env'],
+        ['bash', '-c', 'source "$1" && env', 'bash', str(global_vars_path)],
         capture_output=True,
         text=True,
         check=True

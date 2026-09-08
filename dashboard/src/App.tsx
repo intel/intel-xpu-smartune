@@ -21,8 +21,9 @@ import HistoryDashboard from './components/HistoryDashboard'
 import About from './components/About'
 import LoginGate from './components/LoginGate'
 import { COLORS } from './styles/theme'
-import { api, getToken, clearToken, setUnauthorizedHandler } from './api/client'
+import { api, getToken, clearToken, setUnauthorizedHandler, consumeUrlToken, login } from './api/client'
 import { GlobalConfigNoticesProvider, useGlobalConfigNotices } from './hooks/useGlobalConfigNotices'
+import { useUiLease } from './hooks/useUiLease'
 import { useBenchEvent, useBenchStream } from './hooks/useBenchEvents'
 
 const { Header, Content } = Layout
@@ -75,6 +76,27 @@ export default function App() {
   // valid until the server rejects a request with 401 (handled below).
   const [authed, setAuthed] = useState(() => !!getToken())
   const [settingsOpen, setSettingsOpen] = useState(false)
+  // While a bootstrap token from the URL hash (desktop launcher) is being
+  // validated, hold rendering so the login gate does not flash before we know
+  // whether the auto-login succeeds. Only blocks when such a token is present.
+  const [booting, setBooting] = useState(() => /[#&]token=/.test(window.location.hash))
+
+  // Consume a one-shot token passed in the URL hash by the desktop launcher and
+  // auto-login with it, so clicking the desktop icon lands straight in the app.
+  useEffect(() => {
+    if (!booting) return
+    const urlToken = consumeUrlToken()
+    if (!urlToken) {
+      setBooting(false)
+      return
+    }
+    login(urlToken)
+      .then((ok) => {
+        if (ok) setAuthed(true)
+      })
+      .catch(() => {})
+      .finally(() => setBooting(false))
+  }, [booting])
 
   // Any 401 (expired/revoked/invalid token) drops us back to the login gate.
   useEffect(() => {
@@ -93,6 +115,11 @@ export default function App() {
       })
       .catch(() => setBalancerEnabled(true))
   }, [authed])
+
+  // Hold an open-UI lease while logged in so the packaged monitor can stop
+  // itself once the last dashboard tab is closed. No-op against a server that
+  // doesn't arm the watchdog (dev / balancer).
+  useUiLease(authed)
 
   // The benchmark event stream is owned here rather than by the tab: a setup
   // takes an hour and a run can take longer, so the whole point is that the user
@@ -277,6 +304,11 @@ export default function App() {
       children: <About active={activeTab === '6'} />,
     },
   ]
+
+  // Validating a URL-hash bootstrap token — hold off rendering the gate.
+  if (booting) {
+    return <div style={{ minHeight: '100vh', background: COLORS.bg }} />
+  }
 
   if (!authed) {
     return <LoginGate onAuthenticated={() => setAuthed(true)} />

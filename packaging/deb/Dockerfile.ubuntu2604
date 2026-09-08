@@ -1,0 +1,24 @@
+FROM ubuntu:26.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV npm_config_fetch_retries=5 \
+    npm_config_fetch_retry_maxtimeout=120000 \
+    npm_config_fetch_retry_mintimeout=20000 \
+    npm_config_fetch_timeout=300000
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        dpkg-dev \
+        git \
+        nodejs \
+        npm \
+        python3 \
+        python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install --global npm@10
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/workspace/packaging/deb/build_deb.sh"]

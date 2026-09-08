@@ -1,0 +1,23 @@
+#!/bin/bash
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Privileged helper — the ONLY thing start_gui.sh elevates via pkexec. It is a
+# fixed, root-owned executable at a stable path so a polkit action can be
+# registered against it (see com.intel.smartune.policy): that action supplies a
+# human-readable authentication prompt instead of pkexec's default "run
+# '/usr/bin/bash -c ...' as the super user", which would otherwise dump this
+# whole command line into the password dialog.
+#
+# Runs as root. Starts the monitor service if it is not already running, waits
+# for the root-only api_token file the server writes at startup, and prints that
+# token on stdout for start_gui.sh to hand the dashboard for auto-login.
+# systemctl start is idempotent, so re-running against a live unit is a no-op.
+set -u
+
+UNIT="smartune-monitor.service"
+TOKEN_FILE="/opt/intel/smartune/key/api_token"
+
+systemctl start "$UNIT" >&2 || exit 1
+for _ in $(seq 1 20); do [ -s "$TOKEN_FILE" ] && break; sleep 0.5; done
+cat "$TOKEN_FILE" 2>/dev/null

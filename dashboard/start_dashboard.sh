@@ -8,19 +8,25 @@ cd "$SCRIPT_DIR"
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [-h]
+Usage: $(basename "$0") [-i] [-h]
 
 Proxies /api to the SmarTune backend on port 9001. Both server modes ('-a' and
 '-m') listen on 9001, and the UI auto-adapts to a monitor-only server via
 /smartune/capabilities. Override the backend with VITE_PROXY_TARGET, e.g.:
   VITE_PROXY_TARGET=https://192.168.1.10:9001 $(basename "$0")
 
+Dependencies are installed only when they are missing or out of date -- see
+'deps_are_current' below.
+
+  -i   Install dependencies even if they look current.
   -h   Show this help and exit.
 EOF
 }
 
-while getopts "h" opt; do
+FORCE_INSTALL=false
+while getopts "ih" opt; do
   case "$opt" in
+    i) FORCE_INSTALL=true ;;
     h) usage; exit 0 ;;
     *) usage >&2; exit 1 ;;
   esac
@@ -178,16 +184,37 @@ if ! command -v npm &>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-# Install npm dependencies only when they are absent or stale. npm writes its
-# resolved dependency tree to node_modules/.package-lock.json, so comparing it
-# with the source lockfile avoids a registry check on every dashboard launch.
+# Install npm dependencies (reads dashboard/package.json)
+#
+# Only when they are not already there and current. `npm install` on an
+# up-to-date tree still contacts the registry, so on a slow or firewalled
+# network it can sit for minutes before deciding it had nothing to do -- which
+# is most starts of this script, and reads as the dashboard hanging.
+#
+# What "current" means: npm writes node_modules/.package-lock.json at the end of
+# every install, describing the tree it just produced. If that file is newer
+# than both manifests, the tree was built from them and nothing has been asked
+# for since. Anything else -- no node_modules, no marker, an edited
+# package.json, a pulled lockfile -- installs.
 # ---------------------------------------------------------------------------
-if [ ! -f node_modules/.package-lock.json ] || [ package-lock.json -nt node_modules/.package-lock.json ]; then
-  echo "[INFO] Installing npm dependencies from package-lock.json..."
+deps_are_current() {
+  local marker="node_modules/.package-lock.json"
+  [ -d node_modules ] || return 1
+  [ -f "$marker" ] || return 1
+  [ package.json -nt "$marker" ] && return 1
+  [ -f package-lock.json ] && [ package-lock.json -nt "$marker" ] && return 1
+  return 0
+}
+
+if [ "$FORCE_INSTALL" = "false" ] && deps_are_current; then
+  echo "[INFO] Dependencies are current — skipping npm install. ✓"
+  echo "       Run with -i to install anyway."
+else
+  echo "[INFO] Installing npm dependencies from package.json..."
+  # No audit and no funding notice: both are registry round-trips that have
+  # nothing to do with whether the app can start.
   npm install --no-audit --no-fund
   echo "[INFO] Dependencies installed. ✓"
-else
-  echo "[INFO] npm dependencies are current. Skipping installation. ✓"
 fi
 echo ""
 

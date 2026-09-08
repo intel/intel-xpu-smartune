@@ -1,0 +1,31 @@
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Installed but NOT enabled: the service is launched on demand by the desktop
+# icon (start_gui.sh -> pkexec systemctl start), never at boot.
+#
+# Rendered by build_deb.sh: @RUN_SCRIPT@ is the install-time run script for the
+# selected package variant — run_monitor.sh (smartune.py -m) for the monitor-only
+# deb, run_all.sh (smartune.py -a, balancer + monitor) for the full deb. The
+# installed unit filename stays smartune-monitor.service in both variants so the
+# authhelper, start_gui.sh and prerm can reference a fixed name.
+
+[Unit]
+Description=Intel XPU SmarTune Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/intel/smartune
+ExecStart=@RUN_SCRIPT@
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+StandardOutput=append:/opt/intel/smartune/logs/smartune-monitor.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

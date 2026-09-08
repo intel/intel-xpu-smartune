@@ -34,8 +34,7 @@ fi
 
 echo "Using DIR_ENV_ROOT: ${DIR_ENV_ROOT}"
 
-# OpenVINO repository
-OPENVINO_GENAI_REPO="${OPENVINO_GENAI_REPO:-https://github.com/openvinotoolkit/openvino.genai.git}"
+OPENVINO_GENAI_REPO="https://github.com/openvinotoolkit/openvino.genai.git"
 
 # Version report paths
 VERSION_REPORT="${DIR_LOGS}/setup_versions.txt"
@@ -55,7 +54,7 @@ sync_repo() {
 		exit 1
 	else
 		echo "Cloning repository: ${repo_url}"
-		git clone --depth 1 "${repo_url}" "${repo_dir}"
+		git clone --depth 1 -- "${repo_url}" "${repo_dir}"
 		echo "✓ Repository cloned"
 	fi
 }

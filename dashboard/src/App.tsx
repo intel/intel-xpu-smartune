@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect } from 'react'
-import { Tabs, Layout, Typography, Space, Alert, Button } from 'antd'
+import { Tabs, Layout, Typography, Space, Alert, Button, notification } from 'antd'
 import {
   DashboardOutlined,
   AppstoreOutlined,
@@ -9,20 +9,33 @@ import {
   InfoCircleOutlined,
   LogoutOutlined,
   SettingOutlined,
+  ExperimentOutlined,
 } from '@ant-design/icons'
 import SettingsModal from './components/SettingsModal'
 import SystemOverview from './components/SystemOverview'
 import AppResources from './components/AppResources'
 import Processes from './components/Processes'
 import Balance from './components/Balance'
+import Benchmark from './components/Benchmark'
 import HistoryDashboard from './components/HistoryDashboard'
 import About from './components/About'
 import LoginGate from './components/LoginGate'
 import { COLORS } from './styles/theme'
 import { api, getToken, clearToken, setUnauthorizedHandler } from './api/client'
 import { GlobalConfigNoticesProvider, useGlobalConfigNotices } from './hooks/useGlobalConfigNotices'
+import { useBenchEvent, useBenchStream } from './hooks/useBenchEvents'
 
 const { Header, Content } = Layout
+
+const BENCHMARK_TAB = '7'
+
+// What a finished benchmark job is called in a notification. The tab's own
+// wording is "environment setup" / "run"; these are the same two things said in
+// a sentence that has to make sense out of context.
+const BENCH_JOB_LABEL: Record<string, string> = {
+  setup: 'Benchmark environment setup',
+  run: 'Benchmark run',
+}
 
 function GlobalConfigNoticeBar() {
   const { notices, dismissNotice } = useGlobalConfigNotices()
@@ -52,6 +65,10 @@ export default function App() {
   // 1 = balancer + monitor, 0 = monitor only. Default to enabled so older
   // servers without the /smartune/capabilities endpoint keep full behaviour.
   const [balancerEnabled, setBalancerEnabled] = useState(true)
+  // Whether this server mounts the /bench API. Defaults to false (unlike the
+  // balancer above): an older server that omits the field has no /bench routes,
+  // so showing the tab would give a page that 404s on every request.
+  const [benchmarkEnabled, setBenchmarkEnabled] = useState(false)
   // Set from the Processes tab's "Add to balancer" action; consumed by the Balance tab.
   const [registerKeyword, setRegisterKeyword] = useState<string | null>(null)
   // Gate the whole app behind a valid access token. A stored token is assumed
@@ -69,9 +86,56 @@ export default function App() {
     if (!authed) return
     api
       .getCapabilities()
-      .then((c) => setBalancerEnabled(c.capabilities === 1))
+      .then((c) => {
+        setBalancerEnabled(c.capabilities === 1)
+        // Absent on older servers, which never served /bench at all.
+        setBenchmarkEnabled(c.benchmark === 1)
+      })
       .catch(() => setBalancerEnabled(true))
   }, [authed])
+
+  // The benchmark event stream is owned here rather than by the tab: a setup
+  // takes an hour and a run can take longer, so the whole point is that the user
+  // goes elsewhere and is told when it is done. Log deltas are only requested
+  // while the tab is actually on screen -- see benchEventsUrl.
+  const benchTabActive = activeTab === BENCHMARK_TAB
+  useBenchStream(authed && benchmarkEnabled, benchTabActive)
+
+  const [notify, notifyHolder] = notification.useNotification()
+
+  useBenchEvent(
+    useCallback(
+      (event) => {
+        // Only worth interrupting for when they cannot already see it happening.
+        if (event.type !== 'job' || event.job.status === 'running' || benchTabActive) return
+        const label = BENCH_JOB_LABEL[event.job.kind] ?? 'Benchmark job'
+        const done = event.job.status === 'done'
+        const key = `bench-job-${event.job.id}`
+        notify[done ? 'success' : 'warning']({
+          key,
+          message: `${label} ${event.job.status}`,
+          description: done
+            ? 'The results are ready in the Models tab.'
+            : `Exit code ${event.job.returncode ?? 'unknown'}. The log is in the Models tab.`,
+          duration: 0, // they were not looking; let them find it in their own time
+          btn: (
+            <Button
+              type="primary"
+              size="small"
+              onClick={() => {
+                setActiveTab(BENCHMARK_TAB)
+                notify.destroy(key)
+              }}
+            >
+              Open Models
+            </Button>
+          ),
+        })
+      },
+      [benchTabActive, notify],
+    ),
+    authed && benchmarkEnabled,
+  )
 
   const handleLogout = useCallback(() => {
     clearToken()
@@ -184,6 +248,24 @@ export default function App() {
           },
         ]
       : []),
+    // Same conditional treatment as the Balancer tab: a server without the
+    // benchmark feature omits the tab rather than showing a dead one.
+    ...(benchmarkEnabled
+      ? [
+          {
+            key: BENCHMARK_TAB,
+            label: (
+              <Space>
+                <ExperimentOutlined />
+                Models
+              </Space>
+            ),
+            // No `active` prop: the tab keeps itself current off the event
+            // stream owned above, so switching away and back costs nothing.
+            children: <Benchmark />,
+          },
+        ]
+      : []),
     {
       key: '6',
       label: (
@@ -202,6 +284,7 @@ export default function App() {
 
   return (
     <GlobalConfigNoticesProvider>
+      {notifyHolder}
       <Layout style={{ minHeight: '100vh', background: COLORS.bg }}>
         <Header
           style={{

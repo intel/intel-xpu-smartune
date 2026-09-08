@@ -16,10 +16,6 @@ from utils.logger import logger
 _CORE_CLASS_CACHE: Dict[str, Any] = {"cpu_count": None, "result": None}
 _CORE_TOPOLOGY: Optional[List[Optional[int]]] = None
 
-# Prime psutil's internal CPU-time baseline so the first get_cpu_dynamic()
-# call returns a meaningful delta-averaged value instead of 0.0.
-psutil.cpu_percent(interval=None, percpu=True)
-
 
 def _expand_cpu_ranges(spec: Optional[str]) -> Set[int]:
     if not spec:
@@ -303,6 +299,84 @@ def _avg(values: List[Optional[float]], indices: List[int]) -> Optional[float]:
     return round(sum(picked) / len(picked), 2)
 
 
+def _busy_and_span(times) -> tuple:
+    """``(busy, busy + idle)`` for one core's cpu_times, using psutil's definition.
+
+    Mirrors psutil's own ``_cpu_busy_time`` / ``_cpu_tot_time`` so a reading from
+    :class:`CpuUsageSampler` matches what ``psutil.cpu_percent()`` would have
+    said: guest time is already counted inside user/nice, and iowait is dropped
+    from both the busy time and the interval (the CPU is not executing, but it is
+    not idle either).
+    """
+    total = sum(times)
+    total -= getattr(times, "guest", 0.0) + getattr(times, "guest_nice", 0.0)
+    iowait = getattr(times, "iowait", 0.0)
+    busy = total - times.idle - iowait
+    return busy, busy + times.idle
+
+
+class CpuUsageSampler:
+    """Per-core CPU usage over the interval between successive :meth:`sample` calls.
+
+    Every instance keeps its OWN ``psutil.cpu_times()`` baseline, and that is the
+    entire reason this class exists. ``psutil.cpu_percent(interval=None)`` keeps a
+    single baseline per PROCESS, so two callers running on different schedules --
+    the dashboard's ~2s poller and benchmark/service/sampler.py's 2 Hz loop --
+    each consume the interval the other was about to measure, and both end up
+    reporting slivers of time rather than the period they think they asked for.
+
+    Same shape as membw.Sampler and gpu_perf.IndependentGpuSampler: the module
+    keeps one shared instance for the dashboard, and any second consumer that
+    samples on its own clock constructs one of its own. Unlike those two there is
+    nothing to release, so there is no ``close()``.
+    """
+
+    def __init__(self) -> None:
+        self._prev = None
+        self.prime()
+
+    def prime(self) -> None:
+        """Take a baseline, so the first :meth:`sample` covers a real interval
+        instead of everything since boot."""
+        try:
+            self._prev = psutil.cpu_times(percpu=True)
+        except Exception:
+            self._prev = None
+
+    def sample(self) -> List[Optional[float]]:
+        """Per-core busy percentage since the previous call.
+
+        A core whose interval was empty (two calls inside one clock tick) reports
+        None rather than a divide-by-zero or a fabricated 0.0; an unreadable
+        cpu_times yields an empty list. Both are cases the caller has to render
+        as "unknown", which is not the same fact as "idle".
+        """
+        try:
+            current = psutil.cpu_times(percpu=True)
+        except Exception:
+            return []
+        previous, self._prev = self._prev, current
+        if previous is None:
+            return [None] * len(current)
+
+        usage: List[Optional[float]] = []
+        for before, after in zip(previous, current):
+            busy_before, span_before = _busy_and_span(before)
+            busy_after, span_after = _busy_and_span(after)
+            span = span_after - span_before
+            if span <= 0:
+                usage.append(None)
+                continue
+            percent = 100.0 * (busy_after - busy_before) / span
+            usage.append(round(max(0.0, min(100.0, percent)), 2))
+        return usage
+
+
+# The dashboard's poller. Primed at import, as psutil's own baseline used to be,
+# so the first get_cpu_dynamic() call already covers a real interval.
+_shared_usage_sampler = CpuUsageSampler()
+
+
 def _get_cpu_base_freq_mhz() -> Optional[float]:
     """Read the base CPU frequency (kHz → MHz) from sysfs, or return None."""
     try:
@@ -315,8 +389,38 @@ def _get_cpu_base_freq_mhz() -> Optional[float]:
     return None
 
 
+def get_per_core_freq() -> List[Optional[Any]]:
+    """Per-core frequency records from sysfs, one per logical CPU.
+
+    Every reader of clock speed in this repo goes through here -- the dashboard's
+    pollers below, and the benchmark sampler (benchmark/service/sampler.py),
+    which used to call psutil directly and so had one collector that did not come
+    from monitor.metrics. There is no shared state to protect (unlike usage or
+    energy, this is a plain sysfs read), so it is the call itself being shared
+    rather than an instance: one place decides what "the frequency of a core" is
+    and what an unreadable core looks like (None, never 0.0).
+    """
+    try:
+        return list(psutil.cpu_freq(percpu=True) or [])
+    except Exception as exc:
+        logger.debug(f"Per-core CPU frequency unavailable: {exc}")
+        return []
+
+
+def get_per_core_freq_mhz() -> tuple:
+    """(current, max) MHz per logical CPU, rounded as the callers want them.
+
+    The pair rather than one list: classify_cores() keys off the maximum, and
+    every caller that wants the current clock also wants that classification.
+    """
+    freqs = get_per_core_freq()
+    current = [round(f.current, 1) if f else None for f in freqs]
+    maximum = [f.max if f and f.max is not None else None for f in freqs]
+    return current, maximum
+
+
 def get_cpu_freq_summary() -> Dict[str, Any]:
-    freqs = psutil.cpu_freq(percpu=True)
+    freqs = get_per_core_freq()
     per_core = []
     min_vals = []
     max_vals = []
@@ -362,15 +466,18 @@ def get_cpu_freq_summary() -> Dict[str, Any]:
 
 
 def get_cpu_dynamic() -> Dict[str, Any]:
-    # interval=None: average over the time since the last call in this
-    # process, giving true delta semantics (no blocking, no missed peaks).
-    # Primed at module import so the first real call is already valid.
-    usage_per_core = psutil.cpu_percent(interval=None, percpu=True)
+    # Averaged over the time since the last call in this process, giving true
+    # delta semantics (no blocking, no missed peaks). The baseline belongs to
+    # _shared_usage_sampler rather than to psutil, so a second sampler on its own
+    # clock (benchmark/service/sampler.py) cannot eat this interval -- see
+    # CpuUsageSampler. A core the sampler could not resolve reads as 0.0 here,
+    # keeping the payload's type stable for the dashboard.
+    usage_per_core = [v if v is not None else 0.0
+                      for v in _shared_usage_sampler.sample()]
     total_usage = round(sum(usage_per_core) / len(usage_per_core), 2) if usage_per_core else 0.0
-    freqs = psutil.cpu_freq(percpu=True)
-    per_core_freq = [round(f.current, 1) if f else None for f in freqs or []]
+    per_core_freq, per_core_max = get_per_core_freq_mhz()
 
-    core_class = classify_cores([f.max if f else None for f in freqs or []])
+    core_class = classify_cores(per_core_max)
     p_cores = core_class["p_cores"]
     e_cores = core_class["e_cores"]
     lpe_cores = core_class.get("lpe_cores", [])
@@ -422,8 +529,16 @@ def get_core_topology(num_logical: int) -> List[Optional[int]]:
 
 
 def get_cpu_temperatures(num_logical: int = 0) -> Dict[str, Any]:
-    """Return Intel CPU package + per-core temperatures from coretemp."""
-    result: Dict[str, Any] = {"package_c": None, "per_core_c": []}
+    """Return Intel CPU package + per-core temperatures from coretemp.
+
+    ``package_tjmax_c`` is the package throttle point. It is a constant of the
+    part rather than a reading, but it comes off the same coretemp entry that
+    ``package_c`` does, so taking it here costs nothing and saves the caller a
+    second pass over sensors_temperatures() -- without it there is no thermal
+    headroom signal to put the temperature in context.
+    """
+    result: Dict[str, Any] = {"package_c": None, "package_tjmax_c": None,
+                              "per_core_c": []}
     try:
         temps = psutil.sensors_temperatures()
         if not temps:
@@ -437,6 +552,11 @@ def get_cpu_temperatures(num_logical: int = 0) -> Dict[str, Any]:
             if "package" in label:
                 if entry.current is not None:
                     result["package_c"] = round(entry.current, 1)
+                # `critical` is Tjmax where the part is exposed; `high` is the
+                # throttle trip point on the ones that are not.
+                limit = entry.critical or entry.high
+                if limit:
+                    result["package_tjmax_c"] = round(limit, 1)
             elif label.startswith("core "):
                 try:
                     idx = int(label.split()[1])

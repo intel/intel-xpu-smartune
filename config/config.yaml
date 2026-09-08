@@ -309,3 +309,42 @@ network_system_ports:
   - 123
 
 network_interfaces: []
+
+# Model-benchmark toolchain (benchmark/, driven by benchmark/service/). Every key is optional.
+benchmark:
+  # false hides the Benchmark tab and leaves /bench unregistered. The feature is
+  # also skipped automatically when benchmark/ is not present in the deployment --
+  # which is the case for the monitor-only .deb; the full package ships it.
+  enabled: true
+  # Runtime root: venv, downloaded models, IR, logs, generated run scripts.
+  # Empty = <benchmark/>/runtime, i.e. <repo>/benchmark/runtime from a source
+  # checkout and /opt/intel/smartune/benchmark/runtime from the full .deb.
+  # Expect tens of GB here; point it at a data volume rather than the root
+  # filesystem if space is tight. Note that `apt purge` removes the install dir
+  # wholesale, so a path set here is also what survives a purge.
+  env_root: ""
+  # HuggingFace access token for gated repos. Empty = fall back to the HF_TOKEN
+  # environment variable. Passed to subprocesses via the environment only -- it is
+  # never written into a generated script.
+  hf_token: ""
+  # Empty = https://huggingface.co. Set to a mirror where the hub is unreachable.
+  hf_endpoint: "https://huggingface.co"
+  # Proxy for model downloads. Empty = direct. Site-specific, hence configured
+  # here rather than hardcoded in the vendored scripts.
+  http_proxy: ""
+  https_proxy: ""     # empty = reuse http_proxy
+  no_proxy: ""
+  # Optional upstream network profile (scheme1 / scheme2), which selects the HF
+  # endpoint and download tuning. Empty = no profile.
+  network_profile: ""
+  # Enumerating the benchmarkable models on HuggingFace takes a few minutes, so
+  # the Benchmark tab reads a cached list. true rebuilds a missing or stale cache
+  # once in the background at service start, instead of leaving the first user to
+  # wait for it. Skipped automatically when the `hf` CLI is not installed yet
+  # (i.e. before the benchmark environment is built). Set false on machines with
+  # no route to huggingface.co at boot.
+  prefetch_models: true
+  # How old the cached model list may be before the startup refresh above rebuilds
+  # it. 0 disables ageing (only a missing cache is rebuilt). The Refresh button in
+  # the tab always rebuilds regardless.
+  models_cache_ttl_days: 7

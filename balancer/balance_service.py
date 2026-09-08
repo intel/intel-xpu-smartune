@@ -25,7 +25,8 @@ from monitor.monitor_api import (
     stop_dynamic_info_collector,
 )
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
-from smartune_api import auth_bp, smartune_bp, set_balancer_available
+from features import mount_benchmark
+from smartune_api import auth_bp, smartune_bp, set_balancer_available, set_benchmark_available
 from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, fetch_unregistered_apps, get_priority_value, get_app_processes_for_app, get_cgroup_path_by_pid, reconcile_controlled_apps, restore_config_entry, serialize_config_meta
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
@@ -34,7 +35,11 @@ app = Flask(__name__)
 app.register_blueprint(monitor_bp)
 app.register_blueprint(smartune_bp)
 app.register_blueprint(auth_bp)
+# Optional: skipped when the feature is disabled in config.yaml or benchmark/ is
+# absent from the deployment. See monitor_service.py for the same registration.
+benchmark_available = mount_benchmark(app)
 set_balancer_available(True)
+set_benchmark_available(benchmark_available)
 _start_snapshot_cleanup_task()
 
 _KEY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "key")

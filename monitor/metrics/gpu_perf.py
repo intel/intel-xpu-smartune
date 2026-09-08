@@ -10,6 +10,7 @@ Intel GPUs (i915 / Xe).
 Public API:
     get_gpu_usage_output()  -> Dict with available/parsed/error
     shutdown_gpu_usage()    -> Tear down the GPU monitor
+    create_independent_sampler() -> A private, non-singleton sampler
 """
 
 import threading
@@ -235,6 +236,71 @@ def get_gpu_usage_output() -> Dict[str, Any]:
                 "error": f"gpu_monitor sample failed, using cached: {exc}",
             }
         return {"available": False, "raw": None, "parsed": None, "error": str(exc)}
+
+
+class IndependentGpuSampler:
+    """A GPUMonitor of one's own, for a caller that samples on its own schedule.
+
+    `get_gpu_usage_output()` above shares one process-wide monitor, which is
+    right for the dashboard: many HTTP handlers, one set of counters. It is
+    wrong for a second, faster sampling loop -- `sample_delta()` consumes the
+    baseline it reads, so two callers interleaving on the same instance each get
+    the other's leftovers. Engine busy% just gets noisy; power is worse, since
+    it comes from differencing an energy counter, and a dt sliced down to
+    microseconds turns one counter tick into thousands of watts.
+
+    So the benchmark sampler takes its own instance and leaves the singleton
+    alone. Parsing is shared -- `_convert_monitor_results()` is stateless.
+    """
+
+    def __init__(self) -> None:
+        self._monitor = None
+        self.error: Optional[str] = None
+
+    def start(self) -> bool:
+        """Open a private GPUMonitor. False (with `error` set) if unavailable."""
+        try:
+            from monitor.gpu_monitor import GPUMonitor
+            monitor = GPUMonitor(xe_pmu=False)
+            monitor.start_sampling()
+            # Same reason as _get_or_init_monitor(): let one hwmon energy-counter
+            # refresh cycle pass so the first sample_delta() has a real dt.
+            time.sleep(0.2)
+            self._monitor = monitor
+            return True
+        except Exception as exc:
+            self.error = str(exc)
+            logger.warning("Independent GPUMonitor init failed: %s", exc)
+            return False
+
+    def sample(self) -> Optional[Dict[str, Any]]:
+        """One delta sample in the same shape `get_gpu_usage_output()` parses,
+        or None when the monitor is down or returned nothing."""
+        if self._monitor is None:
+            return None
+        try:
+            results = self._monitor.sample_delta()
+        except Exception as exc:
+            logger.debug("Independent GPUMonitor sample failed: %s", exc)
+            self.error = str(exc)
+            return None
+        if not results:
+            return None
+        return _convert_monitor_results(results)
+
+    def close(self) -> None:
+        if self._monitor is not None:
+            try:
+                self._monitor.close()
+            except Exception as exc:
+                logger.debug("Independent GPUMonitor close failed: %s", exc)
+            self._monitor = None
+
+
+def create_independent_sampler() -> IndependentGpuSampler:
+    """A GPU sampler that does not touch the module singleton. Caller owns it
+    and must `close()` it -- the monitor holds open perf/sysfs descriptors."""
+    return IndependentGpuSampler()
 
 
 def shutdown_gpu_usage() -> None:

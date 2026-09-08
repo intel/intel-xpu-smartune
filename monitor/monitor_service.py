@@ -33,7 +33,8 @@ from monitor.monitor_api import (
     stop_dynamic_info_collector,
 )
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
-from smartune_api import auth_bp, smartune_bp
+from features import mount_benchmark
+from smartune_api import auth_bp, set_benchmark_available, smartune_bp
 from utils.logger import logger
 
 app = Flask(__name__)
@@ -44,6 +45,12 @@ app.register_blueprint(smartune_bp)
 # auth_bp enforces the access token app-wide (before_app_request) and serves
 # /auth/login, so the monitor-only deployment is protected too.
 app.register_blueprint(auth_bp)
+# The benchmark blueprint is optional: it is skipped when the feature is disabled
+# in config.yaml or when benchmark/ is absent from the deployment (this is the
+# variant that ships without it). Registering it after auth_bp is not required
+# (the gate is app-wide), but keeps the reading order "auth first, then the routes
+# it protects".
+set_benchmark_available(mount_benchmark(app))
 _start_snapshot_cleanup_task()
 
 _KEY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "key")

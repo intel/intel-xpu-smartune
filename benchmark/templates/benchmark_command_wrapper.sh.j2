@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Auto-generated benchmark wrapper script
+# Tool: {{ tool }}
+# Model: {{ model }}
+# Generated: {{ timestamp }}
+
+#set -euo pipefail
+
+# Activate venv
+source {{ venv_dir }}/bin/activate
+
+# Set environment variables
+export HF_HOME="{{ hf_home }}"
+export TOKENIZERS_PARALLELISM=false
+
+# Run benchmark
+{{ benchmark_command }}
+
+exit_code=$?
+
+exit $exit_code

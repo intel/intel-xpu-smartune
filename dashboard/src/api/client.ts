@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import axios from 'axios'
+import type { AxiosRequestConfig } from 'axios'
 import type {
   ApiResponse,
   AppResourceStatsData,
@@ -30,6 +31,17 @@ import type {
   DiscoverExtractData,
   WizardCommitPayload,
   WizardCommitData,
+  BenchActionResult,
+  BenchDevice,
+  BenchEnvData,
+  BenchJob,
+  BenchModelsData,
+  BenchPrecision,
+  BenchMatrixData,
+  BenchResultsData,
+  BenchTimelineData,
+  BenchRunsData,
+  BenchStage,
 } from './types'
 
 // Server uses RetCode.CONFLICT (409) for optimistic-concurrency mismatches
@@ -145,6 +157,30 @@ export function appEventsUrl(): string {
   return token ? `/api/app/events?token=${encodeURIComponent(token)}` : '/api/app/events'
 }
 
+// Identifies this browser tab to the benchmark event stream for as long as the
+// page is loaded. Toggling the log channel reconnects, and the server uses this
+// to retire the connection being replaced rather than counting both against its
+// client limit — it cannot otherwise tell a superseded stream from a live one
+// until the next heartbeat write fails.
+const BENCH_CLIENT_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+
+/**
+ * URL for the Benchmark tab's SSE stream (benchmark/service/events.py).
+ *
+ * `withLogs` asks the server to also stream the running job's output. It is off
+ * while the tab is off screen: job/env/result events still arrive (that is how a
+ * backgrounded dashboard reports a finished run), but a build writes megabytes
+ * of log that nobody is looking at.
+ */
+export function benchEventsUrl(withLogs: boolean): string {
+  const params = new URLSearchParams()
+  const token = getToken()
+  if (token) params.set('token', token)
+  if (withLogs) params.set('logs', '1')
+  params.set('client', BENCH_CLIENT_ID)
+  return `/api/bench/events?${params.toString()}`
+}
+
 async function get<T>(url: string): Promise<T> {
   const res = await client.get<ApiResponse<T>>(url)
   if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
@@ -153,6 +189,14 @@ async function get<T>(url: string): Promise<T> {
 
 async function post<T>(url: string, body: object = {}): Promise<T> {
   const res = await client.post<ApiResponse<T>>(url, body)
+  if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
+  return res.data.data
+}
+
+async function del<T>(url: string, body: object = {}): Promise<T> {
+  // Axios puts a DELETE body under `data`, not as the second positional
+  // argument -- the one place the verb helpers here are not interchangeable.
+  const res = await client.delete<ApiResponse<T>>(url, { data: body })
   if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
   return res.data.data
 }
@@ -172,9 +216,28 @@ async function postWithConflict<TOk>(url: string, body: object): Promise<SaveRes
   throw new Error(res.data.retmsg)
 }
 
+// Bench actions treat 409 as an answerable state rather than a failure: the slot
+// is busy, or an environment already exists and rebuilding it needs confirmation.
+// Every other non-zero retcode still throws, like post().
+async function postBench<TOk>(
+  url: string,
+  body: object = {},
+  config?: AxiosRequestConfig,
+): Promise<BenchActionResult<TOk>> {
+  const res = await client.post<ApiResponse<TOk>>(url, body, config)
+  if (res.data.retcode === 0) return { status: 'ok', data: res.data.data }
+  if (res.data.retcode === RETCODE_CONFLICT) {
+    return { status: 'conflict', data: res.data.data, message: res.data.retmsg }
+  }
+  throw new Error(res.data.retmsg)
+}
+
 export const api = {
   // Server capability level: 1 = balancer + monitor, 0 = monitor only.
-  getCapabilities: () => get<{ capabilities: number }>('/smartune/capabilities'),
+  // `benchmark`: 1 = the /bench API is mounted here (NOT that its environment is
+  // installed — that comes from getBenchEnv().ready).
+  getCapabilities: () =>
+    get<{ capabilities: number; benchmark?: number }>('/smartune/capabilities'),
   getAppResourceStats: (n = 10) => get<AppResourceStatsData>(`/monitor/app_resource_stats?n=${n}`),
   getAppDiskIoStats: (n = 10) => get<AppDiskIoStatsData>(`/monitor/app_disk_io_stats?n=${n}`),
   getProcesses: (gpu = false, io = false) => {
@@ -376,6 +439,76 @@ export const api = {
   // Generic auto-control config get/set (thresholds, weights, pressure_detection,
   // collection, limit_policy).  These share one parametrized backend endpoint;
   // the section-specific shapes are provided by the caller via the type param.
+  // --- Benchmark ---------------------------------------------------------
+  getBenchEnv: () => get<BenchEnvData>('/bench/env'),
+  // force=false against an existing environment answers 'conflict' so the caller
+  // can confirm before spending an hour and tens of GB rebuilding it. Deciding
+  // that means reading the venv's package list, which the server refuses to guess
+  // at and which costs a cold torch import on the first call after a restart --
+  // well past the default client timeout.
+  setupBenchEnv: (force = false) =>
+    postBench<BenchJob>('/bench/env/setup', { force }, { timeout: 150_000 }),
+  getBenchSetupLog: (offset = 0) => get<BenchJob>(`/bench/env/setup/log?offset=${offset}`),
+  // Switch the active OpenVINO version. Relinks the pre-built pool, so it returns
+  // the fresh environment status directly; a busy execution slot comes back as a
+  // 'conflict' the caller surfaces rather than an error toast.
+  switchBenchOv: (version: string) =>
+    postBench<BenchEnvData>('/bench/env/ov', { version }),
+
+  // The whole cached list, once per session: it runs to a few hundred entries,
+  // which is small enough to filter in the browser and saves a request per
+  // keystroke. The server still accepts search/limit for other callers.
+  getBenchModels: () => get<BenchModelsData>('/bench/models'),
+  // A refusal comes back as a 200 with `reason` set -- not being able to search
+  // is a state of the machine, not a failed request.
+  refreshBenchModels: () =>
+    post<{ started: boolean; reason: string | null }>('/bench/models/refresh'),
+
+  // `devices` names the devices to benchmark on; omitting it means all of them,
+  // which is what the pipeline did before the choice existed. `ov` is the
+  // OpenVINO version a benchmark builds/runs against (chosen on the Models tab,
+  // built on demand); omitted for a pure download.
+  startBenchRun: (
+    // `args` is free-form extra CLI arguments appended to every benchmark
+    // run_case for the model (validated server-side in runner.py); ignored by a
+    // pure build/download, which never runs a case.
+    models: { id: string; build?: BenchPrecision[]; args?: string }[],
+    opt: BenchStage,
+    devices?: BenchDevice[],
+    ov?: string,
+  ) => postBench<BenchJob>('/bench/run', { models, opt, devices, ov }),
+  getBenchRuns: () => get<BenchRunsData>('/bench/run'),
+  getBenchRun: (runId: string, offset?: number) =>
+    get<BenchJob>(
+      `/bench/run/${encodeURIComponent(runId)}${offset === undefined ? '' : `?offset=${offset}`}`,
+    ),
+  cancelBenchRun: (runId: string) =>
+    post<{ cancelled: boolean }>(`/bench/run/${encodeURIComponent(runId)}/cancel`),
+
+  getBenchResults: (backend?: string) =>
+    get<BenchResultsData>(`/bench/results${backend ? `?backend=${backend}` : ''}`),
+  getBenchMatrix: (backend?: string) =>
+    get<BenchMatrixData>(`/bench/results/matrix${backend ? `?backend=${backend}` : ''}`),
+  getBenchCaseLog: (path: string) =>
+    get<{ path: string; content: string }>(
+      `/bench/results/log?path=${encodeURIComponent(path)}`,
+    ),
+  // The samples behind one case's medians. 404s for a case that was never
+  // sampled -- an old run, or one whose sampling CSV has since been cleaned up
+  // -- which the drawer reports as such rather than as an error.
+  getBenchCaseTimeline: (caseDir: string) =>
+    get<BenchTimelineData>(
+      `/bench/results/timeline?case=${encodeURIComponent(caseDir)}`,
+    ),
+  // Cases are named by their directories, which the caller has from the matrix.
+  // Used when a configuration is re-run and its previous measurement is not
+  // worth keeping; a run directory whose last case goes is removed with it.
+  deleteBenchCases: (cases: string[]) =>
+    del<{ removed: number; runs_removed: number; skipped: string[] }>(
+      '/bench/results',
+      { cases },
+    ),
+
   getConfig: <T>(section: string) => get<T>(`/monitor/config/${section}`),
   updateConfig: <T extends { updated_at?: number }>(
     section: string,

@@ -747,3 +747,310 @@ export interface LimitPolicyData {
 export type SaveResult<TOk> =
   | { status: 'ok'; data: TOk }
   | { status: 'conflict'; current: any; message: string }
+
+// --- Benchmark (benchmark/service/) ---------------------------------------------------
+
+export type BenchStage = 'build' | 'benchmark' | 'all'
+export type BenchPrecision = 'fp16' | 'int8' | 'int4'
+// Lowercase here and in result rows; the API accepts either and the pipeline
+// spells them uppercase (benchmark/service/runner.py VALID_DEVICES).
+export type BenchDevice = 'cpu' | 'gpu' | 'npu'
+export type BenchJobStatus = 'running' | 'done' | 'failed' | 'cancelled'
+
+// A background job: either the environment setup or a pipeline run. Both are
+// reported with the same shape (benchmark/service/jobs.py Job.to_dict).
+export interface BenchJob {
+  id: string
+  kind: 'setup' | 'run'
+  status: BenchJobStatus
+  returncode: number | null
+  started_at: number
+  finished_at: number | null
+  duration: number
+  log_path: string
+  meta: {
+    stage?: BenchStage
+    force?: boolean
+    models?: { id: string; build?: string }[]
+    // Uppercase, as the pipeline spells them. Absent on a build-only job and on
+    // runs started before the request could name devices.
+    devices?: string[]
+    // BENCH_RUN_NAME: what every result directory this job wrote is named after.
+    run_name?: string
+  }
+  // Present only when the request asked for a log tail (?offset=).
+  chunk?: string
+  offset?: number
+  size?: number
+}
+
+export interface BenchEnvData {
+  enabled: boolean
+  env_root: string
+  src_root: string
+  venv_dir: string
+  venv_exists: boolean
+  venv_usable: boolean
+  // The active (base) venv can import huggingface_hub -- enough to list and
+  // download models. OpenVINO is built per-version on demand at benchmark time.
+  hf_ready: boolean
+  genai_ready: boolean
+  // hf_ready: a run can be started -- the build/download stage needs only the
+  // `hf` CLI, and a benchmark builds its OpenVINO column on demand.
+  ready: boolean
+  // The venv's package list is still being read on a server-side background
+  // thread. Until it clears, `versions` is empty and `venv_usable`/`ready` are
+  // false because the answer is unknown -- not because anything is wrong.
+  probing: boolean
+  versions: Record<string, string | null>
+  // OpenVINO columns already built on disk, and the one the active venv points
+  // at. May be empty / null until a benchmark has built a column; no longer
+  // drives a switch UI (kept for diagnostics).
+  ov_versions: string[]
+  active_ov: string | null
+  // Each BUILT OpenVINO version and the exact packages inside its venv. What the
+  // Environment drawer's dropdown lists; empty until a version has been built, so
+  // the drawer's package list is empty on a fresh environment.
+  ov_versions_detail: { version: string; packages: Record<string, string | null> }[]
+  // Static reference of known releases -> package versions. Not shown in the
+  // drawer; only seeds the Models tab's version suggestions.
+  ov_reference: { version: string; packages: Record<string, string> }[]
+  models_dir: string
+  model_count: number
+  setup_script: string
+  setup_job: BenchJob | null
+  // Whichever job currently holds the single execution slot, if any.
+  busy: BenchJob | null
+}
+
+/** One OpenVINO conversion of a source model, as cached by search_models.py. */
+export interface BenchModelVariant {
+  repo: string
+  // null when the repo name carries no recognisable weight-format suffix.
+  precision: BenchPrecision | null
+}
+
+// A benchmarkable model. `task`/`downloads`/`likes` describe the OpenVINO
+// conversion rather than the original repo — that is what the cache enumerates,
+// and reading the source repo's own stats would cost one HF lookup per model.
+export interface BenchModel {
+  id: string
+  task: string | null
+  downloads: number
+  likes: number
+  last_modified: string | null
+  variants: BenchModelVariant[]
+  // Precisions this model can be downloaded in, derived from `variants`.
+  precisions: BenchPrecision[]
+  // Per-precision presence in the runtime IR directory. Only lists precisions
+  // that are either offered or already present.
+  local: Partial<Record<BenchPrecision, boolean>>
+  downloaded: boolean
+}
+
+// Cache status without the list, as carried by the `models` SSE event.
+export interface BenchModelsState {
+  total: number
+  // 1 = the original list-of-ids cache, still readable; 2 = objects with variants.
+  version: number
+  updated_at: string | null
+  refreshing: boolean
+  last_error: string | null
+  cache_file: string
+  cached: boolean
+}
+
+export interface BenchModelsData extends BenchModelsState {
+  models: BenchModel[]
+  count: number
+  matched: number
+}
+
+// --- /bench/events -------------------------------------------------------
+// The server pushes these instead of the tab polling for them; see
+// benchmark/service/events.py.
+
+/** An incremental slice of a job's log, at absolute byte offsets. */
+export interface BenchLogDelta {
+  job_id: string
+  start: number
+  end: number
+  chunk: string
+  // Snapshot only: the stream joined a job already in progress, so `start` is
+  // not the beginning of the log.
+  truncated?: boolean
+}
+
+export type BenchEvent =
+  | {
+      type: 'snapshot'
+      env: BenchEnvData
+      job: BenchJob | null
+      log: BenchLogDelta | null
+      models: BenchModelsState | null
+      results_rev: number
+    }
+  | { type: 'job'; job: BenchJob }
+  | ({ type: 'log' } & BenchLogDelta)
+  | { type: 'env'; env: BenchEnvData }
+  | { type: 'models'; models: BenchModelsState }
+  | { type: 'results'; rev: number }
+
+export interface BenchRunsData {
+  current: BenchJob | null
+  recent: BenchJob[]
+}
+
+export interface BenchResultRow {
+  model: string
+  quant: string
+  status: string
+  task?: string
+  device?: string
+  port?: string
+  model_dir?: string
+  log_file?: string
+  // KPIs scraped from detail.log plus hardware medians over the case's
+  // measurement window. Absent for a case the aggregation step could not parse.
+  metrics?: Record<string, number>
+  // How the aggregator classified the case: device, precision, mode, batch_size.
+  // Its spellings, not summary.tsv's -- see BenchMatrixRow.
+  dimensions?: Record<string, string>
+  // One line from detail.log saying why a failed case failed. Failures differ:
+  // "the NPU compiler rejected this quantisation" and "the device fell off the
+  // bus" call for different responses, and "failed" alone says neither.
+  failure_reason?: string | null
+}
+
+export interface BenchResultRun {
+  backend: string
+  run: string
+  dir: string
+  updated_at: number
+  report: string | null
+  rows: BenchResultRow[]
+  // Metric keys present on this run's rows, in the order they were first seen.
+  metric_columns: string[]
+  ok: number
+  failed: number
+}
+
+export interface BenchResultsData {
+  runs: BenchResultRun[]
+  count: number
+  // Descriptors for every metric key any run produced. Optional so an older
+  // server still renders, just with derived column titles.
+  metrics?: BenchMetricMeta[]
+  primary_metric?: string | null
+  benchmarks_dir: string
+  metrics_available: boolean
+}
+
+// What a metric key means, so a chart can label an axis and know which end of it
+// is good without the frontend keeping its own table of every KPI the pipeline
+// might emit.
+export interface BenchMetricMeta {
+  key: string
+  label: string
+  unit: string | null
+  // Three-valued on purpose. null means the metric has no direction -- a clock
+  // frequency or an input length is worth showing and meaningless to rank -- so
+  // "best in row" is left unmarked rather than picked arbitrarily.
+  higher_is_better: boolean | null
+  group: string
+  group_label: string
+  // What the number actually means, where the name does not say. Mostly the
+  // derived ratios, whose denominator decides how they read -- a column of
+  // 1.00× means "this row is the baseline" for one metric and "this sweep had
+  // nothing to compare with" for another. Shown on hover.
+  description?: string | null
+}
+
+// One case, flattened out of its run directory. A run holds a single device, so
+// every cross-device comparison spans several of them; the backend does that
+// join and hands back a plain long table.
+export interface BenchMatrixRow {
+  backend: string
+  // The run directory this case was measured in. Benchmarking the same model,
+  // precision and device again produces another row with another run, not a
+  // replacement -- every repetition is kept.
+  run: string
+  // The invocation the run directory belongs to. One job sweeps every device it
+  // was asked for, so several runs ("<job>_CPU", "<job>_NPU") share one job --
+  // that is what the Results tab folds by.
+  job: string
+  // When the job started, from the timestamp its name carries. null for a tree
+  // whose directories were not named by runner.py (the legacy "TEST" ones);
+  // read `updated_at` instead.
+  job_started_at: number | null
+  // When that run last wrote its summary, for ordering repetitions by age.
+  updated_at: number
+  model: string
+  // Lowercase, matching the aggregator: summary.tsv writes "NPU" where the
+  // medians CSV writes "npu", and grouping on the raw string would split one
+  // device into two.
+  device: string
+  // "int4" -- the weight format alone, where `quant` is the exported variant
+  // ("int4_ov", "int4_cw_ov") that names the repository it came from.
+  precision: string
+  quant: string
+  mode: string
+  batch_size: string
+  status: string
+  task: string
+  case_dir: string
+  log_file: string
+  model_dir: string
+  metrics: Record<string, number>
+  // Failed cases are returned too, with the reason: a chart that dropped them
+  // would show CPU and GPU with no hint that NPU was ever attempted.
+  failure_reason?: string | null
+}
+
+export interface BenchMatrixData {
+  rows: BenchMatrixRow[]
+  // Distinct values per axis, sorted -- what the selectors offer.
+  dimensions: {
+    models: string[]
+    devices: string[]
+    precisions: string[]
+    backends: string[]
+    runs: string[]
+    // Newest first, unlike the others: a job is a moment, and the one a reader
+    // wants at the top is the last one they started.
+    jobs: string[]
+  }
+  metrics: BenchMetricMeta[]
+  // The metric the pipeline's report profile calls the headline one, and so the
+  // one that decides which repetition of a test was the best. null when no
+  // pivot report has been produced yet.
+  primary_metric?: string | null
+  benchmarks_dir: string
+  metrics_available: boolean
+}
+
+// The hardware samples taken while one case was being measured -- what the
+// medians reported everywhere else were taken over. A median cannot tell a case
+// that ramped from 15 W to 40 W from one that sat at 28 W; this can.
+export interface BenchTimelineData {
+  case_dir: string
+  // Epoch seconds bounding the measurement window, as the aggregation step
+  // defines it. Shown only as a duration; `t` is what the chart plots.
+  start: number
+  end: number
+  duration_s: number
+  count: number
+  // Seconds into the window, one per sample.
+  t: number[]
+  // Keyed by the *median* metric name (`cpu_usage_percent_median`), so the same
+  // descriptors that label a table column label this chart's axis. A gap in a
+  // series is null -- a collector that missed a tick, never a zero.
+  series: Record<string, (number | null)[]>
+}
+
+// Bench actions distinguish three outcomes rather than two: the slot being busy
+// and "an environment already exists" are both 409s that the UI answers with a
+// prompt, not an error toast.
+export type BenchActionResult<TOk> =
+  | { status: 'ok'; data: TOk }
+  | { status: 'conflict'; data: any; message: string }

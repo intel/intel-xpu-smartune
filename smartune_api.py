@@ -36,11 +36,12 @@ TOKEN_FILE = os.path.join(_KEY_DIR, "api_token")
 # other route requires a valid X-Auth-Token header.
 _AUTH_EXEMPT_PATHS = frozenset({"/auth/login"})
 
-# The SSE stream is the ONLY route allowed to authenticate via a query-string
+# The SSE streams are the ONLY routes allowed to authenticate via a query-string
 # token, because EventSource cannot set custom headers. Query-string tokens are
 # more exposed (access logs, proxies, Referer), so every other route must use the
-# header. Kept in sync with the /app/events route in balance_service.py.
-_SSE_TOKEN_PATH = "/app/events"
+# header. Kept in sync with the /app/events route in balance_service.py and the
+# /bench/events route in benchmark/service/bench_api.py.
+_SSE_TOKEN_PATHS = frozenset({"/app/events", "/bench/events"})
 
 _secret_hash = None  # SHA-256 of the active API token; resolved lazily.
 
@@ -128,9 +129,9 @@ def _enforce_api_token():
         return None
 
     # Header is required everywhere; the ?token= fallback is accepted only for the
-    # SSE stream, which cannot send a custom header.
+    # SSE streams, which cannot send a custom header.
     provided = request.headers.get("X-Auth-Token")
-    if not provided and request.path == _SSE_TOKEN_PATH:
+    if not provided and request.path in _SSE_TOKEN_PATHS:
         provided = request.args.get("token")
     if _token_is_valid(provided):
         return None
@@ -181,6 +182,7 @@ def login():
 
 
 _balancer_available = False
+_benchmark_available = False
 
 
 def set_balancer_available(available: bool) -> None:
@@ -190,10 +192,32 @@ def set_balancer_available(available: bool) -> None:
     _balancer_available = bool(available)
 
 
+def set_benchmark_available(available: bool) -> None:
+    """Mark whether the benchmark blueprint (/bench) is mounted on this process.
+
+    Reported separately from `capabilities` because it is orthogonal: the
+    benchmark feature can be present or absent in either a balancer or a
+    monitor-only deployment. Both services call this at startup.
+    """
+    global _benchmark_available
+    _benchmark_available = bool(available)
+
+
 @smartune_bp.route('/capabilities', methods=['GET'])
 def get_capabilities():
-    """Report server capability level: 1 = balancer + monitor, 0 = monitor only."""
+    """Report what this server serves.
+
+    `capabilities`: 1 = balancer + monitor, 0 = monitor only.
+    `benchmark`:    1 = the /bench API is mounted, 0 = not available here.
+
+    Note that benchmark=1 only means the feature is mounted, NOT that its Python
+    environment is installed -- the dashboard needs the tab to exist in order to
+    offer the "install environment" action. Readiness comes from GET /bench/env.
+    """
     return construct_response(
-        data={"capabilities": 1 if _balancer_available else 0},
+        data={
+            "capabilities": 1 if _balancer_available else 0,
+            "benchmark": 1 if _benchmark_available else 0,
+        },
         retmsg="Successfully retrieved capabilities",
     )

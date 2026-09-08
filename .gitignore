@@ -19,3 +19,12 @@ my_database.db-wal
 logs/
 
 config/runtime_state.json
+
+# Benchmark runtime tree: venv, downloaded models, IR, logs, generated run
+# scripts. Multi-GB and fully reproducible from setup_env.sh.
+benchmark/runtime/
+benchmark/.generated_run_*.sh
+benchmark/**/__pycache__/
+# Fallback location for search_models.py's caches when it is run standalone
+# (a configured service writes them under the runtime tree instead).
+benchmark/service/models_cache*.json

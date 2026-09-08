@@ -75,6 +75,10 @@ class Config:
     # monitors (feeds the live cache + history). None = monitor all sections;
     # [] = pure on-demand (no background collector). See DYNAMIC_INFO_SECTIONS.
     monitored_sections: list = None
+    # Settings for the vendored model-benchmark toolchain (see benchmark/service/env.py):
+    # enabled, env_root, hf_token, hf_endpoint, network_profile, http_proxy,
+    # https_proxy, no_proxy. Absent/None means "enabled with defaults".
+    benchmark: dict = None
     _config_path: str = field(default=_DEFAULT_CONFIG_PATH, repr=False, compare=False)
     _persist_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False, init=False)
 

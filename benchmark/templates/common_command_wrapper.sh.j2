@@ -1,0 +1,68 @@
+#!/bin/bash
+# {{ stage_title }} wrapper for {{ tool }}
+# Generated at: {{ timestamp }}
+
+set -e
+set -o pipefail
+
+{% if venv_dir -%}
+# Activate virtual environment
+source {{ venv_dir }}/bin/activate
+
+{% endif -%}
+{% if hf_home -%}
+# Environment
+export HF_HOME={{ hf_home }}
+
+{% endif -%}
+# Create output directory
+mkdir -p {{ output_dir }}
+
+# Logging
+LOGFILE={{ output_dir }}/{{ stage }}_{{ model_safe_name }}_{{ timestamp }}.log
+exec > >(tee -a ${LOGFILE}) 2>&1
+
+echo "[$(date)] Starting {{ tool }} {{ stage }}"
+{% if tool == 'optimum-cli' -%}
+echo "Model: {{ model }}"
+{% if weight_format %}echo "Weight format: {{ weight_format }}"{% endif %}
+{% elif tool in ['ovc', 'mv'] -%}
+echo "Input: {{ input_path }}"
+{% elif tool == 'notebook' -%}
+echo "IR path: {{ ir_path }}"
+{% elif tool == 'nncf' -%}
+echo "IR path: {{ ir_path }}"
+echo "Preset: {{ preset }}"
+{% endif -%}
+echo "Output: {{ output_dir }}"
+
+# Execute {{ stage }} command
+{{ command }}
+
+# Validation - check for any *.xml and matching .bin files
+XML_FILES=$(find {{ output_dir }} -maxdepth 1 -name "*.xml" 2>/dev/null)
+if [ -z "$XML_FILES" ]; then
+    echo "[$(date)] {{ stage_title }} FAILED - no *.xml files found"
+    exit 1
+fi
+
+# Verify each XML has a corresponding BIN file
+SUCCESS=true
+for xml_file in $XML_FILES; do
+    bin_file="${xml_file%.xml}.bin"
+    if [ ! -f "$bin_file" ]; then
+        echo "[$(date)] WARNING: Missing corresponding .bin file for $xml_file"
+        SUCCESS=false
+    fi
+done
+
+if [ "$SUCCESS" = true ]; then
+    echo "[$(date)] {{ stage_title }} SUCCESS"
+    echo "Model files generated in: {{ output_dir }}"
+    echo "Found XML files:"
+    echo "$XML_FILES" | sed 's/^/  - /'
+    exit 0
+else
+    echo "[$(date)] {{ stage_title }} FAILED - incomplete model files"
+    exit 1
+fi

@@ -1732,28 +1732,44 @@ export default function Balance({
     },
   ]
 
+  // Mirror the Control Center table's column-width vector so the shared columns
+  // (App Name / Priority / Status) line up. Both tables stretch to the same card width, so
+  // identical widths + identical leading offset ⇒ identical column positions. The leading
+  // 48px spacer stands in for the Control Center expand-icon column; Remark absorbs the
+  // Control Center's Remark (220) + Actions (240) widths so it fills the row's remainder
+  // instead of leaving a blank trailing column.
   const pendingColumns: ColumnsType<AppInfo> = [
+    {
+      title: '',
+      key: 'expand_spacer',
+      width: 48,
+      render: () => null,
+    },
     {
       title: 'App Name',
       dataIndex: 'app_name',
       key: 'app_name',
+      width: 240,
       render: (name: string) => <Text style={{ color: COLORS.text }}>{name}</Text>,
     },
     {
       title: 'Priority',
       dataIndex: 'priority',
       key: 'priority',
+      width: 150,
       render: (p: string) => <PriorityTag priority={p} />,
     },
     {
       title: 'Status',
       key: 'status',
+      width: 230,
       render: () => <Tag color="processing">Pending</Tag>,
     },
     {
       title: 'Remark',
       dataIndex: 'remark',
       key: 'remark',
+      width: 220 + 240,
       render: (v: string) => <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>{v ?? '—'}</Text>,
     },
   ]
@@ -2380,30 +2396,12 @@ export default function Balance({
       {/* App Cgroup control center — the merged, entity-centric management table. */}
       <Card
         title={
-          <Space size={8} wrap>
-            <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
-              <ControlOutlined style={{ marginRight: 8, color: COLORS.accent }} />
-              Application Control Center
-            </Text>
-            <Tabs
-              size="small"
-              activeKey={controlTab}
-              onChange={(k) => setControlTab(k as 'auto' | 'manual' | 'excluded')}
-              style={{ marginBottom: -12 }}
-              items={[
-                { key: 'manual', label: `🟠 Manual Control (${manualTabCount})` },
-                { key: 'auto', label: `🔴 Auto Control (${autoTabCount})` },
-                {
-                  key: 'excluded',
-                  label: (
-                    <Tooltip title={EXCLUDED_APPS_TOOLTIP}>
-                      <span>{`⛔ Excluded (${excludedTabCount})`}</span>
-                    </Tooltip>
-                  ),
-                },
-              ]}
-            />
-          </Space>
+          // Single-line title, identical to the "Add application" header — the header's own
+          // full-width borderBottom draws the divider; the tabs live in the card body below it.
+          <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
+            <ControlOutlined style={{ marginRight: 8, color: COLORS.accent }} />
+            Application Control Center
+          </Text>
         }
         style={{
           background: COLORS.panelBg,
@@ -2414,6 +2412,25 @@ export default function Balance({
         headStyle={{ borderBottom: `1px solid ${COLORS.border}`, padding: '8px 16px', minHeight: 40 }}
         bodyStyle={{ padding: '0' }}
       >
+        <Tabs
+          className="control-center-tabs"
+          size="small"
+          activeKey={controlTab}
+          onChange={(k) => setControlTab(k as 'auto' | 'manual' | 'excluded')}
+          tabBarStyle={{ padding: '0 16px', marginBottom: 0 }}
+          items={[
+            { key: 'manual', label: `🟠 Manual Control (${manualTabCount})` },
+            { key: 'auto', label: `🔴 Auto Control (${autoTabCount})` },
+            {
+              key: 'excluded',
+              label: (
+                <Tooltip title={EXCLUDED_APPS_TOOLTIP}>
+                  <span>{`⛔ Excluded (${excludedTabCount})`}</span>
+                </Tooltip>
+              ),
+            },
+          ]}
+        />
         {controlTab === 'excluded' ? (
           <ExcludedAppsTable
             rows={userRestoredExclusions}
@@ -2433,6 +2450,9 @@ export default function Balance({
               .filter(Boolean)
               .join(' ')}
           expandable={{
+            // Pin the expand-icon column width so the Pending Queue table can mirror it
+            // exactly and keep its data columns aligned with this table.
+            columnWidth: 48,
             expandedRowKeys: expandedProcessRows,
             onExpandedRowsChange: (keys) => {
               setExpandedProcessRows([...keys])
@@ -2628,6 +2648,7 @@ export default function Balance({
           dataSource={pendingApps.map((a) => ({ ...a, key: a.app_id }))}
           size="small"
           pagination={false}
+          scroll={{ x: 'max-content' }}
           rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
         />
       </Card>
@@ -2716,6 +2737,7 @@ export default function Balance({
         .ant-table-tbody > tr:hover > td {
           background: ${COLORS.rowAlt} !important;
         }
+        .control-center-tabs .ant-tabs-nav::before { border-bottom: none !important; }
       `}</style>
     </div>
   )

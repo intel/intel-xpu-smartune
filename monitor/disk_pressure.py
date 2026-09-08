@@ -336,6 +336,73 @@ class DiskIOMonitor:
             pass
         return result
 
+    @staticmethod
+    def _parent_disk_for_block(block_name: str) -> str:
+        """Resolve a block device name to its parent whole-disk name.
+
+        ``psutil.disk_partitions`` reports partition nodes (e.g. ``nvme0n1p2``),
+        while this monitor tracks whole disks (e.g. ``nvme0n1``). Resolve through
+        sysfs when possible; fall back to the original name on failure.
+        """
+        if not block_name:
+            return block_name
+        sysfs_block = f"/sys/class/block/{block_name}"
+        try:
+            if os.path.exists(f"{sysfs_block}/partition"):
+                return os.path.basename(os.path.realpath(f"{sysfs_block}/.."))
+        except OSError:
+            return block_name
+        return block_name
+
+    def _collect_disk_space_stats(self, disks: List[str]) -> Dict[str, Dict[str, float]]:
+        """Collect per-disk capacity usage from mounted filesystems.
+
+        Returns byte-accurate totals aggregated by parent whole disk:
+        ``{disk: {total_bytes, used_bytes, free_bytes, usage_percent}}``.
+        """
+        tracked = set(disks)
+        if not tracked:
+            return {}
+
+        totals: Dict[str, Dict[str, float]] = {}
+        seen_mounts = set()
+        for part in psutil.disk_partitions(all=False):
+            device = getattr(part, 'device', '') or ''
+            mountpoint = getattr(part, 'mountpoint', '') or ''
+            if not device.startswith('/dev/') or not mountpoint:
+                continue
+
+            mount_key = (device, mountpoint)
+            if mount_key in seen_mounts:
+                continue
+            seen_mounts.add(mount_key)
+
+            block_name = os.path.basename(os.path.realpath(device))
+            disk_name = self._parent_disk_for_block(block_name)
+            if disk_name not in tracked:
+                continue
+
+            try:
+                usage = psutil.disk_usage(mountpoint)
+            except (OSError, PermissionError, ValueError):
+                continue
+
+            row = totals.setdefault(disk_name, {
+                'total_bytes': 0.0,
+                'used_bytes': 0.0,
+                'free_bytes': 0.0,
+            })
+            row['total_bytes'] += float(usage.total)
+            row['used_bytes'] += float(usage.used)
+            row['free_bytes'] += float(usage.free)
+
+        for row in totals.values():
+            total = row.get('total_bytes', 0.0)
+            used = row.get('used_bytes', 0.0)
+            row['usage_percent'] = round((used / total) * 100.0, 2) if total > 0 else None
+
+        return totals
+
     def _disk_profile(self, disk: str) -> Dict[str, Any]:
         """Media class and sigmoid half-points for a disk.
 
@@ -415,9 +482,20 @@ class DiskIOMonitor:
         time_elapsed = curr_time - self.prev_time
 
         merged_result = {}
+        disk_space = self._collect_disk_space_stats(disks)
         for disk in disks:
             curr = curr_io.get(disk)
             prev = prev_io.get(disk)
+            space = disk_space.get(disk, {})
+
+            total_bytes = space.get('total_bytes')
+            used_bytes = space.get('used_bytes')
+            free_bytes = space.get('free_bytes')
+            usage_percent = space.get('usage_percent')
+
+            total_gb = round(total_bytes / (1024 ** 3), 2) if isinstance(total_bytes, (int, float)) and total_bytes > 0 else None
+            used_gb = round(used_bytes / (1024 ** 3), 2) if isinstance(used_bytes, (int, float)) and used_bytes >= 0 else None
+            free_gb = round(free_bytes / (1024 ** 3), 2) if isinstance(free_bytes, (int, float)) and free_bytes >= 0 else None
             if not curr or not prev or time_elapsed <= 0:
                 merged_result[disk] = {
                     'utilization': 0.0,
@@ -427,6 +505,10 @@ class DiskIOMonitor:
                     'write_iops': 0.0,
                     'await_ms': 0.0,
                     'aqu': 0.0,
+                    'total_size_gb': total_gb,
+                    'used_size_gb': used_gb,
+                    'free_size_gb': free_gb,
+                    'usage_percent': usage_percent,
                 }
                 continue
 
@@ -473,6 +555,10 @@ class DiskIOMonitor:
                 'write_iops': round(write_iops, 2),
                 'await_ms': round(await_ms, 3),
                 'aqu': round(aqu, 3),
+                'total_size_gb': total_gb,
+                'used_size_gb': used_gb,
+                'free_size_gb': free_gb,
+                'usage_percent': usage_percent,
             }
 
         self.prev_io = curr_io

@@ -668,7 +668,13 @@ function buildDiskTrendPoints(items: HistorySnapshotItem[]): { points: DiskTrend
     const point: DiskTrendPoint = { timestamp: label, ts }
 
     const disk = dynamic?.disk as (DynamicInfoData['disk'] & {
-      per_disk?: Record<string, { util?: number | null; read_mb?: number | null; write_mb?: number | null; max_throughput_mb?: number | null } | number | null>
+      per_disk?: Record<string, {
+        util?: number | null
+        read_mb?: number | null
+        write_mb?: number | null
+        max_throughput_mb?: number | null
+        usage_percent?: number | null
+      } | number | null>
     }) | undefined
     const perDisk = disk?.per_disk
     if (perDisk && typeof perDisk === 'object') {
@@ -677,6 +683,7 @@ function buildDiskTrendPoints(items: HistorySnapshotItem[]): { points: DiskTrend
         if (val && typeof val === 'object' && ('util' in val || 'read_mb' in val)) {
           // New format
           point[`${name}:util`] = normalizePercent(val.util)
+          point[`${name}:capUsedPct`] = normalizePercent(val.usage_percent)
           point[`${name}:read`] = toNumber(val.read_mb)
           point[`${name}:write`] = toNumber(val.write_mb)
           const tp = toNumber(val.max_throughput_mb)
@@ -684,6 +691,7 @@ function buildDiskTrendPoints(items: HistorySnapshotItem[]): { points: DiskTrend
         } else {
           // Old format: single utilization number
           point[`${name}:util`] = typeof val === 'number' ? normalizePercent(val) : null
+          point[`${name}:capUsedPct`] = null
           point[`${name}:read`] = null
           point[`${name}:write`] = null
         }
@@ -692,6 +700,7 @@ function buildDiskTrendPoints(items: HistorySnapshotItem[]): { points: DiskTrend
       for (const [name, diskData] of Object.entries(disk.disk_io)) {
         diskNameSet.add(name)
         point[`${name}:util`] = normalizePercent(diskData?.utilization)
+        point[`${name}:capUsedPct`] = normalizePercent(diskData?.usage_percent)
         point[`${name}:read`] = toNumber(diskData?.read_kb_per_sec != null ? diskData.read_kb_per_sec / 1024 : null)
         point[`${name}:write`] = toNumber(diskData?.write_kb_per_sec != null ? diskData.write_kb_per_sec / 1024 : null)
       }
@@ -2560,7 +2569,8 @@ export default function HistoryDashboard({ active }: Props) {
       {/* Disk — Utilization & Bandwidth per device */}
       {visibleSections.includes('disk') && !loading && diskNames.length > 0 && diskNames.map((diskName) => {
         const diskLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string }> = [
-          { key: `${diskName}:util`, name: 'Util %', color: METRIC_COLORS.util, yAxisId: 'util' },
+          { key: `${diskName}:util`, name: 'I/O Util %', color: METRIC_COLORS.util, yAxisId: 'util' },
+          { key: `${diskName}:capUsedPct`, name: 'Capacity Used %', color: '#f59e0b', dasharray: '6 3', yAxisId: 'util' },
           { key: `${diskName}:read`, name: 'Read MB/s', color: METRIC_COLORS.read, yAxisId: 'bw' },
           { key: `${diskName}:write`, name: 'Write MB/s', color: METRIC_COLORS.write, yAxisId: 'bw' },
         ]

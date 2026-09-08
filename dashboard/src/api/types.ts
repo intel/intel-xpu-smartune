@@ -14,6 +14,10 @@ export interface DiskDeviceData {
   write_kb_per_sec: number
   read_iops?: number
   write_iops?: number
+  total_size_gb?: number | null
+  used_size_gb?: number | null
+  free_size_gb?: number | null
+  usage_percent?: number | null
 }
 
 export interface DiskData {

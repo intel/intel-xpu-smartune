@@ -20,6 +20,9 @@ logs/
 
 config/runtime_state.json
 
+# deb packaging build output
+/build/
+
 # Benchmark runtime tree: venv, downloaded models, IR, logs, generated run
 # scripts. Multi-GB and fully reproducible from setup_env.sh.
 benchmark/runtime/

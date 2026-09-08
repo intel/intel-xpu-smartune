@@ -74,6 +74,22 @@ export function clearToken(): void {
   localStorage.removeItem(TOKEN_STORAGE_KEY)
 }
 
+/**
+ * Consume the one-shot token supplied by the desktop launcher in the URL hash.
+ * Removing it immediately prevents credentials from lingering in the address bar
+ * or being accidentally reused after a refresh.
+ */
+export function consumeUrlToken(): string | null {
+  const hash = window.location.hash.startsWith('#')
+    ? window.location.hash.slice(1)
+    : window.location.hash
+  const token = new URLSearchParams(hash).get('token')
+  if (token) {
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
+  }
+  return token || null
+}
+
 // Registered by App so a 401 anywhere can bounce the user back to the login gate.
 let onUnauthorized: (() => void) | null = null
 export function setUnauthorizedHandler(handler: (() => void) | null): void {
@@ -179,6 +195,23 @@ export function benchEventsUrl(withLogs: boolean): string {
   if (withLogs) params.set('logs', '1')
   params.set('client', BENCH_CLIENT_ID)
   return `/api/bench/events?${params.toString()}`
+}
+
+export function sendHeartbeat(sessionId: string): Promise<void> {
+  return post<void>('/smartune/ui/heartbeat', { session_id: sessionId })
+}
+
+export function sendUiRelease(sessionId: string): void {
+  const token = getToken()
+  void fetch('/api/smartune/ui/release', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { [AUTH_HEADER]: token } : {}),
+    },
+    body: JSON.stringify({ session_id: sessionId }),
+    keepalive: true,
+  }).catch(() => {})
 }
 
 async function get<T>(url: string): Promise<T> {

@@ -1,0 +1,14 @@
+Package: smartune-monitor
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Maintainer: Intel Corporation <smartune@intel.com>
+Depends: python3 (>= 3.10), python3-venv, python3-pip, openssl, xdg-utils, policykit-1|polkitd, curl
+Recommends: cpuid, msr-tools
+Description: Intel XPU SmarTune Monitor
+ Telemetry and system-pressure monitoring dashboard for Intel XPU platforms.
+ .
+ Installs a desktop launcher (application menu + desktop icon) that starts the
+ monitor service on demand and opens the dashboard in the default browser at
+ https://localhost:9001. Not started at boot; runs only while in use.

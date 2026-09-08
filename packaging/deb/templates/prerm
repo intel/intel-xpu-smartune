@@ -1,0 +1,20 @@
+#!/bin/bash
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        # Stop the service if it happens to be running (it is never enabled).
+        systemctl stop smartune-monitor.service 2>/dev/null || true
+
+        # Remove the best-effort desktop-icon copies dropped by postinst.
+        for user_home in /home/*; do
+            for desk in "$user_home/Desktop" "$user_home/桌面"; do
+                rm -f "$desk/smartune-monitor.desktop" 2>/dev/null || true
+            done
+        done
+        ;;
+esac
+
+exit 0

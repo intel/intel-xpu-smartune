@@ -1,0 +1,47 @@
+#!/bin/bash
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+set -e
+
+INSTALL_DIR="/opt/intel/smartune"
+DESKTOP_FILE="/usr/share/applications/smartune-monitor.desktop"
+
+case "$1" in
+    configure)
+        # Executables (git archive preserves mode bits, but be explicit).
+        chmod 0755 "$INSTALL_DIR"/*.sh 2>/dev/null || true
+        mkdir -p "$INSTALL_DIR/logs"
+
+        # Build the Python venv from the bundled wheels (offline). Under `set -e`
+        # a failure here aborts postinst, so apt reports the install as failed
+        # rather than shipping a half-configured package that breaks at launch.
+        "$INSTALL_DIR/ensure_venv.sh"
+
+        # Register the systemd unit but DO NOT enable it — launched on demand.
+        systemctl daemon-reload 2>/dev/null || true
+
+        # Best-effort desktop icon on each existing user's Desktop. The reliable
+        # entry is the application-menu one in /usr/share/applications; the
+        # Desktop copy is a convenience and may need a manual "Allow Launching"
+        # on some GNOME versions.
+        for user_home in /home/*; do
+            [ -d "$user_home" ] || continue
+            user="$(basename "$user_home")"
+            for desk in "$user_home/Desktop" "$user_home/桌面"; do
+                [ -d "$desk" ] || continue
+                target="$desk/smartune-monitor.desktop"
+                cp "$DESKTOP_FILE" "$target" 2>/dev/null || continue
+                chown "$user:$user" "$target" 2>/dev/null || true
+                chmod 0755 "$target" 2>/dev/null || true
+                sudo -u "$user" gio set "$target" metadata::trusted true 2>/dev/null || true
+            done
+        done
+
+        update-desktop-database /usr/share/applications 2>/dev/null || true
+        gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+
+        echo "[smartune] Installed. Launch from the application menu or desktop icon 'Intel XPU SmarTune Monitor'."
+        ;;
+esac
+
+exit 0

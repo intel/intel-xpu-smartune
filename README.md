@@ -128,6 +128,22 @@ Each component of the Edge Infrastructure external is licensed under [Apache 2.0
                  sudo rm /etc/systemd/system/smartune.service
                  sudo systemctl daemon-reload
 
+        Option C) Build and install a Debian package (.deb):
+            # Two mutually exclusive packages are produced by the same build script:
+            #   monitor only (smartune-monitor):   packaging/deb/build_deb.sh
+            #   full: balancer + monitor (smartune): packaging/deb/build_deb.sh --full
+            # The full package runs `smartune.py -a` (the ./start_smartune.sh default).
+            #
+            # Pinned pip deps are bundled as offline wheels and installed into a venv at
+            # install time. The full package additionally declares apt dependencies for the
+            # balancer's native tools (python3-bpfcc/bcc, cpupower, iproute2, iptables,
+            # iotop, kmod) — `apt install` pulls them, and a matching linux-headers-* must
+            # be present for runtime eBPF compilation.
+            packaging/deb/build_deb.sh --full          # -> build/smartune_<ver>_amd64.deb
+            sudo apt install ./build/smartune_*.deb     # resolves Depends automatically
+            # See docs/DEB_USER_GUIDE.md for install/launch/uninstall details.
+            # A reproducible in-container build is available via packaging/deb/build_deb_docker.sh [--full].
+
     2. client (React dashboard – Grafana-style 6-tab UI):
         # Node.js 20.19+ is required. The script auto-installs/upgrades it on Ubuntu/Debian
         # if missing or outdated. See dashboard/README.md for full setup instructions.

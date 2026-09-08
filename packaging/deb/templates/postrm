@@ -1,0 +1,48 @@
+#!/bin/bash
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+set -e
+
+INSTALL_DIR="/opt/intel/smartune"
+
+case "$1" in
+    remove)
+        # The venv is a derived install artifact (built from the bundled wheels),
+        # not user data — once the package files are gone it is dead weight, so
+        # remove it on plain `remove`. User state (TLS keys + api_token, logs, the
+        # database) is preserved until `purge` so a reinstall restores it.
+        #
+        # Note this is the APP venv only. benchmark/runtime/ — the benchmark venv,
+        # downloaded models and IR — is also derived, but regenerating it costs
+        # hours and tens of GB of downloads, so it is treated as user state and
+        # kept until `purge`.
+        rm -rf "$INSTALL_DIR/venv" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        update-desktop-database /usr/share/applications 2>/dev/null || true
+        ;;
+    purge)
+        # dpkg has already removed every file it tracks, so whatever is left in
+        # INSTALL_DIR is runtime-generated and untracked: the venv, logs, TLS
+        # keys + token, the database, plus config/runtime_state.json and the
+        # __pycache__ dirs Python scatters throughout. Enumerating those is
+        # fragile (an earlier attempt listed only a few paths, so rmdir kept
+        # failing on the leftover __pycache__/config and the tree survived a
+        # purge). Just remove the whole install dir — it is ours and nothing
+        # tracked remains — so purge truly leaves nothing behind.
+        #
+        # That sweep includes benchmark/runtime/, which can be tens of GB of
+        # downloaded models. Deleting that much without a word would be a nasty
+        # surprise, so say so — and say it before the rm, while it is still true.
+        BENCH_RUNTIME="$INSTALL_DIR/benchmark/runtime"
+        if [ -d "$BENCH_RUNTIME" ]; then
+            echo "[smartune] Purging the benchmark environment and downloaded models" \
+                 "($(du -sh "$BENCH_RUNTIME" 2>/dev/null | cut -f1)) from $BENCH_RUNTIME."
+        fi
+        rm -rf "$INSTALL_DIR" 2>/dev/null || true
+        rmdir /opt/intel 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        update-desktop-database /usr/share/applications 2>/dev/null || true
+        ;;
+esac
+
+exit 0

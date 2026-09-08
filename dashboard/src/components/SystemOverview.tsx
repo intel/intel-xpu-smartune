@@ -211,10 +211,15 @@ function formatPlain(value: unknown): string {
   return `${value}`
 }
 
+// Unified utilization threshold: at or above this a device is considered "busy"
+// and its metric gauge turns red. Applied uniformly across CPU / Memory / GPU /
+// NPU / Network so all devices follow the same rule.
+const BUSY_UTIL_THRESHOLD = 80
+
 function getGpuStatus(available: boolean, throttled: boolean, utilization: number | null): { status: GpuStatus; color: string } {
   if (!available) return { status: 'Offline', color: COLORS.textMuted }
   if (throttled) return { status: 'Throttle', color: COLORS.orange }
-  if (isNumber(utilization) && utilization >= 75) return { status: 'Busy', color: COLORS.red }
+  if (isNumber(utilization) && utilization >= BUSY_UTIL_THRESHOLD) return { status: 'Busy', color: COLORS.red }
   return { status: 'OK', color: COLORS.green }
 }
 
@@ -1565,7 +1570,6 @@ function TrendPanel({
   accent,
   value,
   unit,
-  status,
   statusColor,
   series,
   details,
@@ -1592,7 +1596,6 @@ function TrendPanel({
   accent: string
   value: number | null
   unit?: string
-  status?: string
   statusColor?: string
   series: Array<number | null>
   details: Array<{ label: string; value: string; source?: DataSourceKind; divider?: boolean }>
@@ -1629,21 +1632,6 @@ function TrendPanel({
         <Space size={8}>
           <span className="perf-trend-dot" style={{ background: accent }} />
           <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>{title}</Text>
-        </Space>
-        <Space size={6}>
-          {status && (
-            <Tag
-              style={{
-                color: statusColor || accent,
-                borderColor: statusColor || accent,
-                background: `${statusColor || accent}22`,
-                fontSize: 10,
-                letterSpacing: 1,
-              }}
-            >
-              {status}
-            </Tag>
-          )}
         </Space>
       </div>
       {alert && (
@@ -2219,17 +2207,6 @@ function GpuDeviceCard({
           <Space size={8}>
             <PartitionOutlined style={{ color: PERF_COLORS.gpu }} />
             <Text style={{ color: COLORS.text, fontSize: 14, fontWeight: 600 }}>{device.displayLabel}</Text>
-            <Tag
-              style={{
-                color: device.statusColor,
-                borderColor: device.statusColor,
-                background: `${device.statusColor}22`,
-                fontSize: 10,
-                letterSpacing: 1,
-              }}
-            >
-              {device.status}
-            </Tag>
           </Space>
           <Text style={{ color: COLORS.textMuted, fontSize: 11, display: 'block', marginTop: 4 }}>
             {device.name}
@@ -2873,7 +2850,7 @@ export default function SystemOverview({ active }: Props) {
   const gpuCombinedStatus = useMemo(() => {
     if (!gpuDevices.length) return undefined
     if (gpuHasThrottle) return 'Throttle'
-    if (isNumber(gpuAggregateUtil) && gpuAggregateUtil >= 80) return 'Busy'
+    if (isNumber(gpuAggregateUtil) && gpuAggregateUtil >= BUSY_UTIL_THRESHOLD) return 'Busy'
     return 'OK'
   }, [gpuDevices, gpuHasThrottle, gpuAggregateUtil])
 
@@ -3104,12 +3081,14 @@ export default function SystemOverview({ active }: Props) {
   const npuValue = npuUtilValue
   const cpuTrendValue = cpuUsagePct
   const memoryTrendValue = memoryUsagePct
-  const cpuBusy = isNumber(cpuTrendValue) ? cpuTrendValue >= 80 : false
-  const memoryBusy = isNumber(memoryTrendValue) ? memoryTrendValue >= 80 : false
-  const cpuTrendStatus = isNumber(cpuTrendValue) ? (cpuBusy ? 'Busy' : 'OK') : undefined
-  const memoryTrendStatus = isNumber(memoryTrendValue) ? (memoryBusy ? 'Busy' : 'OK') : undefined
-  const cpuTrendStatusColor = cpuTrendStatus ? (cpuBusy ? COLORS.red : COLORS.green) : COLORS.textMuted
-  const memoryTrendStatusColor = memoryTrendStatus ? (memoryBusy ? COLORS.red : COLORS.green) : COLORS.textMuted
+  const cpuBusy = isNumber(cpuTrendValue) ? cpuTrendValue >= BUSY_UTIL_THRESHOLD : false
+  const memoryBusy = isNumber(memoryTrendValue) ? memoryTrendValue >= BUSY_UTIL_THRESHOLD : false
+  const cpuTrendStatusColor = cpuBusy ? COLORS.red : isNumber(cpuTrendValue) ? COLORS.green : COLORS.textMuted
+  const memoryTrendStatusColor = memoryBusy ? COLORS.red : isNumber(memoryTrendValue) ? COLORS.green : COLORS.textMuted
+  // NPU now follows the same utilization rule as other devices (was availability-only).
+  const npuAvailable = Boolean(dynamicInfo?.npu?.npu_smi?.available)
+  const npuBusy = npuAvailable && isNumber(npuUtilValue) && npuUtilValue >= BUSY_UTIL_THRESHOLD
+  const npuStatusColor = !npuAvailable ? COLORS.textMuted : npuBusy ? COLORS.red : COLORS.green
 
   const coreGroups = useMemo<Array<{ label: string; type: 'P' | 'E' | 'LPE' | 'Core'; indices: number[] }>>(() => {
     const usage = dynamicInfo?.cpu?.per_core_usage || []
@@ -3377,7 +3356,6 @@ export default function SystemOverview({ active }: Props) {
             accent={PERF_COLORS.cpu}
             value={cpuTrendValue}
             unit="%"
-            status={cpuTrendStatus}
             statusColor={cpuTrendStatusColor}
             series={getSeries('util:cpu')}
             subtitle={cpuSnapshotMeta}
@@ -3411,7 +3389,6 @@ export default function SystemOverview({ active }: Props) {
             accent={PERF_COLORS.memory}
             value={memoryTrendValue}
             unit="%"
-            status={memoryTrendStatus}
             statusColor={memoryTrendStatusColor}
             series={getSeries('util:memory')}
             subtitle={memorySnapshotMeta}
@@ -3451,7 +3428,6 @@ export default function SystemOverview({ active }: Props) {
               accent={PERF_COLORS.disk}
               value={normalizePercent(diskData.utilization)}
               unit="%"
-              status={diskData.is_busy ? 'Busy' : 'OK'}
               statusColor={diskData.is_busy ? COLORS.red : COLORS.green}
               series={getSeries(`disk:${diskName}:util`)}
               subtitle={diskSizeLookup[diskName] != null ? `${formatMetric(diskSizeLookup[diskName], 'GB', 1)}` : undefined}
@@ -3478,8 +3454,7 @@ export default function SystemOverview({ active }: Props) {
                 accent={PERF_COLORS.network}
                 value={nic.utilMax}
                 unit="%"
-                status={isNumber(nic.utilMax) ? (nic.utilMax >= 80 ? 'Busy' : 'OK') : undefined}
-                statusColor={isNumber(nic.utilMax) && nic.utilMax >= 80 ? COLORS.red : PERF_COLORS.network}
+                statusColor={isNumber(nic.utilMax) && nic.utilMax >= BUSY_UTIL_THRESHOLD ? COLORS.red : PERF_COLORS.network}
                 series={getSeries(`util:network:${nic.nicName}`)}
                 splitBars={[
                   { key: 'rx-bar', label: 'Receive (RX)', value: nic.rxUtil, color: PERF_COLORS.network, sublabel: `${formatBytesRate(nic.rxRate)}` },
@@ -3538,8 +3513,7 @@ export default function SystemOverview({ active }: Props) {
               accent={PERF_COLORS.network}
               value={networkNicCards.length === 1 ? networkNicCards[0].utilMax : fallbackUtilMax}
               unit="%"
-              status={isNumber(networkUtilMax) ? (networkUtilMax >= 80 ? 'Busy' : 'OK') : undefined}
-              statusColor={isNumber(networkUtilMax) && networkUtilMax >= 80 ? COLORS.red : PERF_COLORS.network}
+              statusColor={isNumber(networkUtilMax) && networkUtilMax >= BUSY_UTIL_THRESHOLD ? COLORS.red : PERF_COLORS.network}
               series={getSeries(networkNicCards.length === 1 ? `util:network:${networkNicCards[0].nicName}` : 'util:network')}
               splitBars={[
                 { key: 'rx-bar', label: 'Receive (RX)', value: networkNicCards.length === 1 ? networkNicCards[0].rxUtil : fallbackRxUtil, color: PERF_COLORS.network, sublabel: formatBytesRate(networkNicCards.length === 1 ? networkNicCards[0].rxRate : fallbackRxRate) },
@@ -3611,8 +3585,7 @@ export default function SystemOverview({ active }: Props) {
             accent={PERF_COLORS.npu}
             value={npuValue}
             unit="%"
-            status={dynamicInfo ? (dynamicInfo.npu?.npu_smi?.available ? 'OK' : 'Offline') : undefined}
-            statusColor={dynamicInfo?.npu?.npu_smi?.available ? COLORS.green : COLORS.textMuted}
+            statusColor={npuStatusColor}
             series={getSeries('npu:util')}
             subtitle={npuSnapshotMeta}
             details={[
@@ -3645,7 +3618,6 @@ export default function SystemOverview({ active }: Props) {
               accent={GPU_UTIL_COLORS[index % GPU_UTIL_COLORS.length]}
               value={device.utilization}
               unit="%"
-              status={device.status !== 'Offline' ? device.status : undefined}
               statusColor={device.statusColor}
               series={getSeries(`gpu:${device.id}:util`)}
               subtitle={(() => {

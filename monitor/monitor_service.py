@@ -33,9 +33,10 @@ from monitor.monitor_api import (
     stop_dynamic_info_collector,
 )
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
-from features import mount_benchmark
+from features import mount_benchmark, mount_dashboard
 from smartune_api import auth_bp, set_benchmark_available, smartune_bp
 from utils.logger import logger
+from utils.ui_lease import get_ui_lease_manager
 
 app = Flask(__name__)
 app.register_blueprint(monitor_bp)
@@ -51,6 +52,9 @@ app.register_blueprint(auth_bp)
 # (the gate is app-wide), but keeps the reading order "auth first, then the routes
 # it protects".
 set_benchmark_available(mount_benchmark(app))
+# Serve the built dashboard (dashboard/dist) and route its /api/* calls to the
+# blueprints above, so the browser sees a full UI at the same https origin.
+mount_dashboard(app)
 _start_snapshot_cleanup_task()
 
 _KEY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "key")
@@ -103,6 +107,17 @@ def _handle_signal(signum, frame):
     raise SystemExit(0)
 
 
+def _request_ui_shutdown():
+    """UI-lease watchdog callback: the last dashboard UI is gone, so exit.
+
+    Runs on the watchdog thread; signal handlers only fire on the main thread,
+    so we raise SIGTERM to ourselves. The existing _handle_signal then performs
+    the same graceful teardown + SystemExit(0) as `systemctl stop`, and exit
+    code 0 means systemd's Restart=on-failure will not bring us back."""
+    logger.info("UI closed; shutting down monitor service.")
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
 def main():
     f = _ClientDisconnectFilter()
     for name in ("werkzeug", ""):
@@ -133,6 +148,12 @@ def main():
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+
+    # Packaged (desktop-launched) deployments set SMARTUNE_UI_LEASE so the
+    # service stops itself once the last dashboard UI is closed. Left unset in
+    # dev runs (python -m monitor.monitor_service), which then run until killed.
+    if os.environ.get("SMARTUNE_UI_LEASE"):
+        get_ui_lease_manager().enable(_request_ui_shutdown)
 
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_context.load_cert_chain(CERT_FILE, KEY_FILE)

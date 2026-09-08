@@ -1,0 +1,33 @@
+Package: smartune
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Maintainer: Intel Corporation <smartune@intel.com>
+Depends: python3 (>= 3.10), python3-venv, python3-pip, python3-bpfcc, openssl, xdg-utils, policykit-1|polkitd, curl, git, iproute2, iptables, iotop, kmod
+Recommends: cpuid, msr-tools, linux-headers-generic, cpupower
+Conflicts: smartune-monitor
+Replaces: smartune-monitor
+Provides: smartune-monitor
+Description: Intel XPU SmarTune (Balancer + Monitor)
+ Full Intel XPU SmarTune product: the system-pressure/telemetry monitoring
+ dashboard together with the balancer (eBPF app interception, cgroup/CPU/memory/
+ IO/network governance) running as one service.
+ .
+ Also includes the model-benchmark toolchain behind the dashboard's Benchmark
+ tab. Only its scripts are packaged; the Python environment, model downloads and
+ conversion outputs are built on first use under
+ /opt/intel/smartune/benchmark/runtime and need internet access and tens of GB of
+ disk (git and curl are pulled in for that). Set benchmark.env_root in
+ config.yaml to place them on another volume, or benchmark.enabled to false to
+ hide the tab entirely.
+ .
+ Installs a desktop launcher (application menu + desktop icon) that starts the
+ combined service on demand and opens the dashboard in the default browser at
+ https://localhost:9001. Not started at boot; runs only while in use.
+ .
+ The balancer needs the BCC/eBPF Python bindings (python3-bpfcc) and matching
+ kernel headers (linux-headers-*) so its eBPF programs compile at runtime, plus
+ iproute2, iptables, iotop and kmod for network/IO control. cpupower is
+ recommended for CPU frequency and governor control but is not required. This
+ package supersedes and conflicts with smartune-monitor.

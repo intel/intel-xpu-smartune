@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Intel XPU SmarTune Monitor
+GenericName=System Monitor
+Comment=Open the Intel XPU SmarTune monitoring dashboard
+Exec=/opt/intel/smartune/start_gui.sh
+Icon=smartune-monitor
+Terminal=false
+Categories=System;Monitor;
+Keywords=intel;xpu;gpu;monitor;smartune;telemetry;
+StartupNotify=true

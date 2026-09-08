@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright (c) 2026 Intel Corporation - SPDX-License-Identifier: Apache-2.0 -->
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Registers a polkit action for the SmarTune privileged helper. When pkexec runs
+  a program, it looks for an action whose org.freedesktop.policykit.exec.path
+  annotation matches that program's path; finding this one means the graphical
+  password prompt shows our <message> below instead of pkexec's generic "run
+  '/usr/bin/bash -c ...' as the super user" (which dumps the raw command line).
+
+  The exec.path MUST match the exact absolute path start_gui.sh passes to pkexec.
+-->
+<policyconfig>
+  <vendor>Intel Corporation</vendor>
+  <vendor_url>https://www.intel.com</vendor_url>
+
+  <action id="com.intel.smartune.launch">
+    <description>Start the Intel XPU SmarTune monitor</description>
+    <description xml:lang="zh_CN">启动 Intel XPU SmarTune 监控</description>
+    <message>Authentication is required to start the Intel XPU SmarTune monitor.</message>
+    <message xml:lang="zh_CN">启动 Intel XPU SmarTune 监控需要进行身份验证。</message>
+    <icon_name>smartune-monitor</icon_name>
+    <defaults>
+      <!-- Require an administrator password. This matches the current behaviour
+           (root is needed to start the service and read the token); only the
+           prompt text changes. To make the desktop icon prompt-free for local
+           logged-in users, change allow_active to "yes" (weaker: any active
+           local user could then start the service without a password). -->
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/opt/intel/smartune/smartune-authhelper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

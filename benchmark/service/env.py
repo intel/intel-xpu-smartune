@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from config.config import b_config
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 from benchmark.service import jobs, privilege
 

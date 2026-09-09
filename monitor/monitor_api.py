@@ -31,7 +31,8 @@ from monitor.network_pressure import (
 from utils import quiet_mode
 from utils.app_utils import get_cgroup_path_by_pid
 from utils.http_utils import RetCode, construct_response
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 from utils.self_ident import is_own_process
 
 monitor_bp = Blueprint('monitor', __name__, url_prefix='/monitor')

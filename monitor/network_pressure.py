@@ -27,7 +27,8 @@ from typing import Any, Dict, Optional
 from config.config import b_config
 from monitor.network import NetworkMonitor
 from utils import quiet_mode
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 # --- pressure snapshot: shared buffer + UI aggregation --------------------------

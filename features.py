@@ -21,7 +21,8 @@ import os
 from flask import send_from_directory
 from werkzeug.exceptions import NotFound
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 # --- dashboard ------------------------------------------------------------
 #
@@ -156,4 +157,69 @@ def mount_benchmark(app) -> bool:
         # The tab works off whatever cache exists (and a manual refresh button);
         # it is not worth failing service startup over.
         logger.exception("Benchmark model prefetch could not be started")
+    return True
+
+
+# --- diagnostics ----------------------------------------------------------
+#
+# The diagnostics module (diagnostics/) provides the /diag/* API: event ledger,
+# alerts, context assembly and the unified log-query façade. Unlike
+# benchmark it depends only on always-present pieces (db, the log store), so it
+# is normally available; the ImportError guard mirrors the benchmark pattern only
+# to degrade gracefully if the package is stripped from a minimal deployment.
+
+_DIAGNOSTICS_ABSENT = {"diagnostics"}
+
+
+def mount_diagnostics(app) -> bool:
+    """Register the /diag blueprint on ``app``. Returns whether it is available.
+
+    The caller passes the result to smartune_api.set_diagnostics_available so
+    /smartune/capabilities reports it to the dashboard (conditional Diagnostics
+    tab). Also ensures the diagnostics SQLite tables exist, so a monitor-only or
+    freshly-provisioned deployment can serve /diag/* immediately.
+    """
+    try:
+        from diagnostics.diag_api import diag_bp
+        from diagnostics import event_store
+    except ImportError as exc:
+        if getattr(exc, "name", None) not in _DIAGNOSTICS_ABSENT:
+            raise
+        logger.info("Diagnostics feature not present in this deployment; /diag not mounted.")
+        return False
+
+    event_store.ensure_tables()
+    app.register_blueprint(diag_bp)
+    try:
+        from diagnostics.control_lifecycle import reconcile_interrupted_lifecycles
+        reconcile_interrupted_lifecycles()
+    except Exception:
+        logger.exception("Diagnostics control lifecycle reconciliation could not be completed")
+    try:
+        from diagnostics.retention import start_cleanup_loop
+        start_cleanup_loop()
+    except Exception:
+        logger.exception("Diagnostics retention cleanup could not be started")
+    # Background detector: turn newly-arrived ERROR/CRITICAL application-log lines
+    # into events. Idempotent + daemon; failure here must not fail the mount.
+    try:
+        from diagnostics.detectors import start_detector_loop
+        start_detector_loop()
+    except Exception:
+        logger.exception("Diagnostics detector loop could not be started")
+    # Background pressure-level monitor: turns the persisted pressure snapshot
+    # series into point-in-time level-change events. Snapshot-driven, so it works
+    # in monitor-only too (the only source of pressure events there).
+    try:
+        from diagnostics.episodes import start_pressure_loop
+        start_pressure_loop()
+    except Exception:
+        logger.exception("Diagnostics episode loop could not be started")
+    # Wire benchmark lifecycle -> events via the JobManager observer (no-op when
+    # benchmark is absent). Kept here so benchmark never imports diagnostics.
+    try:
+        from diagnostics.hooks import register_benchmark_listener
+        register_benchmark_listener()
+    except Exception:
+        logger.exception("Diagnostics benchmark listener could not be registered")
     return True

@@ -23,7 +23,8 @@ import queue
 import threading
 from typing import Dict, Optional
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 from benchmark.service import env, jobs, models
 

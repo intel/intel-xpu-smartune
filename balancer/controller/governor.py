@@ -5,7 +5,8 @@
 # with shell=False (default). No untrusted shell execution or string 
 # concatenation is performed. All inputs are internally validated.
 import subprocess # nosec
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 from config.config import b_config
 
 class GovernorController:

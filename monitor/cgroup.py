@@ -37,7 +37,8 @@ import os
 import time
 from typing import Any, Dict, Iterable, Optional, Tuple
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 CGROUP_MOUNT = "/sys/fs/cgroup"
 

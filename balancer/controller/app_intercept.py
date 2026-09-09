@@ -14,7 +14,8 @@ from bcc import BPF
 from controller.control_manager import ControlManager
 from db.DatabaseModel import AIAppPriority
 from utils import app_utils
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 # Constants matching those defined in the BPF C code

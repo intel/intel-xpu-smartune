@@ -45,7 +45,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 from benchmark.service import env
 

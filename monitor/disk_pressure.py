@@ -33,7 +33,8 @@ from typing import Any, Dict, List
 import psutil
 
 from config.config import b_config
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 # --- Per-disk pressure model constants ---------------------------------------
 # These are DEFAULTS. Every one of them can be overridden live from

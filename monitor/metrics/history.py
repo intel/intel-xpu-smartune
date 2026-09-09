@@ -12,7 +12,8 @@ from typing import Any, Dict, List, Optional
 from db.DatabaseModel import MonitorSnapshot
 from monitor.metrics.utils import safe_read, to_float
 from utils import quiet_mode
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 _DYNAMIC_SNAPSHOT_LOCK = threading.Lock()
 _DYNAMIC_SNAPSHOT_STATE: Dict[str, Any] = {"last_persist_ts": 0.0}

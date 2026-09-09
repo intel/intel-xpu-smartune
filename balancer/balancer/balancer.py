@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
 import os, signal, subprocess, time
 import psutil
@@ -10,7 +11,17 @@ from typing import Any, Dict, Optional, Tuple, Union
 from collections import OrderedDict
 from controller.app_intercept import AppIntercept
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
+try:
+    # record_control_action is the diagnostics control seam; it is internally
+    # best-effort, so the only thing to guard is the import itself (a minimal
+    # deployment may strip the diagnostics package). Fall back to a no-op so
+    # control flow is unchanged.
+    from diagnostics import record_control_action
+except Exception:  # pragma: no cover - diagnostics absent
+    def record_control_action(*_a, **_k):
+        return None
 from utils import app_utils, quiet_mode
 from config.config import b_config
 import threading
@@ -24,6 +35,49 @@ from monitor.disk_pressure import media_for_disk
 
 IO_LIMIT_MBPS_THRESHOLD = 100
 IO_LIMIT_IOPS_THRESHOLD = 1000
+
+
+def _protection_id(source: str, public_app_id: str, effective_app_id: str, limited_at: float) -> str:
+    """Stable ID shared by each resource event in one limit lifecycle."""
+    material = f"{source}:{public_app_id}:{effective_app_id}:{limited_at:.6f}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def _control_resources(parts: dict, resource_parts: dict) -> list:
+    """Map the balancer's channel/part flags onto the neutral resource vocabulary.
+
+    CPU and memory travel together as one control channel here; the ledger names
+    them individually. Keeping this translation on the balancer side stops the
+    internal ``parts``/``resource_parts`` shape from leaking across the
+    diagnostics boundary -- diagnostics only ever sees CPU / MEMORY / DISK_IO.
+    """
+    resources = []
+    if parts.get("cpu_mem_limited"):
+        cpu = bool(resource_parts.get("cpu"))
+        memory = bool(resource_parts.get("memory"))
+        # cpu_mem_limited means the channel is capped. When the split names
+        # neither -- combined policy never records it, and a merge can leave
+        # {cpu:False, memory:False} -- attribute to both rather than drop the
+        # resource, so RECOVERED stays symmetric with APPLIED.
+        if not (cpu or memory):
+            cpu = memory = True
+        if cpu:
+            resources.append("CPU")
+        if memory:
+            resources.append("MEMORY")
+    if parts.get("io_limited"):
+        resources.append("DISK_IO")
+    return resources
+
+
+def _emit_control_events(action: str, parts: dict, *, app_id: str, app_name: str,
+                         protection_id: str, attributes: dict) -> None:
+    """Hand a completed limit action to diagnostics as neutral control facts."""
+    resource_parts = (attributes or {}).get("resource_parts") or {}
+    record_control_action(
+        action, app_id=app_id, app_name=app_name, protection_id=protection_id,
+        resources=_control_resources(parts, resource_parts), facts=attributes,
+    )
 
 
 @dataclass
@@ -75,6 +129,7 @@ class LimitedApp:
     source: str                              # "auto" | "manual"
     limit_rates: dict
     limit_parts: dict
+    resource_parts: dict = field(default_factory=dict)
     state: Optional[str] = None
     priority: str = "undefined"
     is_controlled: bool = False
@@ -87,6 +142,7 @@ class LimitedApp:
     pids: set = field(default_factory=set)
     representative_pid: Optional[int] = None
     limited_at: float = 0.0                   # epoch seconds when the limit was applied
+    protection_id: str = ""                   # stable control-event lifecycle identity
     adopted_from_auto: bool = False           # retain the auto-limit cgroup scope in Manual Control
 
 
@@ -987,6 +1043,11 @@ class DynamicBalancer:
         except Exception as exc:
             logger.error("Failed to push pressure level change: %s", exc)
 
+        # NOTE: durable pressure events are NOT emitted here. They are owned by the
+        # snapshot-driven pressure-level monitor (diagnostics/episodes.py), which
+        # records debounced level-change events and works in monitor-only too.
+        # Emitting here as well would double-count.
+
     def _maybe_trigger_prefetch(self, state: "_MonitorLoopState", pressure: str,
                                 disk_level: str, passive_enabled: bool) -> None:
         """Edge-trigger and sustained-critical recheck for the
@@ -1467,8 +1528,22 @@ class DynamicBalancer:
         logger.info(f"{why}. {restore_type.capitalize()} restore of {channel} "
                     f"limits for app {app_id}.")
 
+        # Snapshot before restore_resources clears the entry's part flags and a
+        # full restore may pop it.
+        recover_attrs = {"app_name": app_name, "limit_parts": dict(entry.limit_parts),
+                         "resource_parts": entry.resource_parts,
+                         "cgroups": entry.cgroups, "pids": entry.pids}
+        recover_app_id = entry.public_app_id or app_id
+        protection_id = entry.protection_id
+
         if not self.restore_resources(app_id, app_name, entry.limit_rates, parts, restore_type):
             logger.warning(f"{restore_type.capitalize()} {channel} restore failed for {app_name}")
+            # A failed full restore leaves the cap in place, so the lifecycle is
+            # not recovered.
+            if restore_type == "full":
+                _emit_control_events(
+                    "FAILED", parts, app_id=recover_app_id, app_name=app_name,
+                    protection_id=protection_id, attributes=recover_attrs)
             self.all_limits.apps.move_to_end(app_id)
             return False
 
@@ -1485,6 +1560,11 @@ class DynamicBalancer:
         # Full restore: restore_resources has cleared this channel's flag on the
         # entry; the app only leaves the registry once neither channel is capped.
         entry.partial_parts[channel] = False
+        # RECOVERED for the channel just lifted, even when the other channel of the
+        # same lifecycle is still capped.
+        _emit_control_events(
+            "RECOVERED", parts, app_id=recover_app_id, app_name=app_name,
+            protection_id=protection_id, attributes=recover_attrs)
         still_limited = (entry.limit_parts.get('cpu_mem_limited')
                          or entry.limit_parts.get('io_limited'))
         if still_limited:
@@ -1570,7 +1650,8 @@ class DynamicBalancer:
     def _upsert_auto_limited(self, app_id, public_id, app_name, limit_rates,
                              resource_limited, io_limited, priority, is_controlled,
                              limit_reason, pressure_level, cgroups,
-                             limit_disks=None, pids=None, representative_pid=None) -> None:
+                             limit_disks=None, pids=None, representative_pid=None,
+                             resource_parts=None) -> None:
         """Record -- or refresh -- the registry entry of an auto-limited app.
 
         Under sustained critical pressure the same app can be limited again, or capped on
@@ -1587,15 +1668,32 @@ class DynamicBalancer:
         """
         now = time.time()
         parts = {'cpu_mem_limited': bool(resource_limited), 'io_limited': bool(io_limited)}
+        resource_parts = dict(resource_parts or {})
         partial_parts = {'sys': False, 'disk_io': False}
         state = None
         limited_at = now
+        protection_id = _protection_id("auto", public_id, app_id, limited_at)
         cgroups = list(dict.fromkeys(cgroups or []))
         limit_disks = list(limit_disks or [])
         pids = set(pids or [])
 
         prev = self.all_limits.apps.get(app_id)
-        if prev is not None and prev.source == "auto":
+        prev_is_auto = prev is not None and prev.source == "auto"
+        prev_lp = prev.limit_parts if prev_is_auto else {}
+        # Channels this apply newly caps, versus any prior auto state: a reused
+        # protection_id can gain a channel later (CPU/memory first, disk-IO after).
+        # Gate on the *_limited flags -- the actual control result -- not on
+        # limit_rates/resource_parts, which carry the whole priority profile and stay
+        # populated even when disk pressure caps IO alone (resource_limited=False).
+        # The cpu/memory split is left to _emit_control_events; here we only decide
+        # whether the channel itself was newly hit.
+        cpu_mem_newly = bool(resource_limited) and not bool(prev_lp.get('cpu_mem_limited'))
+        io_newly = bool(io_limited) and not bool(prev_lp.get('io_limited'))
+        if prev_is_auto:
+            resource_parts = {
+                'cpu': bool(prev.resource_parts.get('cpu')) or bool(resource_parts.get('cpu')),
+                'memory': bool(prev.resource_parts.get('memory')) or bool(resource_parts.get('memory')),
+            }
             parts = {
                 'cpu_mem_limited': bool(prev.limit_parts.get('cpu_mem_limited')) or parts['cpu_mem_limited'],
                 'io_limited': bool(prev.limit_parts.get('io_limited')) or parts['io_limited'],
@@ -1606,6 +1704,7 @@ class DynamicBalancer:
             }
             state = "partially_restored" if any(partial_parts.values()) else None
             limited_at = prev.limited_at or now
+            protection_id = prev.protection_id or _protection_id("auto", public_id, app_id, limited_at)
             limit_reason = prev.limit_reason or limit_reason
             # The disk arm's limit_rates carries no cpu_rate/mem_rate, so overwriting
             # would leave the staged restore of an earlier CPU/memory cap without the
@@ -1622,6 +1721,7 @@ class DynamicBalancer:
             source="auto",
             limit_rates=limit_rates,
             limit_parts=parts,
+            resource_parts=resource_parts,
             state=state,
             priority=priority or "undefined",
             is_controlled=bool(is_controlled),
@@ -1633,7 +1733,23 @@ class DynamicBalancer:
             pids=pids,
             representative_pid=representative_pid,
             limited_at=limited_at,
+            protection_id=protection_id,
         )
+
+        # A re-cap of an already-capped channel yields no newly-hit channel, so
+        # sustained-critical ticks neither flood the ledger nor pay for the process
+        # snapshot inside _emit_control_events. resource_parts (merged) carries the
+        # cpu/memory split for the channel just hit.
+        applied_parts = {'cpu_mem_limited': cpu_mem_newly, 'io_limited': io_newly}
+        if any(applied_parts.values()):
+            _emit_control_events(
+                "APPLIED", applied_parts, app_id=public_id, app_name=app_name,
+                protection_id=protection_id,
+                attributes={"app_name": app_name, "reason": limit_reason,
+                            "pressure_level": pressure_level, "limit_rates": limit_rates,
+                            "parts": parts, "resource_parts": resource_parts,
+                            "cgroups": cgroups, "pids": pids},
+            )
 
     def _apply_combined_critical_limits(
         self,
@@ -1741,6 +1857,10 @@ class DynamicBalancer:
                 cgroups=[app_id] + list(extra_cgroup_ids),
                 pids=target.get('pids'),
                 representative_pid=(target.get('process') or {}).get('pid'),
+                # Combined policy caps CPU and memory together, so both track
+                # resource_limited; recording it keeps the registry entry (and the
+                # RECOVERED ledger) from having to guess the split later.
+                resource_parts={'cpu': resource_limited, 'memory': resource_limited},
             )
 
             if is_controlled:
@@ -2106,6 +2226,13 @@ class DynamicBalancer:
                 limit_disks=limited_disks,
                 pids=target_app.get('pids'),
                 representative_pid=(target_app.get('process') or {}).get('pid'),
+                # Only claim cpu/memory when this apply actually capped that channel:
+                # under disk pressure resource_limited is False even though the
+                # priority limit_rates still carry cpu_rate/mem_rate.
+                resource_parts={
+                    'cpu': resource_limited and bool(limit_rates.get('cpu_rate')),
+                    'memory': resource_limited and bool(limit_rates.get('mem_rate')),
+                },
             )
 
             if is_controlled:
@@ -2495,6 +2622,8 @@ class DynamicBalancer:
         key = cgroups[0]
         app_name, source = entry.app_name, entry.source
         restore_success = True
+        restored_parts = {'cpu_mem_limited': False, 'io_limited': False}
+        failed_parts = {'cpu_mem_limited': False, 'io_limited': False}
         logger.info(f"Restoring resources for {source} limited app: {key}, name: {app_name}")
         try:
             gone = 0
@@ -2511,11 +2640,13 @@ class DynamicBalancer:
                     if not self.control_manager.adjust_resources(cg, "low") and is_primary:
                         logger.error(f"Failed to restore CPU/Memory for {source} limited app {cg}")
                         restore_success = False
+                        failed_parts['cpu_mem_limited'] = True
                 if entry.limit_parts.get('io_limited', False):
                     if not self.io_ctl.restore_disk_io_throttle(
                             cg, disk_filter=entry.limit_disks or None) and is_primary:
                         logger.error(f"Failed to remove IO limits for {source} limited app {cg}")
                         restore_success = False
+                        failed_parts['io_limited'] = True
 
             if gone == len(cgroups):
                 logger.info(f"All cgroups for {source} limited app {key} already gone; limit already cleared")
@@ -2524,6 +2655,34 @@ class DynamicBalancer:
         except Exception as e:
             logger.error(f"Failed to restore resources for app {key}: {str(e)}")
             restore_success = False
+            # An unexpected raise leaves the loop half-done, so the state of the
+            # remaining parts is unknown. Fail safe: mark every limited part
+            # failed rather than let the finally block below infer RECOVERED for
+            # parts we never confirmed -- a false RECOVERED is worse than a
+            # conservative FAILED in the lifecycle ledger.
+            for part, limited in entry.limit_parts.items():
+                if limited:
+                    failed_parts[part] = True
+        finally:
+            for part, limited in entry.limit_parts.items():
+                if limited and not failed_parts.get(part, False):
+                    restored_parts[part] = True
+                elif limited:
+                    failed_parts[part] = True
+            _emit_control_events(
+                "RECOVERED", restored_parts, app_id=entry.public_app_id,
+                app_name=app_name, protection_id=entry.protection_id,
+                attributes={"app_name": app_name, "limit_parts": entry.limit_parts,
+                            "resource_parts": entry.resource_parts,
+                            "cgroups": entry.cgroups, "pids": entry.pids},
+            )
+            _emit_control_events(
+                "FAILED", failed_parts, app_id=entry.public_app_id,
+                app_name=app_name, protection_id=entry.protection_id,
+                attributes={"app_name": app_name, "limit_parts": entry.limit_parts,
+                            "resource_parts": entry.resource_parts,
+                            "cgroups": entry.cgroups, "pids": entry.pids},
+            )
 
         if notify and restore_success:
             # Recompute runtime state instead of forcing "stopped": when one
@@ -2676,6 +2835,25 @@ class DynamicBalancer:
         if not alive:
             return True
 
+        if entry.representative_pid and self._pid_gone_or_dying(entry.representative_pid):
+            if entry.source == "auto" or entry.adopted_from_auto:
+                try:
+                    status = app_utils.check_app_running_status(
+                        entry.public_app_id,
+                        entry.app_name,
+                        "",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Reaper: representative PID for limited app {entry.public_app_id} "
+                        f"is gone, but running-status check failed: {e}")
+                else:
+                    if status == "stopped":
+                        logger.info(
+                            f"Reaper: representative PID {entry.representative_pid} for "
+                            f"limited app {entry.public_app_id} is gone and app is stopped")
+                        return True
+
         return False
 
     def _reap_closed_apps(self) -> None:
@@ -2695,9 +2873,29 @@ class DynamicBalancer:
                 if entry is None:
                     continue
                 if not entry.pids:
+                    try:
+                        status = app_utils.check_app_running_status(
+                            entry.public_app_id,
+                            entry.app_name,
+                            "",
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Reaper: no PID snapshot for limited app {key} "
+                            f"({entry.app_name}); running-status check failed: {e}")
+                        continue
+                    if status == "stopped":
+                        logger.info(
+                            f"Reaper: no PID snapshot for limited app {key} "
+                            f"({entry.app_name}), but app is stopped; restoring")
+                        self.all_limits.apps.pop(key, None)
+                        self.all_limits.manual_limit_baseline.pop(key, None)
+                        self.all_limits.remove_exclusion(key)
+                        closed.append(entry)
+                        continue
                     logger.warning(
                         f"Reaper: no PID snapshot for limited app {key} "
-                        f"({entry.app_name}); skipping close-check")
+                        f"({entry.app_name}); app still appears to be running")
                     continue
                 if self._is_app_closed(entry):
                     self.all_limits.apps.pop(key, None)
@@ -3115,6 +3313,10 @@ class DynamicBalancer:
 
         resource_limited = False
         io_limited = False
+        attempted_parts = {
+            'cpu_mem_limited': (cpu_quota is not None or mem_high is not None) and self.is_running,
+            'io_limited': should_apply_io_limit and bool(io_limits) and self.is_running,
+        }
 
         per_cg_mem = usage.get('per_cgroup_mem', {})
         per_cg_cpu_delta = usage.get('per_cgroup_cpu_delta', {})
@@ -3195,19 +3397,22 @@ class DynamicBalancer:
                 logger.info(f"Removed {app_name} from auto-limited apps (now manually limited)")
 
             if resource_limited or io_limited:
+                limited_at = time.time()
                 self.all_limits.apps[effective_app_id] = LimitedApp(
                     public_app_id=app_id,
                     app_name=app_name,
                     source="manual",
                     limit_rates=limit_rates,
                     limit_parts={'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
+                    resource_parts={'cpu': cpu_quota is not None, 'memory': mem_high is not None},
                     state=None,
                     priority=(priority or "undefined"),
                     # Manual limits always come from the UI acting on a controlled app.
                     is_controlled=True,
                     cgroups=[effective_app_id] + list(extra_effective_ids),
                     pids=selected_scope_pids,
-                    limited_at=time.time(),
+                    limited_at=limited_at,
+                    protection_id=_protection_id("manual", app_id, effective_app_id, limited_at),
                 )
                 app_utils.update_app_status(app_id, "a_limited")
                 app_utils.callback_manager.send_callback_notification({
@@ -3234,8 +3439,35 @@ class DynamicBalancer:
                 self.all_limits.add_exclusion(
                     self.all_limits.apps[effective_app_id], reason="manual_limit")
                 logger.info(f"Recorded resource limits for {app_name}")
+                _emit_control_events(
+                    "APPLIED", self.all_limits.apps[effective_app_id].limit_parts,
+                    app_id=app_id, app_name=app_name,
+                    protection_id=self.all_limits.apps[effective_app_id].protection_id,
+                    attributes={"app_name": app_name, "priority": priority,
+                                "limit_overrides": limit_overrides,
+                                "resource_parts": {'cpu': cpu_quota is not None, 'memory': mem_high is not None},
+                                "cgroups": [effective_app_id] + list(extra_effective_ids),
+                                "pids": selected_scope_pids},
+                )
+                _emit_control_events(
+                    "FAILED",
+                    {part: attempted and not self.all_limits.apps[effective_app_id].limit_parts.get(part)
+                     for part, attempted in attempted_parts.items()},
+                    app_id=app_id, app_name=app_name,
+                    protection_id=self.all_limits.apps[effective_app_id].protection_id,
+                    attributes={"app_name": app_name, "priority": priority,
+                                "resource_parts": {'cpu': cpu_quota is not None, 'memory': mem_high is not None},
+                                "limit_overrides": limit_overrides},
+                )
                 return True
 
+        failed_at = time.time()
+        _emit_control_events(
+            "FAILED", attempted_parts, app_id=app_id, app_name=app_name,
+            protection_id=_protection_id("manual", app_id, effective_app_id, failed_at),
+            attributes={"app_name": app_name, "priority": priority,
+                        "limit_overrides": limit_overrides},
+        )
         logger.warning(f"No resource limits successfully applied for {app_name}")
         return False
 
@@ -3259,6 +3491,8 @@ class DynamicBalancer:
                 effective_app_ids = list(entry.cgroups) or [effective_app_id]
                 app_name = entry.app_name
                 limit_parts = entry.limit_parts
+                protection_id = entry.protection_id
+                resource_parts = entry.resource_parts
                 self.all_limits.apps.pop(effective_app_id, None)
                 # The user gave the app back; drop the "manual_limit" exemption so the
                 # pressure loop may manage it again.
@@ -3268,10 +3502,14 @@ class DynamicBalancer:
                 # matching the previous default when no mapping existed.
                 effective_app_ids = [app_id]
                 app_name, limit_parts = None, {}
+                protection_id = ""
+                resource_parts = {}
 
         effective_app_id = effective_app_ids[0]
         extra_effective_ids = effective_app_ids[1:]
         restore_success = True
+        restored_parts = {'cpu_mem_limited': False, 'io_limited': False}
+        failed_parts = {'cpu_mem_limited': False, 'io_limited': False}
         try:
             logger.info(f"Restoring resources for app: {app_id}, name: {app_name}")
 
@@ -3279,6 +3517,9 @@ class DynamicBalancer:
                 if not self.control_manager.adjust_resources(effective_app_id, "low"):
                     logger.error(f"Failed to restore CPU/Memory for {app_id} ({effective_app_id})")
                     restore_success = False
+                    failed_parts['cpu_mem_limited'] = True
+                else:
+                    restored_parts['cpu_mem_limited'] = True
                 for extra_id in extra_effective_ids:
                     self.control_manager.adjust_resources(extra_id, "low")
 
@@ -3286,6 +3527,9 @@ class DynamicBalancer:
                 if not self.io_ctl.restore_disk_io_throttle(effective_app_id):
                     logger.error(f"Failed to remove IO limits for {app_id} ({effective_app_id})")
                     restore_success = False
+                    failed_parts['io_limited'] = True
+                else:
+                    restored_parts['io_limited'] = True
                 for extra_id in extra_effective_ids:
                     self.io_ctl.restore_disk_io_throttle(extra_id)
 
@@ -3298,6 +3542,18 @@ class DynamicBalancer:
                     'purpose': "app"
                 }, False)
                 logger.info(f"Resources restored for {app_id}")
+            _emit_control_events(
+                "RECOVERED", restored_parts, app_id=app_id, app_name=app_name or app_id,
+                protection_id=protection_id,
+                attributes={"app_name": app_name, "limit_parts": limit_parts,
+                            "resource_parts": resource_parts},
+            )
+            _emit_control_events(
+                "FAILED", failed_parts, app_id=app_id, app_name=app_name or app_id,
+                protection_id=protection_id,
+                attributes={"app_name": app_name, "limit_parts": limit_parts,
+                            "resource_parts": resource_parts},
+            )
 
             return restore_success
         except Exception as e:
@@ -3441,6 +3697,9 @@ class DynamicBalancer:
                         })
                     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                         continue
+                if row.get("representative_pid"):
+                    representative_pid = int(row["representative_pid"])
+                    processes.sort(key=lambda process: process["pid"] != representative_pid)
                 scope_processes[cgroup] = processes
             row["scope_processes"] = scope_processes
 

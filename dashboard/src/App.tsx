@@ -2,6 +2,7 @@ import React, { useState, useCallback, useEffect } from 'react'
 import { Tabs, Layout, Typography, Space, Alert, Button, notification } from 'antd'
 import {
   DashboardOutlined,
+  AlertOutlined,
   AppstoreOutlined,
   NodeIndexOutlined,
   ControlOutlined,
@@ -18,6 +19,7 @@ import Processes from './components/Processes'
 import Balance from './components/Balance'
 import Benchmark from './components/Benchmark'
 import HistoryDashboard from './components/HistoryDashboard'
+import Diagnostics from './components/Diagnostics'
 import About from './components/About'
 import LoginGate from './components/LoginGate'
 import { COLORS } from './styles/theme'
@@ -29,6 +31,11 @@ import { useBenchEvent, useBenchStream } from './hooks/useBenchEvents'
 const { Header, Content } = Layout
 
 const BENCHMARK_TAB = '7'
+
+type HistoryRangeIntent = {
+  from: number
+  to: number
+}
 
 // What a finished benchmark job is called in a notification. The tab's own
 // wording is "environment setup" / "run"; these are the same two things said in
@@ -63,6 +70,7 @@ function GlobalConfigNoticeBar() {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('1')
+  const [historyRangeIntent, setHistoryRangeIntent] = useState<HistoryRangeIntent | null>(null)
   // 1 = balancer + monitor, 0 = monitor only. Default to enabled so older
   // servers without the /smartune/capabilities endpoint keep full behaviour.
   const [balancerEnabled, setBalancerEnabled] = useState(true)
@@ -70,6 +78,7 @@ export default function App() {
   // balancer above): an older server that omits the field has no /bench routes,
   // so showing the tab would give a page that 404s on every request.
   const [benchmarkEnabled, setBenchmarkEnabled] = useState(false)
+  const [diagnosticsEnabled, setDiagnosticsEnabled] = useState(false)
   // Set from the Processes tab's "Add to balancer" action; consumed by the Balance tab.
   const [registerKeyword, setRegisterKeyword] = useState<string | null>(null)
   // Gate the whole app behind a valid access token. A stored token is assumed
@@ -112,8 +121,12 @@ export default function App() {
         setBalancerEnabled(c.capabilities === 1)
         // Absent on older servers, which never served /bench at all.
         setBenchmarkEnabled(c.benchmark === 1)
+        setDiagnosticsEnabled(c.diagnostics === 1)
       })
-      .catch(() => setBalancerEnabled(true))
+      .catch(() => {
+        setBalancerEnabled(true)
+        setDiagnosticsEnabled(false)
+      })
   }, [authed])
 
   // Hold an open-UI lease while logged in so the packaged monitor can stop
@@ -242,6 +255,28 @@ export default function App() {
         />
       ),
     },
+    ...(diagnosticsEnabled
+      ? [
+          {
+            key: 'diagnostics',
+            label: (
+              <Space>
+                <AlertOutlined />
+                Diagnostics
+              </Space>
+            ),
+            children: (
+              <Diagnostics
+                active={activeTab === 'diagnostics'}
+                onOpenHistory={(range) => {
+                  setHistoryRangeIntent(range)
+                  setActiveTab('4')
+                }}
+              />
+            ),
+          },
+        ]
+      : []),
     {
       key: '4',
       label: (
@@ -250,7 +285,13 @@ export default function App() {
           History
         </Space>
       ),
-      children: <HistoryDashboard active={activeTab === '4'} />,
+      children: (
+        <HistoryDashboard
+          active={activeTab === '4'}
+          historyRangeIntent={historyRangeIntent}
+          onHistoryRangeIntentConsumed={() => setHistoryRangeIntent(null)}
+        />
+      ),
     },
     // Balancer tab is only shown when the server supports balancing; in
     // monitor-only mode it is omitted entirely rather than shown as disabled.

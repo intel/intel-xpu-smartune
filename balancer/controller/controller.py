@@ -8,7 +8,8 @@ import time
 from subprocess import check_output # nosec
 from typing import Optional
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 from utils import app_utils
 from config.config import b_config
 

@@ -65,7 +65,8 @@ from monitor.network_pressure import (
     _compute_fused_network_pressure,
     _build_network_interface_pressure,
 )
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 _STATIC_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
 _STATIC_CACHE_LOCK = threading.Lock()

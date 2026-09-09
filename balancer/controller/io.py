@@ -6,7 +6,8 @@ import re
 import subprocess
 from typing import Optional, List, Dict, Union
 from config.config import b_config
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 from utils.app_utils import write_cgroup_file
 
 # A cgroup/unit name as it appears on disk: scope/service/slice names, digits,

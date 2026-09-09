@@ -33,7 +33,8 @@ from typing import Any, Dict, List, Optional
 from monitor.metrics import cpu as cpu_metrics
 from monitor.metrics import gpu_perf, membw, npu as npu_metrics
 from utils import quiet_mode
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 from benchmark.service import privilege
 

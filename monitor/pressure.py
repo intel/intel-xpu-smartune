@@ -3,7 +3,8 @@
 
 import math
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 class PressureAnalyzer:
     # Fraction of a limited app's self-inflicted CPU/IO stall to actually remove from the

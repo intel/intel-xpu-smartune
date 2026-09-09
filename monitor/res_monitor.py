@@ -20,7 +20,8 @@ from utils.app_utils import (
     get_cgroup_path_by_pid,
     get_pids_in_cgroup,
 )
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 from monitor import PSIMonitor
 from monitor.app_discovery import is_noise_process

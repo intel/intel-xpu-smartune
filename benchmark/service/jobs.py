@@ -29,7 +29,8 @@ from collections import deque
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 from benchmark.service import privilege
 

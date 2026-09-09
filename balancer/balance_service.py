@@ -25,12 +25,18 @@ from monitor.monitor_api import (
     stop_dynamic_info_collector,
 )
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
-from features import mount_benchmark, mount_dashboard
-from smartune_api import auth_bp, smartune_bp, set_balancer_available, set_benchmark_available
+from features import mount_benchmark, mount_dashboard, mount_diagnostics
+from smartune_api import auth_bp, smartune_bp, set_balancer_available, set_benchmark_available, set_diagnostics_available
 from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, fetch_unregistered_apps, get_priority_value, get_app_processes_for_app, get_cgroup_path_by_pid, reconcile_controlled_apps, restore_config_entry, serialize_config_meta
 from utils import quiet_mode
 from utils.http_utils import RetCode, construct_response
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
+try:
+    from diagnostics import emit_event  # best-effort seam; no-op if stripped
+except Exception:  # pragma: no cover
+    def emit_event(*_a, **_k):
+        return None
 
 app = Flask(__name__)
 app.register_blueprint(monitor_bp)
@@ -39,11 +45,14 @@ app.register_blueprint(auth_bp)
 # Optional: skipped when the feature is disabled in config.yaml or benchmark/ is
 # absent from the deployment. See monitor_service.py for the same registration.
 benchmark_available = mount_benchmark(app)
+# Diagnostics /diag/* API (event ledger, alerts, incident/context, log query).
+diagnostics_available = mount_diagnostics(app)
 # Keep the full balancer deployment consistent with monitor-only: serve the
 # dashboard from this same Flask process and route its /api calls to the API.
 mount_dashboard(app)
 set_balancer_available(True)
 set_benchmark_available(benchmark_available)
+set_diagnostics_available(diagnostics_available)
 _start_snapshot_cleanup_task()
 
 _KEY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "key")
@@ -174,6 +183,9 @@ def start_service():
             signal.signal(signal.SIGINT, _handle_signal)
             signal.signal(signal.SIGTERM, _handle_signal)
             _service.start()
+            emit_event("PLATFORM_SERVICE_STARTED", severity="info", category="platform.availability",
+                       source="balancer", summary="Balancer service started",
+                       attributes={"mode": os.environ.get("SMARTUNE_MODE", "all")})
         else:
             logger.debug("DynamicService already initialized, skipping")
     return _service
@@ -194,6 +206,8 @@ def _shutdown_service_once():
             return
         _shutdown_started = True
 
+    emit_event("PLATFORM_SERVICE_STOPPING", severity="info", category="platform.availability",
+               source="balancer", summary="Balancer service stopping")
     try:
         if _service:
             _service.shutdown()
@@ -1977,7 +1991,12 @@ def main():
     logging.getLogger("werkzeug").propagate = False
 
     try:
-        app.run(host=host, port=port, debug=False, use_reloader=False, ssl_context=ssl_context)
+        # threaded=True: the dev server otherwise handles ONE request at a time,
+        # so a blocking /diag/* query (log-file scan, journalctl subprocess) stalls
+        # the dashboard's continuous /monitor polling. Concurrent handling keeps the
+        # UI responsive when the Diagnostics page fires its request batch.
+        app.run(host=host, port=port, debug=False, use_reloader=False,
+                threaded=True, ssl_context=ssl_context)
     except KeyboardInterrupt:
         pass
     finally:

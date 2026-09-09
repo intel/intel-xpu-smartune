@@ -24,8 +24,15 @@ Restart=on-failure
 RestartSec=5
 KillSignal=SIGINT
 TimeoutStopSec=20
-StandardOutput=append:/opt/intel/smartune/logs/smartune-monitor.log
-StandardError=inherit
+# Single landing: SmartTune writes every application record into its own rotated,
+# structured store (logs/multi_tasks_*.log), which the diagnostics `smartune`
+# source reads back -- no second file, not journald. systemd only captures the
+# console stream as a safety net for early crashes that happen before the logger
+# is configured (i.e. "the process never came up"). This mirrors smartune.service;
+# the previous append:.../smartune-monitor.log sink is dropped so packaged
+# installs do not keep a second, unread log store.
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

@@ -10,7 +10,8 @@ import re
 import subprocess # nosec
 import threading
 import time
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 from config.config import b_config
 from monitor import NetworkMonitor
 from monitor.network_pressure import publish_network_pressure_snapshot

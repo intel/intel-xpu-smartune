@@ -14,7 +14,8 @@ from flask import Blueprint, Response, request, stream_with_context
 
 from utils import quiet_mode
 from utils.http_utils import RetCode, construct_response
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 from benchmark.service import env, events, jobs, models, results, runner
 

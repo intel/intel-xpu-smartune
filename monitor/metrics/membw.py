@@ -36,7 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 # x86_64. This module is Intel-uncore-specific anyway, so there is no other arch
 # to care about.

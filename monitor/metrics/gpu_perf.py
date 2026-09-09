@@ -17,7 +17,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 #  Engine name mapping: gpu_monitor display names -> short keys (rcs/bcs/…)

@@ -9,6 +9,7 @@ from peewee import (
     BooleanField,
     CharField,
     DateTimeField,
+    FloatField,
     IntegerField,
     IntegrityError,
     Model,
@@ -21,7 +22,8 @@ import time
 from datetime import datetime
 from enum import Enum
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 class DBStatus(Enum):
     SUCCESS = "SUCCESS"
@@ -270,12 +272,349 @@ class MonitorSnapshot(DataBaseModel):
                 return 0
 
 
+class OperationalEvent(DataBaseModel):
+    """Structured operational-event ledger (diagnostics plan §3).
+
+    The single high-value event account: pressure transitions, control actions,
+    benchmark lifecycle, detected exceptions. Raw application/system logs are NOT
+    stored here -- they stay in their own sources and are joined by
+    a time window. ``create_time`` (inherited, epoch seconds at
+    insert) backs the cheap time-window range query; ``ts_utc`` keeps the precise
+    timezone-aware origin timestamp for display.
+    """
+
+    event_id = CharField(max_length=32, primary_key=True)
+    ts_utc = CharField(max_length=40, null=False, help_text="timezone-aware ISO 8601", index=True)
+    severity = CharField(max_length=16, null=False, help_text="info/warning/error/critical", index=True)
+    category = CharField(max_length=32, null=False, help_text="service/pressure/control/benchmark/kernel", index=True)
+    # event_type IS the normalized reason_code: <DOMAIN>_<SUBJECT>_<STATE>, per the
+    # §A.1.4 registry (e.g. CONTROL_CPU_LIMIT_APPLIED / RESOURCE_MEMORY_OOM_KILL).
+    event_type = CharField(max_length=64, null=False, help_text="normalized reason_code <DOMAIN>_<SUBJECT>_<STATE>", index=True)
+    summary = TextField(null=False)
+    source = CharField(max_length=32, null=True, help_text="producer: balancer/monitor/benchmark/detector", index=True)
+    service = CharField(max_length=32, null=True, index=True)
+    app_id = CharField(max_length=64, null=True, index=True)
+    job_id = CharField(max_length=64, null=True, index=True)
+    # Read-model columns (diagnostics plan §3 / §8.1.1). impact = verified outcome;
+    # resource_type/protection_id drive the "Active resource protections" read model;
+    # episode_id pairs a Health Episode's OPEN with its RESOLVED (§8.1.2).
+    impact = CharField(max_length=16, null=True, help_text="none/degraded/failed/unavailable", index=True)
+    resource_type = CharField(max_length=24, null=True, help_text="cpu_mem/disk_io/network/memory/system", index=True)
+    protection_id = CharField(max_length=96, null=True, index=True)
+    episode_id = CharField(max_length=32, null=True, index=True)
+    attributes_json = TextField(null=True, help_text="structured extra fields (JSON)")
+    acknowledged_at = CharField(max_length=40, null=True)
+
+    @classmethod
+    def insert_event(cls, *, event_id, ts_utc, severity, category, event_type,
+                     summary, source=None, service=None, app_id=None, job_id=None,
+                     impact=None, resource_type=None,
+                     protection_id=None, episode_id=None, attributes=None):
+        with db_lock:
+            timestamp = int(time.time())
+            now = datetime.now()
+            attrs = json.dumps(attributes, ensure_ascii=False, default=str) if attributes else None
+            try:
+                with db.atomic():
+                    cls.create(
+                        event_id=event_id, ts_utc=ts_utc, severity=severity,
+                        category=category, event_type=event_type, summary=summary,
+                        source=source, service=service, app_id=app_id, job_id=job_id,
+                        impact=impact,
+                        resource_type=resource_type, protection_id=protection_id,
+                        episode_id=episode_id, attributes_json=attrs,
+                        create_time=timestamp, create_date=now,
+                        update_time=timestamp, update_date=now,
+                    )
+                    _bump_write_epoch(cls)
+                    return DBStatus.SUCCESS
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error inserting operational event: {e}")
+                return DBStatus.FAILED
+
+    @classmethod
+    def query_events(cls, *, event_id=None, severity=None, category=None, source=None,
+                     event_type=None, app_id=None, job_id=None,
+                     impact=None, resource_type=None, protection_id=None, episode_id=None,
+                     keyword=None, start_time=None, end_time=None,
+                     limit=200, offset=0):
+        """Filtered, newest-first event query. ``start_time``/``end_time`` are
+        epoch seconds matched against the inherited ``create_time``."""
+        with db_lock:
+            try:
+                with db.atomic():
+                    query = cls.select()
+                    for field, value in (
+                        (cls.event_id, event_id),
+                        (cls.severity, severity), (cls.category, category),
+                        (cls.source, source), (cls.event_type, event_type),
+                        (cls.app_id, app_id), (cls.job_id, job_id),
+                        (cls.impact, impact),
+                        (cls.resource_type, resource_type),
+                        (cls.protection_id, protection_id), (cls.episode_id, episode_id),
+                    ):
+                        if value:
+                            query = query.where(field == value)
+                    if keyword:
+                        query = query.where(
+                            cls.summary.contains(keyword) | cls.event_type.contains(keyword))
+                    if isinstance(start_time, int):
+                        query = query.where(cls.create_time >= start_time)
+                    if isinstance(end_time, int):
+                        query = query.where(cls.create_time <= end_time)
+                    query = query.order_by(cls.create_time.desc())
+                    query = query.limit(max(1, limit)).offset(max(0, offset))
+                    return list(query)
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error querying operational events: {e}")
+                return []
+
+    @classmethod
+    def delete_older_than(cls, days: int) -> int:
+        """Delete operational events outside the retention window, but keep the
+        full history of any control protection that is still unresolved.
+
+        A one-shot event (``protection_id`` NULL: OOM kill, log error, panic)
+        expires normally. A control lifecycle must not: control_lifecycle.summarize()
+        and reboot reconciliation rebuild a *live* protection from its original
+        ``*_APPLIED`` event, so pruning that event -- even when it predates the
+        window -- would erase a still-active resource limit from the dashboard and
+        make the reboot check unable to classify it. Protections retained here are
+        deleted whole on a later pass once they resolve and age out together."""
+        cutoff = int(time.time()) - max(1, int(days)) * 86400
+        with db_lock:
+            try:
+                with db.atomic():
+                    retain = cls._protection_ids_to_retain(cutoff)
+                    query = cls.delete().where(cls.create_time < cutoff)
+                    if retain:
+                        query = query.where(
+                            cls.protection_id.is_null(True)
+                            | cls.protection_id.not_in(list(retain)))
+                    return query.execute()
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error deleting old operational events: {e}")
+                return 0
+
+    @classmethod
+    def _scan_control_lifecycles(cls) -> dict:
+        """One pass over control events -> per-protection tallies
+        ``{applied, closed, rebooted, latest}``, shared by retention and the
+        active-protection read model. Lock-free: callers that need isolation hold
+        ``db_lock`` (``delete_older_than`` does)."""
+        stats = {}
+        rows = cls.select(cls.protection_id, cls.event_type, cls.create_time).where(
+            cls.protection_id.is_null(False) & (cls.category == "platform.control"))
+        for row in rows:
+            state = stats.get(row.protection_id)
+            if state is None:
+                state = stats[row.protection_id] = {
+                    "applied": 0, "closed": 0, "rebooted": False, "latest": 0}
+            event_type = row.event_type or ""
+            if event_type.endswith("_APPLIED"):
+                state["applied"] += 1
+            elif event_type.endswith(("_RECOVERED", "_FAILED")):
+                state["closed"] += 1
+            elif event_type == "CONTROL_LIFECYCLE_CLEARED_BY_REBOOT":
+                state["rebooted"] = True
+            state["latest"] = max(state["latest"], row.create_time or 0)
+        return stats
+
+    @staticmethod
+    def _is_unresolved(state) -> bool:
+        """A protection with an APPLIED that has no matching terminal
+        ``*_RECOVERED``/``*_FAILED`` and was not cleared by a reboot -- the
+        balancer emits one terminal per resource, so the counts pair up -- i.e. a
+        resource limit that is still live."""
+        return not state["rebooted"] and state["applied"] > state["closed"]
+
+    @classmethod
+    def _protection_ids_to_retain(cls, cutoff: int) -> set:
+        """Control ``protection_id``s whose events must survive a pruning pass:
+        unresolved (still live), or having at least one event newer than ``cutoff``
+        (deleting its older events would leave a partial lifecycle -- a phantom
+        RECOVERED without its APPLIED)."""
+        stats = cls._scan_control_lifecycles()
+        return {
+            pid for pid, state in stats.items()
+            if cls._is_unresolved(state) or state["latest"] >= cutoff
+        }
+
+    @classmethod
+    def unresolved_protection_ids(cls) -> set:
+        """protection_ids of still-active resource limits, regardless of age or
+        event volume. Lets the lifecycle read model surface a live protection even
+        when its APPLIED event predates a bounded newest-N event query."""
+        with db_lock:
+            try:
+                with db.atomic():
+                    return {pid for pid, state in cls._scan_control_lifecycles().items()
+                            if cls._is_unresolved(state)}
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error scanning control lifecycles: {e}")
+                return set()
+
+    @classmethod
+    def events_for_protections(cls, protection_ids, app_id=None):
+        """All events for the given protection_ids, newest-first. Bounded by the
+        number of protections asked for, not by the total ledger size."""
+        ids = [pid for pid in (protection_ids or []) if pid]
+        if not ids:
+            return []
+        with db_lock:
+            try:
+                with db.atomic():
+                    query = cls.select().where(cls.protection_id.in_(ids))
+                    if app_id:
+                        query = query.where(cls.app_id == app_id)
+                    return list(query.order_by(cls.create_time.desc()))
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error querying protection events: {e}")
+                return []
+
+
+class AlertState(DataBaseModel):
+    """Derived alert state -- an alert is a ``severity>=warning`` event plus
+    dedup/cooldown/ack, never a second log (diagnostics plan §3). Always points
+    back to the event that produced it via ``last_event_id``."""
+
+    dedup_key = CharField(max_length=128, primary_key=True)
+    first_fired_at = CharField(max_length=40, null=False)
+    last_fired_at = CharField(max_length=40, null=False)
+    fire_count = IntegerField(default=0)
+    last_event_id = CharField(max_length=32, null=True)
+    acknowledged_at = CharField(max_length=40, null=True)
+    severity = CharField(max_length=16, null=True, index=True)
+    event_type = CharField(max_length=64, null=True, index=True)
+    summary = TextField(null=True)
+
+    @classmethod
+    def record_fire(cls, *, dedup_key, ts_utc, event_id, severity=None,
+                    event_type=None, summary=None,
+                    cooldown_seconds=300):
+        """Register that ``dedup_key`` fired at ``ts_utc``. Returns
+        ``(should_notify, fire_count)``. Within ``cooldown_seconds`` of the last
+        fire the count is aggregated and ``should_notify`` is False (suppress the
+        duplicate); a first fire or one past the cooldown returns True. The whole
+        get-then-update runs under one lock/transaction to avoid races."""
+        with db_lock:
+            now = int(time.time())
+            dt = datetime.now()
+            try:
+                with db.atomic():
+                    row = cls.get_or_none(cls.dedup_key == dedup_key)
+                    if row is None:
+                        cls.create(
+                            dedup_key=dedup_key, first_fired_at=ts_utc,
+                            last_fired_at=ts_utc, fire_count=1, last_event_id=event_id,
+                            severity=severity,
+                            event_type=event_type, summary=summary,
+                            create_time=now, create_date=dt,
+                            update_time=now, update_date=dt,
+                        )
+                        _bump_write_epoch(cls)
+                        return True, 1
+                    should_notify = (now - int(row.update_time or 0)) >= max(0, cooldown_seconds)
+                    count = int(row.fire_count or 0) + 1
+                    (cls.update(
+                        last_fired_at=ts_utc, fire_count=count, last_event_id=event_id,
+                        severity=severity, event_type=event_type, summary=summary,
+                        update_time=now, update_date=dt,
+                    ).where(cls.dedup_key == dedup_key).execute())
+                    _bump_write_epoch(cls)
+                    return should_notify, count
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error recording alert fire: {e}")
+                return False, 0
+
+    @classmethod
+    def query_alerts(cls, *, unacknowledged_only=False, limit=200):
+        with db_lock:
+            try:
+                with db.atomic():
+                    query = cls.select()
+                    if unacknowledged_only:
+                        query = query.where(cls.acknowledged_at.is_null(True))
+                    query = query.order_by(cls.last_fired_at.desc()).limit(max(1, limit))
+                    return list(query)
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error querying alerts: {e}")
+                return []
+
+    @classmethod
+    def delete_acknowledged_older_than(cls, days: int) -> int:
+        """Delete acknowledged alert state outside the diagnostics retention window."""
+        cutoff = int(time.time()) - max(1, int(days)) * 86400
+        with db_lock:
+            try:
+                with db.atomic():
+                    return (cls.delete()
+                            .where((cls.acknowledged_at.is_null(False)) & (cls.update_time < cutoff))
+                            .execute())
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error deleting old acknowledged alerts: {e}")
+                return 0
+
+
+class DetectorCursor(DataBaseModel):
+    """Persistent scan position for a diagnostics event source."""
+
+    source = CharField(max_length=64, primary_key=True)
+    cursor_epoch = FloatField(default=0.0)
+
+    @classmethod
+    def get_cursor(cls, source: str) -> float:
+        with db_lock:
+            try:
+                with db.atomic():
+                    record = cls.get_or_none(cls.source == source)
+                    return float(record.cursor_epoch) if record is not None else 0.0
+            except (IntegrityError, OperationalError, TypeError, ValueError) as e:
+                logger.error(f"Error reading detector cursor: {e}")
+                return 0.0
+
+    @classmethod
+    def save_cursor(cls, source: str, cursor_epoch: float) -> bool:
+        try:
+            cursor_epoch = float(cursor_epoch)
+        except (TypeError, ValueError):
+            return False
+
+        with db_lock:
+            timestamp = int(time.time())
+            now = datetime.now()
+            try:
+                with db.atomic():
+                    record = cls.get_or_none(cls.source == source)
+                    if record is None:
+                        cls.create(
+                            source=source, cursor_epoch=cursor_epoch,
+                            create_time=timestamp, create_date=now,
+                            update_time=timestamp, update_date=now,
+                        )
+                    else:
+                        (cls.update(
+                            cursor_epoch=cursor_epoch,
+                            update_time=timestamp,
+                            update_date=now,
+                        ).where(cls.source == source).execute())
+                    _bump_write_epoch(cls)
+                    return True
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error saving detector cursor: {e}")
+                return False
+
+
 def _apply_migrations():
     """Apply incremental schema migrations for existing databases."""
     migrations = [
         "ALTER TABLE aiapppriority ADD COLUMN limit_overrides_json TEXT",
         "ALTER TABLE aiapppriority ADD COLUMN network_priority VARCHAR(32)",
         "ALTER TABLE aiapppriority ADD COLUMN config_meta_json TEXT",
+        "ALTER TABLE operationalevent ADD COLUMN impact VARCHAR(16)",
+        "ALTER TABLE operationalevent ADD COLUMN resource_type VARCHAR(24)",
+        "ALTER TABLE operationalevent ADD COLUMN protection_id VARCHAR(96)",
+        "ALTER TABLE operationalevent ADD COLUMN episode_id VARCHAR(32)",
     ]
     for sql in migrations:
         try:
@@ -284,12 +623,29 @@ def _apply_migrations():
             if "duplicate column" not in str(e).lower():
                 logger.warning(f"Migration warning ({sql!r}): {e}")
 
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS operationalevent_impact ON operationalevent (impact)",
+        "CREATE INDEX IF NOT EXISTS operationalevent_resource_type ON operationalevent (resource_type)",
+        "CREATE INDEX IF NOT EXISTS operationalevent_protection_id ON operationalevent (protection_id)",
+        "CREATE INDEX IF NOT EXISTS operationalevent_episode_id ON operationalevent (episode_id)",
+    ]
+    for sql in indexes:
+        try:
+            db.execute_sql(sql)
+        except OperationalError as e:
+            logger.warning(f"Migration warning ({sql!r}): {e}")
+
 
 def init_database():
-    db.create_tables([AIAppPriority, MonitorSnapshot])  # Add other tables as needed
-    _apply_migrations()
+    db.create_tables([AIAppPriority, MonitorSnapshot, AlertState, DetectorCursor])
+    # Peewee creates indexes while processing create_tables(). Upgrade an
+    # existing event table before that step so indexes never target a column
+    # that is absent from a legacy schema.
+    if "operationalevent" in db.get_tables():
+        _apply_migrations()
+    OperationalEvent.create_table(safe=True)
 
 
 if __name__ == "__main__":
     db.connect()
-    db.create_tables([AIAppPriority, MonitorSnapshot])
+    init_database()

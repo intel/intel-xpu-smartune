@@ -1644,8 +1644,6 @@ export default function Balance({
           : selectedCgroups.length > 0
         const isCritical = (record.priority ?? '').toLowerCase() === 'critical'
         const isLimited = record.control_status === 'MANUAL_LIMITED'
-          || record.status === APP_STATUS.LIMITED
-          || record.status === APP_STATUS.A_LIMITED
 
         return (
           <Space size={4} wrap={false}>
@@ -2230,20 +2228,8 @@ export default function Balance({
       && !controlledAppIds.has(app.app_id)
       && !controlledAppIds.has(app.effective_app_id),
   )
-  const autoRowFor = (a: AutoLimitedApp): ControlRow => ({
-    app_id: a.app_id,
-    app_name: a.app_name,
-    cpu_usage: 0,
-    memory_mb: 0,
-    io_read_rate: 0,
-    priority: a.priority,
-    status: APP_STATUS.A_LIMITED,
-    controlled: false,
-    control_status: 'AUTO_LIMITED',
-    effective: a.effective,
-    auto_detail: a.auto_detail,
-    limited_scopes: a.cgroups,
-    process_status_rows: a.cgroups.map((cgroup) => {
+  const autoRowFor = (a: AutoLimitedApp): ControlRow => {
+    const processRows: ProcessStatusRow[] = a.cgroups.map((cgroup) => {
       const scopeProcesses = a.scope_processes?.[cgroup] ?? []
       return {
         key: `${a.effective_app_id}:${cgroup}`,
@@ -2257,10 +2243,28 @@ export default function Balance({
         applied_at: a.limited_at,
         note: scopeProcesses.length > 0 ? 'Applied' : 'No running process found',
       }
-    }),
-    __auto: a,
-    key: `auto:${a.effective_app_id}`,
-  })
+    })
+    const hasRunningProcess = processRows.some((row) => row.runtime_status === 'Running')
+    return {
+      app_id: a.app_id,
+      app_name: a.app_name,
+      cpu_usage: 0,
+      memory_mb: 0,
+      io_read_rate: 0,
+      priority: a.priority,
+      status: APP_STATUS.A_LIMITED,
+      controlled: false,
+      control_status: 'AUTO_LIMITED',
+      effective: a.effective,
+      auto_detail: a.auto_detail,
+      limited_scopes: a.cgroups,
+      app_summary_status: hasRunningProcess ? 'Limited' : 'No Running Process',
+      runtime_hint: hasRunningProcess ? 'Running' : 'Stopped',
+      process_status_rows: processRows,
+      __auto: a,
+      key: `auto:${a.effective_app_id}`,
+    }
+  }
 
   const controlledMatchingTab = controlledApps.filter((a) =>
     controlTab === 'auto'

@@ -12,7 +12,8 @@ from typing import Any, Dict, List, Optional
 
 from monitor.metrics.utils import safe_read, run_cmd
 from monitor.npu_monitor import PmtTelemetry, get_npu_processes
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 _pmt_init_warned = False

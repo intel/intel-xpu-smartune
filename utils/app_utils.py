@@ -12,7 +12,8 @@ import psutil
 import threading
 from datetime import datetime
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 from db.DatabaseModel import AIAppPriority, DBStatus, get_write_epoch
 from typing import List, Dict, Any, Optional
 from config.config import b_config
@@ -623,6 +624,105 @@ def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.
         return False, str(e)
 
 
+def _filter_visible_cgroup_pids(pids):
+    filtered_pids = []
+    for pid in map(int, pids):
+        try:
+            cmdline = psutil.Process(pid).cmdline()
+            if cmdline and cmdline[0] == "bash":
+                continue
+            filtered_pids.append(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return filtered_pids
+
+
+# Cache for the expensive basename->cgroupfs-dir walk. res_monitor samples every
+# cgroup on each cycle, so without this a host with many cgroups re-walks the whole
+# tree per sample. Entries are short-lived (TTL) and revalidated on hit because
+# cgroups are ephemeral; a bounded map size keeps it from growing with cgroup churn.
+_CGROUP_DIR_CACHE = {}          # basename -> (dirs, expiry_epoch)
+_CGROUP_DIR_CACHE_LOCK = threading.Lock()
+_CGROUP_DIR_CACHE_TTL = 30.0
+_CGROUP_DIR_CACHE_MAX = 512
+
+
+def _walk_for_basename(root, basename):
+    """Full-tree scan resolving a cgroup basename to its cgroupfs dir(s)."""
+    matches = []
+    try:
+        for current_root, dirs, _files in os.walk(root):
+            if os.path.basename(current_root.rstrip("/")) == basename:
+                matches.append(current_root)
+                dirs[:] = []  # a scope/slice has no matching descendant below itself
+    except OSError as e:
+        logger.debug(f"Failed to scan cgroup root {root}: {e}")
+    return matches
+
+
+def _cached_basename_dirs(root, basename):
+    """Resolve ``basename`` under ``root``, caching the walk. A hit is revalidated
+    (each dir must still exist) and expires on a short TTL so a freshly-created
+    cgroup is still picked up promptly; misses are cached too, to stop a stale
+    basename from re-walking the tree every sample."""
+    now = time.time()
+    with _CGROUP_DIR_CACHE_LOCK:
+        entry = _CGROUP_DIR_CACHE.get(basename)
+        if entry is not None:
+            dirs, expiry = entry
+            if now < expiry and all(os.path.isdir(directory) for directory in dirs):
+                return list(dirs)
+            _CGROUP_DIR_CACHE.pop(basename, None)
+    dirs = _walk_for_basename(root, basename)
+    with _CGROUP_DIR_CACHE_LOCK:
+        if len(_CGROUP_DIR_CACHE) >= _CGROUP_DIR_CACHE_MAX:
+            _CGROUP_DIR_CACHE.clear()  # cheap bound; entries are short-lived anyway
+        _CGROUP_DIR_CACHE[basename] = (dirs, now + _CGROUP_DIR_CACHE_TTL)
+    return list(dirs)
+
+
+def _candidate_cgroup_dirs(cgroup_path):
+    root = _default_cgroup_root()
+    raw = str(cgroup_path or "").strip()
+    if not raw:
+        return []
+
+    candidates = []
+    direct = raw if os.path.isabs(raw) else os.path.join(root, raw.lstrip("/"))
+    if os.path.isdir(direct):
+        candidates.append(direct)
+
+    # Auto-limit entries store the cgroup basename (for example
+    # ``session-7782.scope``), while systemd-cgls may require a full cgroupfs
+    # path. Resolve the basename through the mounted cgroup tree as a fallback.
+    basename = os.path.basename(raw.rstrip("/"))
+    if basename and direct != root:
+        candidates.extend(_cached_basename_dirs(root, basename))
+
+    seen = set()
+    unique = []
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if real not in seen:
+            seen.add(real)
+            unique.append(candidate)
+    return unique
+
+
+def _pids_from_cgroupfs(cgroup_path):
+    pids = []
+    for directory in _candidate_cgroup_dirs(cgroup_path):
+        try:
+            for current_root, _dirs, files in os.walk(directory):
+                if "cgroup.procs" not in files:
+                    continue
+                with open(os.path.join(current_root, "cgroup.procs"), "r") as handle:
+                    pids.extend(int(line.strip()) for line in handle if line.strip().isdigit())
+        except OSError as e:
+            logger.debug(f"Failed to read cgroup.procs under {directory}: {e}")
+    return _filter_visible_cgroup_pids(dict.fromkeys(pids))
+
+
 def get_pids_in_cgroup(cgroup_path):
     """Return all process PIDs inside the specified cgroup."""
     try:
@@ -636,27 +736,17 @@ def get_pids_in_cgroup(cgroup_path):
 
         if not output:
             logger.debug(f"No output from systemd-cgls for cgroup {cgroup_path}")
-            return []
+            return _pids_from_cgroupfs(cgroup_path)
 
         pids = re.findall(r"[├└]─(\d+)\s+.+", output)
-        filtered_pids = []
-        for pid in map(int, pids):
-            try:
-                cmdline = psutil.Process(pid).cmdline()
-                if cmdline and cmdline[0] == "bash":
-                    continue  # Skip processes with cmdline "bash"
-                filtered_pids.append(pid)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-
-        return filtered_pids
+        return _filter_visible_cgroup_pids(pids) or _pids_from_cgroupfs(cgroup_path)
 
     except subprocess.TimeoutExpired:
         logger.warning(f"Timeout while getting PIDs for cgroup {cgroup_path}")
-        return []
+        return _pids_from_cgroupfs(cgroup_path)
     except Exception as e:
         logger.error(f"Error getting PIDs for cgroup {cgroup_path}: {str(e)}")
-        return []
+        return _pids_from_cgroupfs(cgroup_path)
 
 
 def _get_executable_name(app_name, app_cmdline):

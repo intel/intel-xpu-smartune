@@ -9,6 +9,10 @@ from typing import Any, Optional
 
 import yaml
 
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
 # config.yaml lives alongside this module. Resolve it relative to __file__ so the
 # config package works regardless of the process working directory (e.g. when the
 # package is imported from the repository root rather than from balancer/).
@@ -250,7 +254,6 @@ class Config:
                         disk_cfg["rate"][p] = disk_rate_cfg
 
             if modified:
-                from utils.logger import logger
                 logger.info(f"Configuration updated: limit_policy - {list(yaml_updates.keys())}")
                 self._patch_limit_policy_yaml(yaml_updates, self._config_path)
 
@@ -371,7 +374,6 @@ class Config:
         existing indentation style are preserved.  The in-memory attribute
         ``self.<section>`` is updated to match.
         """
-        from utils.logger import logger
 
         target = path or self._config_path
         with self._persist_lock:
@@ -410,7 +412,6 @@ class Config:
 
     def set_list_section(self, section: str, entries: list[Any], path: Optional[str] = None) -> bool:
         """Replace or create a top-level YAML list and update its in-memory value."""
-        from utils.logger import logger
 
         if not isinstance(entries, list):
             return False
@@ -480,7 +481,6 @@ class Config:
         ``match``.  Returns the number of items removed.  Only supports
         list-of-mapping sections; scalar lists should use a different helper.
         """
-        from utils.logger import logger
 
         if not match:
             return 0
@@ -563,7 +563,6 @@ class Config:
         corrupting the YAML.  An empty list is written as ``[]`` (pure
         on-demand, no background collector).
         """
-        from utils.logger import logger
 
         if not isinstance(sections, list):
             return False
@@ -622,7 +621,6 @@ class Config:
         The in-memory ``self.limit_policy`` is updated to match.  Returns True if
         anything changed.
         """
-        from utils.logger import logger
 
         if not isinstance(updates, dict) or not updates:
             return False
@@ -728,7 +726,6 @@ class Config:
         device class and are edited in config.yaml. Only changed leaves are rewritten
         (comments preserved); returns True if anything changed.
         """
-        from utils.logger import logger
 
         if not isinstance(updates, dict) or not updates:
             return False
@@ -782,7 +779,6 @@ class Config:
 
         Ratios are expected in [0, 1]. Only changed leaves are patched in YAML.
         """
-        from utils.logger import logger
 
         if not isinstance(updates, dict) or not updates:
             return False
@@ -865,7 +861,6 @@ class Config:
         The in-memory attributes are updated to match.  Returns True if at least
         one value changed.
         """
-        from utils.logger import logger
 
         if not isinstance(updates, dict) or not updates:
             return False
@@ -911,7 +906,6 @@ class Config:
         Returns:
             True if config was updated successfully, False otherwise
         """
-        from utils.logger import logger
 
         if not isinstance(updates, dict) or not section:
             return False

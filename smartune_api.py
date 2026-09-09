@@ -15,7 +15,8 @@ from flask import Blueprint, request
 
 from features import DASHBOARD_ENDPOINT
 from utils.http_utils import RetCode, construct_response
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 from utils.ui_lease import get_ui_lease_manager
 
 # The dashboard queries /smartune/capabilities to learn whether the server it is
@@ -194,6 +195,16 @@ def login():
 
 _balancer_available = False
 _benchmark_available = False
+_diagnostics_available = False
+
+
+def set_diagnostics_available(available: bool) -> None:
+    """Mark whether the diagnostics blueprint (/diag) is mounted on this process.
+
+    Reported in `capabilities` so the dashboard shows the Diagnostics tab
+    conditionally. Both the balancer and monitor-only services call this."""
+    global _diagnostics_available
+    _diagnostics_available = bool(available)
 
 
 def set_balancer_available(available: bool) -> None:
@@ -229,6 +240,7 @@ def get_capabilities():
         data={
             "capabilities": 1 if _balancer_available else 0,
             "benchmark": 1 if _benchmark_available else 0,
+            "diagnostics": 1 if _diagnostics_available else 0,
         },
         retmsg="Successfully retrieved capabilities",
     )

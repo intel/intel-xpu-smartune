@@ -1,0 +1,529 @@
+.diagnostics-page {
+  margin-top: 12px;
+  border-color: var(--diagnostics-border, #2d3149) !important;
+}
+
+.diagnostics-page > .ant-card-body {
+  padding-top: 8px !important;
+}
+
+.diagnostics-toolbar {
+  position: sticky;
+  top: var(--app-sticky-top, 128px);
+  z-index: 25;
+  margin-bottom: 16px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--diagnostics-border, #2d3149);
+  background: rgba(11, 15, 20, 0.9);
+  backdrop-filter: blur(8px);
+}
+
+.diagnostics-filter-row {
+  width: 100%;
+}
+
+.diagnostics-filter-group,
+.diagnostics-toolbar-actions,
+.diagnostics-log-controls,
+.diagnostics-event-controls {
+  gap: 8px;
+}
+
+.diagnostics-filter-group {
+  align-items: center;
+}
+
+.diagnostics-range-controls {
+  flex: 0 0 auto;
+  padding-right: 12px;
+  border-right: 1px solid var(--diagnostics-border, #2d3149);
+}
+
+.diagnostics-control-label {
+  flex: 0 0 auto;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.diagnostics-search {
+  width: min(260px, 100%);
+}
+
+.diagnostics-severity-select {
+  width: 150px;
+}
+
+.diagnostics-category-select {
+  width: 190px;
+}
+
+.diagnostics-activity-filter {
+  max-width: 100%;
+}
+
+.diagnostics-refresh-select {
+  width: 120px;
+}
+
+.diagnostics-boot-select {
+  width: 280px;
+}
+
+.diagnostics-log-source-select {
+  width: 160px;
+}
+
+.diagnostics-range {
+  display: block;
+  margin-top: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.diagnostics-range-summary {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.diagnostics-pressure-trend {
+  width: 100%;
+}
+
+.diagnostics-pressure-trend {
+  min-width: 0;
+}
+
+.diagnostics-pressure-chart {
+  height: 150px;
+  margin-top: 8px;
+}
+
+.diagnostics-activity-empty {
+  margin-bottom: 12px;
+}
+
+.diagnostics-clock-skew {
+  margin-bottom: 12px;
+}
+
+.diagnostics-overview {
+  display: grid;
+  grid-template-columns: 1fr;
+  margin-bottom: 16px;
+  border: 1px solid var(--diagnostics-border, #2d3149);
+  background: #13182a;
+}
+
+.diagnostics-event-activity {
+  min-width: 0;
+  padding-top: 8px;
+}
+
+.diagnostics-overview-heading {
+  display: block;
+  padding: 0 16px 10px;
+  color: var(--diagnostics-text-muted, #8e9ab3);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.diagnostics-event-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.diagnostics-overview-metric {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  padding: 14px 16px 16px;
+  border: 0;
+  border-right: 1px solid var(--diagnostics-border, #2d3149);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: center;
+}
+
+.diagnostics-overview-metric:first-child {
+  border-right-color: var(--diagnostics-text-muted, #8e9ab3);
+}
+
+.diagnostics-overview-metric:hover,
+.diagnostics-overview-metric:focus-visible {
+  background: rgba(87, 148, 242, 0.08);
+  outline: 1px solid var(--diagnostics-border, #2d3149);
+  outline-offset: -1px;
+}
+
+/* Selected category: the tiles are the single tab control, so the active one must be
+   unmistakable (tint + inset accent bar + accent label), not color-only. */
+.diagnostics-overview-metric[aria-selected='true'] {
+  background: rgba(87, 148, 242, 0.14);
+  box-shadow: inset 0 -3px 0 #5794f2;
+}
+
+.diagnostics-overview-metric[aria-selected='true'] > .ant-typography-secondary {
+  color: #5794f2;
+}
+
+.diagnostics-overview-metric > .ant-typography-secondary {
+  color: var(--diagnostics-text-muted, #8e9ab3);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.diagnostics-metric-sub {
+  font-size: 12px;
+  line-height: 16px;
+}
+
+/* Active controls folded into the top of the Resource control tab: a compact,
+   left-hugging line (app · resources · status · updated) so current state reads
+   above the control event history without card-in-card weight. */
+.diagnostics-active-controls {
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--diagnostics-border, #2d3149);
+}
+
+.diagnostics-active-controls-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.diagnostics-active-controls-scope {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+}
+
+.diagnostics-active-controls-list {
+  display: grid;
+  gap: 2px;
+}
+
+.diagnostics-active-control-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  padding: 4px 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.diagnostics-active-control-app {
+  max-width: 240px;
+  min-width: 0;
+  font-weight: 600;
+}
+
+.diagnostics-active-control-sep {
+  color: var(--diagnostics-text-muted, #8e9ab3);
+}
+
+.diagnostics-active-controls-toggle {
+  justify-self: start;
+  padding-inline: 0;
+}
+
+.diagnostics-event-metrics .diagnostics-overview-metric:last-child {
+  border-right: 0;
+}
+
+.diagnostics-overview-value {
+  display: block;
+  color: var(--diagnostics-text, #d9d9d9);
+  font-size: 24px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.diagnostics-panel,
+.diagnostics-logs {
+  margin-bottom: 12px;
+  border-color: var(--diagnostics-border, #2d3149) !important;
+  background: #13182a !important;
+}
+
+.diagnostics-panel .ant-card-head-title,
+.diagnostics-logs .ant-collapse-header-text {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.diagnostics-table .ant-table-cell {
+  font-variant-numeric: tabular-nums;
+}
+
+.diagnostics-severity-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.diagnostics-severity-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* Summary cell: the text ellipsizes while the trigger tag keeps its full width. */
+.diagnostics-summary-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.diagnostics-summary-text {
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.diagnostics-trigger-tag {
+  flex: none;
+  margin-inline-end: 0;
+}
+
+/* Colored inline labels (not filled tags) so triggers and lifecycle statuses read
+   as annotations rather than clickable buttons. */
+.diagnostics-trigger-note,
+.diagnostics-status-label {
+  flex: none;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.diagnostics-related-tag,
+.diagnostics-evidence-item-interactive {
+  cursor: pointer;
+}
+
+.diagnostics-evidence-item,
+.diagnostics-log-excerpt {
+  padding-top: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(45, 49, 73, 0.6);
+}
+
+.diagnostics-evidence-item:last-child,
+.diagnostics-log-excerpt:last-child {
+  border-bottom: 0;
+}
+
+.diagnostics-evidence-item:hover,
+.diagnostics-log-excerpt:hover {
+  background: rgba(87, 148, 242, 0.08);
+}
+
+.diagnostics-log-count {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.diagnostics-event-controls {
+  width: 100%;
+  margin-bottom: 12px;
+}
+
+.diagnostics-event-count {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.diagnostics-code-block {
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--diagnostics-border, #2d3149);
+  border-radius: 6px;
+  background: #11151f;
+  color: #d9d9d9;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.diagnostics-control-details-table {
+  width: 100%;
+}
+
+.diagnostics-investigation-summary,
+.diagnostics-investigation-section {
+  padding: 0 0 12px;
+  border-bottom: 1px solid var(--diagnostics-border, #2d3149);
+}
+
+.diagnostics-investigation-section:last-child {
+  border-bottom: 0;
+}
+
+.diagnostics-investigation-heading,
+.diagnostics-investigation-section > .ant-typography-secondary {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.diagnostics-scope-detail {
+  padding: 6px 0;
+  overflow-wrap: anywhere;
+}
+
+.diagnostics-investigation-summary-header {
+  justify-content: space-between;
+  width: 100%;
+}
+
+.diagnostics-investigation-summary-header .diagnostics-investigation-heading {
+  margin-bottom: 0;
+}
+
+.diagnostics-investigation-impact {
+  margin-top: 10px;
+}
+
+.diagnostics-investigation-section-header {
+  justify-content: space-between;
+  width: 100%;
+}
+
+.diagnostics-evidence-timeline {
+  margin-top: 12px;
+}
+
+.diagnostics-evidence-item {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.diagnostics-evidence-time {
+  font-variant-numeric: tabular-nums;
+}
+
+.diagnostics-log-excerpts {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.diagnostics-log-excerpt {
+  display: grid;
+  gap: 4px;
+  padding-left: 12px;
+  border-left: 2px solid var(--diagnostics-border, #2d3149);
+  overflow-wrap: anywhere;
+}
+
+.diagnostics-log-truncation {
+  display: block;
+  margin-top: 8px;
+}
+
+@media (max-width: 767px) {
+  .diagnostics-toolbar {
+    margin-inline: -4px;
+    padding-inline: 4px;
+  }
+
+  .diagnostics-filter-row .ant-col:last-child {
+    width: 100%;
+  }
+
+  .diagnostics-toolbar-actions {
+    width: 100%;
+  }
+
+  .diagnostics-search,
+  .diagnostics-severity-select,
+  .diagnostics-category-select,
+  .diagnostics-refresh-select,
+  .diagnostics-boot-select,
+  .diagnostics-log-source-select,
+  .diagnostics-filter-group .ant-picker {
+    width: 100%;
+  }
+
+  .diagnostics-filter-group,
+  .diagnostics-range-controls,
+  .diagnostics-toolbar-actions,
+  .diagnostics-log-controls,
+  .diagnostics-event-controls {
+    display: flex;
+  }
+
+  .diagnostics-range-controls {
+    width: 100%;
+    padding-right: 0;
+    padding-bottom: 8px;
+    border-right: 0;
+    border-bottom: 1px solid var(--diagnostics-border, #2d3149);
+  }
+
+  .diagnostics-control-label {
+    width: 100%;
+  }
+
+  .diagnostics-overview {
+    grid-template-columns: 1fr;
+  }
+
+  .diagnostics-event-activity {
+    border-right: 0;
+    border-bottom: 1px solid var(--diagnostics-border, #2d3149);
+  }
+
+  .diagnostics-event-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .diagnostics-event-metrics .diagnostics-overview-metric:nth-child(2n),
+  .diagnostics-event-metrics .diagnostics-overview-metric:last-child {
+    border-right: 0;
+  }
+
+  .diagnostics-range-summary {
+    width: 100%;
+    white-space: normal;
+  }
+
+  .diagnostics-toolbar-actions > .ant-btn:last-child {
+    flex: 1;
+  }
+
+  .diagnostics-queue-header,
+  .diagnostics-queue-item {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .diagnostics-queue-action {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .diagnostics-investigation-section-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .diagnostics-investigation-summary-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .diagnostics-history-tabs .ant-tabs-nav {
+    overflow-x: auto;
+  }
+}

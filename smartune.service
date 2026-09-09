@@ -12,8 +12,12 @@ Restart=on-failure
 RestartSec=5
 KillSignal=SIGINT
 TimeoutStopSec=20
-StandardOutput=append:__SMARTUNE_ROOT__/logs/smartune.log
-StandardError=inherit
+# The application log is written solely by SmartTune into its own rotated,
+# structured store (logs/multi_tasks_*.log) -- no second file, not journald.
+# systemd only captures the console stream as a safety net for early crashes
+# that happen before the logger is configured (i.e. "the process never came up").
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

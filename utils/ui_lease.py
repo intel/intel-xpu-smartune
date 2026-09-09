@@ -18,7 +18,8 @@ import os
 import threading
 import time
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 def _env_float(name: str, default: float) -> float:

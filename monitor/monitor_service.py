@@ -25,6 +25,11 @@ from flask import Flask
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Tag log records with mode=monitor when this module is launched directly
+# (`python -m monitor.monitor_service`); setdefault keeps smartune.py's value
+# when it launches us. Must precede the utils.logger import below.
+os.environ.setdefault("SMARTUNE_MODE", "monitor")
+
 from db.DatabaseModel import init_database
 from monitor.monitor_api import (
     monitor_bp,
@@ -33,9 +38,15 @@ from monitor.monitor_api import (
     stop_dynamic_info_collector,
 )
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
-from features import mount_benchmark, mount_dashboard
-from smartune_api import auth_bp, set_benchmark_available, smartune_bp
-from utils.logger import logger
+from features import mount_benchmark, mount_dashboard, mount_diagnostics
+from smartune_api import auth_bp, set_benchmark_available, set_diagnostics_available, smartune_bp
+from utils.logger import get_logger
+logger = get_logger(__name__)
+try:
+    from diagnostics import emit_event  # best-effort seam; no-op if stripped
+except Exception:  # pragma: no cover
+    def emit_event(*_a, **_k):
+        return None
 from utils.ui_lease import get_ui_lease_manager
 
 app = Flask(__name__)
@@ -52,6 +63,9 @@ app.register_blueprint(auth_bp)
 # (the gate is app-wide), but keeps the reading order "auth first, then the routes
 # it protects".
 set_benchmark_available(mount_benchmark(app))
+# Diagnostics /diag/* API. Available in monitor-only too: its value is precisely
+# being able to inspect events/logs when the main service is degraded.
+set_diagnostics_available(mount_diagnostics(app))
 # Serve the built dashboard (dashboard/dist) and route its /api/* calls to the
 # blueprints above, so the browser sees a full UI at the same https origin.
 mount_dashboard(app)
@@ -92,6 +106,8 @@ def _shutdown_once():
         return
     _shutdown_started = True
     logger.info("Shutting down Monitor Service...")
+    emit_event("PLATFORM_SERVICE_STOPPING", severity="info", category="platform.availability",
+               source="monitor", summary="Monitor service stopping")
     try:
         stop_dynamic_info_collector()
     except Exception as exc:
@@ -149,6 +165,10 @@ def main():
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    emit_event("PLATFORM_SERVICE_STARTED", severity="info", category="platform.availability",
+               source="monitor", summary="Monitor service started",
+               attributes={"mode": os.environ.get("SMARTUNE_MODE", "monitor")})
+
     # Packaged (desktop-launched) deployments set SMARTUNE_UI_LEASE so the
     # service stops itself once the last dashboard UI is closed. Left unset in
     # dev runs (python -m monitor.monitor_service), which then run until killed.
@@ -165,7 +185,11 @@ def main():
     port = int(os.environ.get("MONITOR_PORT", "9001"))
 
     try:
-        app.run(host=host, port=port, debug=False, use_reloader=False, ssl_context=ssl_context)
+        # threaded=True: without it the dev server serializes every request, so a
+        # blocking /diag/* query would stall the dashboard's continuous /monitor
+        # polling. See balance_service.py for the same rationale.
+        app.run(host=host, port=port, debug=False, use_reloader=False,
+                threaded=True, ssl_context=ssl_context)
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:

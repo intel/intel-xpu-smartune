@@ -23,6 +23,8 @@ const { Text, Title } = Typography
 
 interface Props {
   active: boolean
+  historyRangeIntent: { from: number; to: number } | null
+  onHistoryRangeIntentConsumed: () => void
 }
 
 interface PressureTrendPoint {
@@ -1605,7 +1607,7 @@ function CpuPerCoreHistoryCard({ info, timeWindow }: { info: CpuPerCoreInfo; tim
   )
 }
 
-export default function HistoryDashboard({ active }: Props) {
+export default function HistoryDashboard({ active, historyRangeIntent, onHistoryRangeIntentConsumed }: Props) {
   const [rangePreset, setRangePreset] = useState<RangePreset>('15m')
   const [customRange, setCustomRange] = useState<[Dayjs | null, Dayjs | null] | null>(null)
   const { publishNotice } = useGlobalConfigNotices()
@@ -1620,6 +1622,18 @@ export default function HistoryDashboard({ active }: Props) {
   ), [monitoredSectionSet])
   const allSections = useMemo(() => sectionOptions.map((o) => o.value), [sectionOptions])
   const [visibleSections, setVisibleSections] = useState<string[]>(DEFAULT_ALL_SECTIONS)
+
+  useEffect(() => {
+    if (!active || !historyRangeIntent) return
+    const { from, to } = historyRangeIntent
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to < from) {
+      onHistoryRangeIntentConsumed()
+      return
+    }
+    setCustomRange([dayjs.unix(from), dayjs.unix(to)])
+    setRangePreset('custom')
+    onHistoryRangeIntentConsumed()
+  }, [active, historyRangeIntent, onHistoryRangeIntentConsumed])
 
   useEffect(() => {
     setVisibleSections((prev) => {
@@ -1671,6 +1685,7 @@ export default function HistoryDashboard({ active }: Props) {
 
   const fetchHistory = useCallback(async () => {
     if (!active) return
+    if (historyRangeIntent) return
     if (rangePreset === 'custom' && !customRangeReady) return
     setLoading(true)
     setHistory(null)
@@ -1722,13 +1737,14 @@ export default function HistoryDashboard({ active }: Props) {
     } finally {
       setLoading(false)
     }
-  }, [active, rangePreset, customRange, customRangeReady])
+  }, [active, historyRangeIntent, rangePreset, customRange, customRangeReady])
 
   useEffect(() => {
     if (!active) return
+    if (historyRangeIntent) return
     if (rangePreset === 'custom' && !customRangeReady) return
     fetchHistory()
-  }, [active, fetchHistory, rangePreset, customRangeReady])
+  }, [active, fetchHistory, historyRangeIntent, rangePreset, customRangeReady])
 
   // Keyed off the fetch that just landed, so the note and the charts describe
   // the same moment.

@@ -32,7 +32,8 @@ import math
 import os
 import time
 from typing import Dict, Optional
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 from config.config import b_config
 

@@ -11,7 +11,8 @@ from typing import Any, Dict, List, Optional, Set
 import psutil
 
 from monitor.metrics.utils import safe_read, run_cmd
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 _CORE_CLASS_CACHE: Dict[str, Any] = {"cpu_count": None, "result": None}
 _CORE_TOPOLOGY: Optional[List[Optional[int]]] = None

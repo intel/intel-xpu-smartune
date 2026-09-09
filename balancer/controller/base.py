@@ -3,7 +3,8 @@
 
 from abc import ABC, abstractmethod
 import os
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 from typing import Optional, List
 
 # Reserved

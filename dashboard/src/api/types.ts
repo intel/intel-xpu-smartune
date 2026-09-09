@@ -7,6 +7,181 @@ export interface ApiResponse<T> {
   data: T
 }
 
+export interface CapabilitiesData {
+  capabilities: number
+  benchmark?: number
+  diagnostics?: number
+}
+
+export type DiagSeverity = 'info' | 'warning' | 'error' | 'critical'
+
+export interface DiagEvent {
+  event_id: string
+  ts_utc: string
+  severity: DiagSeverity | string
+  category: string
+  event_type: string
+  summary: string
+  source?: string | null
+  service?: string | null
+  app_id?: string | null
+  job_id?: string | null
+  impact?: string | null
+  resource_type?: string | null
+  protection_id?: string | null
+  episode_id?: string | null
+  attributes?: Record<string, unknown> | null
+  acknowledged_at?: string | null
+}
+
+export interface DiagEventsData {
+  events: DiagEvent[]
+  count: number
+}
+
+export interface DiagEventQuery {
+  event_id?: string
+  severity?: string
+  category?: string
+  source?: string
+  event_type?: string
+  app_id?: string
+  job_id?: string
+  impact?: string
+  resource_type?: string
+  protection_id?: string
+  episode_id?: string
+  keyword?: string
+  from?: number
+  to?: number
+  limit?: number
+  offset?: number
+}
+
+export interface DiagLogRecord {
+  ts_epoch: number
+  ts_iso: string
+  level: string
+  source: string
+  logger: string
+  message: string
+  service?: string | null
+  app_id?: string | null
+  job_id?: string | null
+  fields?: Record<string, unknown> | null
+}
+
+export interface DiagLogQuery {
+  source?: string | string[]
+  from?: number
+  to?: number
+  level?: string
+  job_id?: string
+  boot_id?: string
+  keyword?: string
+  limit?: number
+}
+
+export interface DiagLogsData {
+  records: DiagLogRecord[]
+  sources: string[]
+  available_sources: string[]
+  truncated: boolean
+  count: number
+}
+
+export interface DiagBoot {
+  boot_id: string
+  index: number | null
+  first_ts: number | null
+  last_ts: number | null
+  running: boolean
+  source?: string
+}
+
+export interface DiagBootsData {
+  boots: DiagBoot[]
+  sources: string[]
+}
+
+export interface DiagContextQuery {
+  job_id?: string
+  app_id?: string
+  from?: number
+  to?: number
+}
+
+export interface DiagMonitorSample {
+  collected_at?: string | null
+  ts_epoch: number
+  data?: Record<string, unknown> | null
+}
+
+export interface DiagContextData {
+  scope: { kind: string; value: string | null }
+  window: { from: number | null; to: number | null }
+  boot_id: string | null
+  events: DiagEvent[]
+  control_actions: DiagEvent[]
+  concurrent_jobs: string[]
+  alerts: DiagAlert[]
+  metrics: {
+    monitor: { series: DiagMonitorSample[]; count: number }
+    benchmark: { kpi: Record<string, unknown> | null; series: unknown[]; run: string | null }
+    window: { from: number | null; to: number | null }
+  }
+  logs: DiagLogsData
+  findings: unknown[]
+}
+
+export type DiagControlLifecycleStatus =
+  | 'active'
+  | 'recovered'
+  | 'failed'
+  | 'cleared_by_reboot'
+  | 'requires_verification'
+
+export interface DiagControlLifecycle {
+  protection_id: string
+  status: DiagControlLifecycleStatus | string
+  started_at: string | null
+  last_updated_at: string | null
+  app_id: string | null
+  source: string | null
+  boot_id: string | null
+  applied_resources: string[]
+  recovered_resources: string[]
+  failed_resources: string[]
+  active_resources: string[]
+  events: DiagEvent[]
+}
+
+export interface DiagControlLifecyclesData {
+  lifecycles: DiagControlLifecycle[]
+  count: number
+}
+
+export interface DiagControlLifecycleQuery {
+  from?: number
+  to?: number
+  app_id?: string
+  protection_id?: string
+  limit?: number
+  offset?: number
+}
+
+export interface DiagAlert {
+  dedup_key: string
+  first_fired_at: string
+  last_fired_at: string
+  fire_count: number
+  last_event_id: string | null
+  acknowledged_at: string | null
+  severity: DiagSeverity | string
+  event_type: string
+  summary: string | null
+}
+
 export interface DiskDeviceData {
   utilization: number
   is_busy: boolean

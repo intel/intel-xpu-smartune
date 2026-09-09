@@ -3,7 +3,8 @@
 
 from concurrent.futures import ThreadPoolExecutor
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 from monitor.monitor_api import SystemPressureMonitor
 
 from controller.controller import Controller

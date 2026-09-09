@@ -42,6 +42,11 @@ def main():
                        help="start the monitor only (standalone)")
     args = parser.parse_args()
 
+    # Surface the launch mode as the `mode` field on every log record. Set it
+    # before the service modules (and utils.logger) are imported below so the
+    # base logger picks it up. setdefault: an explicit env override still wins.
+    os.environ.setdefault("SMARTUNE_MODE", "monitor" if args.monitor else "all")
+
     run_monitor() if args.monitor else run_all()
 
 

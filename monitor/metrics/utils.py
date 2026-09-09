@@ -7,7 +7,8 @@ import os
 import subprocess # nosec
 from typing import Any, Dict, List, Optional
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 def safe_read(path: str) -> Optional[str]:

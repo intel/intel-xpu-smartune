@@ -39,6 +39,7 @@ import balancer.balancer as balancer_mod  # noqa: E402
 import balance_service as balance_service_mod  # noqa: E402
 import controller.app_intercept as app_intercept_mod  # noqa: E402
 from controller.app_intercept import AppIntercept  # noqa: E402
+from diagnostics import control_events, control_lifecycle  # noqa: E402
 from monitor.res_monitor import ResourceMonitor  # noqa: E402
 from balancer.balancer import (  # noqa: E402
     DynamicBalancer,
@@ -365,6 +366,96 @@ class GoneTargetTests(unittest.TestCase):
                 mock.patch.object(b, '_cgroup_exists', return_value=True):
             self.assertTrue(b._target_still_present(_candidate('x.scope'), 'x.scope'))
 
+    def test_reaper_records_recovery_when_a_manual_limited_app_exits(self):
+        b = _balancer()
+        entry = _limited('exited.scope', cpu_mem=True, io=True, public_id='app-1')
+        entry.source = 'manual'
+        entry.protection_id = 'protect-1'
+        b.all_limits.apps['exited.scope'] = entry
+
+        with mock.patch.object(b, '_pid_gone_or_dying', return_value=True), \
+                mock.patch.object(b, '_cgroup_exists', return_value=False), \
+                mock.patch.object(balancer_mod, '_emit_control_events') as emit, \
+                mock.patch.object(balancer_mod.app_utils, 'check_app_running_status', return_value='stopped'), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils.callback_manager, 'send_callback_notification'):
+            b._reap_closed_apps()
+
+        self.assertNotIn('exited.scope', b.all_limits.apps)
+        recovered = [call for call in emit.call_args_list if call.args[0] == 'RECOVERED']
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].kwargs['protection_id'], 'protect-1')
+        self.assertEqual(
+            recovered[0].args[1],
+            {'cpu_mem_limited': True, 'io_limited': True},
+        )
+
+    def test_reaper_restores_auto_handoff_without_pid_snapshot_when_app_is_stopped(self):
+        b = _balancer()
+        entry = _limited('optimum.scope', cpu_mem=True, public_id='optimum-app')
+        entry.source = 'manual'
+        entry.adopted_from_auto = True
+        entry.pids = set()
+        b.all_limits.apps['optimum.scope'] = entry
+
+        with mock.patch.object(b, '_cgroup_exists', return_value=False), \
+                mock.patch.object(balancer_mod.app_utils, 'check_app_running_status', return_value='stopped'), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils.callback_manager, 'send_callback_notification'):
+            b._reap_closed_apps()
+
+        self.assertNotIn('optimum.scope', b.all_limits.apps)
+
+    def test_reaper_keeps_no_pid_limit_when_app_still_runs(self):
+        b = _balancer()
+        entry = _limited('active.scope', cpu_mem=True, public_id='active-app')
+        entry.source = 'manual'
+        entry.pids = set()
+        b.all_limits.apps['active.scope'] = entry
+
+        with mock.patch.object(balancer_mod.app_utils, 'check_app_running_status', return_value='running'):
+            b._reap_closed_apps()
+
+        self.assertIn('active.scope', b.all_limits.apps)
+
+    def test_reaper_restores_auto_discovery_when_representative_exits_in_shared_scope(self):
+        b = _balancer()
+        entry = _limited('session-7782.scope', io=True, public_id='session-7782.scope')
+        entry.source = 'auto'
+        entry.app_name = 'optimum-cli'
+        entry.pids = {2007693, 1974386}
+        entry.representative_pid = 2007693
+        b.all_limits.apps['session-7782.scope'] = entry
+
+        def gone(pid):
+            return pid == 2007693
+
+        with mock.patch.object(b, '_pid_gone_or_dying', side_effect=gone), \
+                mock.patch.object(balancer_mod.app_utils, 'check_app_running_status', return_value='stopped'), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils.callback_manager, 'send_callback_notification'):
+            b._reap_closed_apps()
+
+        self.assertNotIn('session-7782.scope', b.all_limits.apps)
+
+    def test_reaper_keeps_shared_scope_limit_when_representative_app_still_runs(self):
+        b = _balancer()
+        entry = _limited('session-7782.scope', io=True, public_id='session-7782.scope')
+        entry.source = 'auto'
+        entry.app_name = 'optimum-cli'
+        entry.pids = {2007693, 1974386}
+        entry.representative_pid = 2007693
+        b.all_limits.apps['session-7782.scope'] = entry
+
+        def gone(pid):
+            return pid == 2007693
+
+        with mock.patch.object(b, '_pid_gone_or_dying', side_effect=gone), \
+                mock.patch.object(balancer_mod.app_utils, 'check_app_running_status', return_value='running'):
+            b._reap_closed_apps()
+
+        self.assertIn('session-7782.scope', b.all_limits.apps)
+
 
 class AutoToManualScopeTests(unittest.TestCase):
     """Taking control must retain exactly the cgroups Auto Control limited."""
@@ -447,6 +538,39 @@ class AutoToManualScopeTests(unittest.TestCase):
                 'cmdline': 'worker --batch',
             }],
         })
+
+    def test_auto_limit_row_orders_representative_process_first(self):
+        b = _balancer()
+        b._upsert_auto_limited(
+            'session-7782.scope', 'session-7782.scope', 'optimum-cli', {'disk_io_rate': {}},
+            resource_limited=False,
+            io_limited=True,
+            priority='undefined',
+            is_controlled=False,
+            limit_reason='disk_pressure',
+            pressure_level='critical',
+            cgroups=['session-7782.scope'],
+            pids=[1974342, 2014356],
+            representative_pid=2014356,
+        )
+
+        def process_for(pid):
+            process = mock.Mock()
+            process.is_running.return_value = True
+            process.status.return_value = 'running'
+            if pid == 2014356:
+                process.name.return_value = 'python'
+                process.cmdline.return_value = ['python', 'optimum-cli']
+            else:
+                process.name.return_value = 'sshd'
+                process.cmdline.return_value = ['sshd: user [priv]']
+            return process
+
+        with mock.patch.object(balancer_mod.app_utils, 'get_pids_in_cgroup', return_value=[1974342, 2014356]), \
+                mock.patch.object(balancer_mod.psutil, 'Process', side_effect=process_for):
+            rows = b.get_auto_limited_apps()['apps']
+
+        self.assertEqual(rows[0]['scope_processes']['session-7782.scope'][0]['pid'], 2014356)
 
     def test_bpf_exit_persists_stopped_status(self):
         intercept = AppIntercept.__new__(AppIntercept)
@@ -620,6 +744,103 @@ class AutoToManualScopeTests(unittest.TestCase):
 
 class SeparatedRestoreChannelTests(unittest.TestCase):
     """Separated policy means separated recovery: one timer, one channel."""
+
+    def test_lifecycle_records_added_and_recovered_channels_symmetrically(self):
+        b = _balancer()
+        with mock.patch.object(control_events, 'emit_event') as emit, \
+                mock.patch.object(control_events, 'read_boot_id', return_value='boot-1'), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils, 'callback_manager'):
+            b._upsert_auto_limited(
+                'app.scope', 'app-1', 'demo', {'disk_io_rate': {}},
+                resource_limited=False, io_limited=True, priority='low',
+                is_controlled=False, limit_reason='disk_pressure', pressure_level='critical',
+                cgroups=['app.scope'], resource_parts={},
+            )
+            b._upsert_auto_limited(
+                'app.scope', 'app-1', 'demo', {'cpu_rate': 0.3, 'mem_rate': 0.1},
+                resource_limited=True, io_limited=False, priority='low',
+                is_controlled=False, limit_reason='system_pressure', pressure_level='critical',
+                cgroups=['app.scope'], resource_parts={'cpu': True, 'memory': True},
+            )
+            b._restore_channel('disk_io', 'full', 'test')
+            b._restore_channel('sys', 'full', 'test')
+
+        events = [
+            {
+                'event_id': str(index),
+                'ts_utc': f'2026-01-01T00:00:0{index}+00:00',
+                'event_type': call.args[0],
+                'protection_id': call.kwargs['protection_id'],
+                'resource_type': call.kwargs['resource_type'],
+                'app_id': call.kwargs['app_id'],
+                'source': call.kwargs['source'],
+            }
+            for index, call in enumerate(emit.call_args_list, start=1)
+        ]
+
+        lifecycle = control_lifecycle.summarize(events)[0]
+        self.assertEqual(lifecycle['applied_resources'], ['cpu', 'disk_io', 'memory'])
+        self.assertEqual(lifecycle['recovered_resources'], ['cpu', 'disk_io', 'memory'])
+        self.assertEqual(lifecycle['active_resources'], [])
+        self.assertEqual(lifecycle['status'], 'recovered')
+
+    def test_combined_auto_limit_recovers_cpu_memory_after_sustained_recap(self):
+        """Combined policy caps CPU+memory+IO together and records no cpu/memory
+        split. A sustained-critical re-cap must not turn that missing split into a
+        {cpu:False, memory:False} value that drops CPU/MEMORY from the RECOVERED
+        ledger and leaves them stuck 'active' after the user restores the app."""
+        b = _balancer()
+        with mock.patch.object(control_events, 'emit_event') as emit, \
+                mock.patch.object(control_events, 'read_boot_id', return_value='boot-1'):
+            for _ in range(2):  # second tick exercises the merge branch
+                b._upsert_auto_limited(
+                    'app.scope', 'app-1', 'demo',
+                    {'cpu_rate': 0.3, 'mem_rate': 0.1, 'disk_io_rate': {}},
+                    resource_limited=True, io_limited=True, priority='low',
+                    is_controlled=False, limit_reason='system_pressure',
+                    pressure_level='critical', cgroups=['app.scope'])
+            entry = b.all_limits.apps.pop('app.scope')  # caller pops before restore
+            with mock.patch.object(b, '_cgroup_exists', return_value=True):
+                self.assertTrue(b._restore_entry(entry, notify=False))
+
+        events = [
+            {
+                'event_id': str(index),
+                'ts_utc': f'2026-01-01T00:00:0{index}+00:00',
+                'event_type': call.args[0],
+                'protection_id': call.kwargs['protection_id'],
+                'resource_type': call.kwargs['resource_type'],
+                'app_id': call.kwargs['app_id'],
+                'source': call.kwargs['source'],
+            }
+            for index, call in enumerate(emit.call_args_list, start=1)
+        ]
+
+        lifecycle = control_lifecycle.summarize(events)[0]
+        self.assertEqual(lifecycle['recovered_resources'], ['cpu', 'disk_io', 'memory'])
+        self.assertEqual(lifecycle['active_resources'], [])
+        self.assertEqual(lifecycle['status'], 'recovered')
+
+    def test_disk_pressure_apply_records_only_disk_io(self):
+        """Disk-pressure limiting caps only IO. The priority limit_rates still carry
+        cpu_rate/mem_rate and a caller may hand a resource_parts that reflects the
+        config rather than what was applied -- but resource_limited is False, so
+        APPLIED must claim DISK_IO only. Otherwise CPU/memory show up applied, never
+        recover, and stick as 'active'."""
+        b = _balancer()
+        with mock.patch.object(control_events, 'emit_event') as emit, \
+                mock.patch.object(control_events, 'read_boot_id', return_value='boot-1'):
+            b._upsert_auto_limited(
+                'app.scope', 'app-1', 'demo',
+                {'cpu_rate': 0.3, 'mem_rate': 0.1, 'disk_io_rate': {'read': 20}},
+                resource_limited=False, io_limited=True, priority='low',
+                is_controlled=False, limit_reason='disk_pressure',
+                pressure_level='critical', cgroups=['app.scope'],
+                resource_parts={'cpu': True, 'memory': True})
+        self.assertEqual(
+            [c.args[0] for c in emit.call_args_list],
+            ['CONTROL_DISK_IO_LIMIT_APPLIED'])
 
     def test_sys_restore_leaves_the_disk_cap_alone(self):
         """CPU/memory being calm for 30 minutes says nothing about the disk, which has

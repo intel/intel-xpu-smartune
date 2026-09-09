@@ -6,7 +6,8 @@ import signal
 
 import psutil
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 from utils.self_ident import is_own_process
 
 # Never signal init / very low PIDs.

@@ -11,7 +11,8 @@ from typing import Any, Dict, List, Optional
 import psutil
 
 from monitor.metrics.utils import safe_read, read_first_existing, parse_freq_val, run_cmd
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 def get_gpu_cards() -> List[str]:

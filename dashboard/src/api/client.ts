@@ -46,6 +46,17 @@ import type {
   BenchPreflightData,
   BenchQuietModeState,
   BenchRunSampleData,
+  CapabilitiesData,
+  DiagBootsData,
+  DiagContextData,
+  DiagContextQuery,
+  DiagEvent,
+  DiagEventQuery,
+  DiagEventsData,
+  DiagControlLifecycleQuery,
+  DiagControlLifecyclesData,
+  DiagLogQuery,
+  DiagLogsData,
 } from './types'
 
 // Server uses RetCode.CONFLICT (409) for optimistic-concurrency mismatches
@@ -123,15 +134,23 @@ client.interceptors.request.use((config) => {
 const MAX_CONSECUTIVE_ERRORS = 3
 const GATEWAY_ERROR_STATUSES = new Set([502, 503, 504])
 let consecutiveNetworkErrors = 0
+let latestServerTime: number | null = null
 
 export function isBackendUnreachable(): boolean {
   return consecutiveNetworkErrors >= MAX_CONSECUTIVE_ERRORS
+}
+
+export function getLatestServerTime(): number | null {
+  return latestServerTime
 }
 
 // A 401 means the token is missing/invalid/revoked: drop it and prompt re-login.
 client.interceptors.response.use(
   (res) => {
     consecutiveNetworkErrors = 0
+    const dateHeader = res.headers.date
+    const serverTime = typeof dateHeader === 'string' ? Date.parse(dateHeader) : Number.NaN
+    if (Number.isFinite(serverTime)) latestServerTime = Math.floor(serverTime / 1000)
     return res
   },
   (error) => {
@@ -273,8 +292,54 @@ export const api = {
   // Server capability level: 1 = balancer + monitor, 0 = monitor only.
   // `benchmark`: 1 = the /bench API is mounted here (NOT that its environment is
   // installed — that comes from getBenchEnv().ready).
-  getCapabilities: () =>
-    get<{ capabilities: number; benchmark?: number }>('/smartune/capabilities'),
+  getCapabilities: () => get<CapabilitiesData>('/smartune/capabilities'),
+  getDiagEvents: (params: DiagEventQuery = {}) => {
+    const q = new URLSearchParams()
+    for (const [k, v] of Object.entries(params)) {
+      if (v === undefined || v === null || v === '') continue
+      q.set(k, String(v))
+    }
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+    return get<DiagEventsData>(`/diag/events${suffix}`)
+  },
+  getDiagEvent: async (eventId: string): Promise<DiagEvent | null> => {
+    const data = await get<DiagEventsData>(`/diag/events?event_id=${encodeURIComponent(eventId)}&limit=1`)
+    return data.events?.[0] ?? null
+  },
+  getDiagLogs: (params: DiagLogQuery = {}) => {
+    const q = new URLSearchParams()
+    for (const [k, v] of Object.entries(params)) {
+      if (v === undefined || v === null || v === '') continue
+      if (k === 'source') {
+        const sources = Array.isArray(v) ? v : [v]
+        const joined = sources.map((s) => String(s).trim()).filter(Boolean).join(',')
+        if (joined) q.set('source', joined)
+        continue
+      }
+      q.set(k, String(v))
+    }
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+    return get<DiagLogsData>(`/diag/logs${suffix}`)
+  },
+  getDiagControlLifecycles: (params: DiagControlLifecycleQuery = {}) => {
+    const q = new URLSearchParams()
+    for (const [k, v] of Object.entries(params)) {
+      if (v === undefined || v === null || v === '') continue
+      q.set(k, String(v))
+    }
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+    return get<DiagControlLifecyclesData>(`/diag/control-lifecycles${suffix}`)
+  },
+  getDiagBoots: (limit = 15) => get<DiagBootsData>(`/diag/boots?limit=${limit}`),
+  getDiagContext: (params: DiagContextQuery = {}) => {
+    const q = new URLSearchParams()
+    for (const [k, v] of Object.entries(params)) {
+      if (v === undefined || v === null || v === '') continue
+      q.set(k, String(v))
+    }
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+    return get<DiagContextData>(`/diag/context${suffix}`)
+  },
   getAppResourceStats: (n = 10) => get<AppResourceStatsData>(`/monitor/app_resource_stats?n=${n}`),
   getAppDiskIoStats: (n = 10) => get<AppDiskIoStatsData>(`/monitor/app_disk_io_stats?n=${n}`),
   getProcesses: (gpu = false, io = false) => {

@@ -5,7 +5,8 @@ import os
 from controller.base import ControllerBase
 import subprocess
 
-from utils.logger import logger
+from utils.logger import get_logger
+logger = get_logger(__name__)
 from utils.app_utils import write_cgroup_file
 from config.config import b_config
 

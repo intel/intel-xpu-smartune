@@ -28,6 +28,7 @@ from monitor.network_pressure import (
     start_network_pressure_collector,
     stop_network_pressure_collector,
 )
+from utils import quiet_mode
 from utils.app_utils import get_cgroup_path_by_pid
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
@@ -127,11 +128,15 @@ def _dynamic_info_collector_loop() -> None:
     The configured set is re-read every cycle, so it only ever collects the
     hardware the operator asked to monitor — a deployment configured for GPU
     only never queries CPU/NPU/disk/etc. in the background.
+
+    While quiet mode is up the cycle still ticks but collects nothing, so a
+    benchmark run sees no periodic hardware queries and no history writes from
+    here.  The cache keeps its last snapshot; the endpoints serve that.
     """
     while not _dynamic_info_stop_event.is_set():
         loop_start = time.time()
         try:
-            monitored = _get_monitored_sections()
+            monitored = [] if quiet_mode.is_active() else _get_monitored_sections()
             if monitored:
                 # sections=None collects the full snapshot (and keeps the exact
                 # historical full-snapshot shape); a subset collects just those.
@@ -220,7 +225,12 @@ def _start_app_stats_auto_refresh() -> None:
             # when no dashboard is on the App Resources tab.
             with _APP_STATS_CACHE_LOCK:
                 last_req = _APP_STATS_CACHE.get("last_request_ts", 0.0)
-            if time.time() - last_req > _APP_STATS_IDLE_TIMEOUT_SEC:
+            # Quiet mode reuses the idle park: an open App Resources tab keeps
+            # setting last_request_ts, so the timeout alone would not stop the
+            # pipeline. Parking (rather than sleeping) also means the request
+            # handler's set() wakes us straight back into this check, and we
+            # park again until the gate drops -- no polling of the gate.
+            if quiet_mode.is_active() or time.time() - last_req > _APP_STATS_IDLE_TIMEOUT_SEC:
                 # Drop stale cache so the next request gets fresh data instead
                 # of whatever was last computed minutes/hours ago.
                 with _APP_STATS_CACHE_LOCK:
@@ -557,7 +567,13 @@ def _start_snapshot_cleanup_task() -> None:
         # then every _SNAPSHOT_CLEANUP_INTERVAL_SEC seconds.
         time.sleep(30)
         while True:
-            _run_snapshot_cleanup()
+            # Skipped under quiet mode: a retention DELETE against a
+            # multi-hundred-MB snapshot table is exactly the kind of periodic
+            # spike that makes two runs of the same model incomparable. Nothing
+            # to compensate for afterwards -- the sweep is idempotent, so the
+            # next cycle deletes whatever this one would have.
+            if not quiet_mode.is_active():
+                _run_snapshot_cleanup()
             time.sleep(_SNAPSHOT_CLEANUP_INTERVAL_SEC)
 
     t = threading.Thread(target=cleanup_loop, daemon=True, name="snapshot-cleanup")
@@ -668,6 +684,13 @@ class SystemPressureMonitor:
         def refresh_loop():
             while True:
                 time.sleep(self._next_interval * 0.9)
+                # Stopped, not slowed, under quiet mode. It reads PSI plus a
+                # full ResourceMonitor pass, and the only consumer that acts on
+                # the result -- the balancer's control loop -- is gated too, so
+                # what remains is cost without a consumer. Accepted trade-off:
+                # for the duration of a run there is no OOM backstop signal.
+                if quiet_mode.is_active():
+                    continue
                 self._safe_update()
 
         threading.Thread(target=refresh_loop, daemon=True).start()
@@ -854,6 +877,16 @@ def get_app_resource_stats():
         _start_app_stats_auto_refresh()
         n = int(request.args.get('n', 10))
 
+        if quiet_mode.is_active():
+            # Same reasoning as _respond_dynamic_info_quiet: the cold-cache
+            # branch below collects on demand, so gating only the refresher
+            # would let an open App Resources tab keep the (expensive)
+            # _get_top_processes pipeline running through a benchmark run.
+            return construct_response(
+                data={'apps': [], 'quiet_mode': {'active': True}},
+                retmsg="Quiet mode: per-app stats collection is suspended for a benchmark run"
+            )
+
         with _APP_STATS_CACHE_LOCK:
             _APP_STATS_CACHE["last_request_ts"] = time.time()
             apps = _APP_STATS_CACHE.get("resource")
@@ -889,6 +922,12 @@ def get_app_disk_io_stats():
     try:
         _start_app_stats_auto_refresh()
         n = int(request.args.get('n', 10))
+
+        if quiet_mode.is_active():
+            return construct_response(
+                data={'apps': [], 'quiet_mode': {'active': True}},
+                retmsg="Quiet mode: per-app stats collection is suspended for a benchmark run"
+            )
 
         with _APP_STATS_CACHE_LOCK:
             _APP_STATS_CACHE["last_request_ts"] = time.time()
@@ -1149,6 +1188,39 @@ def _project_sections(data, sections):
     return result
 
 
+def _respond_dynamic_info_quiet(sections=None):
+    """Serve /dynamic_info out of the cache alone, collecting nothing.
+
+    Gating the collector loop is not enough to make a run's background load
+    independent of the UI: both respond paths below fall through to
+    ``collect_dynamic_info`` whenever a section is missing from the cache, so a
+    second tab parked on System Overview would go on forking xpu-smi/npu-smi at
+    its own poll rate and quietly defeat quiet mode.  The interception therefore
+    sits at the entry to both, not in the loop.
+
+    Whatever the collector last cached is returned as-is — stale, and labelled
+    stale via ``quiet_mode.cached_at``.  Sections it never cached are simply
+    absent; the dashboard already renders a missing section as blank, and blank
+    is the honest answer while collection is suspended.
+    """
+    with _DYNAMIC_INFO_CACHE_LOCK:
+        cached = _DYNAMIC_INFO_CACHE.get("data")
+        cached_ts = _DYNAMIC_INFO_CACHE.get("ts") or 0.0
+
+    if isinstance(cached, dict):
+        payload = _project_sections(cached, sections) if sections else dict(cached)
+    else:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload["monitored_sections_updated_at"] = _get_monitored_sections_updated_at()
+    payload["quiet_mode"] = {"active": True, "cached_at": cached_ts or None}
+    return construct_response(
+        data=payload,
+        retmsg="Quiet mode: background collection is suspended for a benchmark run",
+    )
+
+
 def _respond_dynamic_info_full():
     """Serve the full snapshot (all sections).
 
@@ -1158,6 +1230,9 @@ def _respond_dynamic_info_full():
     we assemble all sections — monitored ones from the cache, the rest on demand
     — so /dynamic_info always returns all sections regardless of config.
     """
+    if quiet_mode.is_active():
+        return _respond_dynamic_info_quiet()
+
     if not set(_get_monitored_sections()).issuperset(DYNAMIC_INFO_SECTIONS):
         return _respond_dynamic_sections(list(DYNAMIC_INFO_SECTIONS))
 
@@ -1191,6 +1266,9 @@ def _respond_dynamic_sections(sections):
     path that never queries hardware the caller didn't ask for.  A short
     per-section TTL cache coalesces rapid on-demand polls.
     """
+    if quiet_mode.is_active():
+        return _respond_dynamic_info_quiet(sections)
+
     monitored = set(_get_monitored_sections())
     result = {
         "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),

@@ -14,7 +14,7 @@ import {
 } from 'recharts'
 import dayjs, { type Dayjs } from 'dayjs'
 import { api } from '../api/client'
-import type { DynamicInfoData, HistoryData, HistoryRetentionData, HistorySnapshotItem, GpuUsageDevice, StaticInfoData } from '../api/types'
+import type { BenchQuietModeState, DynamicInfoData, HistoryData, HistoryRetentionData, HistorySnapshotItem, GpuUsageDevice, StaticInfoData } from '../api/types'
 import { COLORS } from '../styles/theme'
 import { useMonitoredSections } from '../hooks/useMonitoredSections'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
@@ -168,6 +168,12 @@ const STICKY_TOOLBAR_STYLE: React.CSSProperties = {
 }
 
 const SNAPSHOT_INTERVAL_SECONDS = 5
+
+// A hole in the charts worth explaining. Snapshots land every ~5 s, so a minute
+// without one is not jitter: either the service was not running, or a benchmark
+// run had monitoring paused. Both leave the same shape on screen, and the note
+// below says so rather than guessing.
+const HISTORY_GAP_WARN_SECONDS = 60
 const HISTORY_LIMIT_CAP = 100000
 const MAX_CHART_POINTS = 800
 
@@ -1623,6 +1629,17 @@ export default function HistoryDashboard({ active }: Props) {
     api.getStaticInfo().then(setStaticInfo).catch(() => {})
   }, [active])
 
+  // Whether a benchmark run currently has history writing suspended, so the
+  // live end of these charts stopping can be explained rather than read as a
+  // machine that went idle.
+  //
+  // Read when the page is opened and again with every history fetch -- never
+  // polled. A periodic request from this page during the one window a run is
+  // measuring would be exactly the background activity quiet mode exists to
+  // remove. Left null when the request fails, which on a monitor-only server
+  // means every time: there are no /bench routes there, and no runs either.
+  const [quietRun, setQuietRun] = useState<BenchQuietModeState | null>(null)
+
   // Retention settings state
   const [retention, setRetention] = useState<HistoryRetentionData | null>(null)
   const [pendingRetentionDays, setPendingRetentionDays] = useState<number | null>(null)
@@ -1703,6 +1720,13 @@ export default function HistoryDashboard({ active }: Props) {
     if (rangePreset === 'custom' && !customRangeReady) return
     fetchHistory()
   }, [active, fetchHistory, rangePreset, customRangeReady])
+
+  // Keyed off the fetch that just landed, so the note and the charts describe
+  // the same moment.
+  useEffect(() => {
+    if (!active) return
+    api.getBenchQuietMode().then(setQuietRun).catch(() => setQuietRun(null))
+  }, [active, lastFetchAt])
 
   const fetchRetention = useCallback(async () => {
     if (!active) return
@@ -1787,6 +1811,23 @@ export default function HistoryDashboard({ active }: Props) {
     () => (history?.items ?? []).filter((item: HistorySnapshotItem) => item.snapshot_type === 'dynamic'),
     [history],
   )
+
+  // The widest stretch of the shown window with no snapshot in it. Only decides
+  // whether the note below is worth showing: the charts already draw the hole
+  // (downsampleWithGaps leaves it blank rather than joining across it), and what
+  // a reader is missing is not the hole but the reason for it.
+  const longestGapSeconds = useMemo(() => {
+    const stamps = dynamicItems
+      .map((item) => item.create_time)
+      .filter((ts) => Number.isFinite(ts) && ts > 0)
+      .sort((a, b) => a - b)
+    let widest = 0
+    for (let i = 1; i < stamps.length; i++) {
+      const delta = stamps[i] - stamps[i - 1]
+      if (delta > widest) widest = delta
+    }
+    return widest
+  }, [dynamicItems])
 
   // Time span the X axis covers: the window that was actually queried, echoed
   // back by the server, so the ruler stays put no matter how much of it has
@@ -2284,6 +2325,44 @@ export default function HistoryDashboard({ active }: Props) {
           style={{ marginBottom: 16 }}
         />
       )}
+
+      {/* Why the charts stop, in the two ways a reader meets it: live, with a
+          run in flight, and after the fact, as a hole in the window. Neither is
+          an error, so both are info -- and the past-tense one is closable,
+          since a reader who knows what the hole is does not need telling
+          again. */}
+      {quietRun?.active ? (
+        <Alert
+          message="History is paused while a benchmark run measures"
+          description={
+            'A benchmark run is in progress, so SmarTune has stopped writing history for its' +
+            ' duration — its own collection would otherwise be part of what the run measures.' +
+            ' The run samples CPU, memory, GPU and NPU every 0.5 s into a file of its own,' +
+            " which is finer than history's 5 s; open it from Models → Benchmark Results → the" +
+            ' case. Writing resumes by itself when the run finishes.'
+          }
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
+      ) : longestGapSeconds >= HISTORY_GAP_WARN_SECONDS ? (
+        <Alert
+          message={`This window has a gap of about ${
+            longestGapSeconds >= 120
+              ? `${Math.round(longestGapSeconds / 60)} minutes`
+              : `${Math.round(longestGapSeconds)} seconds`
+          } with no samples`}
+          description={
+            'Either SmarTune was not running then, or a benchmark run had monitoring paused for' +
+            " the length of the run. A run's own hardware samples are kept with the run, under" +
+            ' Models → Benchmark Results → the case.'
+          }
+          type="info"
+          showIcon
+          closable
+          style={{ marginBottom: 16 }}
+        />
+      ) : null}
 
       <div style={STICKY_TOOLBAR_STYLE}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>

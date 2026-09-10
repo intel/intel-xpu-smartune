@@ -42,6 +42,7 @@ import type {
   NetworkInterfacePressure,
 } from '../api/types'
 import { usePolling } from '../hooks/usePolling'
+import { useBenchEvent } from '../hooks/useBenchEvents'
 import { useDocumentVisible } from '../hooks/useDocumentVisible'
 import { useMonitoredSections } from '../hooks/useMonitoredSections'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
@@ -58,6 +59,13 @@ const DEFAULT_REFRESH_INTERVAL_MS = 2000
 // background request load.  The slower samples are placed on their true time
 // coordinate (see pushTrendPoints) rather than compressed into 2s slots.
 const INACTIVE_REFRESH_INTERVAL_MS = 10000
+// While a measured benchmark run holds quiet mode there is nothing new to fetch:
+// the endpoint refuses to collect and hands back the cache it froze when the run
+// started.  Polling it would be pure noise -- the very background traffic quiet
+// mode exists to remove -- so this page stops entirely when it is not in the
+// foreground, and drops to this slow probe when it is, purely so a reader
+// watching the page sees it come back to life on its own.
+const QUIET_PROBE_INTERVAL_MS = 30000
 const REFRESH_INTERVAL_OPTIONS = [
   { label: '2s', value: 2000 },
   { label: '3s', value: 3000 },
@@ -2487,6 +2495,11 @@ export default function SystemOverview({ active }: Props) {
   const [loadingDynamic, setLoadingDynamic] = useState(false)
   const [errorStatic, setErrorStatic] = useState<string | null>(null)
   const [errorDynamic, setErrorDynamic] = useState<string | null>(null)
+  // Whether a measured benchmark run currently holds quiet mode.  Read off the
+  // snapshot rather than fetched: the endpoint says so in every reply, so
+  // knowing it costs no extra request -- which matters here, because the whole
+  // point is to stop making them.
+  const [quietActive, setQuietActive] = useState(false)
 
   const [refreshIntervalMs, setRefreshIntervalMs] = useState<number>(DEFAULT_REFRESH_INTERVAL_MS)
   const [trendWindow, setTrendWindow] = useState<'1m' | '5m'>('1m')
@@ -2574,6 +2587,8 @@ export default function SystemOverview({ active }: Props) {
     setLoadingDynamic(true)
     try {
       const data = await api.getDynamicInfo(monitoredSectionList)
+      const quiet = Boolean(data.quiet_mode?.active)
+      setQuietActive(quiet)
       setDynamicInfo((prev) => ({
         ...data,
         // Keep previous CPU payload if CPU is enabled and this tick briefly omits it.
@@ -2701,7 +2716,10 @@ export default function SystemOverview({ active }: Props) {
         updates['gpu:aggregate'] = gpuUtils.length ? Math.max(...gpuUtils) : null
       }
 
-      pushTrendPoints(updates)
+      // A frozen cache is not a measurement.  Feeding it to the trends would
+      // draw the machine as flat-lining at whatever it was doing when the run
+      // started, which is a worse lie than the gap the paused poll leaves.
+      if (!quiet) pushTrendPoints(updates)
     } catch (e: unknown) {
       setErrorDynamic(e instanceof Error ? e.message : 'Failed to fetch dynamic info')
     } finally {
@@ -2724,7 +2742,18 @@ export default function SystemOverview({ active }: Props) {
     fetchStatic()
   }, [fetchStatic])
 
-  usePolling(fetchDynamic, foreground ? refreshIntervalMs : INACTIVE_REFRESH_INTERVAL_MS, hasMonitoredSections)
+  usePolling(
+    fetchDynamic,
+    quietActive
+      ? QUIET_PROBE_INTERVAL_MS
+      : foreground
+        ? refreshIntervalMs
+        : INACTIVE_REFRESH_INTERVAL_MS,
+    // Under quiet mode a backgrounded page makes no requests at all.  usePolling
+    // fires once as soon as `enabled` goes true again, so coming back to this tab
+    // both refreshes it and clears `quietActive` on its own once the run ends.
+    hasMonitoredSections && (!quietActive || foreground),
+  )
 
   // Refetch immediately when the *content* of the monitored section set changes
   // (not on every fetchDynamic identity change) so newly enabled cards fill in
@@ -2747,6 +2776,22 @@ export default function SystemOverview({ active }: Props) {
     if (!monitoredSectionList.length) return
     void fetchDynamicRef.current()
   }, [active, monitoredSectionsKey, monitoredSectionList.length])
+
+  // A run ending is the moment collection resumes, and it arrives on the
+  // benchmark event stream App already holds open.  Without it this page would
+  // sit on the slow probe (or, backgrounded, on nothing at all) for up to half a
+  // minute after the machine went live again.  Only subscribed while quiet.
+  useBenchEvent(
+    useCallback(
+      (event) => {
+        if (event.type !== 'job' || event.job.status === 'running') return
+        setQuietActive(false)
+        if (active) void fetchDynamicRef.current()
+      },
+      [active],
+    ),
+    quietActive,
+  )
 
   const gpuDevices = useMemo(() => buildGpuDevices(staticInfo, dynamicInfo), [staticInfo, dynamicInfo])
 
@@ -3265,6 +3310,27 @@ export default function SystemOverview({ active }: Props) {
 
       {errorDynamic && (
         <Alert message="Dynamic Info Error" description={errorDynamic} type="error" showIcon style={{ marginBottom: 12 }} />
+      )}
+
+      {quietActive && (
+        <Alert
+          message="Monitoring is paused for a benchmark run"
+          description={
+            <>
+              Quiet mode is holding SmarTune's own collection down so the run competes with a
+              constant machine. Everything below is the snapshot from just before it started,
+              not the machine as it is now, and the trends are not being extended. This page
+              refreshes itself when the run finishes.
+              <br />
+              The run is still recording the platform at 2&nbsp;Hz into its own metrics.csv. To
+              watch live instead, turn Quiet mode off on the Benchmark tab — at the cost of that
+              run's comparability.
+            </>
+          }
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+        />
       )}
 
       {!hasMonitoredSections && (

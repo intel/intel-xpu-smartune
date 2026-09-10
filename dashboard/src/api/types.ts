@@ -582,6 +582,12 @@ export interface GpuUsageOutput {
 export interface DynamicInfoData {
   collected_at: string
   monitored_sections_updated_at?: number
+  // Present only while a measured benchmark run holds quiet mode. The payload is
+  // then whatever was last cached rather than a fresh collection -- the endpoint
+  // refuses to query hardware while the gate is up -- so a reader must say so
+  // instead of drawing it as current. `cached_at` is null for a section that was
+  // never cached (monitor_api.py _respond_dynamic_* ).
+  quiet_mode?: { active: boolean; cached_at: number | null }
   cpu: {
     usage_total: number | null
     per_core_usage: number[]
@@ -777,6 +783,11 @@ export interface BenchJob {
     devices?: string[]
     // BENCH_RUN_NAME: what every result directory this job wrote is named after.
     run_name?: string
+    // Whether this run held quiet mode from start to finish. False means the
+    // user restored full monitoring part-way through, so the results were taken
+    // in a dirtied environment and are not comparable with other runs. Absent on
+    // build-only jobs (nothing to measure) and on runs from before quiet mode.
+    quiet_held?: boolean
   }
   // Present only when the request asked for a log tail (?offset=).
   chunk?: string
@@ -899,6 +910,52 @@ export type BenchEvent =
 export interface BenchRunsData {
   current: BenchJob | null
   recent: BenchJob[]
+}
+
+/**
+ * Quiet mode: the gate that stands SmarTune's own background activity down for
+ * the duration of a measured run, so the load a run competes with does not
+ * depend on which dashboard page happens to be open.
+ */
+export interface BenchQuietModeState {
+  /** Is the gate in effect right now? False while the user has it dropped. */
+  active: boolean
+  /** Does a run hold quiet mode at all? False outside a measured run. */
+  held: boolean
+  /** The run id holding it, for logs/diagnosis. */
+  owner: string | null
+  /** Epoch seconds the hold started. */
+  since: number | null
+  /** Has the user dropped the gate during this hold? Latches until the run ends. */
+  user_exited: boolean
+}
+
+/** One reason a measured run cannot start. */
+export interface BenchPreflightBlocker {
+  name: string
+  reason?: string
+  action?: string
+  apps?: { app_id: string | null; app_name: string | null }[]
+}
+
+export interface BenchPreflightData {
+  blocked: boolean
+  blockers: BenchPreflightBlocker[]
+  quiet_mode: BenchQuietModeState
+}
+
+/**
+ * The running run's most recent hardware sample, straight off the sampler that
+ * is already writing metrics.csv. Column names are that CSV's schema
+ * (benchmark/service/sampler.py COLUMNS) -- CPU/memory/GPU/NPU only, since it
+ * collects no disk or network counters.
+ */
+export interface BenchRunSampleData {
+  row: Record<string, number | null> | null
+  /** False once the run's sampler has been torn down. */
+  sampling: boolean
+  period_s: number | null
+  quiet_mode: BenchQuietModeState
 }
 
 export interface BenchResultRow {

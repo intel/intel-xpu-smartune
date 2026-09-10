@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional
 
 from config.config import b_config
 from monitor.network import NetworkMonitor
+from utils import quiet_mode
 from utils.logger import logger
 
 
@@ -138,6 +139,13 @@ def _build_network_monitors() -> Dict[str, NetworkMonitor]:
 def _network_pressure_collector_loop() -> None:
     monitors = _build_network_monitors()
     while not _network_pressure_stop_event.is_set():
+        if quiet_mode.is_active():
+            # Each monitor differences the interface counters over its own dt,
+            # so the first sample after the gap simply reports the average rate
+            # across it -- suspending here costs resolution, not correctness.
+            _network_pressure_stop_event.wait(_NETWORK_PRESSURE_REFRESH_INTERVAL_SEC)
+            continue
+
         loop_start = time.time()
         try:
             if not monitors:

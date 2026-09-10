@@ -11,7 +11,7 @@ from collections import OrderedDict
 from controller.app_intercept import AppIntercept
 
 from utils.logger import logger
-from utils import app_utils
+from utils import app_utils, quiet_mode
 from config.config import b_config
 import threading
 from multiprocessing import JoinableQueue
@@ -841,41 +841,75 @@ class DynamicBalancer:
                     self.all_limits.is_limited_app_dominant = False
                     self.control_manager.set_limited_app_dominant(False)
 
-                # A RISING EDGE into critical bypasses the idle_check_interval gate. This loop
-                # wakes every ~1s (see time.sleep below), so a fresh critical level -- e.g.
-                # memory racing toward OOM -- gets a limit applied within ~1s instead of
-                # waiting up to idle_check_interval. Edge- (not level-) triggered on purpose:
-                # while critical persists, the tick reverts to the normal idle_check cadence,
-                # so we don't re-run the apply pipeline every second. Uses the non-consuming
-                # current level (does NOT reset the peak latch consumed below).
-                critical_now = self.control_manager.current_level == "critical"
-                critical_edge = critical_now and not state.prev_critical
-                state.prev_critical = critical_now
-                if (not self.app_priority_queue.empty()
-                        or critical_edge
-                        or (state.current_time - state.last_check_time) >= state.idle_check_interval):
-                    # Use consume_peak_pressure_level() instead of get_current_pressure_level()
-                    # so that transient "critical" spikes that occurred while the
-                    # idle_check_interval gate was closed are never silently dropped.
-                    disk_level = "low"
-                    if policy == "separated":
-                        pressure, _, disk_level = self.control_manager.consume_peak_pressure_level()
-                    else:  # policy == "combined"
-                        pressure, *_ = self.control_manager.consume_peak_pressure_level()
+                # Quiet mode (a benchmark run is being measured) suspends
+                # automatic intervention. Never by touching the config switch:
+                # routing it through passive_resource_control would fire the
+                # falling edge above and convert every existing auto limit into a
+                # manual one that never restores itself. Hence the local override,
+                # applied *after* prev_passive_enabled has been recorded, as a
+                # backstop for anything added outside the branch below.
+                quiet = quiet_mode.is_active()
+                if quiet:
+                    passive_enabled = False
 
-                    state.last_check_time = state.current_time
-                    # Top-consumer prefetch / recheck only exist to warm the cache for the
-                    # auto-limit path.  When passive control is off we are not going to
-                    # apply any auto-limit, so skip the multi-second sampling pipeline.
-                    self._maybe_trigger_prefetch(state, pressure, disk_level, passive_enabled)
+                if quiet:
+                    # The whole decision block is skipped, not just neutered.
+                    # SystemPressureMonitor is stopped for the length of the run,
+                    # so every level this block could read is frozen at the last
+                    # tick before the run started -- and with passive control off
+                    # the only arms it can still reach are release-only ones.
+                    # Deciding a staged restore off stale pressure is worse than
+                    # not deciding, and consuming the peak latch each tick would
+                    # log a pressure reading nobody sampled. So: keep the one duty
+                    # that must not stop, and nothing else.
+                    #
+                    # Draining is pure release (SIGCONT plus bookkeeping, see
+                    # _drain_pending_app_queue). Without it an app the user
+                    # launched and had held pending would stay suspended for the
+                    # length of the benchmark.
+                    state.prev_critical = False
+                    if not self.app_priority_queue.empty():
+                        self._drain_pending_app_queue(state)
+                else:
+                    # A RISING EDGE into critical bypasses the idle_check_interval gate. This loop
+                    # wakes every ~1s (see time.sleep below), so a fresh critical level -- e.g.
+                    # memory racing toward OOM -- gets a limit applied within ~1s instead of
+                    # waiting up to idle_check_interval. Edge- (not level-) triggered on purpose:
+                    # while critical persists, the tick reverts to the normal idle_check cadence,
+                    # so we don't re-run the apply pipeline every second. Uses the non-consuming
+                    # current level (does NOT reset the peak latch consumed below).
+                    critical_now = self.control_manager.current_level == "critical"
+                    critical_edge = critical_now and not state.prev_critical
+                    state.prev_critical = critical_now
+                    if (not self.app_priority_queue.empty()
+                            or critical_edge
+                            or (state.current_time - state.last_check_time) >= state.idle_check_interval):
+                        # Use consume_peak_pressure_level() instead of get_current_pressure_level()
+                        # so that transient "critical" spikes that occurred while the
+                        # idle_check_interval gate was closed are never silently dropped.
+                        disk_level = "low"
+                        if policy == "separated":
+                            pressure, _, disk_level = self.control_manager.consume_peak_pressure_level()
+                        else:  # policy == "combined"
+                            pressure, *_ = self.control_manager.consume_peak_pressure_level()
 
-                    if policy == "separated":
-                        self._tick_separated_policy(state, pressure, disk_level, passive_enabled)
-                    elif policy == "combined":
-                        self._tick_combined_policy(state, pressure, passive_enabled)
-                    state.prev_pressure = pressure
-                    state.prev_disk_level = disk_level
-                self._run_network_tick(state)
+                        state.last_check_time = state.current_time
+                        # Top-consumer prefetch / recheck only exist to warm the cache for the
+                        # auto-limit path.  When passive control is off we are not going to
+                        # apply any auto-limit, so skip the multi-second sampling pipeline.
+                        self._maybe_trigger_prefetch(state, pressure, disk_level, passive_enabled)
+
+                        if policy == "separated":
+                            self._tick_separated_policy(state, pressure, disk_level, passive_enabled)
+                        elif policy == "combined":
+                            self._tick_combined_policy(state, pressure, passive_enabled)
+                        state.prev_pressure = pressure
+                        state.prev_disk_level = disk_level
+
+                    # Both halves of the tick have to go under quiet mode: the
+                    # sampling side reads every interface on its own cadence, and
+                    # the handling side can install tc classes on the run's traffic.
+                    self._run_network_tick(state)
 
                 # Reaper: restore limits for apps that have since closed. Runs
                 # on its own short cadence (limit_reap_interval), independent of

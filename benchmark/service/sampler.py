@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional
 
 from monitor.metrics import cpu as cpu_metrics
 from monitor.metrics import gpu_perf, membw, npu as npu_metrics
+from utils import quiet_mode
 from utils.logger import logger
 
 # 2 Hz. npu._collect_npu_smi_once() sleeps 200ms internally to difference the
@@ -97,10 +98,21 @@ class RunSampler:
     straight through monitor.metrics' module functions.
     """
 
-    def __init__(self, csv_path: Path, period_s: float = DEFAULT_PERIOD_S):
+    def __init__(self, csv_path: Path, period_s: float = DEFAULT_PERIOD_S,
+                 quiet_owner: Optional[str] = None):
         self.csv_path = Path(csv_path)
         self.period_s = max(0.1, float(period_s))
         self.rows_written = 0
+        # Whose quiet-mode lease this thread renews, if any. The lease is what
+        # stops the gate from outliving the run: if this thread dies without its
+        # job reaching a terminal status, nothing renews and the watchdog
+        # restores normal monitoring.
+        self.quiet_owner = quiet_owner
+        # Last row sampled, served to the dashboard by latest(). Quiet mode has
+        # the background collectors stood down, so this thread's 2 Hz data is the
+        # only live reading in the process -- and it costs nothing extra to keep,
+        # since _sample() already produced it for the CSV.
+        self._last_row: Optional[Dict[str, Any]] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._fh = None
@@ -183,11 +195,27 @@ class RunSampler:
                         self.rows_written, self.csv_path)
 
     # --- sampling loop ----------------------------------------------------
+    def latest(self) -> Optional[Dict[str, Any]]:
+        """The most recent sampled row, or None before the first tick.
+
+        A plain attribute read: dict assignment in _loop is atomic under the GIL,
+        so a reader either sees the previous row or the new one, never a
+        half-populated one -- and no lock is taken on the sampling thread's hot
+        path just to serve a 3 s dashboard poll.
+        """
+        return self._last_row
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             started = time.monotonic()
+            if self.quiet_owner:
+                # Renewed unconditionally, including while the user has the gate
+                # manually down: the lease exists to stop the hold from leaking,
+                # not to record whether the gate is up.
+                quiet_mode.heartbeat(self.quiet_owner)
             try:
                 row = self._sample()
+                self._last_row = row
                 if self._writer is not None:
                     self._writer.writerow(row)
                     self._fh.flush()

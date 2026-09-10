@@ -20,6 +20,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Card, Modal, Space, Tabs, Tag, Tooltip, Typography, message } from 'antd'
 import {
   CheckCircleTwoTone,
+  CloudDownloadOutlined,
   LeftOutlined,
   PlayCircleOutlined,
   RightOutlined,
@@ -37,13 +38,15 @@ import type {
   BenchModel,
   BenchModelsState,
   BenchPrecision,
+  BenchPreflightBlocker,
+  BenchPreflightData,
   BenchStage,
 } from '../api/types'
 import { useBenchEvent } from '../hooks/useBenchEvents'
 import BenchCaseDrawer from './BenchCaseDrawer'
 import BenchCompare from './BenchCompare'
 import BenchEnvDrawer, { EnvStatusTag, versionSummary } from './BenchEnvDrawer'
-import BenchModelDetail, { runStageFor } from './BenchModelDetail'
+import BenchModelDetail, { missingPrecisions } from './BenchModelDetail'
 import BenchModelList, { type ModelFilter } from './BenchModelList'
 import BenchOutput, { JobStatusTag } from './BenchOutput'
 import BenchResults from './BenchResults'
@@ -69,6 +72,11 @@ interface PendingRun {
   stage: BenchStage
   ids: string[]
   conflicts: RerunConflict[]
+}
+
+interface BenchmarkProps {
+  /** Switch the app to the Balancer tab. Absent in monitor-only mode. */
+  onOpenBalance?: () => void
 }
 
 /**
@@ -108,10 +116,25 @@ function findConflicts(
   return conflicts
 }
 
+/**
+ * One line naming the apps a preflight blocker is about, or its bare reason.
+ *
+ * Names, not counts: "resolve two apps" sends the reader hunting through the
+ * Balancer page, and the whole point of surfacing this before the click is that
+ * they know what to go and do.
+ */
+function blockerLine(blocker: BenchPreflightBlocker): string {
+  const apps = (blocker.apps ?? [])
+    .map((app) => app.app_name || app.app_id)
+    .filter(Boolean) as string[]
+  const reason = blocker.reason || blocker.name
+  return apps.length ? `${reason} (${apps.join(', ')})` : reason
+}
+
 // No `active` prop: the stream App holds keeps this component current whether or
 // not the tab is on screen, which is the whole point -- coming back to a
 // finished run is instant, with nothing to re-fetch.
-export default function Benchmark() {
+export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   const [env, setEnv] = useState<BenchEnvData | null>(null)
   const [envError, setEnvError] = useState<string | null>(null)
   const [envOpen, setEnvOpen] = useState(false)
@@ -163,6 +186,11 @@ export default function Benchmark() {
   const [mainTab, setMainTab] = useState<MainTab>('results')
   const [starting, setStarting] = useState(false)
   const [siderOpen, setSiderOpen] = useState(true)
+  // Whether a measured run could start right now. A measured run takes the
+  // machine quiet for its duration, and cannot do that while the balancer is
+  // holding automatic limits on an app -- so the answer is shown here, before
+  // the click, rather than being an error the Run button returns.
+  const [preflight, setPreflight] = useState<BenchPreflightData | null>(null)
 
   const busy = job?.status === 'running' || !!env?.busy
   const installing = (env?.busy?.kind ?? (job?.status === 'running' ? job.kind : null)) === 'setup'
@@ -186,14 +214,15 @@ export default function Benchmark() {
   const activeDetailId =
     selectedId && detailIds.includes(selectedId) ? selectedId : (detailIds[0] ?? null)
 
-  // "Run all" means the same thing as a model's own Run button, decided over the
-  // whole batch: skip the fetch only when every ticked model already has every
-  // ticked precision. A model that is checked but no longer in the list counts
-  // as missing, which is why this filters rather than maps.
-  const batchStage = useMemo<BenchStage>(() => {
+  // "Download all" / "Run all" mean the same thing as a model's own two buttons,
+  // decided over the whole batch: the batch can be benchmarked only when every
+  // ticked model already has every ticked precision. A model that is checked but
+  // no longer in the list counts as missing, which is why this compares lengths
+  // rather than just mapping.
+  const batchMissing = useMemo<BenchPrecision[]>(() => {
     const checked = models.filter((m) => checkedIds.includes(m.id))
-    if (checked.length !== checkedIds.length) return 'all'
-    return runStageFor(checked, precisions)
+    if (checked.length !== checkedIds.length) return precisions
+    return missingPrecisions(checked, precisions)
   }, [models, checkedIds, precisions])
 
   // OpenVINO versions to suggest, and whether the one in the box is runnable.
@@ -259,6 +288,25 @@ export default function Benchmark() {
     }
   }, [])
 
+  /**
+   * Re-read whether a measured run can start.
+   *
+   * Not polled. What it reports is decided on the Balancer page, and polling for
+   * it would put a periodic request behind a feature whose entire purpose is to
+   * keep background activity off the machine during a run. Read on mount, when a
+   * job reaches a terminal state, and on the banner's own Re-check -- and the
+   * server checks again for real when Run is pressed, so a stale banner can
+   * only ever be a stale *hint*.
+   */
+  const loadPreflight = useCallback(async () => {
+    try {
+      setPreflight(await api.getBenchPreflight())
+    } catch {
+      // Advisory: a server that cannot answer must not stop anyone running
+      // anything. The block, if there is one, still comes back from Run.
+    }
+  }, [])
+
   // One load per mount. The tab is rendered lazily and then kept mounted, so
   // this is also once per session; live updates after it arrive on the stream.
   //
@@ -271,7 +319,8 @@ export default function Benchmark() {
     void loadEnv()
     void loadModels()
     void loadResults()
-  }, [loadEnv, loadModels, loadResults])
+    void loadPreflight()
+  }, [loadEnv, loadModels, loadResults, loadPreflight])
 
   // Open on the model the results below are about.
   //
@@ -392,9 +441,20 @@ export default function Benchmark() {
             if (event.job.status === 'running') {
               setMainTab('output')
             } else {
-              // Finished: the numbers are the point, so put them back in front.
-              // The log stays one click away and keeps streaming its last lines.
-              setMainTab('results')
+              // Finished. Only a measured run has numbers to show, so only a
+              // measured run takes the reader away from the log: a download or
+              // an environment install would land them on an unchanged Results
+              // table, while what they were actually watching -- how the fetch
+              // went -- is the thing they just got moved away from.
+              const measured =
+                event.job.kind === 'run' && event.job.meta?.stage !== 'build'
+              if (measured) setMainTab('results')
+              // A finished run releases quiet mode, and the balancer resumes --
+              // which is exactly when what preflight reports can change. This
+              // is also the refresh that clears a block the user has just gone
+              // and resolved before running again. Also worth doing after a
+              // setup or a download: the balancer moved on meanwhile.
+              void loadPreflight()
             }
             break
           }
@@ -419,7 +479,7 @@ export default function Benchmark() {
             break
         }
       },
-      [applyDelta, loadModels, loadResults, trackJob],
+      [applyDelta, loadModels, loadPreflight, loadResults, trackJob],
     ),
   )
 
@@ -470,6 +530,46 @@ export default function Benchmark() {
     [],
   )
 
+  /**
+   * Explain a refused run, and offer the one place it can be resolved.
+   *
+   * Deliberately a dialog and not a toast: the user has to do something
+   * elsewhere before the run can happen, and "Open the Balancer" being the
+   * primary button is the difference between a message and an instruction.
+   */
+  const showBlockedDialog = useCallback(
+    (blockers: BenchPreflightBlocker[]) => {
+      const actions = [...new Set(blockers.map((b) => b.action).filter(Boolean))] as string[]
+      Modal.confirm({
+        title: 'This run cannot be measured yet',
+        width: 560,
+        okText: onOpenBalance ? 'Open the Balancer' : 'OK',
+        cancelText: 'Close',
+        okCancel: !!onOpenBalance,
+        onOk: onOpenBalance,
+        content: (
+          <Space direction="vertical" size={8} style={{ marginTop: 8 }}>
+            <Paragraph style={{ marginBottom: 0 }}>
+              A benchmark run takes the machine quiet for its duration — background
+              collection stops and the balancer's automatic control is suspended — so
+              its numbers can be compared with other runs. That cannot be done while
+              limits are already being applied:
+            </Paragraph>
+            {blockers.map((blocker) => (
+              <Text key={blocker.name}>• {blockerLine(blocker)}</Text>
+            ))}
+            {actions.map((action) => (
+              <Text key={action} type="secondary">
+                {action}
+              </Text>
+            ))}
+          </Space>
+        ),
+      })
+    },
+    [onOpenBalance],
+  )
+
   // Send the run. Nothing is asked here -- whether the user has already answered
   // for the results this repeats is decided by requestRun, above it.
   const launchRun = useCallback(
@@ -494,6 +594,23 @@ export default function Benchmark() {
           stage === 'build' ? undefined : ov,
         )
         if (res.status === 'conflict') {
+          // Two different conflicts arrive on this path. A busy execution slot
+          // is a "try again in a minute" and a toast says it fine. A quiet-mode
+          // block is a job for the user on another page, named app by app, and
+          // a toast that disappears in three seconds is the wrong shape for
+          // that -- so it gets a dialog with the way there.
+          const blocked = (res.data as { blockers?: BenchPreflightBlocker[] })?.blockers
+          if (blocked?.length) {
+            setPreflight({
+              blocked: true,
+              blockers: blocked,
+              // Nothing holds quiet mode: the run that would have is the one
+              // just refused. Kept in shape so the banner reads one field.
+              quiet_mode: { active: false, held: false, owner: null, since: null, user_exited: false },
+            })
+            showBlockedDialog(blocked)
+            return
+          }
           message.warning(res.message)
           return
         }
@@ -508,7 +625,7 @@ export default function Benchmark() {
         setStarting(false)
       }
     },
-    [args, devices, ov, precisions],
+    [args, devices, ov, precisions, showBlockedDialog],
   )
 
   /**
@@ -714,6 +831,43 @@ export default function Benchmark() {
             />
           )}
 
+          {/* Shown before anything is clicked, because the fix is on another
+              page: a measured run needs the machine quiet, and it cannot go
+              quiet while the balancer is holding automatic limits. Not
+              closable -- it is a precondition of the button below it, not
+              news. The Run buttons stay live: the server decides, and this
+              banner is only as fresh as its last read. */}
+          {preflight?.blocked && (
+            <Alert
+              type="warning"
+              showIcon
+              message="A benchmark run cannot be measured right now"
+              description={
+                <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                  {preflight.blockers.map((blocker) => (
+                    <Text key={blocker.name}>{blockerLine(blocker)}</Text>
+                  ))}
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    Restore them or lock them to manual, then re-check. Starting a run
+                    anyway will be refused.
+                  </Text>
+                </Space>
+              }
+              action={
+                <Space direction="vertical" size={4}>
+                  {onOpenBalance && (
+                    <Button size="small" type="primary" onClick={onOpenBalance}>
+                      Open the Balancer
+                    </Button>
+                  )}
+                  <Button size="small" onClick={() => void loadPreflight()}>
+                    Re-check
+                  </Button>
+                </Space>
+              }
+            />
+          )}
+
           {/* Flex rather than <Space> so the environment control can be pushed
               to the far edge: it is the one thing here that is not about the
               models, and it belongs out of the way of the ones that are. */}
@@ -728,13 +882,31 @@ export default function Benchmark() {
                 </Tag>
                 <Tooltip
                   title={
-                    devices.length === 0
-                      ? 'Pick at least one device to benchmark on'
-                      : !ovValid
-                        ? 'Enter an OpenVINO version (e.g. 2026.2.0) to benchmark against'
-                        : batchStage === 'benchmark'
-                          ? 'Benchmark every selected model, as one job'
-                          : 'Download whatever is missing, then benchmark every selected model, as one job'
+                    batchMissing.length
+                      ? `Fetch ${batchMissing.join(', ')} for every selected model, as one job`
+                      : 'Every selected model already has the ticked precisions; this fetches them again'
+                  }
+                >
+                  <Button
+                    size="small"
+                    type={batchMissing.length ? 'primary' : 'default'}
+                    icon={<CloudDownloadOutlined />}
+                    disabled={!env?.ready || busy || precisions.length === 0}
+                    loading={starting}
+                    onClick={() => requestRun('build', checkedIds)}
+                  >
+                    Download all
+                  </Button>
+                </Tooltip>
+                <Tooltip
+                  title={
+                    batchMissing.length
+                      ? `Download ${batchMissing.join(', ')} first`
+                      : devices.length === 0
+                        ? 'Pick at least one device to benchmark on'
+                        : !ovValid
+                          ? 'Enter an OpenVINO version (e.g. 2026.2.0) to benchmark against'
+                          : 'Benchmark every selected model, as one job'
                   }
                 >
                   <Button
@@ -742,17 +914,21 @@ export default function Benchmark() {
                     type="primary"
                     icon={<PlayCircleOutlined />}
                     disabled={
-                      !env?.ready || busy || precisions.length === 0 || devices.length === 0 || !ovValid
+                      !env?.ready ||
+                      busy ||
+                      precisions.length === 0 ||
+                      devices.length === 0 ||
+                      !ovValid ||
+                      batchMissing.length > 0
                     }
                     loading={starting}
-                    onClick={() => requestRun(batchStage, checkedIds)}
+                    // Never `all`: see BenchModelDetail's header for why a fetch
+                    // must not happen inside a measured run.
+                    onClick={() => requestRun('benchmark', checkedIds)}
                   >
                     Run all
                   </Button>
                 </Tooltip>
-                <Button size="small" type="text" onClick={() => setCheckedIds([])}>
-                  Clear
-                </Button>
               </>
             ) : (
               <Text type="secondary" style={{ fontSize: 12 }}>

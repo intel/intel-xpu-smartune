@@ -12,6 +12,7 @@
 
 from flask import Blueprint, Response, request, stream_with_context
 
+from utils import quiet_mode
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
 
@@ -241,6 +242,15 @@ def post_run():
         return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg=str(e))
     except jobs.BenchBusy as exc:
         return _busy_response(exc)
+    except runner.QuietModeBlocked as exc:
+        # Must precede the RuntimeError arm below (it is a subclass). CONFLICT,
+        # not ARGUMENT_ERROR: the request is fine, the machine's state is not,
+        # and the blockers say exactly which state and where to resolve it.
+        return construct_response(
+            data={"blocked": True, "blockers": exc.blockers},
+            retcode=RetCode.CONFLICT,
+            retmsg=str(exc),
+        )
     except RuntimeError as e:
         # Environment not ready / feature disabled: actionable, not a server fault.
         return construct_response(retcode=RetCode.NOT_EFFECTIVE, retmsg=str(e))
@@ -278,6 +288,94 @@ def get_run(run_id):
     return construct_response(
         data=runner.job_view(job, offset=_offset_arg()),
         retmsg="Successfully retrieved benchmark run",
+    )
+
+
+@bench_bp.route('/preflight', methods=['GET'])
+def get_preflight():
+    """Whether a measured run can start right now, and what is in the way.
+
+    Lets the Models tab say "resolve these two apps first" before the user
+    commits to a run, instead of taking the click and returning an error. It is
+    advisory only -- ``start_run`` re-checks, because nothing holds the machine's
+    state still between this call and that one.
+    """
+    blockers = quiet_mode.check_blockers()
+    return construct_response(
+        data={
+            "blocked": bool(blockers),
+            "blockers": blockers,
+            "quiet_mode": quiet_mode.state(),
+        },
+        retmsg="Successfully retrieved benchmark preflight state",
+    )
+
+
+@bench_bp.route('/quiet_mode', methods=['GET'])
+def get_quiet_mode():
+    """Current quiet-mode state (whether a run holds it, and whether it is up)."""
+    return construct_response(
+        data=quiet_mode.state(),
+        retmsg="Successfully retrieved quiet mode state",
+    )
+
+
+@bench_bp.route('/quiet_mode', methods=['POST'])
+def post_quiet_mode():
+    """Raise or drop the gate for the run that currently holds it.
+
+    Dropping it is a deliberate choice with a cost the UI spells out first: full
+    monitoring comes back, including the balancer's automatic control, and the
+    run's numbers stop being comparable with other runs. Refused when no run
+    holds quiet mode -- there is nothing to toggle outside a run, and silently
+    accepting would let the UI believe it had changed something.
+    """
+    body = request.get_json(silent=True) or {}
+    if "active" not in body:
+        return construct_response(
+            retcode=RetCode.ARGUMENT_ERROR, retmsg="'active' (bool) is required")
+    want = bool(body["active"])
+
+    if not quiet_mode.state().get("held"):
+        return construct_response(
+            data=quiet_mode.state(), retcode=RetCode.NOT_EFFECTIVE,
+            retmsg="No benchmark run currently holds quiet mode",
+        )
+
+    quiet_mode.set_gate(want)
+    state = quiet_mode.state()
+    logger.info(
+        "Quiet mode gate %s by user request (owner=%s)",
+        "raised" if state.get("active") else "dropped", state.get("owner"),
+    )
+    return construct_response(
+        data=state,
+        retmsg=("Quiet mode restored" if state.get("active")
+                else "Quiet mode exited; full monitoring resumed"),
+    )
+
+
+@bench_bp.route('/run/metrics/latest', methods=['GET'])
+def get_run_metrics_latest():
+    """The running run's most recent sampled row.
+
+    A dict lookup, no collection: the row was already produced for metrics.csv.
+    This is what the Live tiles read under quiet mode, so that showing them costs
+    one read-only poll rather than bringing the 2 s hardware collector back.
+
+    Only CPU / memory / GPU / NPU are present -- the sampler collects no disk or
+    network columns, so those tiles have no source here and the UI hides them.
+    """
+    live = runner.live_sampler()
+    row = live.latest() if live is not None else None
+    return construct_response(
+        data={
+            "row": row,
+            "sampling": live is not None,
+            "period_s": live.period_s if live is not None else None,
+            "quiet_mode": quiet_mode.state(),
+        },
+        retmsg="Successfully retrieved the latest run sample",
     )
 
 

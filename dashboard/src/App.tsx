@@ -289,7 +289,16 @@ export default function App() {
             ),
             // No `active` prop: the tab keeps itself current off the event
             // stream owned above, so switching away and back costs nothing.
-            children: <Benchmark />,
+            //
+            // onOpenBalance is how a preflight block becomes actionable: the
+            // apps holding a run back are released on the Balancer page, and in
+            // monitor-only mode there is no such page (and, equally, no
+            // balancer to block a run), so the prop is left off.
+            children: (
+              <Benchmark
+                onOpenBalance={balancerEnabled ? () => setActiveTab('5') : undefined}
+              />
+            ),
           },
         ]
       : []),

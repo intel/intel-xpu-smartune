@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
+from utils import quiet_mode
 from utils.logger import logger
 
 from benchmark.service import env, jobs, sampler
@@ -61,6 +62,42 @@ _MAX_MODELS = 32
 
 class InvalidRunRequest(ValueError):
     """The requested models/stage cannot be turned into a run."""
+
+
+class QuietModeBlocked(RuntimeError):
+    """Quiet mode cannot be entered, so the run is refused.
+
+    Carries the blockers verbatim so the REST layer can name what is in the way
+    (which apps, and where to resolve them) instead of relaying a bare string.
+    """
+
+    def __init__(self, blockers: list):
+        self.blockers = blockers
+        reasons = "; ".join(
+            str(b.get("reason") or b.get("name")) for b in blockers
+        ) or "unknown"
+        super().__init__(
+            "cannot enter quiet mode, so the run would not be measurable: " + reasons
+        )
+
+
+# Stages that are actually measured. A build fetches and converts weights -- the
+# result is the same file whatever the machine was doing at the time -- so it is
+# not worth suspending the operator's monitoring for. Kept identical to the
+# stages that get a RunSampler, since quiet mode's lease depends on that thread.
+_MEASURED_STAGES = ("benchmark", "all")
+
+# The running run's sampler, or None. Published so the dashboard can read the
+# 2 Hz rows it is already collecting: under quiet mode the background collectors
+# are stood down, so this is the only live hardware reading in the process, and
+# serving it is a dict lookup rather than a second set of hardware queries.
+# Single-slot like the job manager -- there is never more than one.
+_live_sampler: Optional[sampler.RunSampler] = None
+
+
+def live_sampler() -> Optional[sampler.RunSampler]:
+    """The current run's sampler, or None when no measured run is in flight."""
+    return _live_sampler
 
 
 def normalize_devices(devices: Optional[Sequence[str]], stage: str) -> List[str]:
@@ -206,7 +243,8 @@ def start_run(
     ov: Optional[str] = None,
 ) -> jobs.Job:
     """Validate, render and launch a pipeline run. Raises InvalidRunRequest,
-    jobs.BenchBusy, or RuntimeError when the environment is not ready."""
+    jobs.BenchBusy, QuietModeBlocked, or RuntimeError when the environment is
+    not ready."""
     # Validate the request before probing the environment: a malformed request is
     # malformed regardless of environment state, and reporting *that* is more
     # useful than telling the user to spend an hour on setup first.
@@ -231,6 +269,16 @@ def start_run(
     if busy is not None:
         raise jobs.BenchBusy(busy)
 
+    # A measured run must start in a quiet environment or not at all: results
+    # taken while the balancer might drop a cgroup cap on the process are not
+    # comparable with anything. Checked again here even though the UI calls
+    # /bench/preflight first -- that check only tells the user in advance, it
+    # cannot hold the state still until they click Run.
+    if stage in _MEASURED_STAGES:
+        blockers = quiet_mode.check_blockers()
+        if blockers:
+            raise QuietModeBlocked(blockers)
+
     run_id = uuid.uuid4().hex[:12]
     script_path, models_json = render_script(entries, stage, run_id)
     log_path = env.paths()["runs"] / f"run_{run_id}.log"
@@ -248,16 +296,35 @@ def start_run(
     # Sample the platform for the whole run, and hand the pipeline the path so its
     # aggregation step can slice each case's window out of it. A build-only run
     # measures nothing, so it is not worth the perf descriptors.
+    # Quiet mode goes up before the sampler opens its descriptors, so the very
+    # first row already describes the environment the pipeline will run in. The
+    # owner is the run id rather than the job id because the job does not exist
+    # yet -- and the sampler, which renews the lease, is created here too.
+    quiet_owner: Optional[str] = None
+    if stage in _MEASURED_STAGES:
+        quiet_owner = run_id
+        quiet_mode.enter(quiet_owner)
+
     metrics_csv: Optional[Path] = None
     run_sampler: Optional[sampler.RunSampler] = None
-    if stage in ("benchmark", "all"):
+    if stage in _MEASURED_STAGES:
         candidate = env.paths()["runs"] / f"run_{run_id}_metrics.csv"
-        run_sampler = sampler.RunSampler(candidate)
+        run_sampler = sampler.RunSampler(candidate, quiet_owner=quiet_owner)
         if run_sampler.start():
             metrics_csv = candidate
         else:
             # start() logged why. The run proceeds unmetered: KPIs still come out.
             run_sampler = None
+            # With no sampler thread, nothing renews the lease -- and letting it
+            # lapse would lift the gate a couple of minutes into a run that is
+            # still being measured, which is worse than not having the lease at
+            # all. So this hold gets no expiry and leans on the other two safety
+            # nets: the job listener below, and the flag being memory-only.
+            quiet_mode.enter(quiet_owner, ttl=float("inf"))
+            logger.warning(
+                "Benchmark run %s has no metrics sampler; quiet mode is held for "
+                "the job's lifetime with no lease backstop.", run_id
+            )
 
     # One run name per batch, shared by every model/device wrapper this run spawns
     # (the commons default RUN_NAME to $BENCH_RUN_NAME). Timestamp for readable,
@@ -279,7 +346,12 @@ def start_run(
     if metrics_csv:
         extra_env["BENCH_METRICS_CSV"] = str(metrics_csv)
 
+    global _live_sampler
+    _live_sampler = run_sampler
+
     def _stop_sampler(job: jobs.Job) -> None:
+        global _live_sampler
+        _live_sampler = None
         run_sampler.stop()
 
     try:
@@ -292,18 +364,56 @@ def start_run(
             header=header,
             meta={"stage": stage, "models": entries, "devices": devices,
                   "ov": ov, "run_name": run_name,
-                  "metrics_csv": str(metrics_csv) if metrics_csv else None},
+                  "metrics_csv": str(metrics_csv) if metrics_csv else None,
+                  # Which run this job's quiet-mode hold belongs to, so the
+                  # listener below can release exactly that hold and not one
+                  # taken by a later run.
+                  "quiet_owner": quiet_owner,
+                  # Whether the hold survived the run untouched. Set on the
+                  # terminal event; True here so a run that ends before the
+                  # listener fires does not read as dirtied. One bool buys the
+                  # ability to answer, afterwards, whether a given result was
+                  # measured in a clean environment.
+                  "quiet_held": quiet_owner is not None},
             on_finish=_stop_sampler if run_sampler is not None else None,
         )
     except Exception:
         # Nothing is going to reap this job, so release the sampler's descriptors
         # here. Lost the race against another request (BenchBusy) or failed to
         # spawn: either way drop the script we just rendered so the runs directory
-        # does not accumulate orphans.
+        # does not accumulate orphans. Same for the gate -- no job means no
+        # terminal event, so this is the only thing that would ever lift it.
+        _live_sampler = None
         if run_sampler is not None:
             run_sampler.stop()
+        if quiet_owner is not None:
+            quiet_mode.exit(quiet_owner)
         script_path.unlink(missing_ok=True)
         raise
+
+
+def _release_quiet_mode(job: jobs.Job) -> None:
+    """Lift the gate once a measured run reaches a terminal status.
+
+    Registered as a job listener rather than hooked into ``on_finish`` because
+    the listener is called for *every* terminal status by ``jobs._reap`` --
+    normal exit, failure and cancel alike -- which is what makes "the gate never
+    outlives the run" a property of the job lifecycle instead of something each
+    exit path has to remember. ``on_finish`` stays dedicated to the sampler's
+    descriptors, which is the one thing that must be released in that specific
+    order.
+    """
+    if job.kind != "run" or job.status == jobs.STATUS_RUNNING:
+        return
+    owner = (job.meta or {}).get("quiet_owner")
+    if not owner:
+        return
+    # Read before releasing: exit() clears user_exited along with the hold.
+    job.meta["quiet_held"] = quiet_mode.held_clean()
+    quiet_mode.exit(owner)
+
+
+jobs.manager.add_listener(_release_quiet_mode)
 
 
 def job_view(job: Optional[jobs.Job], offset: Optional[int] = None) -> Optional[dict]:

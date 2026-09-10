@@ -28,6 +28,7 @@ from monitor.system_info import preload_static_info, shutdown_gpu_usage
 from features import mount_benchmark, mount_dashboard
 from smartune_api import auth_bp, smartune_bp, set_balancer_available, set_benchmark_available
 from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, fetch_unregistered_apps, get_priority_value, get_app_processes_for_app, get_cgroup_path_by_pid, reconcile_controlled_apps, restore_config_entry, serialize_config_meta
+from utils import quiet_mode
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
 
@@ -64,7 +65,35 @@ class DynamicService:
         # both use the same instance (including is_limited_app_dominant state).
         register_system_pressure_monitor(self.balancer.control_manager.system_pressure_monitor)
         register_network_config_reload_notifier(self.balancer.network_controller.request_reload)
+        # Same reverse-registration direction as the two above: the balancer
+        # pushes a capability into a lower layer instead of that layer importing
+        # it. A monitor-only deployment registers nothing here, so its preflight
+        # simply passes -- no feature detection needed at the call site.
+        quiet_mode.register_blocker("auto_limited_apps", self._auto_limit_blocker)
         self.rebuild_controlled_map()
+
+    def _auto_limit_blocker(self):
+        """Refuse quiet mode while the pressure loop still holds an auto limit.
+
+        Neither automatic escape is acceptable: releasing the caps would let the
+        load they are suppressing stampede back mid-run, and converting them to
+        manual would leave the user with limits that never restore themselves.
+        So the run does not start, and the user decides on the Balance page.
+
+        Returns falsy when clear -- the registry treats that as "no objection".
+        """
+        snapshot = self.balancer.get_auto_limited_apps() or {}
+        apps = snapshot.get("apps") or []
+        if not apps:
+            return None
+        return {
+            "reason": "The balancer is currently auto-limiting one or more apps.",
+            "apps": [
+                {"app_id": app.get("app_id"), "app_name": app.get("app_name")}
+                for app in apps
+            ],
+            "action": "Resolve them on the Balance page (restore or lock to manual), then start the run.",
+        }
 
     def start(self):
         self.balancer.start()

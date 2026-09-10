@@ -42,6 +42,9 @@ import type {
   BenchTimelineData,
   BenchRunsData,
   BenchStage,
+  BenchPreflightData,
+  BenchQuietModeState,
+  BenchRunSampleData,
 } from './types'
 
 // Server uses RetCode.CONFLICT (409) for optimistic-concurrency mismatches
@@ -517,6 +520,25 @@ export const api = {
     ),
   cancelBenchRun: (runId: string) =>
     post<{ cancelled: boolean }>(`/bench/run/${encodeURIComponent(runId)}/cancel`),
+
+  // Whether a measured run can start right now. Advisory: startBenchRun checks
+  // again server-side, because nothing holds the machine's state still between
+  // the two calls. A block comes back from startBenchRun as a 409 carrying the
+  // same blockers.
+  getBenchPreflight: () => get<BenchPreflightData>('/bench/preflight'),
+
+  // Quiet mode is entered automatically when a measured run starts; these are
+  // for the in-run control that lets a user trade the run's comparability for
+  // live system data.
+  getBenchQuietMode: () => get<BenchQuietModeState>('/bench/quiet_mode'),
+  setBenchQuietMode: (active: boolean) =>
+    post<BenchQuietModeState>('/bench/quiet_mode', { active }),
+
+  // The running run's latest 2 Hz sample. A read of memory the sampler already
+  // filled for metrics.csv -- no hardware is queried -- which is what lets the
+  // Live tiles be shown under quiet mode without restoring the background
+  // collector.
+  getBenchRunSample: () => get<BenchRunSampleData>('/bench/run/metrics/latest'),
 
   getBenchResults: (backend?: string) =>
     get<BenchResultsData>(`/bench/results${backend ? `?backend=${backend}` : ''}`),

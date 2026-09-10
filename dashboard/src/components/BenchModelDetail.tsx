@@ -13,10 +13,13 @@
 // is converted locally. The API still calls it `build`, because the vendored
 // pipeline also has real conversion routes behind the same switch.
 //
-// "Run" covers the other two stages. The API distinguishes `benchmark` from
-// `all` (fetch first, then benchmark), but that is a distinction the page can
-// make on the user's behalf -- it already knows, per precision, what is on disk
-// -- so it is one button rather than two. Everything else on this tab is
+// "Run" is the `benchmark` stage, and only that. The API also offers `all`
+// (fetch first, then benchmark) and the page used to pick it automatically when
+// something was missing, but a download that lands inside a measured run holds
+// quiet mode -- and so suspends SmarTune's monitoring -- for however long tens
+// of GB take to arrive, while itself being exactly the kind of load the run is
+// supposed to be measured without. So the two are separate jobs and Run stays
+// disabled until the weights are there. Everything else on this tab is
 // benchmarking, which is why the button does not say so.
 
 import React from 'react'
@@ -45,20 +48,25 @@ const DEVICES: { value: BenchDevice; hint: string }[] = [
 ]
 
 /**
- * The stage a "Run" starts for `models` at the ticked `precisions`.
+ * Which of the ticked `precisions` are not on disk yet for `models`.
  *
- * `benchmark` when every one of them is already on disk, `all` (fetch first)
- * otherwise. Deciding it here rather than making the user pick is not only
- * about saving a download: the build stage resolves each OpenVINO repo with a
- * live hub search, so on a host with no route to huggingface.co, re-running a
- * model that is already present would fail before it ever reached the
- * benchmark. `local` carries only the precisions the cached list knows about,
- * so an unknown one reads as missing -- the safe direction, since the worst
- * case is a download that turns out to be a no-op.
+ * Run used to start the `all` stage and fetch whatever was missing on the way
+ * in. It no longer does: a download of tens of GB would then sit inside quiet
+ * mode, with SmarTune's monitoring suspended for the whole of it, and a heavy
+ * fetch is the opposite of the quiet machine the run is being given. So a
+ * download is its own job now, and Run is only unlocked once its weights are
+ * there.
+ *
+ * `local` carries only the precisions the cached list knows about, so an unknown
+ * one reads as missing -- the safe direction, since the worst case is a download
+ * that turns out to be a no-op.
  */
-export function runStageFor(models: BenchModel[], precisions: BenchPrecision[]): BenchStage {
-  if (!models.length || !precisions.length) return 'all'
-  return models.every((model) => precisions.every((p) => model.local[p])) ? 'benchmark' : 'all'
+export function missingPrecisions(
+  models: BenchModel[],
+  precisions: BenchPrecision[],
+): BenchPrecision[] {
+  if (!models.length || !precisions.length) return precisions
+  return precisions.filter((p) => !models.every((model) => model.local[p]))
 }
 
 interface Props {
@@ -145,8 +153,8 @@ export default function BenchModelDetail({
   // OpenVINO version to run it (validated the same way the server does).
   const ovValid = /^\d+\.\d+\.\d+$/.test(ov.trim())
   const canDownload = ready && !busy && precisions.length > 0
-  const canRun = canDownload && devices.length > 0 && ovValid
-  const runStage = runStageFor([model], precisions)
+  const missing = missingPrecisions([model], precisions)
+  const canRun = canDownload && devices.length > 0 && ovValid && missing.length === 0
   const deviceSummary = devices.map((device) => device.toUpperCase()).join(', ')
 
   return (
@@ -292,9 +300,19 @@ export default function BenchModelDetail({
         </div>
       </div>
 
+      {/* Download first, then Run: whichever is the next thing to do is the one
+          drawn as primary, so the pair reads as a sequence rather than a
+          choice. */}
       <Space style={{ marginTop: 16 }} wrap>
-        <Tooltip title="Fetch the ticked precisions without benchmarking them">
+        <Tooltip
+          title={
+            missing.length
+              ? `Fetch ${missing.join(', ')} — Run unlocks once they are on disk`
+              : 'The ticked precisions are already here; this fetches them again'
+          }
+        >
           <Button
+            type={missing.length ? 'primary' : 'default'}
             icon={<CloudDownloadOutlined />}
             // A download is about weights, not about where they will run: the
             // device selection does not gate it.
@@ -305,17 +323,15 @@ export default function BenchModelDetail({
             Download
           </Button>
         </Tooltip>
-        {/* One button for both benchmark stages: it says what is about to
-            happen rather than making the user work out which stage applies. */}
         <Tooltip
           title={
-            devices.length === 0
-              ? 'Pick at least one device to benchmark on'
-              : !ovValid
-                ? 'Enter an OpenVINO version (e.g. 2026.2.0) to benchmark against'
-                : runStage === 'benchmark'
-                  ? `Benchmark the ticked precisions on ${deviceSummary} with OpenVINO ${ov}`
-                  : `Download whatever is missing, then benchmark on ${deviceSummary} with OpenVINO ${ov}`
+            missing.length
+              ? `Download ${missing.join(', ')} first`
+              : devices.length === 0
+                ? 'Pick at least one device to benchmark on'
+                : !ovValid
+                  ? 'Enter an OpenVINO version (e.g. 2026.2.0) to benchmark against'
+                  : `Benchmark the ticked precisions on ${deviceSummary} with OpenVINO ${ov}`
           }
         >
           <Button
@@ -323,7 +339,9 @@ export default function BenchModelDetail({
             icon={<PlayCircleOutlined />}
             disabled={!canRun}
             loading={starting}
-            onClick={() => onRun(runStage, [model.id])}
+            // Never `all`: fetching inside a measured run is what the split above
+            // exists to prevent.
+            onClick={() => onRun('benchmark', [model.id])}
           >
             Run
           </Button>

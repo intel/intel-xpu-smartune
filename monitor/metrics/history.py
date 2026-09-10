@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from db.DatabaseModel import MonitorSnapshot
 from monitor.metrics.utils import safe_read, to_float
+from utils import quiet_mode
 from utils.logger import logger
 
 _DYNAMIC_SNAPSHOT_LOCK = threading.Lock()
@@ -397,6 +398,17 @@ def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def persist_dynamic_snapshot_if_due(data: Dict[str, Any]) -> None:
+    # Quiet mode stops history writes outright rather than thinning them: an
+    # INSERT into a multi-hundred-MB WAL-mode table is not a constant cost, and a
+    # benchmark run needs its background load to be constant above all. The gap
+    # it leaves in the History page is covered at 2 Hz -- an order of magnitude
+    # finer than this 5 s cadence -- by that run's own metrics.csv.
+    #
+    # Gated here, not only in the collector: this is called from
+    # collect_dynamic_info(persist=True), which any on-demand path could reach.
+    if quiet_mode.is_active():
+        return
+
     now = time.time()
     with _DYNAMIC_SNAPSHOT_LOCK:
         last_ts = float(_DYNAMIC_SNAPSHOT_STATE.get("last_persist_ts") or 0.0)

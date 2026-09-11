@@ -46,7 +46,7 @@ import { useBenchEvent } from '../hooks/useBenchEvents'
 import BenchCaseDrawer from './BenchCaseDrawer'
 import BenchCompare from './BenchCompare'
 import BenchEnvDrawer, { EnvStatusTag, versionSummary } from './BenchEnvDrawer'
-import BenchModelDetail, { missingPrecisions } from './BenchModelDetail'
+import BenchModelDetail, { applicablePrecisions, missingPrecisions } from './BenchModelDetail'
 import BenchModelList, { type ModelFilter } from './BenchModelList'
 import BenchOutput, { JobStatusTag } from './BenchOutput'
 import BenchResults from './BenchResults'
@@ -216,13 +216,38 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
 
   // "Download all" / "Run all" mean the same thing as a model's own two buttons,
   // decided over the whole batch: the batch can be benchmarked only when every
-  // ticked model already has every ticked precision. A model that is checked but
-  // no longer in the list counts as missing, which is why this compares lengths
-  // rather than just mapping.
+  // ticked model already has every ticked precision it offers. A model that is
+  // checked but no longer in the list counts as missing, which is why this
+  // compares lengths rather than just mapping.
+  //
+  // Per model rather than over the set, because what a model offers differs
+  // across the batch: int4 ticked alongside a model published only as fp16 is
+  // not work the batch is waiting on, and counting it kept Run all disabled on
+  // a batch that was ready (see applicablePrecisions).
   const batchMissing = useMemo<BenchPrecision[]>(() => {
     const checked = models.filter((m) => checkedIds.includes(m.id))
     if (checked.length !== checkedIds.length) return precisions
-    return missingPrecisions(checked, precisions)
+    const pending = new Set<BenchPrecision>()
+    checked.forEach((model) =>
+      missingPrecisions([model], applicablePrecisions(model, precisions)).forEach((p) =>
+        pending.add(p),
+      ),
+    )
+    return precisions.filter((p) => pending.has(p))
+  }, [models, checkedIds, precisions])
+
+  // The ticked models that have something to do at all. A model offering none
+  // of the ticked precisions contributes no cases, and a batch of nothing but
+  // those has no job in it -- so the two batch buttons go dead rather than
+  // starting a run that would be empty. A ticked id the list no longer holds is
+  // counted in: there is nothing to intersect against, and quietly dropping it
+  // would be worse than letting the server answer for it.
+  const batchSize = useMemo(() => {
+    const byId = new Map(models.map((m) => [m.id, m]))
+    return checkedIds.filter((id) => {
+      const model = byId.get(id)
+      return (model ? applicablePrecisions(model, precisions) : precisions).length > 0
+    }).length
   }, [models, checkedIds, precisions])
 
   // OpenVINO versions to suggest, and whether the one in the box is runnable.
@@ -580,11 +605,28 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         // Extra args only mean anything to a benchmark case; a build never runs
         // one, so leave them off that request entirely.
         const extra = args.trim()
-        const payload = ids.map((id) => ({
-          id,
-          build: precisions,
-          ...(stage !== 'build' && extra ? { args: extra } : {}),
-        }))
+        const byId = new Map(models.map((m) => [m.id, m]))
+        // Each model is asked only for the precisions it actually offers. The
+        // tick list is global, so sending it verbatim asked a model published
+        // only as fp16/int8 for an int4 repo that does not exist -- a case that
+        // fails deep in the pipeline instead of never being generated. A model
+        // left with nothing to ask for drops out of the request; one the list no
+        // longer holds keeps the raw selection, there being nothing to narrow it
+        // against.
+        const payload = ids
+          .map((id) => {
+            const model = byId.get(id)
+            return {
+              id,
+              build: model ? applicablePrecisions(model, precisions) : precisions,
+              ...(stage !== 'build' && extra ? { args: extra } : {}),
+            }
+          })
+          .filter((entry) => entry.build.length > 0)
+        if (!payload.length) {
+          message.warning('None of the selected models offer the ticked precisions')
+          return
+        }
         // A build fetches weights, which are the same file whatever runs them;
         // the device and OpenVINO selections are only about the benchmark stage.
         const res = await api.startBenchRun(
@@ -625,7 +667,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         setStarting(false)
       }
     },
-    [args, devices, ov, precisions, showBlockedDialog],
+    [args, devices, models, ov, precisions, showBlockedDialog],
   )
 
   /**
@@ -882,16 +924,20 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
                 </Tag>
                 <Tooltip
                   title={
-                    batchMissing.length
-                      ? `Fetch ${batchMissing.join(', ')} for every selected model, as one job`
-                      : 'Every selected model already has the ticked precisions; this fetches them again'
+                    batchSize === 0
+                      ? precisions.length
+                        ? 'No selected model is published in the ticked precisions'
+                        : 'Tick a precision to download'
+                      : batchMissing.length
+                        ? `Fetch ${batchMissing.join(', ')} for every selected model, as one job`
+                        : 'Every selected model already has the ticked precisions; this fetches them again'
                   }
                 >
                   <Button
                     size="small"
                     type={batchMissing.length ? 'primary' : 'default'}
                     icon={<CloudDownloadOutlined />}
-                    disabled={!env?.ready || busy || precisions.length === 0}
+                    disabled={!env?.ready || busy || batchSize === 0}
                     loading={starting}
                     onClick={() => requestRun('build', checkedIds)}
                   >
@@ -900,13 +946,17 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
                 </Tooltip>
                 <Tooltip
                   title={
-                    batchMissing.length
-                      ? `Download ${batchMissing.join(', ')} first`
-                      : devices.length === 0
-                        ? 'Pick at least one device to benchmark on'
-                        : !ovValid
-                          ? 'Enter an OpenVINO version (e.g. 2026.2.0) to benchmark against'
-                          : 'Benchmark every selected model, as one job'
+                    batchSize === 0
+                      ? precisions.length
+                        ? 'No selected model is published in the ticked precisions'
+                        : 'Tick a precision to benchmark'
+                      : batchMissing.length
+                        ? `Download ${batchMissing.join(', ')} first`
+                        : devices.length === 0
+                          ? 'Pick at least one device to benchmark on'
+                          : !ovValid
+                            ? 'Enter an OpenVINO version (e.g. 2026.2.0) to benchmark against'
+                            : 'Benchmark every selected model, as one job'
                   }
                 >
                   <Button
@@ -916,7 +966,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
                     disabled={
                       !env?.ready ||
                       busy ||
-                      precisions.length === 0 ||
+                      batchSize === 0 ||
                       devices.length === 0 ||
                       !ovValid ||
                       batchMissing.length > 0

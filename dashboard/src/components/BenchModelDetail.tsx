@@ -21,13 +21,18 @@
 // supposed to be measured without. So the two are separate jobs and Run stays
 // disabled until the weights are there. Everything else on this tab is
 // benchmarking, which is why the button does not say so.
+//
+// The chosen OpenVINO runtime is gated the same way and for the same reason: it
+// used to be built by the run that needed it, inside that same measured window.
+// So by the time Run is clickable there is nothing left to do but measure.
 
 import React from 'react'
-import { Alert, AutoComplete, Button, Card, Checkbox, Descriptions, Empty, Input, Space, Tag, Tooltip, Typography } from 'antd'
+import { Alert, Button, Card, Checkbox, Descriptions, Empty, Input, Select, Space, Tag, Tooltip, Typography } from 'antd'
 import {
   CloudDownloadOutlined,
   PlayCircleOutlined,
   StopOutlined,
+  ToolOutlined,
 } from '@ant-design/icons'
 
 import type { BenchDevice, BenchModel, BenchPrecision, BenchStage } from '../api/types'
@@ -101,14 +106,14 @@ interface Props {
   onPrecisionsChange: (value: BenchPrecision[]) => void
   devices: BenchDevice[]
   onDevicesChange: (value: BenchDevice[]) => void
-  // The OpenVINO version a benchmark builds/runs against. Free text: a version
-  // not in `ovOptions` is built on demand. Only benchmarks use it; a download
-  // ignores it. `installedOvs` are the ones already built on disk, tagged in the
-  // dropdown so the user can tell a quick pick from a build-on-demand.
+  // The OpenVINO version a benchmark runs against; only benchmarks use it, a
+  // download ignores it. `installedOvs` are the ones already on disk -- the
+  // others have to be installed first, which is what onInstallOv starts.
   ov: string
   onOvChange: (value: string) => void
-  ovOptions: string[]
+  ovChoices: string[]
   installedOvs: string[]
+  onInstallOv: (version: string) => void
   // Free-form extra CLI arguments appended to every benchmark run_case. Applies
   // to the whole run, alongside the OpenVINO version; a download ignores it.
   args: string
@@ -151,8 +156,9 @@ export default function BenchModelDetail({
   onDevicesChange,
   ov,
   onOvChange,
-  ovOptions,
+  ovChoices,
   installedOvs,
+  onInstallOv,
   args,
   onArgsChange,
   ready,
@@ -180,11 +186,12 @@ export default function BenchModelDetail({
   // ticked precisions narrowed to the ones it offers -- not the raw tick list.
   const applicable = applicablePrecisions(model, precisions)
   // A download needs precisions; a benchmark needs somewhere to run and an
-  // OpenVINO version to run it (validated the same way the server does).
-  const ovValid = /^\d+\.\d+\.\d+$/.test(ov.trim())
+  // installed OpenVINO runtime to run in -- one that is not on disk disables Run
+  // and offers Install instead, rather than being built inside the run.
+  const ovInstalled = installedOvs.includes(ov.trim())
   const canDownload = ready && !busy && applicable.length > 0
   const missing = missingPrecisions([model], applicable)
-  const canRun = canDownload && devices.length > 0 && ovValid && missing.length === 0
+  const canRun = canDownload && devices.length > 0 && ovInstalled && missing.length === 0
   const deviceSummary = devices.map((device) => device.toUpperCase()).join(', ')
 
   return (
@@ -290,38 +297,55 @@ export default function BenchModelDetail({
           </div>
         </div>
 
-        {/* OpenVINO version to benchmark against. Free text: a version that is
-            not already built is built on demand when the run starts. Only the
-            benchmark uses it -- a download fetches weights and never touches
-            OpenVINO. */}
+        {/* OpenVINO version to benchmark against, tagged with whether its
+            runtime is installed. Only the benchmark uses it. */}
         <div>
           <Tooltip title="The build/download stage never uses OpenVINO; only the benchmark does.">
             <Text type="secondary">OpenVINO</Text>
           </Tooltip>
           <div style={{ marginTop: 6 }}>
-            <AutoComplete
-              size="small"
-              style={{ width: 180 }}
-              value={ov}
-              onChange={onOvChange}
-              // Show every option regardless of the box's current value: it is
-              // seeded with a version, and the default filter would then hide all
-              // the other installed versions the user wants to pick from.
-              filterOption={false}
-              options={ovOptions.map((v) => ({
-                value: v,
-                label: (
-                  <Space size={6}>
-                    {v}
-                    {installedOvs.includes(v) && (
-                      <Tag color="success" style={{ marginInlineEnd: 0 }}>installed</Tag>
-                    )}
-                  </Space>
-                ),
-              }))}
-              placeholder="e.g. 2026.2.0"
-              status={ov && !ovValid ? 'error' : undefined}
-            />
+            <Space size={6}>
+              <Select
+                size="small"
+                style={{ width: 180 }}
+                value={ov || undefined}
+                onChange={onOvChange}
+                showSearch
+                placeholder="pick a version"
+                options={ovChoices.map((v) => ({
+                  value: v,
+                  label: (
+                    <Space size={6}>
+                      {v}
+                      {installedOvs.includes(v) ? (
+                        <Tag color="success" style={{ marginInlineEnd: 0 }}>installed</Tag>
+                      ) : (
+                        <Tag style={{ marginInlineEnd: 0 }}>not installed</Tag>
+                      )}
+                    </Space>
+                  ),
+                }))}
+              />
+              {/* Next to the box that says the runtime is missing, rather than
+                  in a drawer the user has to be told to open. */}
+              {!!ov && !ovInstalled && (
+                <Tooltip
+                  title={`Install the OpenVINO ${ov} runtime, so this version can be benchmarked`}
+                >
+                  <Button
+                    // Primary, like Run: this is the next step, and Run stays
+                    // greyed out until it is done.
+                    type="primary"
+                    size="small"
+                    icon={<ToolOutlined />}
+                    disabled={busy}
+                    onClick={() => onInstallOv(ov.trim())}
+                  >
+                    Install
+                  </Button>
+                </Tooltip>
+              )}
+            </Space>
           </div>
         </div>
 
@@ -382,9 +406,11 @@ export default function BenchModelDetail({
                 ? `Download ${missing.join(', ')} first`
                 : devices.length === 0
                   ? 'Pick at least one device to benchmark on'
-                  : !ovValid
-                    ? 'Enter an OpenVINO version (e.g. 2026.2.0) to benchmark against'
-                    : `Benchmark ${applicable.join(', ')} on ${deviceSummary} with OpenVINO ${ov}`
+                  : !ov
+                    ? 'Pick an OpenVINO version to benchmark against'
+                    : !ovInstalled
+                      ? `The OpenVINO ${ov} runtime is not installed — install it first, then Run only runs`
+                      : `Benchmark ${applicable.join(', ')} on ${deviceSummary} with OpenVINO ${ov}`
           }
         >
           <Button

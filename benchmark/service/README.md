@@ -8,7 +8,7 @@ SmarTune's integration layer for the model-benchmark toolchain vendored in
 ```
 benchmark/            read-only vendor drop from the upstream model-benchmark project
   scripts/ templates/ configs/ requirements/   pipeline sources -- do not restructure
-  setup_env.sh multi_version.sh                environment installer
+  setup_env.sh uv_build_envs.sh                environment installer (base venv + OpenVINO runtimes)
   runtime/            all generated state (gitignored): venv, models, ir, logs, runs
 
   __init__.py         SmarTune-owned: package marker, exports nothing
@@ -42,6 +42,25 @@ that directory.
 produce meaningless numbers, and a setup that reinstalls the venv underneath a
 running pipeline breaks it outright. A second request gets `RetCode.CONFLICT`
 with the job that holds the slot.
+
+**The environment is installed in two sizes.** Opening the tab
+(`GET /bench/env` -> `env.maybe_bootstrap`) builds the huggingface-only base
+venv if it is missing: seconds, ~80 MB, and all that listing and downloading
+models needs. The OpenVINO runtime for one version -- OpenVINO plus every
+`transformers` the model router picks between -- is installed only when asked
+for, by `POST /bench/env/setup` with an `ov` version. It used to be built by the
+first benchmark that wanted it, i.e. after `quiet_mode.enter()` and with the
+metrics sampler already recording, so a measured run began with a multi-GB `pip`
+install and the machine stayed suspended for it. `runner.start_run` now refuses
+a benchmark whose runtime is absent, and the Models tab keeps Run disabled until
+it is there.
+
+uv resolves each version into its own venv but hardlinks identical wheels across
+all of them, so the first costs a few GB and each one after it only the
+difference (measured: two full versions in 3.2 GB, the second installed in 41 s).
+That also makes `du -sh ov_pool/*` misleading -- shared files are credited to
+whichever directory it walks first, so an existing version appears to shrink when
+a new one is installed.
 
 **Jobs are process groups.** `start_new_session=True` plus `os.killpg` on cancel,
 because `optimum-cli`, `ovms` and `pip` all spawn children that would otherwise
@@ -78,8 +97,8 @@ lands at `/opt/intel/smartune/benchmark`, so the env root resolves to
 `/opt/intel/smartune/benchmark/runtime` with no configuration: the packaged
 layout and a source checkout are identical from `env.py`'s point of view.
 
-`setup_env.sh` clones two repositories and downloads OVMS, hence the `git` and
-`curl` dependencies in `control.full`. `apt remove` keeps `runtime/` (hours of
+`setup_env.sh` clones the openvino.genai repository and fetches `uv`, hence the
+`git` and `curl` dependencies in `control.full`. `apt remove` keeps `runtime/` (hours of
 downloads); `apt purge` removes the whole install dir and says how much it freed.
 
 The monitor-only `.deb` does not ship `benchmark/` at all, and the guard above is
@@ -91,8 +110,8 @@ All routes require `X-Auth-Token`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/bench/env` | environment status, current job |
-| POST | `/bench/env/setup` | install the environment; `{"force": true}` to rebuild |
+| GET | `/bench/env` | environment status, current job; installs the base venv if missing |
+| POST | `/bench/env/setup` | install the environment; `{"ov": "2026.3.1"}` adds that runtime, `{"force": true}` rebuilds |
 | GET | `/bench/env/setup/log?offset=` | setup log tail |
 | GET | `/bench/models?search=&limit=` | cached model list |
 | POST | `/bench/models/refresh` | re-run the HuggingFace search |

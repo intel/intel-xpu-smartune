@@ -478,12 +478,18 @@ export const api = {
   // --- Benchmark ---------------------------------------------------------
   getBenchEnv: () => get<BenchEnvData>('/bench/env'),
   // force=false against an existing environment answers 'conflict' so the caller
-  // can confirm before spending an hour and tens of GB rebuilding it. Deciding
+  // can confirm before moving a working one aside and rebuilding it. Deciding
   // that means reading the venv's package list, which the server refuses to guess
   // at and which costs a cold torch import on the first call after a restart --
   // well past the default client timeout.
-  setupBenchEnv: (force = false) =>
-    postBench<BenchJob>('/bench/env/setup', { force }, { timeout: 150_000 }),
+  // `ov` also installs that version's runtime, which is what a benchmark runs
+  // on. Omitted, this installs only the genai checkout and the base venv.
+  setupBenchEnv: (force = false, ov?: string) =>
+    postBench<BenchJob>(
+      '/bench/env/setup',
+      { force, ...(ov ? { ov } : {}) },
+      { timeout: 150_000 },
+    ),
   getBenchSetupLog: (offset = 0) => get<BenchJob>(`/bench/env/setup/log?offset=${offset}`),
   // Switch the active OpenVINO version. Relinks the pre-built pool, so it returns
   // the fresh environment status directly; a busy execution slot comes back as a

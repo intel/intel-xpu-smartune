@@ -810,25 +810,30 @@ export interface BenchEnvData {
   // download models. OpenVINO is built per-version on demand at benchmark time.
   hf_ready: boolean
   genai_ready: boolean
-  // hf_ready: a run can be started -- the build/download stage needs only the
-  // `hf` CLI, and a benchmark builds its OpenVINO column on demand.
+  // hf_ready: the tab is usable -- browsing and downloading need only the `hf`
+  // CLI. A benchmark additionally needs `ov_versions` to contain the version it
+  // was asked for; that column is installed by setup, never by the run.
   ready: boolean
   // The venv's package list is still being read on a server-side background
   // thread. Until it clears, `versions` is empty and `venv_usable`/`ready` are
   // false because the answer is unknown -- not because anything is wrong.
   probing: boolean
   versions: Record<string, string | null>
-  // OpenVINO columns already built on disk, and the one the active venv points
-  // at. May be empty / null until a benchmark has built a column; no longer
-  // drives a switch UI (kept for diagnostics).
+  // Runtimes already installed on disk, and the one the active venv points at.
+  // `ov_versions` is what the Models tab tags as installed and what gates its
+  // Run button; `active_ov` is diagnostics (a run switches in its own process).
   ov_versions: string[]
   active_ov: string | null
+  // Every version the version dropdown offers, newest first: a static list, what
+  // PyPI publishes for the openvino/-tokenizers/-genai trio, and the installed.
+  ov_choices: string[]
   // Each BUILT OpenVINO version and the exact packages inside its venv. What the
   // Environment drawer's dropdown lists; empty until a version has been built, so
   // the drawer's package list is empty on a fresh environment.
   ov_versions_detail: { version: string; packages: Record<string, string | null> }[]
-  // Static reference of known releases -> package versions. Not shown in the
-  // drawer; only seeds the Models tab's version suggestions.
+  // Static reference of known releases -> package versions, when the service
+  // ships the table. Nothing renders it: the drawer shows what was actually
+  // installed (ov_versions_detail) and the version box reads ov_choices.
   ov_reference: { version: string; packages: Record<string, string> }[]
   models_dir: string
   model_count: number

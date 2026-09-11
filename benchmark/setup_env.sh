@@ -3,12 +3,15 @@
 # This script initializes the runtime environment using global_vars.sh
 #
 # The Python environments are built by uv_build_envs.sh under
-# ${DIR_ENV_ROOT}/.gen/multi_env. Setup only builds the huggingface-only base
-# venv (all that listing/downloading models needs); the OpenVINO x transformers
-# columns are built one version at a time, on demand, when a benchmark asks for
-# one (run_template.sh). This script clones the openvino.genai checkout the OV
-# build reads its requirements from, kicks off the base build, and stages the
-# sample assets / version report around it.
+# ${DIR_ENV_ROOT}/.gen/multi_env. This script clones the openvino.genai checkout
+# the OpenVINO build reads its requirements from, builds the huggingface-only
+# base venv (all that listing/downloading models needs), and -- when
+# BENCH_SETUP_OV names a version -- the complete OpenVINO x transformers column
+# a benchmark runs inside. It then stages the sample assets / version report.
+#
+# BENCH_SETUP_OV comes from the dashboard (benchmark/service/env.py start_setup)
+# and is what makes installing the environment install all of it, rather than
+# leaving the column to the first benchmark that asks for one.
 
 set -euo pipefail
 
@@ -73,12 +76,25 @@ sync_repo "${OPENVINO_GENAI_REPO}" "${DIR_GENAI}"
 echo ""
 
 # Build the huggingface-only base venv with uv (uv_build_envs.sh's `build` ==
-# `bootstrap`). OpenVINO columns are NOT built here: each is built on demand at
-# benchmark time for the version chosen on the Models tab, hardlink-deduped
-# under ${PYENV_MULTI_DIR} and sharing uv's cache with this base venv.
+# `bootstrap`). Seconds, and enough to list and download models.
 echo "Building base huggingface environment with uv..."
 bash "${DIR_AGENTIC_ROOT}/uv_build_envs.sh" build
 echo ""
+
+# The OpenVINO column for the requested version: OpenVINO + openvino-tokenizers
+# + openvino-genai + every transformers python_env_selector.py can pick, all
+# hardlink-deduped, so a second version only costs the wheels that differ.
+#
+# After the clone, necessarily: uv_build_envs.sh derives the shared base
+# requirements from ${DIR_GENAI}/tools/llm_bench/requirements.txt.
+if [[ -n "${BENCH_SETUP_OV:-}" ]]; then
+    echo "Building the OpenVINO ${BENCH_SETUP_OV} environment (the long part)..."
+    bash "${DIR_AGENTIC_ROOT}/uv_build_envs.sh" ensure "${BENCH_SETUP_OV}"
+    echo ""
+else
+    echo "No OpenVINO version requested (BENCH_SETUP_OV unset); base environment only."
+    echo ""
+fi
 
 # Stage sample assets used by the llm_bench harness.
 cp "${DIR_AGENTIC_ROOT}/test_audio.wav" "${DIR_GENAI}/tools/llm_bench/"

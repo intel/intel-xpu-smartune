@@ -24,13 +24,24 @@
 // together they mean both at once. That is why they do not share the Analysis
 // tab's "empty means empty" rule -- a chart has to be told what to plot, while a
 // search box that has not been typed into is asking for everything.
+//
+// Deletion lives here, at both levels the tree has. A job's heading removes
+// everything one press of Run produced; the checkboxes in its table remove
+// chosen cases. Both are irreversible removals from disk, so both confirm
+// first, and both name what is about to go rather than counting it -- a job is
+// identified by a timestamp and a uuid fragment, and "delete 6 cases?" is not
+// something anyone can check before agreeing to it. Until now the only way to
+// discard a measurement was to re-run the same configuration and answer the
+// re-run dialog (BenchRerunModal), which meant a misconfigured sweep stayed in
+// the tree, competing in the Analysis tab to be the best run of its test.
 
-import React, { useMemo, useState } from 'react'
+import React, { useCallback, useMemo, useState } from 'react'
 import {
   Button,
   Checkbox,
   Collapse,
   Empty,
+  Modal,
   Select,
   Space,
   Table,
@@ -38,11 +49,10 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import { ReloadOutlined } from '@ant-design/icons'
+import { DeleteOutlined, ReloadOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 
 import type { BenchMatrixData, BenchMatrixRow } from '../api/types'
-import { COLORS } from '../styles/theme'
 import {
   deviceLabel,
   formatMetric,
@@ -136,6 +146,8 @@ interface JobGroup {
   exact: boolean
   rows: BenchMatrixRow[]
   devices: string[]
+  /** The OpenVINO versions its cases recorded; empty for a run that recorded none. */
+  ovs: string[]
   ok: number
   failed: number
 }
@@ -163,6 +175,11 @@ function jobGroupsOf(rows: BenchMatrixRow[], labels: Map<string, JobLabel>): Job
         a.device.localeCompare(b.device),
     ),
     devices: [...new Set(jobRows.map((row) => row.device).filter(Boolean))].sort(),
+    // Normally one: a job used to be one OpenVINO version by construction, and
+    // still is unless a request asked for several -- in which case each group
+    // is its own job. Read as a set anyway, so a tree assembled by hand cannot
+    // make this claim something it is not.
+    ovs: [...new Set(jobRows.map((row) => row.ov).filter(Boolean) as string[])].sort(),
     ok: jobRows.filter((row) => row.status === 'ok').length,
     failed: jobRows.filter((row) => row.status !== 'ok').length,
   }))
@@ -171,7 +188,7 @@ function jobGroupsOf(rows: BenchMatrixRow[], labels: Map<string, JobLabel>): Job
   return groups.sort((a, b) => b.at - a.at)
 }
 
-function JobHeader({ group }: { group: JobGroup }) {
+function JobHeader({ group, onDelete }: { group: JobGroup; onDelete: () => void }) {
   return (
     <Space size={8} wrap>
       {/* The number, then when it ran. Seconds included: two runs of the same
@@ -190,12 +207,43 @@ function JobHeader({ group }: { group: JobGroup }) {
           </Tag>
         ))}
       </Space>
+      {/* Which runtime produced these numbers. One press of Run can now sweep
+          several OpenVINO versions -- one per model -- so this is no longer
+          implied by "the version the tab was set to", and two jobs are not
+          comparable without it. */}
+      {group.ovs.length > 0 && (
+        <Tooltip title="The OpenVINO runtime this job was benchmarked against">
+          <Tag color="geekblue" style={{ marginInlineEnd: 0 }}>
+            OV {group.ovs.join(', ')}
+          </Tag>
+        </Tooltip>
+      )}
       <Text type="secondary" style={{ fontSize: 12 }}>
         {group.rows.length} case{group.rows.length === 1 ? '' : 's'} · {group.ok} ok
         {group.failed > 0 && ` · ${group.failed} failed`}
       </Text>
+      <Tooltip title="Delete this job and every result it produced">
+        <Button
+          type="text"
+          size="small"
+          danger
+          icon={<DeleteOutlined />}
+          aria-label={`Delete ${group.name}`}
+          // The heading is a Collapse label, so a bare click here would also
+          // fold the panel the button is in.
+          onClick={(event) => {
+            event.stopPropagation()
+            onDelete()
+          }}
+        />
+      </Tooltip>
     </Space>
   )
+}
+
+/** How a row is keyed, in the table and in the selection above it. */
+function caseKey(row: BenchMatrixRow): string {
+  return row.case_dir || `${row.run}-${row.model}-${row.quant}`
 }
 
 /** The cases one job produced, in one table. */
@@ -204,11 +252,17 @@ function JobCases({
   keys,
   index,
   onOpenCase,
+  selected,
+  onSelectedChange,
+  onDeleteSelected,
 }: {
   group: JobGroup
   keys: string[]
   index: MetricIndex
   onOpenCase: (row: BenchMatrixRow) => void
+  selected: string[]
+  onSelectedChange: (keys: string[]) => void
+  onDeleteSelected: () => void
 }) {
   const columns: ColumnsType<BenchMatrixRow> = [
     {
@@ -240,18 +294,46 @@ function JobCases({
     ...metricColumns(keys, index),
   ]
   return (
-    <Table
-      size="small"
-      rowKey={(row) => row.case_dir || `${row.run}-${row.model}-${row.quant}`}
-      columns={columns}
-      dataSource={group.rows}
-      pagination={false}
-      scroll={{ x: 'max-content' }}
-      onRow={(row) => ({
-        onClick: () => onOpenCase(row),
-        style: { cursor: 'pointer' },
-      })}
-    />
+    <Space direction="vertical" size={8} style={{ width: '100%' }}>
+      {/* Only once something is ticked. A disabled button above every table is
+          a permanent reminder of an operation nobody has asked for. */}
+      {selected.length > 0 && (
+        <Space size={8}>
+          <Button size="small" danger icon={<DeleteOutlined />} onClick={onDeleteSelected}>
+            Delete {selected.length} case{selected.length === 1 ? '' : 's'}
+          </Button>
+          <Button size="small" type="text" onClick={() => onSelectedChange([])}>
+            Clear
+          </Button>
+        </Space>
+      )}
+      <Table
+        size="small"
+        rowKey={caseKey}
+        columns={columns}
+        dataSource={group.rows}
+        pagination={false}
+        scroll={{ x: 'max-content' }}
+        rowSelection={{
+          selectedRowKeys: selected,
+          onChange: (keys) => onSelectedChange(keys.map(String)),
+          // A row with no case directory is a summary row whose case never
+          // wrote a log: there is nothing on disk to name, so it cannot be
+          // deleted on its own. Deleting the whole job does take it.
+          getCheckboxProps: (row) => ({ disabled: !row.case_dir }),
+        }}
+        onRow={(row) => ({
+          onClick: (event) => {
+            // Ticking a box is not a request to read the case. Without this the
+            // checkbox column's clicks bubble out to the row and open the
+            // drawer on top of the selection the user was making.
+            if ((event.target as HTMLElement).closest('.ant-table-selection-column')) return
+            onOpenCase(row)
+          },
+          style: { cursor: 'pointer' },
+        })}
+      />
+    </Space>
   )
 }
 
@@ -259,6 +341,10 @@ interface Props {
   matrix: BenchMatrixData | null
   onRefresh: () => void
   onOpenCase: (row: BenchMatrixRow) => void
+  /** Remove one job's run directories. Resolves once the tree has been re-read. */
+  onDeleteJob: (job: string) => Promise<void>
+  /** Remove the named case directories. Resolves once the tree has been re-read. */
+  onDeleteCases: (cases: string[]) => Promise<void>
 }
 
 /** One term of the search: nothing chosen on an axis constrains nothing. */
@@ -266,11 +352,21 @@ function matches(selected: string[], value: string): boolean {
   return selected.length === 0 || selected.includes(value)
 }
 
-export default function BenchResults({ matrix, onRefresh, onOpenCase }: Props) {
+export default function BenchResults({
+  matrix,
+  onRefresh,
+  onOpenCase,
+  onDeleteJob,
+  onDeleteCases,
+}: Props) {
   const [showAll, setShowAll] = useState(false)
   // null until the reader opens or closes something: up to then the newest job
   // is open, which is what they came to see. Their choice sticks afterwards.
   const [openJobs, setOpenJobs] = useState<string[] | null>(null)
+  // Ticked cases, per job. Per job rather than one flat set because the tables
+  // are independent: a selection made in one job and then deleted from another
+  // would be a delete button acting on rows that are not on screen.
+  const [ticked, setTicked] = useState<Record<string, string[]>>({})
 
   const dims = matrix?.dimensions
   // Both start empty, which is every case on disk -- the newest job is the one
@@ -317,6 +413,75 @@ export default function BenchResults({ matrix, onRefresh, onOpenCase }: Props) {
     // Nothing of theirs survived, or they have not chosen yet: the newest.
     return kept.length ? kept : visible.slice(0, 1)
   }, [openJobs, jobGroups])
+
+  // Both deletions confirm first and both say what goes: these remove
+  // directories, and there is nothing to undo them with.
+  const confirmDeleteJob = useCallback(
+    (group: JobGroup) => {
+      Modal.confirm({
+        title: `Delete ${group.name}?`,
+        width: 520,
+        okText: 'Delete',
+        okButtonProps: { danger: true },
+        content: (
+          <Space direction="vertical" size={4} style={{ marginTop: 8 }}>
+            <Text>
+              {group.rows.length} case{group.rows.length === 1 ? '' : 's'} measured{' '}
+              {new Date(group.at * 1000).toLocaleString()}
+              {group.devices.length > 0 &&
+                ` on ${group.devices.map(deviceLabel).join(', ')}`}
+              .
+            </Text>
+            <Text type="secondary">
+              Its result directories are removed from disk. This cannot be undone.
+            </Text>
+          </Space>
+        ),
+        onOk: () => onDeleteJob(group.job),
+      })
+    },
+    [onDeleteJob],
+  )
+
+  const confirmDeleteCases = useCallback(
+    (group: JobGroup) => {
+      const keys = new Set(ticked[group.job] ?? [])
+      const rows = group.rows.filter((row) => keys.has(caseKey(row)) && row.case_dir)
+      if (!rows.length) return
+      Modal.confirm({
+        title: `Delete ${rows.length} case${rows.length === 1 ? '' : 's'} from ${group.name}?`,
+        width: 520,
+        okText: 'Delete',
+        okButtonProps: { danger: true },
+        content: (
+          <Space direction="vertical" size={4} style={{ marginTop: 8 }}>
+            {/* Named, up to a point: the question is whether these are the rows
+                the user meant, and a count alone cannot answer it. */}
+            {rows.slice(0, 8).map((row) => (
+              <Text key={caseKey(row)} style={{ fontSize: 12 }}>
+                {row.model} · {row.quant || row.precision} · {deviceLabel(row.device)}
+              </Text>
+            ))}
+            {rows.length > 8 && (
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                and {rows.length - 8} more
+              </Text>
+            )}
+            <Text type="secondary">
+              Their case directories are removed from disk. This cannot be undone.
+            </Text>
+          </Space>
+        ),
+        onOk: async () => {
+          await onDeleteCases(rows.map((row) => row.case_dir))
+          // Only after the removal succeeded: a failed delete leaves the rows on
+          // screen, and they should still be ticked so it can be retried.
+          setTicked((prev) => ({ ...prev, [group.job]: [] }))
+        },
+      })
+    },
+    [onDeleteCases, ticked],
+  )
 
   return (
     <Space direction="vertical" size={12} style={{ width: '100%' }}>
@@ -392,8 +557,20 @@ export default function BenchResults({ matrix, onRefresh, onOpenCase }: Props) {
           onChange={(keys) => setOpenJobs(Array.isArray(keys) ? keys : [keys])}
           items={jobGroups.map((group) => ({
             key: group.job,
-            label: <JobHeader group={group} />,
-            children: <JobCases group={group} keys={keys} index={index} onOpenCase={onOpenCase} />,
+            label: <JobHeader group={group} onDelete={() => confirmDeleteJob(group)} />,
+            children: (
+              <JobCases
+                group={group}
+                keys={keys}
+                index={index}
+                onOpenCase={onOpenCase}
+                selected={ticked[group.job] ?? []}
+                onSelectedChange={(next) =>
+                  setTicked((prev) => ({ ...prev, [group.job]: next }))
+                }
+                onDeleteSelected={() => confirmDeleteCases(group)}
+              />
+            ),
           }))}
         />
       )}

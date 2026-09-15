@@ -155,6 +155,14 @@ def normalize_request(
 
     Returns the cleaned model entries, the stage, the devices and the OpenVINO
     version, or raises InvalidRunRequest with a message meant for the operator.
+
+    A model entry may carry its own `devices` and `ov`, which is what lets one
+    press of Run benchmark two models against two different runtimes. They are
+    validated exactly like the request-level ones and default to them, so a
+    caller that names neither behaves as it always has. They are kept on the
+    entry under underscore-prefixed keys: everything else here is written into
+    models_input.json for the pipeline to read, and these two are routing -- how
+    to split the run -- rather than input to it.
     """
     if stage not in VALID_STAGES:
         raise InvalidRunRequest(f"stage must be one of {list(VALID_STAGES)}")
@@ -210,6 +218,20 @@ def normalize_request(
                 )
             if tokens:
                 entry["args"] = tokens
+
+        # This model's own devices and OpenVINO version, defaulting to the
+        # request's. Only the benchmark stage has either: a build fetches
+        # weights, which are the same file whatever runs them, so both
+        # normalizers return the request-level answer (all devices / None) for
+        # it and the grouping below collapses to one group.
+        entry["_devices"] = (
+            normalize_devices(item.get("devices"), stage)
+            if item.get("devices") is not None else list(picked_devices)
+        )
+        entry["_ov"] = (
+            normalize_ov(item.get("ov"), stage)
+            if item.get("ov") is not None else picked_ov
+        )
         entries.append(entry)
 
     if stage in ("build", "all") and not any("build" in e for e in entries):
@@ -219,26 +241,146 @@ def normalize_request(
     return entries, stage, picked_devices, picked_ov
 
 
-def render_script(entries: Sequence[dict], stage: str, run_id: str) -> Tuple[Path, str]:
+def run_groups(entries: Sequence[dict], stage: str) -> List[dict]:
+    """Split a request into runs that can share one process.
+
+    The OpenVINO version and the device sweep are process-wide in the pipeline
+    -- run_template.sh activates one OV venv for the whole script, and
+    gen_wrapper.py reads one BENCH_DEVICES -- so models that disagree about
+    either cannot be measured by the same invocation. They are grouped by the
+    pair instead, in first-appearance order (so the tile order on the page is
+    the order the machine works through), and each group becomes its own
+    rendering of the same template.
+
+    A build has neither: it fetches weights with the `hf` CLI and never touches
+    OpenVINO or a device, so it is always one group however the entries were
+    labelled -- splitting it would only download in several passes.
+    """
+    groups: List[dict] = []
+    index: dict = {}
+    for entry in entries:
+        devices = list(entry.get("_devices") or [])
+        ov = entry.get("_ov")
+        key = None if stage == "build" else (ov, tuple(devices))
+        group = index.get(key)
+        if group is None:
+            group = {"ov": ov, "devices": devices, "entries": []}
+            index[key] = group
+            groups.append(group)
+        group["entries"].append(entry)
+    return groups
+
+
+def _pipeline_entry(entry: dict) -> dict:
+    """One model as the pipeline reads it, without our routing keys."""
+    return {key: value for key, value in entry.items() if not key.startswith("_")}
+
+
+def _group_env(group: dict, stage: str, run_name: str) -> str:
+    """The exports that make one rendered script run one group's settings.
+
+    Rendered into the template's __GROUP_ENV__, which sits above everything that
+    reads them, so they override whatever the job's own environment carries. The
+    values are already validated -- ov against _OV_VERSION_RE, devices against
+    VALID_DEVICES, run_name built here -- and quoted on the way out anyway.
+    """
+    lines = [f"export BENCH_RUN_NAME={shlex.quote(run_name)}"]
+    if stage in ("benchmark", "all"):
+        lines.append(f"export BENCH_DEVICES={shlex.quote(' '.join(group['devices']))}")
+        lines.append(f"export BENCH_OV_VERSION={shlex.quote(group['ov'] or '')}")
+        # Read back by benchmark/service/results.py as each row's `ov`. Written
+        # for the measured stages only: a build produces no run directory to
+        # describe.
+        meta = json.dumps({
+            "ov": group["ov"],
+            "devices": list(group["devices"]),
+            "stage": stage,
+        }, separators=(",", ":"))
+        lines.append(f"export BENCH_RUN_META={shlex.quote(meta)}")
+    return "\n".join(lines)
+
+
+def render_script(
+    entries: Sequence[dict], stage: str, run_id: str,
+    group_env: str = "", suffix: str = "",
+) -> Tuple[Path, str]:
     """Write the rendered run script into the runtime tree.
 
     Returns (script_path, models_json). The script is written 0700 and handed to
     the user the pipeline runs as: it lives in a directory the pipeline also
     fills with logs, and 0700 owned by root would be a script that user cannot
     read -- which is the whole job.
+
+    `group_env` is the shell prologue pinning this copy's run name, devices and
+    OpenVINO version (see _group_env); `suffix` distinguishes the script files
+    of a run that has more than one group. Both empty for a single-group run,
+    which then renders exactly the script it always did.
     """
-    models_json = json.dumps({"models": list(entries)}, indent=2)
+    models_json = json.dumps(
+        {"models": [_pipeline_entry(entry) for entry in entries]}, indent=2,
+    )
     template = env.RUN_TEMPLATE.read_text()
     rendered = (template
                 .replace("__MODELS_INPUT_JSON__", models_json)
-                .replace("__OPT__", stage))
+                .replace("__OPT__", stage)
+                .replace("__GROUP_ENV__", group_env))
 
     runs_dir = privilege.ensure_dir(env.paths()["runs"])
-    script_path = runs_dir / f"run_{run_id}.sh"
+    script_path = runs_dir / f"run_{run_id}{suffix}.sh"
     script_path.write_text(rendered)
     script_path.chmod(0o700)
     privilege.chown(script_path)
     return script_path, models_json
+
+
+def render_driver(scripts: Sequence[Tuple[Path, dict]], run_id: str) -> Path:
+    """Write the script that runs a multi-group run's groups in sequence.
+
+    One job, one log, one quiet-mode window and one sampler over the whole
+    sequence -- the alternative was a job per group, and the service has a single
+    execution slot and no queue, so that would have been a run the browser had
+    to babysit. Each group is a child `bash`, which is what lets it activate its
+    own OpenVINO venv without anything having to be switched back.
+
+    A failed group does not stop the ones after it: they are separate
+    measurements that happen to have been asked for together, and the operator
+    would rather have three of four than one. The last failing group's exit code
+    is what the driver returns, so the job is still reported as failed and the
+    log says which groups got that far.
+    """
+    lines = [
+        "#!/usr/bin/env bash",
+        "# Generated by benchmark/service/runner.py -- runs one benchmark job's",
+        "# groups in sequence. Each group has its own OpenVINO version and/or",
+        "# device sweep, both of which are process-wide in the pipeline.",
+        "_rc=0",
+    ]
+    total = len(scripts)
+    for position, (script, group) in enumerate(scripts, start=1):
+        devices = " ".join(group["devices"]) or "-"
+        models = ", ".join(entry["id"] for entry in group["entries"])
+        lines += [
+            "",
+            'echo ""',
+            f'echo "=== group {position}/{total}: OpenVINO {group["ov"] or "-"} '
+            f'on {devices} ==="',
+            f'echo "=== models: {models}"',
+            f"bash {shlex.quote(str(script))} || _rc=$?",
+        ]
+    lines += [
+        "",
+        'echo ""',
+        f'echo "=== all {total} group(s) finished (exit $_rc) ==="',
+        "exit $_rc",
+        "",
+    ]
+
+    runs_dir = privilege.ensure_dir(env.paths()["runs"])
+    driver_path = runs_dir / f"run_{run_id}.sh"
+    driver_path.write_text("\n".join(lines))
+    driver_path.chmod(0o700)
+    privilege.chown(driver_path)
+    return driver_path
 
 
 def start_run(
@@ -263,13 +405,23 @@ def start_run(
         raise RuntimeError(
             "the benchmark environment is not ready; run the environment setup first"
         )
+    # How this request splits: one group per (OpenVINO version, device set), run
+    # in sequence inside one job. Decided before the runtime check below, so
+    # that check can cover every version the run will actually activate.
+    groups = run_groups(entries, stage)
+
     # The column is installed by setup, not by the run: building it here is a
     # multi-GB pip install inside quiet mode with the sampler already recording.
     # The UI keeps Run disabled until it exists; this is the same rule for
-    # anything calling the API directly.
-    if ov is not None and ov not in status["ov_versions"]:
+    # anything calling the API directly. Every group's version is checked, not
+    # just the request's: a run that would stop halfway through to fail on the
+    # second model's runtime should not start.
+    for missing in sorted({
+        group["ov"] for group in groups
+        if group["ov"] is not None and group["ov"] not in status["ov_versions"]
+    }):
         raise RuntimeError(
-            f"OpenVINO {ov} is not installed; install it from the Benchmark tab's "
+            f"OpenVINO {missing} is not installed; install it from the Benchmark tab's "
             "Environment drawer (or POST /bench/env/setup with that version) "
             "before benchmarking against it"
         )
@@ -293,22 +445,72 @@ def start_run(
             raise QuietModeBlocked(blockers)
 
     run_id = uuid.uuid4().hex[:12]
-    script_path, models_json = render_script(entries, stage, run_id)
+
+    # One run name per group, shared by every model/device wrapper that group
+    # spawns (the commons default RUN_NAME to $BENCH_RUN_NAME). Timestamp for
+    # readable, time-sorted result directories; run_id appended so two runs in
+    # the same second cannot collide and the directory ties back to
+    # run_<run_id>.log. Inherited down route -> gen_wrapper -> execute_wrapper ->
+    # each case wrapper via the environment, so a group's cases land in one
+    # benchmarks/<backend>/<name>_<DEVICE>/.
+    #
+    # A run with one group keeps the bare name, which is what every run before
+    # groups existed was called. Several groups have to be told apart -- two
+    # OpenVINO versions writing into one directory would be two measurements
+    # with nothing to distinguish them -- so each takes a "_g<n>" suffix, and
+    # the Results tab lists them as the separate jobs they are.
+    #
+    # Two places read the run id back out of a directory name to find the run's
+    # sampling CSV -- results.timeline(), for the per-case curve, and
+    # run_template.sh's "restore the hardware medians of an older run" pass --
+    # and both have to allow for the suffix. All the groups of one run share a
+    # run id, and so a single CSV: they run in sequence under one sampler thread,
+    # and each case is cut out of it by timestamp.
+    run_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{run_id}"
+    single = len(groups) == 1
+
+    # One rendering of the template per group. Nothing is pinned inside the
+    # script of a single-group run: it inherits from the job's environment
+    # below, exactly as it did before.
+    rendered: List[Tuple[Path, dict]] = []
+    for position, group in enumerate(groups, start=1):
+        group["run_name"] = run_name if single else f"{run_name}_g{position}"
+        group["models"] = [entry["id"] for entry in group["entries"]]
+        path, models_json = render_script(
+            group["entries"], stage, run_id,
+            group_env="" if single else _group_env(group, stage, group["run_name"]),
+            suffix="" if single else f"_g{position}",
+        )
+        group["script"] = str(path)
+        group["models_json"] = models_json
+        rendered.append((path, group))
+
+    script_path = rendered[0][0] if single else render_driver(rendered, run_id)
     log_path = env.paths()["runs"] / f"run_{run_id}.log"
     # privilege.describe() goes into the log the Benchmark tab is already
     # showing: a permission error deep in a vendored script is only quick to
     # read if the paths and the account are stated right above it.
+    #
+    # The groups are spelled out one by one: with per-model devices and runtimes
+    # the request's own devices/ov are only a default, so "what is this run
+    # actually going to do" is no longer one line.
     header = (
         f"=== benchmark run ===\n"
         f"stage  : {stage}\n"
-        f"devices: {' '.join(devices) or '-'}\n"
-        f"ov     : {ov or '-'}\n"
         f"script : {script_path}\n"
         + "".join(f"{line}\n" for line in privilege.describe())
-        + f"models :\n{models_json}\n\n"
+        + "".join(
+            f"group {position}/{len(groups)}: ov={group['ov'] or '-'} "
+            f"devices={' '.join(group['devices']) or '-'} "
+            f"name={group['run_name']}\n"
+            f"models :\n{group['models_json']}\n\n"
+            for position, group in enumerate(groups, start=1)
+        )
     )
-    logger.info(f"Starting benchmark run: stage={stage}, devices={devices}, "
-                f"models={[e['id'] for e in entries]}")
+    logger.info(
+        f"Starting benchmark run: stage={stage}, groups="
+        f"{[(g['ov'], g['devices'], g['models']) for g in groups]}"
+    )
 
     # Sample the platform for the whole run, and hand the pipeline the path so its
     # aggregation step can slice each case's window out of it. A build-only run
@@ -343,13 +545,10 @@ def start_run(
                 "the job's lifetime with no lease backstop.", run_id
             )
 
-    # One run name per batch, shared by every model/device wrapper this run spawns
-    # (the commons default RUN_NAME to $BENCH_RUN_NAME). Timestamp for readable,
-    # time-sorted result directories; run_id appended so two runs in the same
-    # second cannot collide and the directory ties back to run_<run_id>.log.
-    # Inherited down route -> gen_wrapper -> execute_wrapper -> each case wrapper
-    # via the environment, so all cases land in one benchmarks/<backend>/<name>_<DEVICE>/.
-    run_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{run_id}"
+    # The job's own environment: what a single-group run reads, and what a
+    # multi-group run's group scripts override with their own exports. Written
+    # both ways rather than only for the single case, so the values a group does
+    # not pin are still the request's rather than absent.
     extra_env = {"BENCH_RUN_NAME": run_name}
     # Read by gen_wrapper.py when it emits each case wrapper's device loop. Only
     # the benchmark stage has devices to sweep; a build fetches weights, which
@@ -360,6 +559,12 @@ def start_run(
         # OpenVINO column for this run's process. normalize_ov guaranteed it is a
         # valid X.Y.Z for these stages.
         extra_env["BENCH_OV_VERSION"] = ov
+        # Recorded into each run directory as run_meta.json; see _group_env,
+        # which is where a multi-group run gets its own.
+        extra_env["BENCH_RUN_META"] = json.dumps(
+            {"ov": ov, "devices": list(devices), "stage": stage},
+            separators=(",", ":"),
+        )
     if metrics_csv:
         extra_env["BENCH_METRICS_CSV"] = str(metrics_csv)
 
@@ -379,8 +584,18 @@ def start_run(
             env=env.build_subprocess_env(extra_env),
             log_path=log_path,
             header=header,
-            meta={"stage": stage, "models": entries, "devices": devices,
+            meta={"stage": stage,
+                  "models": [_pipeline_entry(entry) for entry in entries],
+                  "devices": devices,
                   "ov": ov, "run_name": run_name,
+                  # What the run actually does, group by group. `devices`/`ov`
+                  # above are the request's defaults, which with per-model
+                  # settings may be what no group uses.
+                  "groups": [
+                      {"ov": group["ov"], "devices": group["devices"],
+                       "models": group["models"], "run_name": group["run_name"]}
+                      for group in groups
+                  ],
                   "metrics_csv": str(metrics_csv) if metrics_csv else None,
                   # Which run this job's quiet-mode hold belongs to, so the
                   # listener below can release exactly that hold and not one
@@ -405,6 +620,10 @@ def start_run(
             run_sampler.stop()
         if quiet_owner is not None:
             quiet_mode.exit(quiet_owner)
+        # Every script this request wrote, driver included -- for a single group
+        # those are the same file, which unlink(missing_ok) handles.
+        for path, _ in rendered:
+            path.unlink(missing_ok=True)
         script_path.unlink(missing_ok=True)
         raise
 

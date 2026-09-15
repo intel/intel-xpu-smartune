@@ -67,6 +67,28 @@ export function formatMetric(value: number | undefined | null): string {
   return value.toFixed(3)
 }
 
+/**
+ * A byte count, as a size on disk.
+ *
+ * Binary units, because that is what every other tool the user will check this
+ * against reports (`du -h`, the file manager) -- a directory this says is
+ * 1.13 GB and `du` says is 1.2G would read as two different directories. One
+ * decimal is as far as the number is worth taking: this is read to decide which
+ * of two downloads to delete, and the answer never turns on the second digit.
+ */
+export function formatBytes(bytes: number | undefined | null): string {
+  if (bytes === undefined || bytes === null || !Number.isFinite(bytes)) return '-'
+  if (bytes < 1024) return `${Math.round(bytes)} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return `${value >= 100 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`
+}
+
 /** Value with its unit, for a tooltip or a stat tile. */
 export function formatWithUnit(value: number | undefined | null, meta?: BenchMetricMeta): string {
   const text = formatMetric(value)

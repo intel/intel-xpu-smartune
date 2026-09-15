@@ -14,6 +14,19 @@ source "$SCRIPT_DIR/configs/global_vars.sh"
 
 opt="__OPT__"  # build + benchmark 阶段选择
 
+# This group's run settings, rendered in by benchmark/service/runner.py.
+#
+# One press of Run can now ask for a different OpenVINO version or a different
+# device set per model, and both of those are process-wide here (the OV venv is
+# activated below; BENCH_DEVICES is read by gen_wrapper.py). So a request that
+# does not agree on them is split into groups, and each group gets its own copy
+# of this script with its own exports -- run in sequence by a driver script, so
+# a group's environment is its own process and never has to be switched.
+#
+# Empty when there is only one group: the run then inherits BENCH_RUN_NAME and
+# the rest from the job's environment, exactly as it did before groups existed.
+__GROUP_ENV__
+
 # 0.5) Environment.
 #
 # Both venvs are installed by setup_env.sh before a run is startable, and
@@ -158,14 +171,15 @@ for _bench_mode in genai app; do
   # a later run's whole-tree pass, and the backend-wide file is all they have.
   # The samples that DO cover them are still on disk -- benchmark/service/runner.py
   # keeps one CSV per run under DIR_RUNS, named after the run id that the
-  # directory itself carries ("<timestamp>_<run_id>_<DEVICE>") -- so the numbers
-  # are recomputed once, into the run's own file, and never disturbed again.
+  # directory itself carries ("<timestamp>_<run_id>_<DEVICE>", with a "_g<n>"
+  # before the device when the run was split into groups) -- so the numbers are
+  # recomputed once, into the run's own file, and never disturbed again.
   for _run_dir in "$_backend_dir"/*/; do
     _run_dir="${_run_dir%/}"
     [ -f "$_run_dir/windowed_metric_medians.csv" ] && continue
     case "$(basename "$_run_dir")" in "${BENCH_RUN_NAME}"_*) continue ;; esac
     _run_id=$(basename "$_run_dir" \
-      | sed -n 's/^[0-9]\{8\}_[0-9]\{6\}_\([0-9a-f]\{1,\}\)_[A-Za-z]\{1,\}$/\1/p')
+      | sed -n 's/^[0-9]\{8\}_[0-9]\{6\}_\([0-9a-f]\{1,\}\)\(_g[0-9]\{1,\}\)\{0,1\}_[A-Za-z]\{1,\}$/\1/p')
     [ -n "$_run_id" ] || continue
     _past_csv="$DIR_RUNS/run_${_run_id}_metrics.csv"
     [ -f "$_past_csv" ] || continue
@@ -204,3 +218,24 @@ for _bench_mode in genai app; do
       || echo "[WARN] pivot report for $_bench_mode skipped (no metrics data)."
   fi
 done
+
+# What this run was measured with, into each directory it produced.
+#
+# Nothing else in the results tree records the OpenVINO version: not the
+# directory name, not summary.tsv, not the medians CSV. That was tolerable while
+# it was one version per press of Run -- the version was a property of the job
+# the operator had just started -- and is not now that one press can sweep
+# several. benchmark/service/results.py reads this back as the `ov` of every row.
+#
+# Last, deliberately: it is a note about the run, and a failure to write it must
+# not cost the results it describes. Absent from every run measured before this
+# block existed, which reads as unknown rather than as a wrong version.
+if [ -n "${BENCH_RUN_META:-}" ] && [ -n "${BENCH_RUN_NAME:-}" ]; then
+  for _bench_mode in genai app; do
+    for _run_dir in "$DIR_BENCHMARKS/$_bench_mode/${BENCH_RUN_NAME}"_*; do
+      [ -d "$_run_dir" ] || continue
+      printf '%s\n' "$BENCH_RUN_META" > "$_run_dir/run_meta.json" \
+        || echo "[WARN] could not record run metadata in $_run_dir."
+    done
+  done
+fi

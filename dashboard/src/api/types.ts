@@ -865,6 +865,10 @@ export interface BenchModel {
   // Per-precision presence in the runtime IR directory. Only lists precisions
   // that are either offered or already present.
   local: Partial<Record<BenchPrecision, boolean>>
+  // What each downloaded precision is holding on disk, in bytes. Only the ones
+  // actually present: a precision that is offered but not downloaded has no
+  // size, and a 0 would read as "already here, costs nothing".
+  local_bytes: Partial<Record<BenchPrecision, number>>
   downloaded: boolean
 }
 
@@ -1049,6 +1053,11 @@ export interface BenchMatrixRow {
   // whose directories were not named by runner.py (the legacy "TEST" ones);
   // read `updated_at` instead.
   job_started_at: number | null
+  // The OpenVINO version this case was measured against, from the run_meta.json
+  // the run wrote. null for anything measured before that file existed: the
+  // tree holds no other trace of the version, so it is shown as unknown rather
+  // than guessed from the versions installed today.
+  ov?: string | null
   // When that run last wrote its summary, for ordering repetitions by age.
   updated_at: number
   model: string
@@ -1085,6 +1094,9 @@ export interface BenchMatrixData {
     // Newest first, unlike the others: a job is a moment, and the one a reader
     // wants at the top is the last one they started.
     jobs: string[]
+    // Only the OpenVINO versions actually recorded; absent from a service too
+    // old to report them, and empty for a tree measured before run_meta.json.
+    ovs?: string[]
   }
   metrics: BenchMetricMeta[]
   // The metric the pipeline's report profile calls the headline one, and so the

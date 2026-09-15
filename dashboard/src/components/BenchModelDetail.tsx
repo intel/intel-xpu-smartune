@@ -1,51 +1,88 @@
 // Copyright (c) 2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// What is known about the selected model, and the actions that apply to it.
+// What is known about one model, and what it will be run as.
 //
-// Everything shown here comes out of the cached model list, so opening a model
-// costs nothing: which precisions exist, how popular the conversion is, and --
-// from the runtime IR directory -- which of them are already on this machine.
+// The body of the drawer a tile opens (BenchModelDrawer). Two blocks, and the
+// split is the point: above, facts the page can only report -- which precisions
+// exist, how popular the conversion is, and, from the runtime IR directory,
+// which of them are already on this machine; below, the choices the operator
+// makes about this one model. All of it comes out of the cached model list, so
+// opening a model costs nothing.
 //
-// "Download" is the pipeline's build stage. As wired in
-// benchmark/templates/run_template.sh, that stage resolves each requested
-// precision to the matching pre-converted OpenVINO repo and fetches it; nothing
-// is converted locally. The API still calls it `build`, because the vendored
-// pipeline also has real conversion routes behind the same switch.
+// Every control here edits ONE model's settings. They used to be one global set
+// shared by whatever was selected, which could not express the thing the page is
+// for -- this model as int4 on the NPU, that one as fp16 on the CPU -- so they
+// are a per-model ModelParams now.
 //
-// "Run" is the `benchmark` stage, and only that. The API also offers `all`
-// (fetch first, then benchmark) and the page used to pick it automatically when
-// something was missing, but a download that lands inside a measured run holds
-// quiet mode -- and so suspends SmarTune's monitoring -- for however long tens
-// of GB take to arrive, while itself being exactly the kind of load the run is
-// supposed to be measured without. So the two are separate jobs and Run stays
-// disabled until the weights are there. Everything else on this tab is
-// benchmarking, which is why the button does not say so.
+// Nothing here starts anything. Download and Run are the tile strip's, and act
+// on whichever tiles are ticked (BenchModelTiles); this pane used to carry its
+// own pair for the single model it showed, which behind a drawer would be a
+// second set of buttons doing the same thing for a set of one. What the two
+// stages mean is documented where those buttons are.
 //
-// The chosen OpenVINO runtime is gated the same way and for the same reason: it
-// used to be built by the run that needed it, inside that same measured window.
-// So by the time Run is clickable there is nothing left to do but measure.
+// One exception, and it is not a run: the OpenVINO box offers Install when the
+// runtime it names is not on disk. That used to be built by the run that needed
+// it, inside the measured window -- a multi-GB pip install with the sampler
+// already recording -- so it is a job of its own now, offered next to the box
+// that says it is missing rather than in a drawer the user has to be told to
+// open.
 
 import React from 'react'
-import { Alert, Button, Card, Checkbox, Descriptions, Empty, Input, Select, Space, Tag, Tooltip, Typography } from 'antd'
-import {
-  CloudDownloadOutlined,
-  PlayCircleOutlined,
-  StopOutlined,
-  ToolOutlined,
-} from '@ant-design/icons'
+import { Alert, Button, Card, Checkbox, Descriptions, Divider, Empty, Input, Select, Space, Tag, Tooltip, Typography } from 'antd'
+import { DeleteOutlined, ToolOutlined } from '@ant-design/icons'
 
-import type { BenchDevice, BenchModel, BenchPrecision, BenchStage } from '../api/types'
+import type { BenchDevice, BenchModel, BenchPrecision } from '../api/types'
+import { formatBytes } from '../utils/benchMetrics'
 
 const { Text, Link } = Typography
 
 const PRECISIONS: BenchPrecision[] = ['fp16', 'int8', 'int4']
+
+// Why a delete is not on offer. The server refuses one while a job holds the
+// slot -- a download or a run is reading exactly these files -- so the control
+// says so rather than failing on the click.
+const WHILE_BUSY = 'Weights cannot be removed while a benchmark job is running'
 
 // Every device the pipeline can sweep, in the order it sweeps them
 // (benchmark/service/runner.py VALID_DEVICES). Not probed: what is installed on
 // the host is a question the OpenVINO runtime answers inside the benchmark
 // venv, and a device that is absent fails its cases visibly rather than
 // silently disappearing from the choice.
+// How every row in this pane is laid out: one item per row, label and value on
+// one line with a colon between them. The label column is pinned rather than
+// sized to its content so that the two blocks below -- what the model is, and
+// how it will be run -- line up as one list, and the rows are given room to
+// breathe: eight items packed at the default spacing filled the top third of
+// the drawer and left the rest of it empty.
+const DESCRIPTION_PROPS = {
+  size: 'small' as const,
+  column: 1,
+  styles: {
+    label: { width: 150, whiteSpace: 'nowrap' as const, paddingBottom: 14 },
+    content: { paddingBottom: 14 },
+  },
+}
+
+/**
+ * A heading over one kind of row.
+ *
+ * The two kinds are worth separating: everything above the second one is a fact
+ * about the model that the page can only report, and everything below it is a
+ * choice the operator makes. Without the split they were eight rows of the same
+ * weight, and which of them could be changed was something to find out by
+ * clicking.
+ */
+function SectionHead({ children, first }: { children: React.ReactNode; first?: boolean }) {
+  return (
+    <Divider orientation="left" plain style={{ margin: first ? '0 0 12px' : '4px 0 12px' }}>
+      <Text type="secondary" style={{ fontSize: 12, textTransform: 'uppercase' }}>
+        {children}
+      </Text>
+    </Divider>
+  )
+}
+
 const DEVICES: { value: BenchDevice; hint: string }[] = [
   { value: 'cpu', hint: 'Also the baseline the report’s speedup columns are measured against' },
   { value: 'gpu', hint: 'Integrated or discrete, whichever OpenVINO resolves GPU to' },
@@ -100,31 +137,44 @@ export function applicablePrecisions(
   return precisions.filter((p) => offered.has(p))
 }
 
+/**
+ * One model's run settings.
+ *
+ * All four are per model. `precisions` and `args` reach the pipeline on that
+ * model's own entry in the run request; `devices` and `ov` are process-wide in
+ * the pipeline, so the server splits a request whose models disagree about them
+ * into groups and runs the groups in sequence (benchmark/service/runner.py,
+ * run_groups).
+ */
+export interface ModelParams {
+  precisions: BenchPrecision[]
+  devices: BenchDevice[]
+  // The OpenVINO version a benchmark runs against; only benchmarks use it, a
+  // download ignores it.
+  ov: string
+  // Free-form extra CLI arguments appended to every benchmark run_case for this
+  // model; a download ignores them.
+  args: string
+}
+
 interface Props {
   model: BenchModel | null
-  precisions: BenchPrecision[]
-  onPrecisionsChange: (value: BenchPrecision[]) => void
-  devices: BenchDevice[]
-  onDevicesChange: (value: BenchDevice[]) => void
-  // The OpenVINO version a benchmark runs against; only benchmarks use it, a
-  // download ignores it. `installedOvs` are the ones already on disk -- the
-  // others have to be installed first, which is what onInstallOv starts.
-  ov: string
-  onOvChange: (value: string) => void
+  params: ModelParams
+  onParamsChange: (next: ModelParams) => void
+  // `installedOvs` are the versions already on disk -- the others have to be
+  // installed first, which is what onInstallOv starts.
   ovChoices: string[]
   installedOvs: string[]
   onInstallOv: (version: string) => void
-  // Free-form extra CLI arguments appended to every benchmark run_case. Applies
-  // to the whole run, alongside the OpenVINO version; a download ignores it.
-  args: string
-  onArgsChange: (value: string) => void
   ready: boolean
+  // Keeps Install and the weight deletes from being pressed while something else
+  // is running; nothing here starts a run any more.
   busy: boolean
   probing: boolean
-  starting: boolean
-  onRun: (stage: BenchStage, models: string[]) => void
-  onCancel: () => void
   onOpenEnv: () => void
+  // Offer to free the disk this model's downloaded weights are holding. An empty
+  // `precisions` asks about all of them.
+  onDeleteLocal: (model: BenchModel, precisions: BenchPrecision[]) => void
 }
 
 function VariantTags({ model }: { model: BenchModel }) {
@@ -150,25 +200,25 @@ function VariantTags({ model }: { model: BenchModel }) {
 
 export default function BenchModelDetail({
   model,
-  precisions,
-  onPrecisionsChange,
-  devices,
-  onDevicesChange,
-  ov,
-  onOvChange,
+  params,
+  onParamsChange,
   ovChoices,
   installedOvs,
   onInstallOv,
-  args,
-  onArgsChange,
   ready,
   busy,
   probing,
-  starting,
-  onRun,
-  onCancel,
   onOpenEnv,
+  onDeleteLocal,
 }: Props) {
+  const { precisions, devices, ov, args } = params
+  const onPrecisionsChange = (value: BenchPrecision[]) =>
+    onParamsChange({ ...params, precisions: value })
+  const onDevicesChange = (value: BenchDevice[]) =>
+    onParamsChange({ ...params, devices: value })
+  const onOvChange = (value: string) => onParamsChange({ ...params, ov: value })
+  const onArgsChange = (value: string) => onParamsChange({ ...params, args: value })
+
   if (!model) {
     return (
       <Card size="small">
@@ -181,18 +231,13 @@ export default function BenchModelDetail({
   }
 
   const offered = new Set(model.precisions)
-  const knowsVariants = model.variants.length > 0
-  // Everything below is about what this model can be asked for, which is the
-  // ticked precisions narrowed to the ones it offers -- not the raw tick list.
+  // What this model can actually be asked for: the ticked precisions narrowed
+  // to the ones it offers, not the raw tick list.
   const applicable = applicablePrecisions(model, precisions)
-  // A download needs precisions; a benchmark needs somewhere to run and an
-  // installed OpenVINO runtime to run in -- one that is not on disk disables Run
-  // and offers Install instead, rather than being built inside the run.
+  // A runtime that is not on disk cannot be benchmarked against, so the box
+  // that names it offers Install instead -- rather than the version being built
+  // inside the measured run, which is what used to happen.
   const ovInstalled = installedOvs.includes(ov.trim())
-  const canDownload = ready && !busy && applicable.length > 0
-  const missing = missingPrecisions([model], applicable)
-  const canRun = canDownload && devices.length > 0 && ovInstalled && missing.length === 0
-  const deviceSummary = devices.map((device) => device.toUpperCase()).join(', ')
 
   return (
     <Card
@@ -210,20 +255,55 @@ export default function BenchModelDetail({
         </Link>
       }
     >
-      <Descriptions size="small" column={{ xs: 1, sm: 2 }} styles={{ label: { whiteSpace: 'nowrap' } }}>
+      {/* One item per row, label and value on the same line, separated by a
+          colon. Two columns is what this used to be, and in a drawer's width
+          that left every value -- each of them a list of tags -- wrapping in
+          half the space it needed. */}
+      <SectionHead first>What this model is</SectionHead>
+      <Descriptions {...DESCRIPTION_PROPS}>
         <Descriptions.Item label="OpenVINO variants">
           <VariantTags model={model} />
         </Descriptions.Item>
+        {/* What is on disk, what it costs, and the one control that gives it
+            back. A conversion is hundreds of megabytes to a couple of gigabytes
+            and nothing else on this tab removes one, so the tag that reports it
+            is also where it is deleted -- with the precision it names already
+            ticked in the dialog. */}
         <Descriptions.Item label="On this machine">
           {model.downloaded ? (
             <Space size={[4, 4]} wrap>
-              {Object.entries(model.local)
-                .filter(([, present]) => present)
-                .map(([precision]) => (
-                  <Tag key={precision} color="success" style={{ marginInlineEnd: 0 }}>
-                    {precision}
+              {PRECISIONS.filter((precision) => model.local[precision]).map((precision) => (
+                <Tooltip key={precision} title={busy ? WHILE_BUSY : 'Delete these weights'}>
+                  <Tag
+                    color="success"
+                    style={{ marginInlineEnd: 0 }}
+                    closable={!busy}
+                    closeIcon={<DeleteOutlined />}
+                    onClose={(e: React.MouseEvent<HTMLElement>) => {
+                      // The tag is a fact about the machine, not a filter chip:
+                      // it goes away when the weights do, and not before.
+                      e.preventDefault()
+                      onDeleteLocal(model, [precision])
+                    }}
+                  >
+                    {precision} · {formatBytes(model.local_bytes[precision])}
                   </Tag>
-                ))}
+                </Tooltip>
+              ))}
+              {/* Only worth offering when there is more than one to take at
+                  once; with a single conversion the tag above is the same act. */}
+              {Object.keys(model.local_bytes).length > 1 && (
+                <Button
+                  type="link"
+                  size="small"
+                  danger
+                  disabled={busy}
+                  style={{ padding: 0, height: 'auto', fontSize: 12 }}
+                  onClick={() => onDeleteLocal(model, [])}
+                >
+                  delete all
+                </Button>
+              )}
             </Space>
           ) : (
             <Text type="secondary">nothing downloaded yet</Text>
@@ -239,30 +319,27 @@ export default function BenchModelDetail({
         </Descriptions.Item>
       </Descriptions>
 
-      {/* Precision and device are the two halves of "what to run": one picks
-          the weights, the other picks what runs them. Side by side because the
-          sweep is their product -- three precisions on two devices is six
-          cases, and that is easier to see when both are in one line of sight. */}
-      <div style={{ marginTop: 12, display: 'flex', gap: 32, flexWrap: 'wrap' }}>
-        <div>
-          <Text type="secondary">Precision</Text>
-          <div style={{ marginTop: 6 }}>
-            <Checkbox.Group
+      {/* The settings, in the same two-column shape as the facts above: these
+          four used to sit side by side across the full width of the page, which
+          a drawer does not have. */}
+      <SectionHead>How it will be run</SectionHead>
+      <Descriptions {...DESCRIPTION_PROPS}>
+        <Descriptions.Item label="Precision">
+          <Checkbox.Group
               // What this model can offer, not the raw selection: a precision it
               // has no conversion for is drawn disabled, and disabled *and*
-              // ticked is a box the user can neither act on nor clear.
+              // ticked is a box the user can neither act on nor clear. The
+              // selection defaults to the last one made on another model, which
+              // is how a tick that this model cannot honour gets here at all.
               value={applicable}
               onChange={(value) =>
-                // The selection is shared by every model, so the ticks this one
-                // cannot honour are carried through rather than dropped on the
-                // way past -- the next model may well offer them. Rebuilt in
-                // canonical order so the state does not depend on click order.
+                // Rebuilt in canonical order, so the state does not depend on
+                // click order. Anything this model does not offer is dropped
+                // rather than carried: the settings are its own now, and a
+                // precision it is not published in is not a thing to remember
+                // about it.
                 onPrecisionsChange(
-                  PRECISIONS.filter(
-                    (p) =>
-                      (value as BenchPrecision[]).includes(p) ||
-                      (knowsVariants && !offered.has(p) && precisions.includes(p)),
-                  ),
+                  PRECISIONS.filter((p) => (value as BenchPrecision[]).includes(p)),
                 )
               }
               options={PRECISIONS.map((precision) => ({
@@ -280,157 +357,102 @@ export default function BenchModelDetail({
                 disabled: model.variants.length > 0 && !offered.has(precision),
               }))}
             />
-          </div>
-        </div>
+        </Descriptions.Item>
 
-        <div>
-          <Text type="secondary">Device</Text>
-          <div style={{ marginTop: 6 }}>
-            <Checkbox.Group
-              value={devices}
-              onChange={(value) => onDevicesChange(value as BenchDevice[])}
-              options={DEVICES.map(({ value, hint }) => ({
-                label: <Tooltip title={hint}>{value.toUpperCase()}</Tooltip>,
-                value,
-              }))}
-            />
-          </div>
-        </div>
+        <Descriptions.Item label="Device">
+          <Checkbox.Group
+            value={devices}
+            onChange={(value) => onDevicesChange(value as BenchDevice[])}
+            options={DEVICES.map(({ value, hint }) => ({
+              label: <Tooltip title={hint}>{value.toUpperCase()}</Tooltip>,
+              value,
+            }))}
+          />
+        </Descriptions.Item>
 
         {/* OpenVINO version to benchmark against, tagged with whether its
             runtime is installed. Only the benchmark uses it. */}
-        <div>
-          <Tooltip title="The build/download stage never uses OpenVINO; only the benchmark does.">
-            <Text type="secondary">OpenVINO</Text>
-          </Tooltip>
-          <div style={{ marginTop: 6 }}>
-            <Space size={6}>
-              <Select
-                size="small"
-                style={{ width: 180 }}
-                value={ov || undefined}
-                onChange={onOvChange}
-                showSearch
-                placeholder="pick a version"
-                options={ovChoices.map((v) => ({
-                  value: v,
-                  label: (
-                    <Space size={6}>
-                      {v}
-                      {installedOvs.includes(v) ? (
-                        <Tag color="success" style={{ marginInlineEnd: 0 }}>installed</Tag>
-                      ) : (
-                        <Tag style={{ marginInlineEnd: 0 }}>not installed</Tag>
-                      )}
-                    </Space>
-                  ),
-                }))}
-              />
-              {/* Next to the box that says the runtime is missing, rather than
-                  in a drawer the user has to be told to open. */}
-              {!!ov && !ovInstalled && (
-                <Tooltip
-                  title={`Install the OpenVINO ${ov} runtime, so this version can be benchmarked`}
+        <Descriptions.Item
+          label={
+            <Tooltip title="The build/download stage never uses OpenVINO; only the benchmark does.">
+              OpenVINO
+            </Tooltip>
+          }
+        >
+          <Space size={6}>
+            <Select
+              size="small"
+              style={{ width: 180 }}
+              value={ov || undefined}
+              onChange={onOvChange}
+              showSearch
+              placeholder="pick a version"
+              options={ovChoices.map((v) => ({
+                value: v,
+                label: (
+                  <Space size={6}>
+                    {v}
+                    {installedOvs.includes(v) ? (
+                      <Tag color="success" style={{ marginInlineEnd: 0 }}>installed</Tag>
+                    ) : (
+                      <Tag style={{ marginInlineEnd: 0 }}>not installed</Tag>
+                    )}
+                  </Space>
+                ),
+              }))}
+            />
+            {/* Next to the box that says the runtime is missing, rather than in
+                a drawer the user has to be told to open. */}
+            {!!ov && !ovInstalled && (
+              <Tooltip
+                title={`Install the OpenVINO ${ov} runtime, so this version can be benchmarked`}
+              >
+                <Button
+                  // Primary: this is the next step, and Run stays greyed out
+                  // until it is done.
+                  type="primary"
+                  size="small"
+                  icon={<ToolOutlined />}
+                  disabled={busy}
+                  onClick={() => onInstallOv(ov.trim())}
                 >
-                  <Button
-                    // Primary, like Run: this is the next step, and Run stays
-                    // greyed out until it is done.
-                    type="primary"
-                    size="small"
-                    icon={<ToolOutlined />}
-                    disabled={busy}
-                    onClick={() => onInstallOv(ov.trim())}
-                  >
-                    Install
-                  </Button>
-                </Tooltip>
-              )}
-            </Space>
-          </div>
-        </div>
+                  Install
+                </Button>
+              </Tooltip>
+            )}
+          </Space>
+        </Descriptions.Item>
 
         {/* Free-form extra arguments, forwarded to the benchmark command at the
             end of each run_case. A way to pass flags the page does not model on
             its own (e.g. --num-warmup 2); only the benchmark uses them. */}
-        <div>
-          <Tooltip title="Appended to the benchmark command for every case; the download stage ignores them.">
-            <Text type="secondary">Extra args</Text>
-          </Tooltip>
-          <div style={{ marginTop: 6 }}>
-            <Input
-              size="small"
-              style={{ width: 220 }}
-              value={args}
-              onChange={(e) => onArgsChange(e.target.value)}
-              placeholder="e.g. --num-warmup 2"
-              allowClear
-            />
-          </div>
-        </div>
-      </div>
+        <Descriptions.Item
+          label={
+            <Tooltip title="Appended to the benchmark command for every case; the download stage ignores them.">
+              Extra args
+            </Tooltip>
+          }
+        >
+          <Input
+            size="small"
+            style={{ width: 240 }}
+            value={args}
+            onChange={(e) => onArgsChange(e.target.value)}
+            placeholder="e.g. --num-warmup 2"
+            allowClear
+          />
+        </Descriptions.Item>
+      </Descriptions>
 
-      {/* Download first, then Run: whichever is the next thing to do is the one
-          drawn as primary, so the pair reads as a sequence rather than a
-          choice. */}
-      <Space style={{ marginTop: 16 }} wrap>
-        <Tooltip
-          title={
-            !applicable.length
-              ? precisions.length
-                ? `This model is not published in ${precisions.join(' or ')} — tick a precision it offers`
-                : 'Tick a precision to download'
-              : missing.length
-                ? `Fetch ${missing.join(', ')} — Run unlocks once they are on disk`
-                : 'The ticked precisions are already here; this fetches them again'
-          }
-        >
-          <Button
-            type={missing.length ? 'primary' : 'default'}
-            icon={<CloudDownloadOutlined />}
-            // A download is about weights, not about where they will run: the
-            // device selection does not gate it.
-            disabled={!canDownload}
-            loading={starting}
-            onClick={() => onRun('build', [model.id])}
-          >
-            Download
-          </Button>
-        </Tooltip>
-        <Tooltip
-          title={
-            !applicable.length
-              ? precisions.length
-                ? `This model is not published in ${precisions.join(' or ')} — tick a precision it offers`
-                : 'Tick a precision to benchmark'
-              : missing.length
-                ? `Download ${missing.join(', ')} first`
-                : devices.length === 0
-                  ? 'Pick at least one device to benchmark on'
-                  : !ov
-                    ? 'Pick an OpenVINO version to benchmark against'
-                    : !ovInstalled
-                      ? `The OpenVINO ${ov} runtime is not installed — install it first, then Run only runs`
-                      : `Benchmark ${applicable.join(', ')} on ${deviceSummary} with OpenVINO ${ov}`
-          }
-        >
-          <Button
-            type="primary"
-            icon={<PlayCircleOutlined />}
-            disabled={!canRun}
-            loading={starting}
-            // Never `all`: fetching inside a measured run is what the split above
-            // exists to prevent.
-            onClick={() => onRun('benchmark', [model.id])}
-          >
-            Run
-          </Button>
-        </Tooltip>
-        {busy && (
-          <Button danger icon={<StopOutlined />} onClick={onCancel}>
-            Cancel
-          </Button>
-        )}
-      </Space>
+      {/* No Download or Run here.
+          This pane used to be the only place either could be pressed, and it
+          carried its own pair for the one model it showed. The tile strip's pair
+          now acts on whichever tiles are ticked -- which is the same act, for
+          one model or six -- and a second pair behind a drawer would be two
+          controls doing one thing, differing only in how many models they
+          happened to include. What is left here is what the numbers will be
+          measured with; the buttons are downstairs. Cancel went to the toolbar
+          for the same reason: stopping the machine is not about a model. */}
 
       {!ready && !probing && (
         <Alert

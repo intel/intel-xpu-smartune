@@ -19,10 +19,17 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Badge, Button, Empty, Input, Segmented, Space, Spin, Tag, Tooltip, Typography } from 'antd'
-import { CheckCircleTwoTone, DownOutlined, ReloadOutlined, RightOutlined } from '@ant-design/icons'
+import {
+  CheckCircleTwoTone,
+  DeleteOutlined,
+  DownOutlined,
+  ReloadOutlined,
+  RightOutlined,
+} from '@ant-design/icons'
 
 import type { BenchModel } from '../api/types'
 import { COLORS } from '../styles/theme'
+import { formatBytes } from '../utils/benchMetrics'
 
 const { Text } = Typography
 
@@ -51,6 +58,13 @@ interface Props {
   checkedIds: string[]
   onCheckedChange: (ids: string[]) => void
   onRefreshList: () => void
+  /** Offer to free the disk one downloaded model is holding. */
+  onDeleteLocal: (model: BenchModel) => void
+}
+
+/** What a model's downloaded conversions are holding on disk, in bytes. */
+function localBytes(model: BenchModel): number {
+  return Object.values(model.local_bytes ?? {}).reduce((sum, value) => sum + (value ?? 0), 0)
 }
 
 function matchesFilter(model: BenchModel, filter: ModelFilter): boolean {
@@ -67,6 +81,10 @@ interface Group {
   publisher: string
   models: BenchModel[]
   downloaded: number
+  // What this publisher's downloaded models are holding, summed. Shown on the
+  // header so the "Downloaded" filter reads as a list of what is taking up the
+  // disk -- which is the question someone collapsing forty groups is asking.
+  bytes: number
 }
 
 /**
@@ -83,12 +101,15 @@ function groupModels(models: BenchModel[]): Group[] {
     const publisher = publisherOf(model)
     let group = index.get(publisher)
     if (!group) {
-      group = { publisher, models: [], downloaded: 0 }
+      group = { publisher, models: [], downloaded: 0, bytes: 0 }
       index.set(publisher, group)
       groups.push(group)
     }
     group.models.push(model)
-    if (model.downloaded) group.downloaded += 1
+    if (model.downloaded) {
+      group.downloaded += 1
+      group.bytes += localBytes(model)
+    }
   }
   return groups
 }
@@ -145,6 +166,7 @@ export default function BenchModelList({
   checkedIds,
   onCheckedChange,
   onRefreshList,
+  onDeleteLocal,
 }: Props) {
   const checked = useMemo(() => new Set(checkedIds), [checkedIds])
   // Which publishers are open, and the only answer to that question: every
@@ -329,12 +351,23 @@ export default function BenchModelList({
                       machine: the one fact that decides whether opening the
                       group is worth it. */}
                   {group.downloaded > 0 && (
-                    <Tooltip title={`${group.downloaded} already downloaded`}>
+                    <Tooltip
+                      title={`${group.downloaded} already downloaded · ${formatBytes(
+                        group.bytes,
+                      )} on disk`}
+                    >
                       <Space size={2} style={{ fontSize: 11 }}>
                         <CheckCircleTwoTone twoToneColor="#52c41a" />
                         <Text type="secondary" style={{ fontSize: 11 }}>
                           {group.downloaded}
                         </Text>
+                        {/* Collapsed, this is the only thing that says where the
+                            disk went. */}
+                        {group.bytes > 0 && (
+                          <Text type="secondary" style={{ fontSize: 11 }}>
+                            · {formatBytes(group.bytes)}
+                          </Text>
+                        )}
                       </Space>
                     </Tooltip>
                   )}
@@ -392,14 +425,39 @@ export default function BenchModelList({
                           </Space>
                         </div>
                         {model.downloaded && (
-                          <Tooltip title="Already downloaded">
-                            <CheckCircleTwoTone twoToneColor="#52c41a" />
-                          </Tooltip>
-                        )}
-                        {model.precisions.length > 0 && (
-                          <Tag style={{ marginInlineEnd: 0, fontSize: 11 }}>
-                            {model.precisions.join(' ')}
-                          </Tag>
+                          <>
+                            {/* Downloaded, and what that costs. The size is the
+                                reason the button next to it exists, so it is
+                                read before the click rather than in the dialog
+                                after it. */}
+                            <Tooltip
+                              title={`Downloaded: ${Object.entries(model.local_bytes ?? {})
+                                .map(([p, size]) => `${p} ${formatBytes(size)}`)
+                                .join(' · ')}`}
+                            >
+                              <Space size={2} style={{ fontSize: 11 }}>
+                                <CheckCircleTwoTone twoToneColor="#52c41a" />
+                                <Text type="secondary" style={{ fontSize: 11 }}>
+                                  {formatBytes(localBytes(model))}
+                                </Text>
+                              </Space>
+                            </Tooltip>
+                            <Tooltip title="Delete downloaded weights to free disk space">
+                              <Button
+                                type="text"
+                                size="small"
+                                danger
+                                aria-label={`Delete downloaded weights for ${model.id}`}
+                                icon={<DeleteOutlined style={{ fontSize: 12 }} />}
+                                // The row selects the model; this does not.
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  onDeleteLocal(model)
+                                }}
+                                style={{ width: 20, minWidth: 20, height: 20 }}
+                              />
+                            </Tooltip>
+                          </>
                         )}
                       </div>
                     )

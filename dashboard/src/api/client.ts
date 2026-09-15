@@ -505,16 +505,40 @@ export const api = {
   // is a state of the machine, not a failed request.
   refreshBenchModels: () =>
     post<{ started: boolean; reason: string | null }>('/bench/models/refresh'),
+  // Give back the disk one model's downloaded weights are holding. The model is
+  // named by its HuggingFace id -- the server derives the directory the same way
+  // the download does -- and `precisions` is which of its conversions to remove;
+  // an empty list means all of them. 409 while a job is running, since a
+  // download or a benchmark is reading exactly these files.
+  deleteBenchModelLocal: (model: string, precisions: BenchPrecision[]) =>
+    del<{
+      model: string
+      removed: BenchPrecision[]
+      freed_bytes: number
+      skipped: BenchPrecision[]
+    }>('/bench/models/local', { model, precisions }),
 
   // `devices` names the devices to benchmark on; omitting it means all of them,
   // which is what the pipeline did before the choice existed. `ov` is the
   // OpenVINO version a benchmark builds/runs against (chosen on the Models tab,
   // built on demand); omitted for a pure download.
+  //
+  // Both may also be given per model, which is what the Models tab sends now:
+  // the server splits the request into one group per (ov, devices) pair and runs
+  // the groups in sequence inside one job (runner.run_groups). The top-level
+  // pair is still sent as the default for an entry that names neither -- and as
+  // what a service too old to read the per-model fields will use for all of them.
   startBenchRun: (
     // `args` is free-form extra CLI arguments appended to every benchmark
     // run_case for the model (validated server-side in runner.py); ignored by a
     // pure build/download, which never runs a case.
-    models: { id: string; build?: BenchPrecision[]; args?: string }[],
+    models: {
+      id: string
+      build?: BenchPrecision[]
+      args?: string
+      devices?: BenchDevice[]
+      ov?: string
+    }[],
     opt: BenchStage,
     devices?: BenchDevice[],
     ov?: string,
@@ -569,6 +593,17 @@ export const api = {
       '/bench/results',
       { cases },
     ),
+  // Everything one press of Run produced: the job's run directories, whole.
+  // Distinct from deleteBenchCases because a job is not always the sum of its
+  // case directories -- a case that failed before it wrote a log has no
+  // directory to name, and would survive a delete made case by case.
+  deleteBenchJob: (job: string) =>
+    del<{
+      job: string
+      removed_runs: number
+      removed_cases: number
+      skipped: string[]
+    }>('/bench/results/job', { job }),
 
   getConfig: <T>(section: string) => get<T>(`/monitor/config/${section}`),
   updateConfig: <T extends { updated_at?: number }>(

@@ -69,6 +69,32 @@ export function missingPrecisions(
   return precisions.filter((p) => !models.every((model) => model.local[p]))
 }
 
+/**
+ * Which of the ticked `precisions` this model can actually be asked for.
+ *
+ * The tick list is one global selection that follows the user from model to
+ * model; what a model offers is not. A precision it has no conversion for is
+ * drawn disabled -- but the tick itself survived, so the default int4 landed on
+ * a model published only as fp16/int8 as a box that was checked, greyed, and
+ * therefore impossible to clear. It counted as missing, Run stayed disabled,
+ * and the only thing that would have unlocked it was a download that could
+ * never succeed.
+ *
+ * Judging a model on the intersection is what that box was already saying.
+ * `variants` empty means the cached list knows no conversion details at all (a
+ * v1 cache, or repo names carrying no format suffix): there is nothing to
+ * intersect against and the pipeline resolves the repo itself, so the selection
+ * passes through -- the same condition under which nothing is disabled either.
+ */
+export function applicablePrecisions(
+  model: BenchModel,
+  precisions: BenchPrecision[],
+): BenchPrecision[] {
+  if (!model.variants.length) return precisions
+  const offered = new Set(model.precisions)
+  return precisions.filter((p) => offered.has(p))
+}
+
 interface Props {
   model: BenchModel | null
   precisions: BenchPrecision[]
@@ -149,11 +175,15 @@ export default function BenchModelDetail({
   }
 
   const offered = new Set(model.precisions)
+  const knowsVariants = model.variants.length > 0
+  // Everything below is about what this model can be asked for, which is the
+  // ticked precisions narrowed to the ones it offers -- not the raw tick list.
+  const applicable = applicablePrecisions(model, precisions)
   // A download needs precisions; a benchmark needs somewhere to run and an
   // OpenVINO version to run it (validated the same way the server does).
   const ovValid = /^\d+\.\d+\.\d+$/.test(ov.trim())
-  const canDownload = ready && !busy && precisions.length > 0
-  const missing = missingPrecisions([model], precisions)
+  const canDownload = ready && !busy && applicable.length > 0
+  const missing = missingPrecisions([model], applicable)
   const canRun = canDownload && devices.length > 0 && ovValid && missing.length === 0
   const deviceSummary = devices.map((device) => device.toUpperCase()).join(', ')
 
@@ -211,8 +241,23 @@ export default function BenchModelDetail({
           <Text type="secondary">Precision</Text>
           <div style={{ marginTop: 6 }}>
             <Checkbox.Group
-              value={precisions}
-              onChange={(value) => onPrecisionsChange(value as BenchPrecision[])}
+              // What this model can offer, not the raw selection: a precision it
+              // has no conversion for is drawn disabled, and disabled *and*
+              // ticked is a box the user can neither act on nor clear.
+              value={applicable}
+              onChange={(value) =>
+                // The selection is shared by every model, so the ticks this one
+                // cannot honour are carried through rather than dropped on the
+                // way past -- the next model may well offer them. Rebuilt in
+                // canonical order so the state does not depend on click order.
+                onPrecisionsChange(
+                  PRECISIONS.filter(
+                    (p) =>
+                      (value as BenchPrecision[]).includes(p) ||
+                      (knowsVariants && !offered.has(p) && precisions.includes(p)),
+                  ),
+                )
+              }
               options={PRECISIONS.map((precision) => ({
                 label: (
                   <Space size={4}>
@@ -306,9 +351,13 @@ export default function BenchModelDetail({
       <Space style={{ marginTop: 16 }} wrap>
         <Tooltip
           title={
-            missing.length
-              ? `Fetch ${missing.join(', ')} — Run unlocks once they are on disk`
-              : 'The ticked precisions are already here; this fetches them again'
+            !applicable.length
+              ? precisions.length
+                ? `This model is not published in ${precisions.join(' or ')} — tick a precision it offers`
+                : 'Tick a precision to download'
+              : missing.length
+                ? `Fetch ${missing.join(', ')} — Run unlocks once they are on disk`
+                : 'The ticked precisions are already here; this fetches them again'
           }
         >
           <Button
@@ -325,13 +374,17 @@ export default function BenchModelDetail({
         </Tooltip>
         <Tooltip
           title={
-            missing.length
-              ? `Download ${missing.join(', ')} first`
-              : devices.length === 0
-                ? 'Pick at least one device to benchmark on'
-                : !ovValid
-                  ? 'Enter an OpenVINO version (e.g. 2026.2.0) to benchmark against'
-                  : `Benchmark the ticked precisions on ${deviceSummary} with OpenVINO ${ov}`
+            !applicable.length
+              ? precisions.length
+                ? `This model is not published in ${precisions.join(' or ')} — tick a precision it offers`
+                : 'Tick a precision to benchmark'
+              : missing.length
+                ? `Download ${missing.join(', ')} first`
+                : devices.length === 0
+                  ? 'Pick at least one device to benchmark on'
+                  : !ovValid
+                    ? 'Enter an OpenVINO version (e.g. 2026.2.0) to benchmark against'
+                    : `Benchmark ${applicable.join(', ')} on ${deviceSummary} with OpenVINO ${ov}`
           }
         >
           <Button

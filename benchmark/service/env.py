@@ -22,7 +22,7 @@ from typing import Dict, Optional
 from config.config import b_config
 from utils.logger import logger
 
-from benchmark.service import jobs
+from benchmark.service import jobs, privilege
 
 # <repo>/benchmark/service/env.py -> <repo>/benchmark -> <repo>
 PKG_ROOT = Path(__file__).resolve().parent
@@ -47,8 +47,17 @@ DEFAULT_ENV_ROOT = SRC_ROOT / "runtime"
 # Created up front so the UI can show real paths (and the user can drop models in
 # by hand) before setup_env.sh has ever run. setup_env.sh creates the same set
 # from global_vars.sh; mkdir is idempotent so the two agree.
+#
+# The .gen entries are here for a second reason: the service itself writes into
+# them before any subprocess does (job logs, rendered run scripts, the model
+# cache, the child's HOME), and the subprocess then writes into them as an
+# unprivileged user. Creating the whole skeleton in one place means "root builds
+# it, hands it to the target user, and everything after that belongs to the
+# user" is one decision -- rather than depending on which of three scattered
+# mkdir calls happened to run first (a model-list refresh can precede any job).
 _RUNTIME_SUBDIRS = (
     "models", "benchmarks", "scripts",
+    ".gen/logs", ".gen/runs", ".gen/cache", ".gen/home",
 )
 
 
@@ -114,10 +123,14 @@ def paths() -> Dict[str, Path]:
 
 
 def ensure_dirs() -> None:
-    """Create the runtime tree. Safe to call on every request."""
+    """Create the runtime tree, owned by whoever the subprocesses run as.
+
+    Safe to call on every request. ensure_dir only hands over the levels it
+    actually creates, so a pre-existing tree is left as the operator arranged it.
+    """
     root = env_root()
     for name in _RUNTIME_SUBDIRS:
-        (root / name).mkdir(parents=True, exist_ok=True)
+        privilege.ensure_dir(root / name)
 
 
 def build_subprocess_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -144,6 +157,23 @@ def build_subprocess_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, st
     env["PATH"] = f"{p['venv'] / 'bin'}{os.pathsep}{env.get('PATH', '')}"
     # Unbuffered child output, so the dashboard's log tail is close to live.
     env["PYTHONUNBUFFERED"] = "1"
+
+    # The children run as an unprivileged user (benchmark/service/privilege.py)
+    # but inherit this process's environment, where HOME is /root. Every tool in
+    # the pipeline that keeps state in HOME would fail on it: uv installing a
+    # managed Python, pip's cache, git reading its config. Point HOME inside the
+    # runtime tree instead -- the same place HF_HOME and UV_CACHE_DIR already
+    # go -- and drop root's XDG_* so those re-derive from it rather than staying
+    # pinned to /root and /run/user/0.
+    who = privilege.target()
+    if who is not None:
+        home = privilege.child_home(p["env_root"])
+        privilege.ensure_dir(home)
+        env["HOME"] = str(home)
+        env["USER"] = env["LOGNAME"] = who.name
+        for name in ("XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME",
+                     "XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
+            env.pop(name, None)
 
     token = str(cfg.get("hf_token") or "").strip() or os.environ.get("HF_TOKEN", "")
     if token:
@@ -265,6 +295,10 @@ def switch_ov(version: str) -> dict:
         capture_output=True,
         text=True,
         timeout=120,
+        # Relinks inside the pool, which belongs to the unprivileged user that
+        # built it -- so this has to run as that user too, or the link it leaves
+        # behind is one the next build cannot replace.
+        **privilege.spawn_kwargs(),
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip().splitlines()
@@ -373,9 +407,14 @@ def _refresh_versions(python: Path, key: tuple) -> None:
             # One subprocess for all packages -- the alternative (one import per
             # package) costs an interpreter start each. Generous timeout: this is
             # off the request path, and a cold torch import is slow.
+            # As the venv's owner, with the pipeline's environment: importing a
+            # module writes a .pyc beside it, and one written by root is a file
+            # the user's own next run cannot update.
             result = subprocess.run(
                 [str(python), "-c", _PROBE_SCRIPT],
+                env=build_subprocess_env(),
                 capture_output=True, text=True, timeout=120,
+                **privilege.spawn_kwargs(),
             )
             if result.returncode == 0:
                 versions = json.loads(result.stdout.strip() or "{}")
@@ -587,11 +626,17 @@ def start_setup(force: bool = False) -> jobs.Job:
         p["venv"].rename(backup)
 
     log_path = p["logs"] / f"setup_{int(time.time())}.log"
+    # The environment description goes in the log the Benchmark tab is already
+    # showing. Every way the privilege drop can go wrong surfaces as a
+    # permission error inside a vendored script, and reading one of those is
+    # quick only if the paths and the account are right there above it.
     header = (
         f"=== benchmark environment setup ===\n"
         f"script : {SETUP_SCRIPT}\n"
         f"root   : {p['env_root']}\n"
-        f"force  : {force}\n\n"
+        f"force  : {force}\n"
+        + "".join(f"{line}\n" for line in privilege.describe())
+        + "\n"
     )
     return jobs.manager.start(
         kind="setup",

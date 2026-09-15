@@ -127,7 +127,7 @@ def mount_benchmark(app) -> bool:
     so /smartune/capabilities reports it to the dashboard.
     """
     try:
-        from benchmark.service import bench_bp, benchmark_enabled, models
+        from benchmark.service import bench_bp, benchmark_enabled, models, privilege
     except ImportError as exc:
         if getattr(exc, "name", None) not in _BENCHMARK_ABSENT:
             raise
@@ -139,6 +139,13 @@ def mount_benchmark(app) -> bool:
         return False
 
     app.register_blueprint(bench_bp)
+    # Where the pipeline lives and which account will run it, once, at startup.
+    # The same lines head every job log; having them in the service log too is
+    # what answers "why is the tab like this" before any job has been started.
+    try:
+        privilege.log_startup()
+    except Exception:
+        logger.exception("Could not describe the benchmark environment")
     # Enumerating the benchmarkable models takes minutes, which is unbearable to
     # discover on first use, so a missing or stale list is rebuilt now, in the
     # background. Returns immediately and declines to do anything when there is no

@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Set
 
 from utils.logger import logger
 
-from benchmark.service import env
+from benchmark.service import env, privilege
 
 # A full search is long; this bounds a wedged search rather than reflecting an
 # expected duration.
@@ -72,6 +72,11 @@ def _run_search() -> bool:
             cwd=str(env.SRC_ROOT),
             env=env.build_subprocess_env(),
             capture_output=True, text=True, timeout=_SEARCH_TIMEOUT_SEC,
+            # Unprivileged, like every other benchmark subprocess: it writes the
+            # cache JSON into the runtime tree, and it reaches the network. The
+            # `hf` calls it makes in turn inherit the drop, so search_models.py
+            # itself needs nothing.
+            **privilege.spawn_kwargs(),
         )
         if result.returncode == 0:
             _state["last_error"] = None

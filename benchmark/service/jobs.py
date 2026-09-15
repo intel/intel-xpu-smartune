@@ -14,6 +14,10 @@
 # Each job is a process GROUP (start_new_session=True) so cancelling reaches the
 # whole tree -- optimum-cli, ovms and pip all spawn children that would otherwise
 # survive as orphans holding the GPU.
+#
+# Both also drop to an unprivileged user: this is the one place that spawns the
+# pipeline, so privilege.spawn_kwargs() below covers every job there is. See
+# benchmark/service/privilege.py for who that user is and why.
 
 import os
 import signal
@@ -26,6 +30,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
 from utils.logger import logger
+
+from benchmark.service import privilege
 
 # Terminated jobs kept for status/log lookup after they finish. Logs stay on disk
 # regardless; this only bounds the in-memory index.
@@ -171,10 +177,21 @@ class JobManager:
             self._current = job
 
         try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
+            privilege.ensure_dir(log_path.parent)
             # Line buffering keeps the dashboard's incremental tail close to live
             # even while the child is mid-run.
+            #
+            # Opened here, by the parent, and inherited as a file descriptor, so
+            # the child writes through it whatever user it ends up as. That also
+            # means the inode belongs to the parent -- root -- which is why it is
+            # handed over immediately afterwards: every other artifact of a run
+            # already is (runner.render_script for the script, sampler for the
+            # metrics CSV), and a tree that is the target user's apart from the
+            # one file per run they most often want to read, copy or delete is a
+            # surprise with nothing behind it. It costs no isolation either: the
+            # directory is theirs, so the file was already theirs to unlink.
             log_f = open(log_path, "w", buffering=1, encoding="utf-8", errors="replace")
+            privilege.chown(log_path)
             if header:
                 log_f.write(header if header.endswith("\n") else header + "\n")
                 log_f.flush()
@@ -187,6 +204,12 @@ class JobManager:
                 stdin=subprocess.DEVNULL,
                 # Own process group: cancel() signals the whole tree, not just bash.
                 start_new_session=True,
+                # Drop to the unprivileged owner of the benchmark tree, if there
+                # is one. This is the single choke point for it: setup and run
+                # both come through here, so neither can be added later without
+                # inheriting the drop. cancel() is unaffected -- the parent is
+                # still root, and root may signal any process group.
+                **privilege.spawn_kwargs(),
             )
         except Exception:
             with self._lock:

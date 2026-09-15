@@ -20,7 +20,7 @@ from typing import List, Optional, Sequence, Tuple
 from utils import quiet_mode
 from utils.logger import logger
 
-from benchmark.service import env, jobs, sampler
+from benchmark.service import env, jobs, privilege, sampler
 
 # Pipeline stages accepted by run_template.sh's `opt` switch.
 VALID_STAGES = ("build", "benchmark", "all")
@@ -221,8 +221,10 @@ def normalize_request(
 def render_script(entries: Sequence[dict], stage: str, run_id: str) -> Tuple[Path, str]:
     """Write the rendered run script into the runtime tree.
 
-    Returns (script_path, models_json). The script is written 0700: it is executed
-    as root and lives under a directory the pipeline also fills with logs.
+    Returns (script_path, models_json). The script is written 0700 and handed to
+    the user the pipeline runs as: it lives in a directory the pipeline also
+    fills with logs, and 0700 owned by root would be a script that user cannot
+    read -- which is the whole job.
     """
     models_json = json.dumps({"models": list(entries)}, indent=2)
     template = env.RUN_TEMPLATE.read_text()
@@ -230,11 +232,11 @@ def render_script(entries: Sequence[dict], stage: str, run_id: str) -> Tuple[Pat
                 .replace("__MODELS_INPUT_JSON__", models_json)
                 .replace("__OPT__", stage))
 
-    runs_dir = env.paths()["runs"]
-    runs_dir.mkdir(parents=True, exist_ok=True)
+    runs_dir = privilege.ensure_dir(env.paths()["runs"])
     script_path = runs_dir / f"run_{run_id}.sh"
     script_path.write_text(rendered)
     script_path.chmod(0o700)
+    privilege.chown(script_path)
     return script_path, models_json
 
 
@@ -282,13 +284,17 @@ def start_run(
     run_id = uuid.uuid4().hex[:12]
     script_path, models_json = render_script(entries, stage, run_id)
     log_path = env.paths()["runs"] / f"run_{run_id}.log"
+    # privilege.describe() goes into the log the Benchmark tab is already
+    # showing: a permission error deep in a vendored script is only quick to
+    # read if the paths and the account are stated right above it.
     header = (
         f"=== benchmark run ===\n"
         f"stage  : {stage}\n"
         f"devices: {' '.join(devices) or '-'}\n"
         f"ov     : {ov or '-'}\n"
         f"script : {script_path}\n"
-        f"models :\n{models_json}\n\n"
+        + "".join(f"{line}\n" for line in privilege.describe())
+        + f"models :\n{models_json}\n\n"
     )
     logger.info(f"Starting benchmark run: stage={stage}, devices={devices}, "
                 f"models={[e['id'] for e in entries]}")

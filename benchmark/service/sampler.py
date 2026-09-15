@@ -35,6 +35,8 @@ from monitor.metrics import gpu_perf, membw, npu as npu_metrics
 from utils import quiet_mode
 from utils.logger import logger
 
+from benchmark.service import privilege
+
 # 2 Hz. npu._collect_npu_smi_once() sleeps 200ms internally to difference the
 # energy counter, so a tick costs ~250ms; going faster would just chain NPU reads
 # back to back. Cases run for tens of seconds, so a median over 2 Hz samples is
@@ -127,8 +129,13 @@ class RunSampler:
         """Open the CSV and the collectors, then start sampling. False if the CSV
         cannot be written -- a run should not be aborted for that, only unmetered."""
         try:
-            self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+            privilege.ensure_dir(self.csv_path.parent)
             self._fh = open(self.csv_path, "w", newline="", encoding="utf-8")
+            # This thread stays in the root parent -- it needs perf and sysfs --
+            # so the CSV it writes lands root-owned in a directory the pipeline
+            # otherwise owns. The pipeline only reads it, but handing it over
+            # keeps the runtime tree uniformly the child's to manage.
+            privilege.chown(self.csv_path)
         except OSError as exc:
             logger.warning("Benchmark sampler disabled; cannot write %s: %s",
                            self.csv_path, exc)

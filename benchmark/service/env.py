@@ -13,6 +13,7 @@
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -237,12 +238,116 @@ def available_ov_versions() -> list:
                 versions.append(entry.name[len("ov_"):])
     except OSError:
         return []
-    # Descending so the highest release sorts first; version parts compared
-    # numerically ("2026.10.0" after "2026.3.0", not before it).
-    def key(v: str) -> tuple:
-        return tuple(int(p) if p.isdigit() else p for p in v.split("."))
+    # Descending so the highest release sorts first, compared numerically
+    # ("2026.10.0" after "2026.3.0", not before it).
+    return sorted(versions, key=_version_key, reverse=True)
 
-    return sorted(versions, key=key, reverse=True)
+
+# A bare X.Y.Z, which is all an OpenVINO version may be: it is interpolated into
+# pool paths and pip specifiers, and it reaches us from a request.
+_OV_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+# Oldest offerable release: from here on, openvino, openvino-tokenizers and
+# openvino-genai all publish the pair install_combo() pins (<OV> and <OV>.0).
+OV_VERSION_FLOOR = "2025.3.0"
+
+# What the dropdown lists with no route to PyPI. ov_choices() unions it with
+# what PyPI publishes now, so a new release usually needs no edit here.
+OV_CHOICES_STATIC = (
+    "2026.3.1", "2026.3.0",
+    "2026.2.1", "2026.2.0",
+    "2026.1.0",
+    "2026.0.0",
+    "2025.4.1", "2025.4.0",
+    "2025.3.0",
+)
+
+_OV_CHOICES_TTL_SEC = 6 * 3600
+_ov_choices_lock = threading.Lock()
+_ov_choices_cache: dict = {"versions": (), "at": 0.0, "running": False}
+
+# The three distributions a column pins together, and how each spells the
+# version: openvino uses X.Y.Z, the other two X.Y.Z.0.
+_OV_TRIO = (("openvino", ""), ("openvino-tokenizers", ".0"), ("openvino-genai", ".0"))
+
+
+def _version_key(version: str) -> tuple:
+    """Numeric sort key for a dotted version ("2026.10.0" after "2026.3.0")."""
+    return tuple(int(p) if p.isdigit() else -1 for p in version.split("."))
+
+
+def _pypi_versions(name: str, opener) -> set:
+    """Releases of ``name`` on PyPI that have files (an empty one is uninstallable)."""
+    with opener.open(f"https://pypi.org/pypi/{name}/json", timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    releases = payload.get("releases") or {}
+    return {version for version, files in releases.items() if files}
+
+
+def _refresh_ov_choices() -> None:
+    """Cache the releases all three distributions publish: a version only one of
+    them has is not a choice, it is a resolution failure a few minutes in.
+
+    Best-effort -- no network or a changed payload leaves the static list alone.
+    """
+    versions: tuple = ()
+    try:
+        # search_models' opener, for the proxy config.yaml exports to every
+        # benchmark subprocess; this request is the one with no subprocess.
+        from benchmark.service.search_models import _http_opener
+
+        opener = _http_opener(build_subprocess_env())
+        found = None
+        for name, suffix in _OV_TRIO:
+            raw = _pypi_versions(name, opener)
+            # Back to the openvino spelling, so the three sets are comparable.
+            bare = {v[: -len(suffix)] for v in raw if v.endswith(suffix)} if suffix else raw
+            found = bare if found is None else (found & bare)
+        floor = _version_key(OV_VERSION_FLOOR)
+        versions = tuple(
+            v for v in (found or ())
+            if len(v.split(".")) == 3 and all(p.isdigit() for p in v.split("."))
+            and _version_key(v) >= floor
+        )
+    except Exception as exc:
+        logger.debug(f"OpenVINO version list not refreshed from PyPI: {exc}")
+
+    with _ov_choices_lock:
+        _ov_choices_cache["running"] = False
+        if versions:
+            _ov_choices_cache["versions"] = versions
+            _ov_choices_cache["at"] = time.time()
+
+    if versions:
+        from benchmark.service import events
+        events.publish_env()
+
+
+def ov_choices() -> list:
+    """Every OpenVINO version the Models tab may offer, newest first: the static
+    list, what PyPI adds to it, and every column already built here (so one
+    installed by an older deployment stays selectable).
+
+    Never blocks -- a stale PyPI answer is refreshed on a background thread.
+    """
+    with _ov_choices_lock:
+        live = _ov_choices_cache["versions"]
+        stale = (time.time() - _ov_choices_cache["at"]) > _OV_CHOICES_TTL_SEC
+        if stale and not _ov_choices_cache["running"]:
+            _ov_choices_cache["running"] = True
+            start = True
+        else:
+            start = False
+    if start:
+        try:
+            threading.Thread(target=_refresh_ov_choices, daemon=True,
+                             name="bench-ov-choices").start()
+        except Exception:
+            with _ov_choices_lock:
+                _ov_choices_cache["running"] = False
+
+    everything = set(OV_CHOICES_STATIC) | set(live) | set(available_ov_versions())
+    return sorted(everything, key=_version_key, reverse=True)
 
 
 def active_ov_version() -> Optional[str]:
@@ -551,10 +656,10 @@ def probe(wait: bool = False) -> dict:
     # A venv without it means setup was interrupted partway.
     genai_ready = (p["genai"] / "tools" / "llm_bench").is_dir()
     venv_exists = python is not None
-    # The active `venv` is now the huggingface-only base venv: listing models and
-    # the build/download stage (`hf download`) need only the `hf` CLI, not
-    # OpenVINO, which is built per-version on demand at benchmark time. So "ready
-    # enough to use the tab" is: the base venv can import huggingface_hub. While
+    # The active `venv` is the huggingface-only base venv: listing models and the
+    # build/download stage (`hf download`) need only the `hf` CLI, not OpenVINO,
+    # which lives in a per-version column installed by setup. So "ready enough to
+    # use the tab" is: the base venv can import huggingface_hub. While
     # `probing` this is not yet known -- the UI must not read the interim False as
     # "broken". transformers is tracked separately (venv_usable) for callers that
     # still care whether a full OV column is present in the active venv.
@@ -570,19 +675,20 @@ def probe(wait: bool = False) -> dict:
         "venv_usable": venv_usable,
         "hf_ready": hf_ready,
         "genai_ready": genai_ready,
-        # A run can be started once huggingface is available: the build/download
-        # stage needs only that, and a benchmark builds its OpenVINO column on
-        # demand (run_template.sh) rather than requiring it to exist up front.
+        # The tab is usable once huggingface is available. A *benchmark* also
+        # needs the column of the version it asked for -- see `ov_versions`.
         "ready": hf_ready,
         # True while the venv's package list is still being read on a background
         # thread. Distinguishes "we do not know yet" from "the venv is broken",
         # which otherwise look identical (both have empty `versions`).
         "probing": probing,
         "versions": versions,
-        # OpenVINO columns already built on disk (may be empty until a benchmark
-        # has built one). No longer drives a switch UI; kept for diagnostics.
+        # Columns already built on disk: what the Models tab tags as "installed"
+        # and what gates its Run button.
         "ov_versions": available_ov_versions(),
         "active_ov": active_ov_version(),
+        # What that tab's version dropdown lists.
+        "ov_choices": ov_choices(),
         # The Environment drawer's OpenVINO dropdown: each BUILT version and the
         # exact packages inside its venv. Empty until a version is built, so the
         # drawer's package list is empty on a fresh environment.
@@ -596,27 +702,36 @@ def probe(wait: bool = False) -> dict:
     }
 
 
-def start_setup(force: bool = False) -> jobs.Job:
-    """Run setup_env.sh in the background.
+def start_setup(force: bool = False, ov: Optional[str] = None) -> jobs.Job:
+    """Run setup_env.sh in the background: genai checkout, base venv, and -- when
+    ``ov`` is given -- the complete OpenVINO column for that version.
 
-    With ``force`` false and a usable venv already in place this refuses (raising
-    SetupAlreadyDone) rather than spending an hour rebuilding what already works;
-    the dashboard turns that into a confirmation prompt. With ``force`` true the
-    old venv is moved aside rather than deleted, so a botched rebuild can be
-    rolled back by renaming it back.
+    ``ov`` is what makes this the whole installation rather than half of it: the
+    column used to be built by the first benchmark that asked for it, inside
+    quiet mode and with the sampler already running, so a measured run began
+    with a multi-GB pip install. Doing it here means Run only ever runs.
+
+    With ``force`` false and everything asked for already in place this refuses
+    (raising SetupAlreadyDone); the dashboard turns that into a confirmation
+    prompt. With ``force`` true what is there is moved aside rather than deleted.
     """
+    ov = str(ov or "").strip() or None
+    if ov is not None and not _OV_VERSION_RE.match(ov):
+        raise ValueError(f"invalid OpenVINO version: {ov!r} (expected X.Y.Z)")
+
     # wait=True: "is there already a usable venv here" decides whether this moves
-    # an hour of work aside, so it must be answered, not guessed at.
+    # an existing environment aside, so it must be answered, not guessed at.
     status = probe(wait=True)
     if not status["enabled"]:
         raise RuntimeError("the benchmark feature is disabled")
 
     p = paths()
-    # Setup now clones genai and builds the huggingface-only base venv (OpenVINO
-    # columns come later, on demand). "Already done" is therefore: the base venv
-    # can list/download models and the genai checkout is present -- not a full OV
-    # venv, which no longer exists until a benchmark builds one.
-    if status["hf_ready"] and status["genai_ready"] and not force:
+    # The ov clause is what lets a working environment gain a second version:
+    # without it, asking for 2026.2.0 on a machine that has 2026.3.1 came back as
+    # "already installed" and the version could never be added.
+    already = (status["hf_ready"] and status["genai_ready"]
+               and (ov is None or ov in status["ov_versions"]))
+    if already and not force:
         raise SetupAlreadyDone(status)
 
     ensure_dirs()
@@ -624,6 +739,15 @@ def start_setup(force: bool = False) -> jobs.Job:
         backup = p["venv"].with_name(f"venv.bak-{int(time.time())}")
         logger.info(f"Rebuilding benchmark venv; moving {p['venv']} -> {backup}")
         p["venv"].rename(backup)
+    if force and ov is not None:
+        # install_ov_column skips any combo whose venv already imports
+        # openvino+transformers, so a rebuild that left it in place would be a
+        # no-op. Moved aside, not deleted, like the venv above.
+        column = p["ov_pool"] / f"ov_{ov}"
+        if column.exists():
+            backup = column.with_name(f"ov_{ov}.bak-{int(time.time())}")
+            logger.info(f"Rebuilding OpenVINO {ov}; moving {column} -> {backup}")
+            column.rename(backup)
 
     log_path = p["logs"] / f"setup_{int(time.time())}.log"
     # The environment description goes in the log the Benchmark tab is already
@@ -635,21 +759,103 @@ def start_setup(force: bool = False) -> jobs.Job:
         f"script : {SETUP_SCRIPT}\n"
         f"root   : {p['env_root']}\n"
         f"force  : {force}\n"
+        f"ov     : {ov or '-'}\n"
         + "".join(f"{line}\n" for line in privilege.describe())
         + "\n"
     )
+    # setup_env.sh reads this and builds the column once the genai checkout it
+    # derives the shared requirements from is in place.
+    extra = {"BENCH_SETUP_OV": ov} if ov else None
     return jobs.manager.start(
         kind="setup",
         argv=["bash", str(SETUP_SCRIPT)],
         # setup_env.sh resolves its own directory, but the pip/git steps behave
         # better with the source tree as CWD.
         cwd=str(SRC_ROOT),
-        env=build_subprocess_env(),
+        env=build_subprocess_env(extra),
         log_path=log_path,
         header=header,
-        meta={"force": force},
+        meta={"force": force, "ov": ov},
         on_finish=_after_setup,
     )
+
+
+# --- the minimum environment, installed without being asked ----------------
+#
+# Browsing models needs nothing installed, but downloading one needs the base
+# venv -- and finding that out by pressing Download is a dead end the user has
+# to leave the page to resolve. It is seconds and ~80 MB, so opening the tab
+# starts it (GET /bench/env). Only the base venv: which OpenVINO version to
+# spend a few GB on is a choice, not a default.
+
+# Without this, a venv that cannot be built would be retried on every poll.
+# Installing from the drawer is a separate path and always honoured.
+_bootstrap_attempted = False
+
+
+def maybe_bootstrap() -> Optional[str]:
+    """Build the base venv in the background if it is missing.
+
+    Returns None when a job was started, or the reason not to have started one.
+    Every reason is a normal outcome: this runs on a status poll.
+    """
+    global _bootstrap_attempted
+    if not enabled():
+        return "the benchmark feature is disabled"
+    if _bootstrap_attempted:
+        return "a bootstrap has already been attempted in this session"
+    if _venv_python(paths()["venv"]) is not None:
+        return "the base environment is already installed"
+    current = jobs.manager.current()
+    if current is not None:
+        # Not marked attempted: if that job was not a bootstrap, the next poll
+        # should try again.
+        return f"a benchmark {current.kind} job is already running"
+
+    ensure_dirs()
+    p = paths()
+    log_path = p["logs"] / f"bootstrap_{int(time.time())}.log"
+    header = (
+        f"=== benchmark base environment ===\n"
+        f"script : {BUILD_SCRIPT} bootstrap\n"
+        f"root   : {p['env_root']}\n"
+        f"reason : opened the Benchmark tab with no base venv present\n"
+        + "".join(f"{line}\n" for line in privilege.describe())
+        + "\n"
+    )
+    _bootstrap_attempted = True
+    logger.info(f"Installing the benchmark base environment via {BUILD_SCRIPT} bootstrap")
+    try:
+        # kind="setup", not a new kind: the "Installing" state, the SSE fan-out
+        # and the setup log endpoint are all keyed on it. `scope` tells the two
+        # apart for anyone reading the job list.
+        jobs.manager.start(
+            kind="setup",
+            argv=["bash", str(BUILD_SCRIPT), "bootstrap"],
+            cwd=str(SRC_ROOT),
+            env=build_subprocess_env(),
+            log_path=log_path,
+            header=header,
+            meta={"scope": "bootstrap"},
+            on_finish=_after_bootstrap,
+        )
+    except jobs.BenchBusy as exc:
+        _bootstrap_attempted = False
+        return str(exc)
+    return None
+
+
+def _after_bootstrap(job: jobs.Job) -> None:
+    """Refresh the model list now that the `hf` CLI exists, if it is stale.
+    Imported here: models imports this module."""
+    if job.returncode != 0:
+        return
+    from benchmark.service import models
+
+    reason = models.refresh_if_stale()
+    if reason:
+        logger.info(f"Benchmark base environment installed; model list not "
+                    f"refreshed: {reason}")
 
 
 def _after_setup(job: jobs.Job) -> None:
@@ -660,12 +866,16 @@ def _after_setup(job: jobs.Job) -> None:
     left was to press Refresh -- the startup prefetch had already declined,
     minutes earlier, because there was no `hf` to search with.
 
+    Only when the cached list is stale, though: unconditionally, installing an
+    environment sent a tab whose list had just been built back to "syncing with
+    HuggingFace, this takes a few minutes" for no new information at all.
+
     Imported here rather than at module scope: models imports this module.
     """
     if job.returncode != 0:
         return
     from benchmark.service import models
 
-    reason = models.refresh_async()
+    reason = models.refresh_if_stale()
     if reason:
         logger.info(f"Benchmark setup finished; model list not refreshed: {reason}")

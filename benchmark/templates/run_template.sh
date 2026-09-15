@@ -14,14 +14,16 @@ source "$SCRIPT_DIR/configs/global_vars.sh"
 
 opt="__OPT__"  # build + benchmark 阶段选择
 
-# 0.5) Environment on demand.
+# 0.5) Environment.
 #
-# Only the huggingface base venv is built up front (setup): it is all that
-# listing models and the build/download stage (`hf download`) need. OpenVINO is
-# built one version at a time, when a benchmark asks for it -- so ensure the base
-# venv exists, and for a benchmark ensure + switch to the chosen OV column. The
-# switch is per-process (this script only): the service-side `venv` symlink stays
-# on the base venv, so model listing keeps working while a benchmark runs.
+# Both venvs are installed by setup_env.sh before a run is startable, and
+# benchmark/service/runner.py refuses a benchmark whose column is missing -- so
+# the `ensure` below is a single import on the normal path, kept for the case
+# where this script is run by hand.
+#
+# The switch to the column is per-process (this script only): the service-side
+# `venv` symlink stays on the base venv, so model listing keeps working while a
+# benchmark runs.
 bash "$SCRIPT_DIR/uv_build_envs.sh" bootstrap || exit 1
 if [ "$opt" == "benchmark" ] || [ "$opt" == "all" ]; then
     if [ -z "${BENCH_OV_VERSION:-}" ]; then

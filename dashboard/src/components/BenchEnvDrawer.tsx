@@ -5,9 +5,11 @@
 // installs it.
 //
 // A drawer rather than a panel on the page. Installing is a once-per-machine
-// act -- it clones two repositories, builds a venv and downloads tens of GB --
-// so after the first hour of its life this content is a status line, and the
-// page belongs to the models and their results instead.
+// act -- it clones a repository and builds the base venv plus one OpenVINO
+// runtime -- so after the first few minutes of its life this content is a status
+// line, and the page belongs to the models and their results instead. Not once
+// ever, though: a further OpenVINO version is installed from the same button,
+// which is why the version is picked here rather than implied.
 
 import React from 'react'
 import { Alert, Button, Descriptions, Divider, Drawer, Select, Space, Tag, Tooltip, Typography } from 'antd'
@@ -24,7 +26,11 @@ interface Props {
   busy: boolean
   installing: boolean
   onRefresh: () => void
-  onSetup: () => void
+  // The version the Models tab is set to, and everything installable. Opening
+  // on the former installs the runtime the user is about to benchmark against.
+  ov: string
+  ovChoices: string[]
+  onSetup: (version: string) => void
 }
 
 export function versionSummary(versions: Record<string, string | null>): string {
@@ -70,20 +76,28 @@ function PathValue({ value }: { value?: string }) {
  * "Can a run start" and "what is the job doing" are different questions that
  * looked contradictory while a setup ran (Not installed / running). Installing
  * and Checking say so explicitly instead.
+ *
+ * "No runtime" is the state between the two halves of the installation: models
+ * can be browsed and downloaded, but nothing can be benchmarked yet. Reading
+ * Ready there would be a ready environment with every Run button greyed out.
  */
 export function EnvStatusTag({ env, installing }: { env: BenchEnvData | null; installing: boolean }) {
   if (installing) return <Tag color="processing">Installing</Tag>
   if (env?.probing) return <Tag color="processing">Checking</Tag>
-  if (env?.ready) return <Tag color="success">Ready</Tag>
+  if (env?.ready) {
+    return env.ov_versions.length
+      ? <Tag color="success">Ready</Tag>
+      : <Tag color="warning">No runtime</Tag>
+  }
   if (env?.venv_exists) return <Tag color="warning">Incomplete</Tag>
   return <Tag>Not installed</Tag>
 }
 
 /**
- * The built OpenVINO versions and what is actually installed inside each. Pick a
+ * The installed OpenVINO versions and what is actually inside each. Pick a
  * version from the dropdown to see the exact package versions in its venv. Empty
- * until a version has been built (OpenVINO columns are built per-run on demand
- * from the Models tab), so a fresh environment shows no packages here.
+ * until a runtime has been installed (the action at the top of this drawer), so
+ * a fresh environment shows no packages here.
  */
 function OvReference({ detail }: { detail?: BenchEnvData['ov_versions_detail'] }) {
   const [selected, setSelected] = React.useState<string | undefined>(undefined)
@@ -93,8 +107,8 @@ function OvReference({ detail }: { detail?: BenchEnvData['ov_versions_detail'] }
     return (
       <Field label="OpenVINO versions">
         <Text type="secondary" style={{ fontSize: 12 }}>
-          No OpenVINO version built yet. Pick a version on the Models tab and run a
-          benchmark; it is built on demand and then appears here.
+          No OpenVINO runtime installed yet. Pick a version above and install it;
+          the packages it brought in then appear here.
         </Text>
       </Field>
     )
@@ -143,9 +157,17 @@ export default function BenchEnvDrawer({
   busy,
   installing,
   onRefresh,
+  ov,
+  ovChoices,
   onSetup,
 }: Props) {
   const ready = !!env?.ready
+  const installedOvs = env?.ov_versions ?? []
+  // Which runtime to install: follows the Models tab until picked here, then
+  // stays put rather than being moved by a change on the tab.
+  const [target, setTarget] = React.useState<string | undefined>(undefined)
+  const version = target ?? ov ?? ''
+  const versionInstalled = installedOvs.includes(version)
 
   return (
     <Drawer
@@ -160,22 +182,47 @@ export default function BenchEnvDrawer({
       width={600}
     >
       {/* The actions sit in the body rather than the drawer header: the header
-          also carries the close button, and three controls in that strip left no
-          room for the one that costs an hour to press. */}
-      <Space style={{ width: '100%', justifyContent: 'flex-end' }} size={8}>
+          also carries the close button, and four controls in that strip left no
+          room for the one that starts an installation. */}
+      <Space style={{ width: '100%', justifyContent: 'flex-end' }} size={8} wrap>
         <Tooltip title="Re-read the environment">
           <Button icon={<ReloadOutlined />} size="small" onClick={onRefresh} />
         </Tooltip>
+        <Tooltip title="The OpenVINO runtime to install alongside the base environment">
+          <Select
+            size="small"
+            style={{ minWidth: 170 }}
+            value={version || undefined}
+            onChange={setTarget}
+            showSearch
+            placeholder="OpenVINO version"
+            disabled={busy}
+            options={ovChoices.map((v) => ({
+              value: v,
+              label: (
+                <Space size={6}>
+                  {v}
+                  {installedOvs.includes(v) && (
+                    <Tag color="success" style={{ marginInlineEnd: 0 }}>installed</Tag>
+                  )}
+                </Space>
+              ),
+            }))}
+          />
+        </Tooltip>
         <Button
-          type={ready ? 'default' : 'primary'}
+          type={ready && versionInstalled ? 'default' : 'primary'}
           size="small"
           icon={<ToolOutlined />}
           // Also while probing: until the venv has been read, this button does
           // not yet know whether it would install or rebuild.
-          disabled={busy || !!env?.probing}
-          onClick={onSetup}
+          disabled={busy || !!env?.probing || !version}
+          // Never force from here: nothing left to install comes back as a
+          // conflict, which the page turns into "rebuild anyway?". Moving a
+          // working environment aside should cost that confirmation.
+          onClick={() => onSetup(version)}
         >
-          {ready ? 'Rebuild' : 'Install'}
+          {ready && versionInstalled ? `Rebuild OV ${version}` : `Install OV ${version}`}
         </Button>
       </Space>
       <Divider style={{ margin: '12px 0' }} />
@@ -199,16 +246,23 @@ export default function BenchEnvDrawer({
 
       {/* Not while probing: until the server has read the venv, "not installed"
           is a guess, and flashing this banner on every page load is noise. */}
-      {!ready && !busy && !env?.probing && (
+      {!busy && !env?.probing && (!ready || (!!version && !versionInstalled)) && (
         <Alert
           style={{ marginTop: 12 }}
           type="info"
           showIcon
-          message="The benchmark environment is not installed yet"
+          message={
+            ready
+              ? `The OpenVINO ${version} runtime is not installed`
+              : 'The benchmark environment is not installed yet'
+          }
           description={
-            'Installing creates a Python virtual environment and clones the OpenVINO ' +
-            'notebooks and GenAI repositories. ' +
-            'It needs internet access and tens of GB of disk, and takes a while.'
+            'Installing clones the OpenVINO GenAI repository, builds the base ' +
+            'environment that lists and downloads models, and then the chosen ' +
+            'OpenVINO runtime with each transformers release the pipeline picks ' +
+            'between. It needs internet access and a few GB of disk; a further ' +
+            'version costs only the wheels that differ from the ones already here. ' +
+            'It happens here rather than inside a measured run.'
           }
         />
       )}

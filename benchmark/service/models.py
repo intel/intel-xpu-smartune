@@ -23,7 +23,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from utils.logger import logger
 
@@ -172,6 +172,28 @@ def _cache_age_days() -> Optional[float]:
     return max(0.0, (now - written).total_seconds() / 86400.0)
 
 
+def freshness() -> Tuple[bool, Optional[float]]:
+    """``(is_stale, age_in_days)``. No cache, or one older than
+    ``models_cache_ttl_days``, is stale; a ttl of 0 disables ageing."""
+    age = _cache_age_days()
+    if age is None:
+        return True, None
+    ttl = float(env.setting("models_cache_ttl_days", _DEFAULT_TTL_DAYS) or 0)
+    return (ttl > 0 and age >= ttl), age
+
+
+def refresh_if_stale() -> Optional[str]:
+    """Refresh only if the list is missing or aged out, returning the reason it
+    was not. What the post-install hooks call: a full search is minutes of hub
+    queries, which is the wrong thing to spend on a list built ten minutes ago.
+    """
+    stale, age = freshness()
+    if not stale:
+        return (f"the cached model list is {age:.1f} days old, within the "
+                "configured lifetime")
+    return refresh_async()
+
+
 def maybe_prefetch() -> bool:
     """Refresh the model list at startup if it is missing or stale.
 
@@ -186,9 +208,8 @@ def maybe_prefetch() -> bool:
         logger.debug("Benchmark model prefetch disabled by configuration.")
         return False
 
-    age = _cache_age_days()
-    ttl = float(env.setting("models_cache_ttl_days", _DEFAULT_TTL_DAYS) or 0)
-    if age is not None and ttl > 0 and age < ttl:
+    stale, age = freshness()
+    if not stale:
         logger.debug(f"Benchmark model cache is {age:.1f} days old; not refreshing.")
         _prefetch_attempted = True
         return False

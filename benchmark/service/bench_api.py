@@ -105,13 +105,30 @@ def get_events():
 
 @bench_bp.route('/env', methods=['GET'])
 def get_env():
-    """Environment status: venv, model count, whether a run is possible at all."""
+    """Environment status: venv, model count, whether a run is possible at all.
+
+    Also where the base environment installs itself: this is the request the
+    Benchmark tab opens with, so env.maybe_bootstrap() builds the missing
+    huggingface-only venv here and declines silently in every other case.
+    """
     try:
         data = env.probe()
         setup_job = jobs.manager.latest(kind="setup")
         data["setup_job"] = setup_job.to_dict() if setup_job else None
         current = jobs.manager.current()
         data["busy"] = current.to_dict() if current else None
+        try:
+            if env.maybe_bootstrap() is None:
+                # Report the job in this very response rather than leaving the
+                # tab to discover it on the next poll.
+                started = jobs.manager.current()
+                if started is not None:
+                    data["busy"] = started.to_dict()
+                    data["setup_job"] = started.to_dict()
+        except Exception:
+            # The status is what was asked for; a failed attempt must not turn
+            # reading it into an error.
+            logger.exception("Could not start the benchmark base environment install")
         return construct_response(data=data, retmsg="Successfully retrieved benchmark environment")
     except Exception:
         logger.exception("Failed to probe the benchmark environment")
@@ -125,15 +142,22 @@ def get_env():
 def post_env_setup():
     """Install (or, with force, rebuild) the benchmark Python environment.
 
-    A usable environment plus force=false answers CONFLICT rather than silently
-    reusing or silently rebuilding: rebuilding costs an hour and tens of GB, so
-    the choice belongs to the operator, who gets the existing environment's
-    details back to decide with.
+    ``{"ov": "2026.3.1"}`` also installs that version's complete column --
+    OpenVINO plus every transformers the model router can pick -- which is what a
+    benchmark runs on. Omitting it installs only the genai checkout and the
+    huggingface base venv.
+
+    Everything asked for already being in place plus force=false answers CONFLICT
+    rather than silently rebuilding: that moves a working environment aside, so
+    the choice belongs to the operator, who gets its details back to decide with.
     """
     body = request.get_json(silent=True) or {}
     force = bool(body.get("force", False))
+    ov = str(body.get("ov") or "").strip() or None
     try:
-        job = env.start_setup(force=force)
+        job = env.start_setup(force=force, ov=ov)
+    except ValueError as e:
+        return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg=str(e))
     except env.SetupAlreadyDone as exc:
         return construct_response(
             data={"status": exc.status, "already_installed": True},

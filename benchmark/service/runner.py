@@ -132,9 +132,10 @@ def normalize_devices(devices: Optional[Sequence[str]], stage: str) -> List[str]
 def normalize_ov(ov: Optional[str], stage: str) -> Optional[str]:
     """The OpenVINO version to build/run against, validated.
 
-    Required for a benchmark (that stage installs and runs an OpenVINO column);
-    ignored for a pure build/download, which only fetches weights with the `hf`
-    CLI and never touches OpenVINO. Returns None when it does not apply.
+    Required for a benchmark (that stage runs inside the column installed for
+    that version); ignored for a pure build/download, which only fetches weights
+    with the `hf` CLI and never touches OpenVINO. Returns None when it does not
+    apply. Whether that column exists is checked in start_run.
     """
     if stage == "build":
         return None
@@ -261,6 +262,16 @@ def start_run(
         # reach the user.
         raise RuntimeError(
             "the benchmark environment is not ready; run the environment setup first"
+        )
+    # The column is installed by setup, not by the run: building it here is a
+    # multi-GB pip install inside quiet mode with the sampler already recording.
+    # The UI keeps Run disabled until it exists; this is the same rule for
+    # anything calling the API directly.
+    if ov is not None and ov not in status["ov_versions"]:
+        raise RuntimeError(
+            f"OpenVINO {ov} is not installed; install it from the Benchmark tab's "
+            "Environment drawer (or POST /bench/env/setup with that version) "
+            "before benchmarking against it"
         )
 
     # Reserve the slot before rendering, so two simultaneous requests cannot both

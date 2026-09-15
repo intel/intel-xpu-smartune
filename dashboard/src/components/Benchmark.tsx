@@ -250,22 +250,25 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     }).length
   }, [models, checkedIds, precisions])
 
-  // OpenVINO versions to suggest, and whether the one in the box is runnable.
-  // Already-built columns come first (quick pick of what is on disk), then the
-  // static reference versions; a version outside both is allowed (built on
-  // demand) as long as it is a bare X.Y.Z.
-  const ovOptions = useMemo(() => {
-    const built = env?.ov_versions ?? []
-    const reference = (env?.ov_reference ?? []).map((v) => v.version)
-    return [...new Set([...built, ...reference])]
-  }, [env?.ov_versions, env?.ov_reference])
-  const ovValid = /^\d+\.\d+\.\d+$/.test(ov.trim())
+  // The versions the dropdown offers, decided by the server, newest first;
+  // ov_versions is the fallback for a service too old to send ov_choices.
+  const ovOptions = useMemo(
+    () => (env?.ov_choices?.length ? env.ov_choices : (env?.ov_versions ?? [])),
+    [env?.ov_choices, env?.ov_versions],
+  )
 
-  // Seed the version box from the newest reference entry once, and only while the
-  // user has not typed one -- so it starts populated but never fights the user.
+  // A benchmark no longer builds its own runtime, so this gates every Run
+  // button the same way the weights do.
+  const ovInstalled = (env?.ov_versions ?? []).includes(ov.trim())
+
+  // Seed the box once, while the user has not chosen: newest *installed* first,
+  // so a machine with a runtime lands on a selection Run can actually use.
   useEffect(() => {
-    if (!ov && ovOptions.length) setOv(ovOptions[0])
-  }, [ov, ovOptions])
+    if (ov) return
+    const installed = env?.ov_versions ?? []
+    if (installed.length) setOv(installed[0])
+    else if (ovOptions.length) setOv(ovOptions[0])
+  }, [ov, ovOptions, env?.ov_versions])
 
   // --- REST loads ---------------------------------------------------------
 
@@ -510,10 +513,17 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
 
   // --- actions ------------------------------------------------------------
 
+  /**
+   * Install the environment, optionally including one OpenVINO runtime.
+   *
+   * `ovVersion` is what turns this from half an installation into all of it:
+   * that runtime is what a benchmark runs inside, and it used to be built by
+   * the first run that needed it, inside a measured window.
+   */
   const startSetup = useCallback(
-    async (force: boolean) => {
+    async (force: boolean, ovVersion?: string) => {
       try {
-        const res = await api.setupBenchEnv(force)
+        const res = await api.setupBenchEnv(force, ovVersion)
         if (res.status === 'conflict') {
           const existing = (res.data as { status?: BenchEnvData })?.status
           if (existing) {
@@ -530,8 +540,12 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
                     <Text type="secondary">Installed: </Text>
                     {versionSummary(existing.versions)}
                   </Text>
+                  <Text>
+                    <Text type="secondary">OpenVINO runtimes: </Text>
+                    {existing.ov_versions.length ? existing.ov_versions.join(', ') : 'none'}
+                  </Text>
                   <Paragraph type="warning" style={{ marginTop: 8, marginBottom: 0 }}>
-                    Rebuilding downloads several GB and can take an hour. The existing
+                    Rebuilding re-downloads several GB of wheels. The existing
                     environment is moved aside, not deleted.
                   </Paragraph>
                 </Space>
@@ -539,20 +553,32 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
               okText: 'Rebuild anyway',
               okButtonProps: { danger: true },
               cancelText: 'Keep it',
-              onOk: () => startSetup(true),
+              onOk: () => startSetup(true, ovVersion),
             })
           } else {
             message.warning(res.message)
           }
           return
         }
-        message.success('Environment setup started')
+        message.success(
+          ovVersion
+            ? `Installing the environment with OpenVINO ${ovVersion}`
+            : 'Environment setup started',
+        )
         setEnvOpen(false)
       } catch (e) {
         message.error(e instanceof Error ? e.message : String(e))
       }
     },
     [],
+  )
+
+  // Install one runtime from the version box on a model's pane. No
+  // confirmation: uv hardlink-shares wheels with the versions already here, so
+  // a second one is a few hundred MB, and the job is cancellable anyway.
+  const installOv = useCallback(
+    (version: string) => void startSetup(false, version),
+    [startSetup],
   )
 
   /**
@@ -954,9 +980,11 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
                         ? `Download ${batchMissing.join(', ')} first`
                         : devices.length === 0
                           ? 'Pick at least one device to benchmark on'
-                          : !ovValid
-                            ? 'Enter an OpenVINO version (e.g. 2026.2.0) to benchmark against'
-                            : 'Benchmark every selected model, as one job'
+                          : !ov
+                            ? 'Pick an OpenVINO version to benchmark against'
+                            : !ovInstalled
+                              ? `The OpenVINO ${ov} runtime is not installed — install it first`
+                              : 'Benchmark every selected model, as one job'
                   }
                 >
                   <Button
@@ -968,7 +996,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
                       busy ||
                       batchSize === 0 ||
                       devices.length === 0 ||
-                      !ovValid ||
+                      !ovInstalled ||
                       batchMissing.length > 0
                     }
                     loading={starting}
@@ -1044,8 +1072,9 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
                       onDevicesChange={setDevices}
                       ov={ov}
                       onOvChange={setOv}
-                      ovOptions={ovOptions}
+                      ovChoices={ovOptions}
                       installedOvs={env?.ov_versions ?? []}
+                      onInstallOv={installOv}
                       args={args}
                       onArgsChange={setArgs}
                       ready={!!env?.ready}
@@ -1069,8 +1098,9 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
               onDevicesChange={setDevices}
               ov={ov}
               onOvChange={setOv}
-              ovOptions={ovOptions}
+              ovChoices={ovOptions}
               installedOvs={env?.ov_versions ?? []}
+              onInstallOv={installOv}
               args={args}
               onArgsChange={setArgs}
               ready={!!env?.ready}
@@ -1144,7 +1174,11 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         busy={busy}
         installing={installing}
         onRefresh={() => void loadEnv()}
-        onSetup={() => void startSetup(false)}
+        // The drawer picks which runtime to install, opening on the version the
+        // tab is set to.
+        ov={ov}
+        ovChoices={ovOptions}
+        onSetup={(version) => void startSetup(false, version)}
       />
     </div>
   )

@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIR_AGENTIC_ROOT="$(cd "${SCRIPT_DIR}" && pwd)"
 
 # Source global variables
-GLOBAL_VARS="${DIR_AGENTIC_ROOT}/configs/global_vars.sh"
+GLOBAL_VARS="${DIR_AGENTIC_ROOT}/env/global_vars.sh"
 if [[ ! -f "${GLOBAL_VARS}" ]]; then
     echo "Error: global_vars.sh not found at: ${GLOBAL_VARS}" >&2
     exit 1

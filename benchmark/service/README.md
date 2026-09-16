@@ -26,7 +26,7 @@ benchmark/            read-only vendor drop from the upstream model-benchmark pr
 The vendored parts are treated as read-only: nothing in `service/` writes into
 them. All runtime state goes to the runtime root (`benchmark/runtime` by
 default), which the vendored scripts pick up through `DIR_ENV_ROOT` --
-`env.py` sets `SMARTUNE_BENCH_ENV_ROOT`, and `benchmark/configs/global_vars.sh`
+`env.py` sets `SMARTUNE_BENCH_ENV_ROOT`, and `benchmark/env/global_vars.sh`
 derives every other path from it.
 
 **Re-syncing from upstream** is a plain file copy, never a mirror-with-delete:

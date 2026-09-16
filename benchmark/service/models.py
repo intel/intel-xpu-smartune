@@ -36,6 +36,10 @@ from benchmark.service import env, privilege
 # expected duration.
 _SEARCH_TIMEOUT_SEC = 900
 
+# On-demand enrichment of a single model is a few hub calls (config, params, one
+# file-tree per downloadable variant); this bounds a stuck one, not a normal one.
+_ENRICH_TIMEOUT_SEC = 120
+
 # How old a cache may be before startup refreshes it, and whether to do so at all.
 # Overridable per deployment (config.yaml `benchmark:`), because the right answer
 # depends on whether the machine has internet at boot.
@@ -57,6 +61,14 @@ _state = {
 # call -- an explicit POST /bench/models/refresh is always still honoured.
 _prefetch_attempted = False
 
+# Serialises on-demand memory enrichment. search_models --enrich read-modify-writes
+# the whole cache file, so two at once would let the later writer drop the earlier
+# one's memory block; one at a time also bounds the outbound hub traffic a burst of
+# opened model pages can kick off. Separate from _lock so a lazy enrich and a full
+# refresh do not block each other -- their writes are both atomic swaps, and a
+# refresh legitimately supersedes a just-enriched entry.
+_enrich_lock = threading.Lock()
+
 
 def cache_file():
     return env.paths()["cache"] / "models_cache.json"
@@ -71,7 +83,12 @@ def _run_search() -> bool:
         env.ensure_dirs()
         logger.info("Refreshing benchmark model list ...")
         result = subprocess.run(
-            [sys.executable, str(env.SEARCH_MODELS_SCRIPT)],
+            # --no-memory: list and source-map the models only. The per-model
+            # weight/KV-cache footprint is the expensive part (a handful of hub
+            # calls for each of ~180 models, minutes in total) and most of it is
+            # never looked at, so it is deferred to ensure_memory() -- computed the
+            # first time a given model's page is opened.
+            [sys.executable, str(env.SEARCH_MODELS_SCRIPT), "--no-memory"],
             cwd=str(env.SRC_ROOT),
             env=env.build_subprocess_env(),
             capture_output=True, text=True, timeout=_SEARCH_TIMEOUT_SEC,
@@ -256,6 +273,10 @@ def _normalize(entry) -> Optional[dict]:
             "likes": entry.get("likes") or 0,
             "last_modified": entry.get("last_modified"),
             "variants": [v for v in (entry.get("variants") or []) if isinstance(v, dict)],
+            # Weight/KV-cache footprint enrichment (search_models.py build_memory).
+            # Optional -- a v1 cache or a model whose config could not be read has
+            # none -- so the dashboard treats its absence as "unknown", not zero.
+            "memory": entry.get("memory"),
         }
     return None
 
@@ -404,6 +425,81 @@ def load(search: Optional[str] = None, limit: int = 0) -> dict:
         "total": total,
     })
     return state
+
+
+# --- on-demand memory footprint -------------------------------------------
+#
+# The list is built with --no-memory (fast, no per-repo network). The weight /
+# KV-cache / logits footprint for a given model is filled in the first time its
+# page is opened, via search_models.py --enrich, and cached back into the same
+# JSON so a second open is free.
+
+
+def _memory_of(model_id: str) -> Optional[dict]:
+    """The cached ``memory`` block for one model id, or None if it has none yet.
+
+    "Has none yet" is any entry the enrich pass has not written a block onto:
+    search_models.build_memory always returns a dict (at least ``{"params": ...}``)
+    once run, so a dict here means enriched and its absence means deferred.
+    """
+    payload = _read_cache() or {}
+    raw = payload.get("models") if isinstance(payload.get("models"), list) else []
+    for entry in raw:
+        if isinstance(entry, dict) and entry.get("id") == model_id:
+            mem = entry.get("memory")
+            return mem if isinstance(mem, dict) else None
+    return None
+
+
+def ensure_memory(model_id: str) -> Optional[dict]:
+    """Return one model's memory footprint, computing it on first request.
+
+    Idempotent and cheap on repeat: an already-enriched entry is served straight
+    from the cache with no subprocess and no network. Otherwise search_models.py
+    --enrich fills it in (a few hub calls) and writes it back, and the fresh block
+    is returned.
+
+    None means the footprint is unavailable -- the model is not in the cache, or
+    the enrich subprocess failed. That is the same "unknown" the dashboard already
+    renders for a v1 cache, not an error to surface. A best-effort enrich that
+    reached the hub but found little still writes a (sparse) block, so a transient
+    failure is the one case that caches "unknown" until the next full refresh.
+    """
+    wanted = str(model_id or "").strip()
+    if not wanted:
+        return None
+
+    existing = _memory_of(wanted)
+    if existing is not None:
+        return existing
+
+    with _enrich_lock:
+        # Re-check under the lock: a concurrent request for the same model may have
+        # filled it in while this one waited, and enrichment is the expensive bit.
+        existing = _memory_of(wanted)
+        if existing is not None:
+            return existing
+        env.ensure_dirs()
+        logger.info(f"Computing memory footprint for {wanted} ...")
+        try:
+            result = subprocess.run(
+                [sys.executable, str(env.SEARCH_MODELS_SCRIPT), "--enrich", wanted],
+                cwd=str(env.SRC_ROOT),
+                env=env.build_subprocess_env(),
+                capture_output=True, text=True, timeout=_ENRICH_TIMEOUT_SEC,
+                # Unprivileged and network-facing, exactly like the full search.
+                **privilege.spawn_kwargs(),
+            )
+        except Exception as exc:
+            logger.warning(f"Memory footprint for {wanted} failed: {exc}")
+            return None
+        if result.returncode != 0:
+            logger.warning(
+                f"Memory footprint for {wanted} failed (exit {result.returncode}): "
+                f"{(result.stderr or '').strip()[-300:]}")
+            return None
+
+    return _memory_of(wanted)
 
 
 # --- deleting downloaded weights ------------------------------------------

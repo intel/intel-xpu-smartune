@@ -198,6 +198,219 @@ def _next_link(header):
     return None
 
 
+# ---- memory footprint enrichment ----------------------------------------
+#
+# For each source model we work out what it costs to actually run:
+#   - weights      the on-disk size of each OpenVINO conversion (authoritative),
+#                  plus a per-precision estimate from the parameter count.
+#   - kv-cache     bytes added to memory per generated/prompt token. Grows with
+#                  sequence length and batch, so it is reported per token and the
+#                  dashboard multiplies by whatever context the user picks.
+#   - logits       the output projection materialised per position (vocab-wide),
+#                  large enough for a 150k-token vocabulary to matter.
+# These are the terms of  peak ~= weights + kv_cache*tokens + activations + logits
+# + framework/runtime overhead; the last two are runtime/impl dependent and left
+# to the dashboard to annotate rather than mis-stated as a precise number here.
+
+# Bytes per stored parameter by weight format, for the rough weight estimate used
+# when a real file size is unavailable. int4 is above 0.5 because the payload
+# carries per-group scales/zero-points on top of the 4-bit weights.
+BYTES_PER_PARAM = {"fp16": 2.0, "int8": 1.0, "int4": 0.55}
+
+# KV-cache element size: OpenVINO keeps the cache in fp16 unless told otherwise.
+KV_CACHE_DTYPE_BYTES = 2
+# The LM head emits fp32 logits.
+LOGITS_DTYPE_BYTES = 4
+
+# What counts toward a repo's weight footprint. OpenVINO IR is .bin (+ a tiny
+# .xml graph); the source repo is .safetensors or .bin; .onnx covers the rest.
+WEIGHT_FILE_SUFFIXES = (".bin", ".safetensors", ".xml", ".onnx")
+
+
+def _http_get_json(env, url):
+    """GET a JSON document through the proxy-aware opener, or None on any error."""
+    headers = {"Accept": "application/json", "User-Agent": "smartune-benchmark"}
+    token = env.get("HF_TOKEN") or env.get("HUGGINGFACE_HUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with _http_opener(env).open(urllib.request.Request(url, headers=headers),
+                                    timeout=HTTP_TIMEOUT_SEC) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"WARN: GET {url} failed: {exc}", file=sys.stderr)
+        return None
+
+
+def _hub_base(env):
+    return (env.get("HF_ENDPOINT") or HF_ENV_DEFAULTS["HF_ENDPOINT"]).rstrip("/")
+
+
+def fetch_config(env, repo):
+    """A repo's config.json as a dict, or None. Works on source and OV repos
+    alike -- an OpenVINO conversion keeps the source config next to its IR."""
+    cfg = _http_get_json(env, f"{_hub_base(env)}/{repo}/resolve/main/config.json")
+    return cfg if isinstance(cfg, dict) else None
+
+
+def fetch_params(env, repo):
+    """Parameter count from the repo's safetensors metadata, or None.
+
+    The hub totals this for us in the ``safetensors`` expand field, so no weight
+    file is downloaded. Absent on repos published without safetensors (older or
+    OpenVINO-only), in which case the caller falls back to file-size estimates.
+    """
+    data = _http_get_json(env, f"{_hub_base(env)}/api/models/{repo}?expand[]=safetensors")
+    st = (data or {}).get("safetensors") if isinstance(data, dict) else None
+    if not isinstance(st, dict):
+        return None
+    total = st.get("total")
+    if isinstance(total, int) and total > 0:
+        return total
+    params = st.get("parameters")
+    if isinstance(params, dict):
+        got = sum(v for v in params.values() if isinstance(v, int))
+        return got or None
+    return None
+
+
+def fetch_repo_weight_bytes(env, repo):
+    """Total size of a repo's weight files, or None if the tree can't be read.
+
+    Sums the LFS-tracked size of every weight file in the tree (recursively, so a
+    multi-part model -- a VLM's separate vision/text IR, a sharded checkpoint --
+    is counted whole). This is the authoritative on-disk weight size, unlike the
+    parameter-count estimate.
+    """
+    base = _hub_base(env)
+    url = f"{base}/api/models/{repo}/tree/main?recursive=true"
+    headers = {"Accept": "application/json", "User-Agent": "smartune-benchmark"}
+    token = env.get("HF_TOKEN") or env.get("HUGGINGFACE_HUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    opener = _http_opener(env)
+    total = 0
+    found = False
+    while url:
+        try:
+            with opener.open(urllib.request.Request(url, headers=headers),
+                             timeout=HTTP_TIMEOUT_SEC) as resp:
+                page = json.loads(resp.read().decode("utf-8"))
+                link = resp.headers.get("Link") or ""
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            print(f"WARN: tree for {repo} failed: {exc}", file=sys.stderr)
+            return total if found else None
+        if not isinstance(page, list):
+            return total if found else None
+        for item in page:
+            if item.get("type") != "file":
+                continue
+            if not item.get("path", "").lower().endswith(WEIGHT_FILE_SUFFIXES):
+                continue
+            lfs = item.get("lfs") if isinstance(item.get("lfs"), dict) else None
+            size = (lfs or {}).get("size") or item.get("size")
+            if isinstance(size, int):
+                total += size
+                found = True
+        url = _next_link(link)
+    return total if found else None
+
+
+def arch_from_config(cfg):
+    """The architecture numbers that drive the memory model, or None.
+
+    Reads the language-model fields, descending into ``text_config`` for the
+    composite configs that vision-language and other multimodal models use.
+    ``num_key_value_heads`` folds back to the attention-head count for models
+    without grouped-query attention; ``head_dim`` is derived when not stated.
+    """
+    if not isinstance(cfg, dict):
+        return None
+    text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
+
+    def field(name):
+        val = cfg.get(name)
+        return text.get(name) if val is None else val
+
+    hidden = field("hidden_size")
+    heads = field("num_attention_heads")
+    kv_heads = field("num_key_value_heads") or heads
+    head_dim = field("head_dim")
+    if head_dim is None and hidden and heads:
+        head_dim = hidden // heads
+    return {
+        "hidden_size": hidden,
+        "num_hidden_layers": field("num_hidden_layers"),
+        "num_attention_heads": heads,
+        "num_kv_heads": kv_heads,
+        "head_dim": head_dim,
+        "vocab_size": field("vocab_size"),
+        "max_position_embeddings": field("max_position_embeddings"),
+    }
+
+
+def build_memory(arch, params, variant_weight_bytes):
+    """Assemble the per-model memory block written into models_cache.json."""
+    mem = {"params": params}
+
+    if arch:
+        layers = arch.get("num_hidden_layers")
+        kv_heads = arch.get("num_kv_heads")
+        head_dim = arch.get("head_dim")
+        vocab = arch.get("vocab_size")
+        # Drop the fields config.json did not provide, so a non-transformer repo
+        # (a CNN classifier, say) does not carry a block of nulls.
+        known = {k: v for k, v in arch.items() if v is not None}
+        if known:
+            mem["arch"] = known
+        if layers and kv_heads and head_dim:
+            # 2 = one key tensor and one value tensor per layer.
+            mem["kv_cache_bytes_per_token"] = (
+                2 * layers * kv_heads * head_dim * KV_CACHE_DTYPE_BYTES)
+            mem["kv_cache_dtype_bytes"] = KV_CACHE_DTYPE_BYTES
+        if vocab:
+            mem["logits_bytes"] = vocab * LOGITS_DTYPE_BYTES
+        # The model's architectural context limit -- the largest window it can be
+        # asked for at all. Promoted out of `arch` so the dashboard reads one
+        # field rather than reaching into the raw config numbers.
+        max_window = arch.get("max_position_embeddings")
+        if max_window:
+            mem["max_window_size"] = max_window
+
+    if params:
+        mem["weights_bytes_est"] = {p: int(params * b) for p, b in BYTES_PER_PARAM.items()}
+    weights = {p: b for p, b in (variant_weight_bytes or {}).items() if b}
+    if weights:
+        mem["weights_bytes"] = weights
+    return mem
+
+
+def enrich_memory(hf_env_map, entry):
+    """Attach a ``memory`` block to a source entry and ``weight_bytes`` to each of
+    its variants. Best-effort: every field is optional and a network failure just
+    leaves it out rather than failing the whole refresh."""
+    source = entry["id"]
+    cfg = fetch_config(hf_env_map, source)
+    if cfg is None and entry.get("variants"):
+        # Source may be gated/unavailable; the OpenVINO conversion carries the
+        # same config and is public.
+        cfg = fetch_config(hf_env_map, entry["variants"][0]["repo"])
+    arch = arch_from_config(cfg)
+    params = fetch_params(hf_env_map, source)
+
+    variant_bytes = {}
+    for variant in entry.get("variants", []):
+        size = fetch_repo_weight_bytes(hf_env_map, variant["repo"])
+        if size:
+            variant["weight_bytes"] = size
+            prec = variant.get("precision")
+            if prec and size > variant_bytes.get(prec, 0):
+                variant_bytes[prec] = size
+
+    entry["memory"] = build_memory(arch, params, variant_bytes)
+    return source
+
+
 def hf_env():
     env = os.environ.copy()
     for k, v in HF_ENV_DEFAULTS.items():
@@ -334,6 +547,48 @@ def write_json(path, payload):
     tmp.replace(path)  # atomic swap so the page never reads a half-written file
 
 
+def read_json(path):
+    """The cache document as a dict, or None if it is missing or unreadable."""
+    try:
+        payload = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def enrich_one(model_id):
+    """Fill the memory block for a single source model already in models_cache.json.
+
+    The on-demand half of the split the dashboard now uses: startup lists the
+    models with --no-memory (seconds, no per-repo network), and the weight /
+    KV-cache footprint for a given model is computed the first time someone opens
+    it -- a handful of HTTP calls instead of the same for all ~180 models.
+
+    Re-reads the cache, enriches the one matching entry in place, and writes the
+    whole document back (atomic swap, updated_at untouched -- only one entry's
+    memory changed, the listing itself did not). Concurrent callers are serialised
+    upstream (models.py), so the read-modify-write here does not race itself.
+
+    Returns 0 when the entry was found and (best-effort) enriched, 1 when there is
+    no cache yet or the model is not in it. A network failure is not a non-zero
+    exit: enrich_memory leaves each field out rather than raising, so the entry
+    still gains a memory block and the caller is not driven to retry forever.
+    """
+    payload = read_json(CACHE_FILE)
+    if not payload or not isinstance(payload.get("models"), list):
+        print(f"no model cache at {CACHE_FILE}; refresh the list first", file=sys.stderr)
+        return 1
+    entry = next((m for m in payload["models"]
+                  if isinstance(m, dict) and m.get("id") == model_id), None)
+    if entry is None:
+        print(f"{model_id} not in cache", file=sys.stderr)
+        return 1
+    enrich_memory(hf_env(), entry)
+    write_json(CACHE_FILE, payload)
+    print(f"enriched memory for {model_id} -> {CACHE_FILE}", file=sys.stderr)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Cache HF model lists for the Benchmark tab")
     parser.add_argument("--author", action="append", default=[],
@@ -342,7 +597,20 @@ def main():
                         help="Skip source-model derivation (OpenVINO names only)")
     parser.add_argument("--workers", type=int, default=8,
                         help="Parallel search workers for the fallback (default 8)")
+    parser.add_argument("--no-memory", action="store_true",
+                        help="Skip weight/KV-cache memory enrichment")
+    parser.add_argument("--memory-limit", type=int, default=0,
+                        help="Only enrich the first N source models (0 = all; for testing)")
+    parser.add_argument("--enrich", metavar="MODEL_ID",
+                        help="Fill the memory block for one source model already in "
+                             "the cache, then exit (on-demand path; see models.py). "
+                             "Skips the whole list/derive pipeline.")
     args = parser.parse_args()
+
+    # On-demand single-model enrichment short-circuits the full pipeline: it needs
+    # the cache the list build already wrote, not another listing.
+    if args.enrich:
+        return enrich_one(args.enrich)
 
     authors = (args.author
                or [a.strip() for a in os.environ.get("AUTHORS", "").split(",") if a.strip()]
@@ -433,6 +701,15 @@ def main():
         entry["likes"] = max(entry["likes"], m.get("likes") or 0)
         if entry["task"] is None:
             entry["task"] = m.get("task")
+
+    # ---- memory footprint: weights, kv-cache/token, logits, per-variant size --
+    if not args.no_memory and sources:
+        targets = sources[:args.memory_limit] if args.memory_limit > 0 else sources
+        print(f"enriching memory footprint for {len(targets)} source models…",
+              file=sys.stderr)
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            for _ in pool.map(lambda e: enrich_memory(env, e), targets):
+                pass
 
     write_json(CACHE_FILE, {
         "version": CACHE_VERSION,

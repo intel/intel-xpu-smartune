@@ -47,11 +47,15 @@ import type {
   BenchPreflightBlocker,
   BenchPreflightData,
   BenchStage,
+  DynamicInfoData,
+  StaticInfoData,
 } from '../api/types'
 import { useBenchEvent } from '../hooks/useBenchEvents'
 import BenchCaseDrawer from './BenchCaseDrawer'
 import BenchCompare from './BenchCompare'
 import BenchEnvDrawer, { EnvStatusTag, versionSummary } from './BenchEnvDrawer'
+import BenchMemoryPreflightModal, { type MemoryPreflightItem } from './BenchMemoryPreflightModal'
+import BenchModelDetail, { missingPrecisions } from './BenchModelDetail'
 import { applicablePrecisions, type ModelParams } from './BenchModelDetail'
 import BenchModelDeleteModal from './BenchModelDeleteModal'
 import BenchModelDrawer from './BenchModelDrawer'
@@ -167,6 +171,13 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   const [runIds, setRunIds] = useState<string[]>([])
   // The model whose drawer is open, or null.
   const [openModelId, setOpenModelId] = useState<string | null>(null)
+  // Model ids whose memory footprint we have already asked the server for this
+  // session. The list arrives without footprints (search_models --no-memory), so
+  // each model's is fetched the first time its drawer opens; this guards against
+  // re-fetching on every reopen, including when the fetch came back "unknown"
+  // (null) -- which is indistinguishable from "not yet fetched" on the model
+  // alone, so it needs its own record.
+  const memoryFetched = useRef<Set<string>>(new Set())
   // The model whose downloaded weights are being deleted, with the precisions
   // the dialog opens ticked. Held here rather than in either of the two places
   // that can ask for it -- the list row and the detail pane's tags -- so both
@@ -221,6 +232,15 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   // here while they answer what should happen to the previous results.
   const [rerun, setRerun] = useState<PendingRun | null>(null)
   const [discarding, setDiscarding] = useState(false)
+  // A benchmark the user asked for, parked while the memory preflight dialog
+  // shows how the selected configs fit the machine's current free memory. Holds
+  // the model ids; the info fetched for the dialog and whether it is in flight
+  // travel alongside so the dialog is a pure render of what it is handed.
+  const [memPreflight, setMemPreflight] = useState<{ ids: string[] } | null>(null)
+  const [memInfo, setMemInfo] = useState<{ dyn: DynamicInfoData | null; stat: StaticInfoData | null }>(
+    { dyn: null, stat: null },
+  )
+  const [memLoading, setMemLoading] = useState(false)
   const [mainTab, setMainTab] = useState<MainTab>('results')
   const [starting, setStarting] = useState(false)
   const [siderOpen, setSiderOpen] = useState(true)
@@ -332,6 +352,37 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
       setModelsLoading(false)
     }
   }, [])
+
+  // Fill in a model's memory footprint when its drawer opens. The list is served
+  // without one (fast, no per-repo hub calls); the server computes and caches a
+  // model's block on first request, and the result is merged into the in-memory
+  // list so the drawer -- and the pre-run memory preflight -- can read it, and so
+  // a reopen is instant. `models` is a dependency so this retries once the list
+  // has actually loaded when a drawer is opened before then.
+  useEffect(() => {
+    const id = openModelId
+    if (!id) return
+    const model = models.find((m) => m.id === id)
+    if (!model) return // list not loaded yet; this effect re-runs when it is
+    if (model.memory) return // already enriched (an object is present)
+    if (memoryFetched.current.has(id)) return // asked already this session
+    memoryFetched.current.add(id)
+    let cancelled = false
+    void (async () => {
+      try {
+        const res = await api.getBenchModelMemory(id)
+        if (cancelled || !res.memory) return
+        setModels((prev) =>
+          prev.map((m) => (m.id === id ? { ...m, memory: res.memory } : m)),
+        )
+      } catch {
+        // Leave it "unknown"; the guard above keeps a reopen from re-asking.
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [openModelId, models])
 
   // One reading of the results tree, shared by both views below.
   //
@@ -757,14 +808,14 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   )
 
   /**
-   * What the Run buttons call.
+   * The rerun-conflict gate, past the memory dialog.
    *
    * A benchmark that would repeat measurements already on disk stops here and
    * asks first -- see BenchRerunModal for why the answer is not obvious. A
    * download has nothing to repeat: the weights are either present or not, and
    * the pipeline decides that per precision.
    */
-  const requestRun = useCallback(
+  const proceedRun = useCallback(
     (stage: BenchStage, ids: string[]) => {
       if (!ids.length) return
       const conflicts =
@@ -777,6 +828,72 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     },
     [launchRun, matrix?.rows, params],
   )
+
+  /**
+   * What the Run buttons call.
+   *
+   * A measured run is shown a memory preflight first: for the selected models,
+   * precisions and devices, does each config fit the memory that is free right
+   * now, and how large a context would? It is a warning, not a gate -- the
+   * numbers are estimates -- so the dialog's Run continues to the rerun gate.
+   * A download skips it: it moves weights, not a running model, and its memory
+   * cost is disk, not RAM/VRAM.
+   */
+  const requestRun = useCallback(
+    (stage: BenchStage, ids: string[]) => {
+      if (!ids.length) return
+      if (stage === 'build') {
+        proceedRun(stage, ids)
+        return
+      }
+      // Open the dialog immediately with a spinner, then fill it in. The reads
+      // are best-effort: the same monitor endpoints System Overview uses, and a
+      // failure just leaves the figures as "N/A" rather than blocking the run.
+      setMemInfo({ dyn: null, stat: null })
+      setMemLoading(true)
+      setMemPreflight({ ids })
+      void (async () => {
+        try {
+          const [dyn, stat] = await Promise.all([
+            api.getDynamicInfo(['memory', 'gpu']),
+            api.getStaticInfo(),
+          ])
+          setMemInfo({ dyn, stat })
+        } catch {
+          setMemInfo({ dyn: null, stat: null })
+        } finally {
+          setMemLoading(false)
+        }
+      })()
+    },
+    [proceedRun],
+  )
+
+  // The models the parked benchmark is about, each with the precisions it will
+  // actually be asked for: its own tick list narrowed to what it offers, the
+  // same narrowing launchRun applies when it builds the request.
+  const memPreflightItems = useMemo<MemoryPreflightItem[]>(() => {
+    if (!memPreflight) return []
+    const byId = new Map(models.map((m) => [m.id, m]))
+    return memPreflight.ids
+      .map((id) => byId.get(id))
+      .filter((m): m is BenchModel => !!m)
+      .map((model) => {
+        const own = params[model.id] ?? defaults
+        return {
+          model,
+          precisions: applicablePrecisions(model, own.precisions),
+          devices: own.devices,
+        }
+      })
+      .filter((entry) => entry.precisions.length > 0)
+  }, [memPreflight, models, params, defaults])
+
+  const confirmMemPreflight = useCallback(() => {
+    const pending = memPreflight
+    setMemPreflight(null)
+    if (pending) proceedRun('benchmark', pending.ids)
+  }, [memPreflight, proceedRun])
 
   const keepAndRun = useCallback(() => {
     const pending = rerun
@@ -1265,6 +1382,16 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         row={caseRow}
         metrics={matrix?.metrics ?? []}
         onClose={() => setCaseOpen(false)}
+      />
+
+      <BenchMemoryPreflightModal
+        open={!!memPreflight}
+        items={memPreflightItems}
+        dynamicInfo={memInfo.dyn}
+        staticInfo={memInfo.stat}
+        loading={memLoading}
+        onRun={confirmMemPreflight}
+        onCancel={() => setMemPreflight(null)}
       />
 
       <BenchRerunModal

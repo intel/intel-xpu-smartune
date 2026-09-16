@@ -1,6 +1,6 @@
 #!/bin/bash
 # Global Variables for Model Agentic Framework
-# Source this file in all scripts: source $(dirname $0)/../configs/global_vars.sh
+# Source this file in all scripts: source $(dirname $0)/../env/global_vars.sh
 #
 # Naming convention (prefix = what the value points at):
 #   DIR_*      directory paths
@@ -47,7 +47,7 @@ export DIR_SCRIPTS_NOTEBOOK=${DIR_SCRIPTS}/notebook
 
 # ============ Directories (source code) ============
 # Auto-detect DIR_AGENTIC_ROOT based on this script's location
-# global_vars.sh is in configs/, so DIR_AGENTIC_ROOT is the parent directory
+# global_vars.sh is in env/, so DIR_AGENTIC_ROOT is the parent directory
 export DIR_AGENTIC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export DIR_SCRIPTS_ROOT=${DIR_AGENTIC_ROOT}/scripts
 export DIR_TEMPLATES_ROOT=${DIR_AGENTIC_ROOT}/templates

@@ -437,27 +437,34 @@ def _extra_case_args(route) -> str:
 BENCH_DEVICES = ('CPU', 'GPU', 'NPU')
 
 
-def _bench_devices() -> List[str]:
-    """The devices this run was asked for, or all of them if it said nothing.
+def _route_devices(route) -> List[str]:
+    """Devices a single route was asked to run on.
 
-    Set by the caller through BENCH_DEVICES (benchmark/service/runner.py exports
-    it from the run request). A user who only has a GPU should not spend an hour
-    watching the NPU cases fail -- but the default has to stay "everything", so
-    that running this generator by hand behaves as it always did.
+    Read from the model's own `device` field (models_input.json -> route
+    passthrough). benchmark/service/runner.py stamps every entry with one -- the
+    per-model choice when given, otherwise the run-wide selection -- so a route
+    that came from the service always carries it. It is absent only when this
+    generator is run by hand off a routes file that never set the field, in which
+    case we fall back to every device so that path behaves as it always did.
     """
-    raw = os.environ.get('BENCH_DEVICES', '')
-    picked = {token.strip().upper() for token in raw.replace(',', ' ').split() if token.strip()}
+    raw = route.get('device') if route else None
+    if isinstance(raw, str):
+        picked = {t.strip().upper() for t in raw.replace(',', ' ').split() if t.strip()}
+    elif isinstance(raw, (list, tuple)):
+        picked = {str(t).strip().upper() for t in raw if str(t).strip()}
+    else:
+        picked = set()
     return [device for device in BENCH_DEVICES if device in picked] or list(BENCH_DEVICES)
 
 
-def _device_loop(body: str) -> str:
+def _device_loop(body: str, route=None) -> str:
     """A shell loop that runs `body` once per requested device, with DEVICE set.
 
     One idiom for all four backends: they used to spell the same three-device
     sweep as three copy-pasted blocks, which is also why adding a fourth device
     (or dropping one) had to be done four times over.
     """
-    return (f'    for device in {" ".join(_bench_devices())}; do\n'
+    return (f'    for device in {" ".join(_route_devices(route))}; do\n'
             f'        DEVICE=$device\n'
             f'    {body}\n'
             f'    done\n')
@@ -478,7 +485,7 @@ def build_genai_benchmark(route, stage, weight_format, env, notebook_inputs):
     case_command = f'run_case "{model_safe_name}" "{quant}" "{task}" "{quantized_path}" {opts}{extra_args}'
     benchmark_command = f"""
     . {GLOBAL_VARS['DIR_TEMPLATES_ROOT']}/benchmark_genai_common.sh
-{_device_loop(case_command)}"""
+{_device_loop(case_command, route)}"""
     context = {'tool': 'openvino_genai', 'benchmark_command': benchmark_command,
                'hf_home': GLOBAL_VARS['HF_HOME']}
     meta = {'metrics_file': str(_bench_scripts_dir('genai') / f"metrics_{model_safe_name}.json"),
@@ -498,7 +505,7 @@ def build_notebook_benchmark(route, stage, weight_format, env, notebook_inputs):
     case_command = f'run_case "{model_safe_name}" "{quant}" "{quantized_path}" "{script_dir}"'
     benchmark_command = f"""
     . {GLOBAL_VARS['DIR_TEMPLATES_ROOT']}/benchmark_notebook_common.sh
-{_device_loop(case_command)}"""
+{_device_loop(case_command, route)}"""
     context = {'tool': 'notebook', 'benchmark_command': benchmark_command,
                'hf_home': GLOBAL_VARS['HF_HOME']}
     meta = {'strategy': 'notebook', 'scripts_dir': script_dir, 'infer_script': infer_script}
@@ -523,7 +530,7 @@ def build_benchmark_app(route, stage, weight_format, env, notebook_inputs):
     case_command = f'run_case "{quantized_path}"{shape_param}'
     benchmark_command = f"""
     . {GLOBAL_VARS['DIR_TEMPLATES_ROOT']}/benchmark_app_common.sh
-{_device_loop(case_command)}"""
+{_device_loop(case_command, route)}"""
     context = {'tool': 'benchmark_app', 'benchmark_command': benchmark_command,
                'hf_home': GLOBAL_VARS['HF_HOME']}
     meta = {'strategy': 'benchmark_app', 'model_xml': model_xml}

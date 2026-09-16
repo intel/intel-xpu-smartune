@@ -1,6 +1,6 @@
 BASE_VENV=${PYENV_VENV_DIR}
 # Side venvs live under the runtime root so they follow DIR_ENV_ROOT wherever
-# SmarTune points it (see configs/global_vars.sh); scripts/utils/python_env_selector.py
+# SmarTune points it (see env/global_vars.sh); scripts/utils/python_env_selector.py
 # discovers them from the same location.
 PYTHON_VERSION_ROOT=${DIR_ENV_ROOT:-/tmp/skill_env}/python_version
 packages=("transformers==5.0.0" "transformers==5.2.0" "transformers==4.57.0" "transformers==5.5.0")

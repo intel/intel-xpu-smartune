@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 """
-透视报表生成器
-读取 windowed_metric_medians.csv，输出一个自包含的交互式 HTML。
+Pivot report generator
+Reads windowed_metric_medians.csv and outputs a self-contained interactive HTML.
 
-每个"面板" = 一张透视表 + 对应柱状图，可在页面上：
-  - 纵向表头(行) / 横向表头(列) 各自是一个"可增删的维度列表" -> 支持多级(嵌套)表头
-  - 选择取值指标(任意 kpi / metric)
-  - 对未用作行/列的维度加过滤(默认 全部→聚合)
-  - 选择聚合方式(median/mean/min/max/count)
-  - 点 "+ 添加面板" 复制出更多面板，并排对比不同指标
+Each "panel" = one pivot table + its bar chart, and on the page you can:
+  - Row header / column header are each an "add/remove-able dimension list" -> supports multi-level (nested) headers
+  - Select the value metric (any kpi / metric)
+  - Add filters on dimensions not used as rows/cols (default: all -> aggregate)
+  - Choose aggregation (median/mean/min/max/count)
+  - Click "+ Add panel" to clone more panels and compare different metrics side by side
 
-数据处理：相同 config (model×device×batch×precision) 的重复 test 行，
-在生成阶段就按每个指标折叠成 median，每个 config 只保留一行。
+Data processing: repeated test rows of the same config (model x device x batch x precision)
+are folded to median per metric at generation time, so each config keeps a single row.
 
-用法:
-  python pivot_report.py [输入csv] [输出html]
-  默认: windowed_metric_medians.csv -> pivot_report.html
+Usage:
+  python pivot_report.py [input_csv] [output_html]
+  Default: windowed_metric_medians.csv -> pivot_report.html
 """
 import csv, json, sys, os
 from collections import OrderedDict
 import argparse
 from pathlib import Path
 
-# 候选配置维度（DIMS）：按需在此扩展，如 platform / model_source 等额外配置。
-# 真正落到透视表 / HTML 的维度由数据决定：CSV 中缺失该列、或整列均为空值的维度会被自动剔除。
+# Candidate config dimensions (DIMS): extend here as needed, e.g. platform / model_source.
+# The dimensions that actually reach the pivot table / HTML are decided by the data: dimensions whose column is missing from the CSV, or whose entire column is empty, are automatically dropped.
 DIMS = ["model_name", "model_source", "platform", "device", "batch_size", "precision"]
 EXCLUDE = set(DIMS + ["case_name", "case_dir"])
 
@@ -40,9 +40,9 @@ def load(csv_path):
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
     if not rows:
-        raise SystemExit("CSV 为空")
+        raise SystemExit("CSV is empty")
     cols = list(rows[0].keys())
-    dims = [d for d in DIMS if d in cols]          # 仅保留 CSV 中存在的候选维度
+    dims = [d for d in DIMS if d in cols]          # keep only candidate dimensions present in the CSV
     metrics = [c for c in cols if c not in EXCLUDE]
 
     def parse(v):
@@ -51,7 +51,7 @@ def load(csv_path):
         except ValueError:
             return None
 
-    # 相同 config 的重复 test 行, 按每个指标折叠成 median -> 每个 config 一行
+    # repeated test rows of the same config, folded to median per metric -> one row per config
     buckets = OrderedDict()
     for r in rows:
         key = tuple(r.get(d, "") for d in dims)
@@ -66,28 +66,28 @@ def load(csv_path):
             rec[m] = _median(b[m])
         data.append(rec)
 
-    # 指标按前缀分组, 便于下拉框 optgroup
+    # group metrics by prefix, convenient for dropdown optgroup
     groups = {}
     labels = {
-        "kpi": "KPI 性能", "cpu": "CPU 功耗/频率/热", "gpu": "GPU 监控",
-        "npu": "NPU", "memory": "内存",
+        "kpi": "KPI Performance", "cpu": "CPU Power/Freq/Thermal", "gpu": "GPU Monitoring",
+        "npu": "NPU", "memory": "Memory",
     }
     for m in metrics:
         pre = m.split("_")[0]
         groups.setdefault(labels.get(pre, pre), []).append(m)
-    # 剔除整列空值的维度：只有存在非空取值的维度才最终落到透视 / HTML
+    # drop all-empty dimensions: only dimensions with at least one non-empty value reach the pivot / HTML
     effective_dims = [d for d in dims if any(r.get(d) not in (None, "") for r in data)]
     dim_values = {d: sorted({r[d] for r in data if r.get(d) not in (None, "")})
                   for d in effective_dims}
-    print("重复 test 折叠: %d 原始行 -> %d 个 config(每指标取median)" % (n_raw, len(data)))
+    print("Repeated-test folding: %d raw rows -> %d configs (median per metric)" % (n_raw, len(data)))
     return data, metrics, groups, dim_values, effective_dims
 
 
 HTML = r"""<!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>透视报表 · 表格+柱状图</title>
+<title>Pivot Report · Table + Bar Chart</title>
 <style>
   :root{--bg:#0f1420;--panel:#1a2130;--line:#2a3346;--fg:#e6ebf5;--mut:#8b97ad;
         --accent:#4da3ff;--good:#3ecf8e;--bad:#ff6b6b;}
@@ -132,7 +132,7 @@ HTML = r"""<!DOCTYPE html>
   .tablewrap{overflow:auto;max-width:100%;max-height:60vh}
   td.best{outline:2px solid var(--good);outline-offset:-2px;font-weight:700;color:#fff}
   .ptitle{font-size:12px;font-weight:600;color:var(--fg);margin:0 0 6px}
-  /* 结论/洞察栏 */
+  /* Conclusions / insights bar */
   #insights{padding:14px 18px 4px}
   #insights .cat{margin-bottom:12px}
   #insights .cath{font-size:12px;color:var(--mut);font-weight:700;margin:0 0 6px}
@@ -154,9 +154,9 @@ HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>透视报表 · 表格 + 柱状图</h1>
+  <h1>Pivot Report · Table + Bar Chart</h1>
   <span class="sub" id="sub"></span>
-  <button class="add" id="addBtn" style="margin-left:auto">+ 添加面板</button>
+  <button class="add" id="addBtn" style="margin-left:auto">+ Add panel</button>
 </header>
 <div id="insights"></div>
 <div id="panels"></div>
@@ -174,7 +174,7 @@ const COLORS = ["#4da3ff","#3ecf8e","#ff9f43","#c17bff","#ff6b6b","#5ad1e0","#f7
 const SEP = "";
 
 document.getElementById("sub").textContent =
-  DATA.length + " config · " + DIMS.length + " 维度 · " + METRICS.length + " 指标";
+  DATA.length + " config · " + DIMS.length + " dims · " + METRICS.length + " metrics";
 
 let uid = 0;
 function agg(vals, how){
@@ -195,16 +195,16 @@ function fmt(v){
   if(a>=1)    return v.toFixed(2);
   return v.toFixed(3);
 }
-// 误差函数近似(Abramowitz & Stegun 7.1.26), 供正态分布 CDF 使用
+// error function approximation (Abramowitz & Stegun 7.1.26), for the normal-distribution CDF
 function erf(x){
   const s=x<0?-1:1; x=Math.abs(x);
   const t=1/(1+0.3275911*x);
   const y=1-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*Math.exp(-x*x);
   return s*y;
 }
-// 标准正态 CDF: z→(0,1); 均值处斜率最大, 聚集数值区分度更高
+// standard normal CDF: z->(0,1); steepest slope at the mean, better resolution where values cluster
 function normCdf(z){ return 0.5*(1+erf(z/Math.SQRT2)); }
-// 带单位的格式化: 根据 UNITS[metric] 追加 × / % / 单位
+// formatting with unit: append x / % / unit based on UNITS[metric]
 function fmtU(v, metric){
   if(v==null) return "–";
   const u=UNITS[metric];
@@ -222,7 +222,7 @@ function optionsHTML(sel){
   }
   return h;
 }
-// 笛卡尔积: dims=[dim,...] -> [[v1,v2,...], ...] (按 DIMV 顺序; 空 dims -> [[]])
+// Cartesian product: dims=[dim,...] -> [[v1,v2,...], ...] (in DIMV order; empty dims -> [[]])
 function product(dims){
   let res=[[]];
   for(const d of dims){
@@ -233,7 +233,7 @@ function product(dims){
   return res;
 }
 function eqPrefix(a,b,level){ for(let k=0;k<=level;k++) if(a[k]!==b[k]) return false; return true; }
-// 连续分组跨度: keys(数组的数组), level -> 每个"组起始行"的跨度(非起始为0)
+// contiguous group spans: keys(array of arrays), level -> span of each "group start row" (0 for non-start)
 function spans(keys, level){
   const res=new Array(keys.length).fill(0);
   let i=0;
@@ -248,19 +248,19 @@ function makePanel(cfg){
   el.className="panel";
   el.innerHTML = `
    <div class="ctl">
-     <h3>${cfg.title ? cfg.title.replace(/</g,"&lt;") : "面板 #"+id}</h3>
-     <button class="close" title="删除">×</button>
+     <h3>${cfg.title ? cfg.title.replace(/</g,"&lt;") : "Panel #"+id}</h3>
+     <button class="close" title="delete">×</button>
    </div>
    <div class="ctl">
-     <label>取值指标<select data-k="metric">${optionsHTML(cfg.metric)}</select></label>
-     <label>聚合<select data-k="how">
+     <label>Value metric<select data-k="metric">${optionsHTML(cfg.metric)}</select></label>
+     <label>Aggregate<select data-k="how">
        ${["median","mean","min","max","count"].map(o=>'<option'+(o===cfg.how?" selected":"")+'>'+o+'</option>').join("")}
      </select></label>
-     <label>高亮<select data-k="highlight">
-       ${[["max","最大值"],["min","最小值"]].map(o=>'<option value="'+o[0]+'"'+(o[0]===(cfg.highlight||"max")?" selected":"")+'>'+o[1]+'</option>').join("")}
+     <label>Highlight<select data-k="highlight">
+       ${[["max","maximum"],["min","minimum"]].map(o=>'<option value="'+o[0]+'"'+(o[0]===(cfg.highlight||"max")?" selected":"")+'>'+o[1]+'</option>').join("")}
      </select></label>
-     <label>着色<select data-k="scale">
-       ${[["percentile","百分位"],["normal","正态"],["linear","均匀"]].map(o=>'<option value="'+o[0]+'"'+(o[0]===(cfg.scale||"percentile")?" selected":"")+'>'+o[1]+'</option>').join("")}
+     <label>Coloring<select data-k="scale">
+       ${[["percentile","percentile"],["normal","normal"],["linear","uniform"]].map(o=>'<option value="'+o[0]+'"'+(o[0]===(cfg.scale||"percentile")?" selected":"")+'>'+o[1]+'</option>').join("")}
      </select></label>
    </div>
    <div class="dims">
@@ -271,27 +271,27 @@ function makePanel(cfg){
    <div class="body"></div>`;
   document.getElementById("panels").appendChild(el);
 
-  // 只保留数据里实际存在的维度：结论面板 spec 可能引用被剔除的空维度(如缺失的 model_name)
+  // keep only dimensions that actually exist in the data: conclusion panel specs may reference dropped empty dims (e.g. a missing model_name)
   const DIMSET = new Set(DIMS);
   const state = {metric:cfg.metric, how:cfg.how};
   state.rows = (cfg.rows||[]).filter(d=>DIMSET.has(d));
   state.cols = (cfg.cols||[]).filter(d=>DIMSET.has(d));
   state.filters = {};
   for(const k in (cfg.filters||{})) if(DIMSET.has(k)) state.filters[k]=cfg.filters[k];
-  state.highlight = cfg.highlight || "max";   // 默认最大值高亮
-  state.scale = cfg.scale || "percentile";    // 着色映射: 百分位/正态/均匀, 默认百分位
+  state.highlight = cfg.highlight || "max";   // default: highlight the maximum
+  state.scale = cfg.scale || "percentile";    // coloring map: percentile/normal/uniform, default percentile
   const usedDims = ()=> new Set(state.rows.concat(state.cols));
 
-  // 可增删的多级表头维度选择器
+  // add/remove-able multi-level header dimension selector
   function renderDims(){
     ["rows","cols"].forEach(axis=>{
       const wrap = el.querySelector('.dimrow[data-axis="'+axis+'"]');
-      const label = axis==="rows" ? "纵向表头(行)" : "横向表头(列)";
+      const label = axis==="rows" ? "Row header (rows)" : "Column header (cols)";
       const chips = state[axis].map((d,i)=>
-        '<span class="chip">'+d+'<b data-rm="'+axis+'|'+i+'" title="移除">×</b></span>').join("");
+        '<span class="chip">'+d+'<b data-rm="'+axis+'|'+i+'" title="remove">×</b></span>').join("");
       const avail = DIMS.filter(d=>!usedDims().has(d));
       const add = avail.length
-        ? '<select class="addsel" data-add="'+axis+'"><option value="">+ 维度</option>'
+        ? '<select class="addsel" data-add="'+axis+'"><option value="">+ dim</option>'
           + avail.map(d=>'<option value="'+d+'">'+d+'</option>').join("") + '</select>'
         : '';
       wrap.innerHTML = '<span class="axl">'+label+'</span>'+chips+add;
@@ -304,7 +304,7 @@ function makePanel(cfg){
     });
   }
 
-  // 过滤器(仅对未用作行/列的维度)
+  // filters (only on dimensions not used as rows/cols)
   function renderFilters(){
     const wrap = el.querySelector(".flt");
     const used = usedDims();
@@ -312,10 +312,10 @@ function makePanel(cfg){
     for(const k in state.filters) if(!free.includes(k)) delete state.filters[k];
     wrap.innerHTML = free.length ? free.map(d=>{
       const cur = state.filters[d]||"__all__";
-      const opts = ['<option value="__all__">全部(聚合)</option>']
+      const opts = ['<option value="__all__">all (aggregate)</option>']
         .concat(DIMV[d].map(v=>'<option value="'+v+'"'+(v===cur?" selected":"")+'>'+v+'</option>')).join("");
-      return '<label>'+d+' 过滤<select data-flt="'+d+'">'+opts+'</select></label>';
-    }).join("") : '<span class="meta">所有维度已用作行/列表头</span>';
+      return '<label>'+d+' filter<select data-flt="'+d+'">'+opts+'</select></label>';
+    }).join("") : '<span class="meta">all dimensions are used as row/col headers</span>';
     wrap.querySelectorAll("select").forEach(s=>s.onchange=()=>{
       const d=s.dataset.flt;
       if(s.value==="__all__") delete state.filters[d]; else state.filters[d]=s.value;
@@ -327,7 +327,7 @@ function makePanel(cfg){
     renderDims(); renderFilters();
     const {rows:rowDims, cols:colDims, metric, how, filters}=state;
     const data = DATA.filter(r=>Object.entries(filters).every(([k,v])=>r[k]===v));
-    // 累积到 bag[rowKey][colKey] = [values...]
+    // accumulate into bag[rowKey][colKey] = [values...]
     const bag={};
     for(const r of data){
       const rkey = rowDims.map(d=>r[d]).join(SEP);
@@ -336,7 +336,7 @@ function makePanel(cfg){
     }
     const K = a=>a.join(SEP);
     const val = (rw,ck)=>{ const b=bag[K(rw)]; return b && b[K(ck)]!=null ? agg(b[K(ck)],how) : null; };
-    // 全组合(按 DIMV 顺序), 再剔除整行/整列全空
+    // full combinations (in DIMV order), then drop all-empty rows/cols
     let rowKeys = product(rowDims), colKeys = product(colDims);
     colKeys = colKeys.filter(ck=>rowKeys.some(rw=>val(rw,ck)!=null));
     rowKeys = rowKeys.filter(rw=>colKeys.some(ck=>val(rw,ck)!=null));
@@ -345,46 +345,46 @@ function makePanel(cfg){
 
     const activeF = Object.entries(filters).map(([k,v])=>k+"="+v).join(" , ");
     const title = state.title ? '<div class="ptitle">'+state.title+'</div>' : '';
-    const meta = '<div class="meta">值 = <b>'+metric+'</b> · '+how+
-                 (activeF?(' · 过滤: '+activeF):'')+'</div>';
+    const meta = '<div class="meta">value = <b>'+metric+'</b> · '+how+
+                 (activeF?(' · filter: '+activeF):'')+'</div>';
     el.querySelector(".body").innerHTML =
       title + meta + tableHTML(rowDims,colDims,rowKeys,colKeys,val,mn,mx,metric,state.highlight,state.scale)
            + chartHTML(rowDims,colDims,rowKeys,colKeys,val,metric);
   }
 
-  // ---- 多级表头透视表 ----
+  // ---- multi-level header pivot table ----
   function tableHTML(rowDims,colDims,rowKeys,colKeys,val,mn,mx,metric,highlight,scale){
     const best = highlight==="max" ? mx : highlight==="min" ? mn : null;
-    if(!rowKeys.length || !colKeys.length) return '<div class="meta">当前筛选下无数据</div>';
+    if(!rowKeys.length || !colKeys.length) return '<div class="meta">no data under current filters</div>';
     const rLev = Math.max(rowDims.length,1);
-    const cornerLbl = (rowDims.join(" / ")||'行')
-                    + ' \\ ' + (colDims.join(" / ")||'列');
-    // 收集可见单元格数值, 供三种着色映射使用
+    const cornerLbl = (rowDims.join(" / ")||'row')
+                    + ' \\ ' + (colDims.join(" / ")||'col');
+    // collect visible cell values for the three coloring maps
     const vals=[];
     for(const rw of rowKeys)for(const ck of colKeys){const a=val(rw,ck); if(a!=null) vals.push(a);}
     const N=vals.length;
     const mean=N?vals.reduce((s,x)=>s+x,0)/N:0;
     const sd=N?Math.sqrt(vals.reduce((s,x)=>s+(x-mean)*(x-mean),0)/N):0;
     const sorted=[...vals].sort((x,y)=>x-y);
-    const PBANDS=10;   // 百分位分段数(每段一档颜色)
-    // 二分求 sorted 中 <a 与 <=a 的个数, 取平均秩得到百分位, 再离散到 PBANDS 段
+    const PBANDS=10;   // number of percentile bands (one color per band)
+    // binary-search count of <a and <=a in sorted, take average rank as percentile, then discretize into PBANDS bands
     function bisect(arr, x, incl){ let lo=0,hi=arr.length; while(lo<hi){const m=(lo+hi)>>1; if(incl?arr[m]<=x:arr[m]<x) lo=m+1; else hi=m;} return lo; }
     function pctBand(a){
       if(N<=1) return 0.5;
-      const p=((bisect(sorted,a,false)+bisect(sorted,a,true))/2 - 0.5)/(N-1);  // 平均秩→(0,1)
-      const b=Math.min(PBANDS-1, Math.max(0, Math.floor(p*PBANDS)));            // 分段
+      const p=((bisect(sorted,a,false)+bisect(sorted,a,true))/2 - 0.5)/(N-1);  // average rank -> (0,1)
+      const b=Math.min(PBANDS-1, Math.max(0, Math.floor(p*PBANDS)));            // band
       return b/(PBANDS-1);
     }
-    // 按当前映射把数值→[0,1] 强度
+    // map value -> [0,1] intensity under the current mapping
     function heat(a){
       if(scale==="linear")     return mx>mn ? (a-mn)/(mx-mn) : 0.5;
       if(scale==="normal")     return sd>0 ? normCdf((a-mean)/sd) : 0.5;
-      return pctBand(a);       // percentile(默认)
+      return pctBand(a);       // percentile (default)
     }
     let t='<div class="tablewrap"><table>';
-    // 列头(嵌套)
+    // column header (nested)
     if(colDims.length===0){
-      t+='<tr><th class="corner" colspan="'+rLev+'">'+cornerLbl+'</th><th>值</th></tr>';
+      t+='<tr><th class="corner" colspan="'+rLev+'">'+cornerLbl+'</th><th>value</th></tr>';
     } else {
       for(let L=0;L<colDims.length;L++){
         t+='<tr>';
@@ -394,17 +394,17 @@ function makePanel(cfg){
         t+='</tr>';
       }
     }
-    // 行头 rowspan 预计算
+    // row-header rowspan precompute
     const rowSpans=[];
     for(let L=0;L<rowDims.length;L++) rowSpans.push(spans(rowKeys,L));
     rowKeys.forEach((rw,ri)=>{
       t+='<tr>';
-      if(rowDims.length===0) t+='<td class="rowh">值</td>';
+      if(rowDims.length===0) t+='<td class="rowh">value</td>';
       else for(let L=0;L<rowDims.length;L++) if(rowSpans[L][ri]) t+='<td class="rowh" rowspan="'+rowSpans[L][ri]+'">'+rw[L]+'</td>';
       colKeys.forEach(ck=>{
         const a=val(rw,ck);
         if(a==null){ t+='<td class="na">–</td>'; return; }
-        // 当前着色映射(百分位/正态/均匀) + 高亮方向: 最小值高亮时反转, 越小越深
+        // current coloring map (percentile/normal/uniform) + highlight direction: invert when highlighting min, smaller is darker
         const norm = heat(a);
         const f = highlight==="min" ? 1-norm : norm;
         const isBest = best!=null && a===best;
@@ -415,7 +415,7 @@ function makePanel(cfg){
     return t+'</table></div>';
   }
 
-  // ---- 多级分组柱状图: 组=行叶子, 系列=列叶子, 行的上层维度加括号 ----
+  // ---- multi-level grouped bar chart: group=row leaf, series=col leaf, upper row dims shown in parentheses ----
   function chartHTML(rowDims,colDims,rowKeys,colKeys,val,metric){
     if(!rowKeys.length || !colKeys.length) return '';
     const K=a=>a.join(SEP);
@@ -440,13 +440,13 @@ function makePanel(cfg){
         const a=val(rw,ck); if(a==null) return;
         const bx=gx+si*barW, by=y(a), bh=padT+ph-by;
         s+='<rect x="'+bx.toFixed(1)+'" y="'+by.toFixed(1)+'" width="'+(barW-2).toFixed(1)+'" height="'+bh.toFixed(1)+
-           '" fill="'+COLORS[si%COLORS.length]+'"><title>'+(rw.join("/")||'值')+' | '+(ck.join("/")||'值')+'\n'+fmtU(a,metric)+'</title></rect>';
+           '" fill="'+COLORS[si%COLORS.length]+'"><title>'+(rw.join("/")||'value')+' | '+(ck.join("/")||'value')+'\n'+fmtU(a,metric)+'</title></rect>';
       });
-      const leaf=(rw[rw.length-1]||"值")+"";
+      const leaf=(rw[rw.length-1]||"value")+"";
       s+='<text x="'+(gx+nS*barW/2).toFixed(1)+'" y="'+(H-padB+13)+'" fill="#e6ebf5" font-size="9" text-anchor="middle">'+
          (leaf.length>8?leaf.slice(0,7)+'…':leaf)+'</text>';
     });
-    if(twoTier){   // 行上层维度的括号标注
+    if(twoTier){   // bracket annotation for the upper row dimension
       const sp=spans(rowKeys,rowDims.length-2);
       rowKeys.forEach((rw,gi)=>{ if(!sp[gi]) return;
         const x0=padL+gi*groupW+2, x1=padL+(gi+sp[gi])*groupW-2, yb=H-padB+30;
@@ -457,7 +457,7 @@ function makePanel(cfg){
     }
     s+='</svg></div>';
     s+='<div class="legend">'+colKeys.map((ck,i)=>
-        '<span><i style="background:'+COLORS[i%COLORS.length]+'"></i>'+(ck.join(" · ")||'值')+'</span>').join("")+'</div>';
+        '<span><i style="background:'+COLORS[i%COLORS.length]+'"></i>'+(ck.join(" · ")||'value')+'</span>').join("")+'</div>';
     return s;
   }
 
@@ -471,7 +471,7 @@ function makePanel(cfg){
 
 document.getElementById("addBtn").onclick=()=>makePanel();
 
-// ---- 结论/洞察栏: 每条结论可点击, 展开其对应的一个或多个面板 ----
+// ---- conclusions / insights bar: each conclusion is clickable and expands its one or more panels ----
 function openConclusion(c){
   if(!c.panels || !c.panels.length) return;
   const first = document.getElementById("panels").children.length;
@@ -484,13 +484,13 @@ function renderInsights(){
   if(!CONCLUSIONS.length){ root.innerHTML=""; return; }
   const order=[], byCat={};
   for(const c of CONCLUSIONS){ if(!byCat[c.category]){byCat[c.category]=[];order.push(c.category);} byCat[c.category].push(c); }
-  let h='<h2>结论 / 洞察 · 点击任一条展开对应面板</h2>';
+  let h='<h2>Conclusions / Insights · click any item to expand its panels</h2>';
   for(const cat of order){
     h+='<div class="cat"><div class="cath">'+cat+'</div><div class="cards">';
     byCat[cat].forEach((c,i)=>{
       const has=c.panels && c.panels.length;
       h+='<div class="insight '+c.severity+(has?'':' noclick')+'" data-cat="'+cat+'" data-i="'+i+'">'
-       + '<div class="t">'+c.title+(has?'<span class="n">面板×'+c.panels.length+'</span>':'')+'</div>'
+       + '<div class="t">'+c.title+(has?'<span class="n">panels x'+c.panels.length+'</span>':'')+'</div>'
        + (c.detail?'<div class="d">'+c.detail+'</div>':'')+'</div>';
     });
     h+='</div></div>';
@@ -501,7 +501,7 @@ function renderInsights(){
   });
 }
 renderInsights();
-// 默认展开第一条带面板的结论(通常是 L1 主 KPI 最优), 让页面不空
+// by default expand the first conclusion that has panels (usually L1 primary KPI best), so the page isn't empty
 const firstWithPanels = CONCLUSIONS.find(c=>c.panels && c.panels.length);
 if(firstWithPanels) openConclusion(firstWithPanels);
 </script>
@@ -514,7 +514,7 @@ def build(csv_path, out_path, profile=None, json_path=None):
     res = None
     if json_path == None:
       import analyze
-      res = analyze.enrich(csv_path, profile)   # 分析引擎产出数据 + 派生指标 + 结论
+      res = analyze.enrich(csv_path, profile)   # analysis engine outputs data + derived metrics + conclusions
       middle_json = Path(out_path).with_suffix(".json")
       with open(middle_json, "w", encoding="utf-8") as f:
           json.dump(res, f, ensure_ascii=False, indent=2)
@@ -531,8 +531,8 @@ def build(csv_path, out_path, profile=None, json_path=None):
             .replace("/*__CONCLUSIONS__*/[]", json.dumps(res["conclusions"], ensure_ascii=False)))
     with open(out_path, "w") as f:
         f.write(html)
-    print("已生成:", out_path, "(", len(html), "字节 )")
-    print("profile=%s · %d config · %d 指标 · %d 条结论" % (
+    print("Generated:", out_path, "(", len(html), "bytes )")
+    print("profile=%s · %d config · %d metrics · %d conclusions" % (
         res["profile"]["name"], len(res["data"]), len(res["metrics"]), len(res["conclusions"])))
 
 
@@ -548,14 +548,14 @@ if __name__ == "__main__":
     csv_file = Path(input_path) / "windowed_metric_medians.csv"
     json_file = Path(input_path) / "pivot_report.json"
     if not csv_file.exists():
-        raise SystemExit("找不到 windowed_metric_medians.csv 文件: " + str(csv_file))
+        raise SystemExit("windowed_metric_medians.csv not found: " + str(csv_file))
     if args.middle_json and not json_file.exists():
-        raise SystemExit("找不到 pivot_report.json 文件: " + str(json_file))
+        raise SystemExit("pivot_report.json not found: " + str(json_file))
 
     out = Path(input_path) / "pivot_report.html"
     prof = None
     if not os.path.exists(input_path):
-        raise SystemExit("找不到输入文件: " + input_path)
+        raise SystemExit("Input file not found: " + input_path)
     if(args.middle_json):
         build(str(csv_file), str(out), prof, str(json_file))
     else:

@@ -831,10 +831,6 @@ export interface BenchEnvData {
   // Environment drawer's dropdown lists; empty until a version has been built, so
   // the drawer's package list is empty on a fresh environment.
   ov_versions_detail: { version: string; packages: Record<string, string | null> }[]
-  // Static reference of known releases -> package versions, when the service
-  // ships the table. Nothing renders it: the drawer shows what was actually
-  // installed (ov_versions_detail) and the version box reads ov_choices.
-  ov_reference: { version: string; packages: Record<string, string> }[]
   models_dir: string
   model_count: number
   setup_script: string
@@ -848,6 +844,36 @@ export interface BenchModelVariant {
   repo: string
   // null when the repo name carries no recognisable weight-format suffix.
   precision: BenchPrecision | null
+}
+
+// Weight / KV-cache footprint for a model, as enriched by
+// benchmark/service/search_models.py (build_memory) and served through
+// GET /bench/models. Every field is optional: a v1 cache or a model whose
+// config could not be read carries none, and the UI treats absence as "unknown"
+// rather than zero. Sizes are bytes; params is a raw parameter count.
+export interface BenchModelMemory {
+  params?: number | null
+  arch?: {
+    hidden_size?: number
+    num_hidden_layers?: number
+    num_attention_heads?: number
+    num_kv_heads?: number
+    head_dim?: number
+    vocab_size?: number
+    max_position_embeddings?: number
+  }
+  // Extra memory per prompt/generated token, driven by sequence length.
+  kv_cache_bytes_per_token?: number
+  kv_cache_dtype_bytes?: number
+  // The vocab-wide output projection, materialised per position.
+  logits_bytes?: number
+  // Authoritative on-disk weight size per precision; the *_est variant is the
+  // parameter-count estimate used when a real file size is unavailable.
+  weights_bytes?: Partial<Record<BenchPrecision, number>>
+  weights_bytes_est?: Partial<Record<BenchPrecision, number>>
+  // The model's architectural context limit (max_position_embeddings), promoted
+  // out of `arch` for direct reading.
+  max_window_size?: number
 }
 
 // A benchmarkable model. `task`/`downloads`/`likes` describe the OpenVINO
@@ -870,6 +896,8 @@ export interface BenchModel {
   // size, and a 0 would read as "already here, costs nothing".
   local_bytes: Partial<Record<BenchPrecision, number>>
   downloaded: boolean
+  // Weight/KV-cache footprint; absent on a v1 cache or an unreadable config.
+  memory?: BenchModelMemory | null
 }
 
 // Cache status without the list, as carried by the `models` SSE event.

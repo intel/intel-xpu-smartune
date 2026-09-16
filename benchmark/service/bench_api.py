@@ -231,6 +231,39 @@ def get_models():
     return construct_response(data=data, retmsg="Successfully retrieved model list")
 
 
+@bench_bp.route('/models/memory', methods=['GET'])
+def get_model_memory():
+    """The weight / KV-cache / logits footprint for one model, computed on demand.
+
+    The list is served without this block (search_models --no-memory) so the tab
+    loads in seconds; a model's footprint is filled in the first time its page is
+    opened and cached, so a second open is free. A `null` memory is the same "not
+    known" the tab already renders for a v1 cache, not an error -- an offline
+    machine, or a model whose config the hub would not give up, simply has none.
+
+    The id is a query parameter, not a path segment: a HuggingFace id carries a
+    slash (``Qwen/Qwen3-8B``) that a path would split.
+    """
+    model = request.args.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return construct_response(
+            retcode=RetCode.ARGUMENT_ERROR, retmsg="model must be a non-empty string",
+        )
+    try:
+        memory = models.ensure_memory(model)
+    except Exception:
+        logger.exception("Failed to compute the model memory footprint")
+        return construct_response(
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg="Failed to compute the model memory footprint",
+        )
+    return construct_response(
+        data={"model": model.strip(), "memory": memory},
+        retmsg=("Memory footprint ready" if memory is not None
+                else "Memory footprint unavailable"),
+    )
+
+
 @bench_bp.route('/models/refresh', methods=['POST'])
 def post_models_refresh():
     """Rebuild the cached model list.

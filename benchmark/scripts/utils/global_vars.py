@@ -28,7 +28,7 @@ def load_global_vars(force_reload: bool = False) -> Dict[str, str]:
 
     # Find global_vars.sh
     current_file = Path(__file__).resolve()
-    global_vars_path = current_file.parent.parent.parent / 'configs' / 'global_vars.sh'
+    global_vars_path = current_file.parent.parent.parent / 'env' / 'global_vars.sh'
 
     if not global_vars_path.exists():
         raise FileNotFoundError(f"global_vars.sh not found at {global_vars_path}")

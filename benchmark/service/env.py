@@ -5,7 +5,7 @@
 # "install the Python environment" action the dashboard exposes.
 #
 # Everything the pipeline reads about where things live comes from
-# benchmark/configs/global_vars.sh, which derives all of its paths from
+# benchmark/env/global_vars.sh, which derives all of its paths from
 # DIR_ENV_ROOT. This module is the single place that decides what DIR_ENV_ROOT
 # is (via SMARTUNE_BENCH_ENV_ROOT) and what credentials/proxies the subprocesses
 # see -- so the vendored tree needs no per-deployment edits, and no secret is ever
@@ -456,29 +456,6 @@ _PROBE_SCRIPT = (
 )
 
 
-# Static reference: what package versions each OpenVINO release installs. Shown
-# read-only in the dashboard's Environment drawer. It does NOT drive any build --
-# the version actually built comes from the per-run choice on the Models tab and
-# uv_build_envs.sh builds that column on demand.
-OV_REFERENCE_FILE = SRC_ROOT / "requirements" / "ov_reference.json"
-_ov_reference_cache: Optional[list] = None
-
-
-def ov_reference() -> list:
-    """The OpenVINO reference table (``[{version, packages}, ...]``), or []."""
-    global _ov_reference_cache
-    if _ov_reference_cache is not None:
-        return _ov_reference_cache
-    try:
-        data = json.loads(OV_REFERENCE_FILE.read_text())
-        versions = data.get("versions", [])
-        _ov_reference_cache = versions if isinstance(versions, list) else []
-    except (OSError, ValueError) as exc:
-        logger.debug(f"OpenVINO reference not loaded: {exc}")
-        _ov_reference_cache = []
-    return _ov_reference_cache
-
-
 def _probe_key(python: Path) -> tuple:
     """Cache key: identity of the interpreter plus the state of its packages.
 
@@ -693,9 +670,6 @@ def probe(wait: bool = False) -> dict:
         # exact packages inside its venv. Empty until a version is built, so the
         # drawer's package list is empty on a fresh environment.
         "ov_versions_detail": ov_versions_detail(),
-        # Static reference of known releases -> package versions. Not shown in the
-        # drawer; used only to seed the Models tab's version suggestions.
-        "ov_reference": ov_reference(),
         "models_dir": str(p["models"]),
         "model_count": _count_models(p["models"]),
         "setup_script": str(SETUP_SCRIPT),

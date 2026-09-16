@@ -1,42 +1,42 @@
 #!/usr/bin/env python3
 """
-基准数据分析引擎（独立脚本，也可被 pivot_report.py import）。
+Benchmark data analysis engine (standalone script, can also be imported by pivot_report.py).
 
-职责：读原始 CSV → 用重复行算 CV → 折叠 median → 算派生指标 d_* → 扫描阈值生成"结论"。
-每条结论自带若干"面板 spec"(rows/cols/metric/how/filters/highlight)，供前端一键可视化。
+Responsibilities: read raw CSV -> compute CV from repeated rows -> fold to median -> compute derived metrics d_* -> scan thresholds to generate "conclusions".
+Each conclusion carries several "panel specs" (rows/cols/metric/how/filters/highlight) for one-click visualization in the frontend.
 
-KPI 由可配置的 PROFILE 驱动，换 benchmark 类型(benchmark_app / genai / 自定义)只需换 profile。
+KPIs are driven by a configurable PROFILE; switching benchmark type (benchmark_app / genai / custom) only requires switching the profile.
 
-用法（独立运行）:
-  python analyze.py [输入csv] [profile名]
-  默认: windowed_metric_medians.csv, profile 自动探测
-  产物: 终端打印结论摘要 + 写出 conclusions.json
+Usage (standalone):
+  python analyze.py [input_csv] [profile_name]
+  Default: windowed_metric_medians.csv, profile auto-detected
+  Output: prints conclusion summary to terminal + writes conclusions.json
 """
 import csv, json, sys, os, statistics
 from collections import OrderedDict
 
-# 候选配置维度（DIMS）：按需在此扩展，如 platform / model_source 等额外配置。
-# 真正落到透视表 / HTML 的维度由数据决定：CSV 中缺失该列、或整列均为空值的维度会被自动剔除。
+# Candidate config dimensions (DIMS): extend here as needed, e.g. platform / model_source.
+# The dimensions that actually reach the pivot table / HTML are decided by the data: dimensions whose column is missing from the CSV, or whose entire column is empty, are automatically dropped.
 DIMS = ["model_name", "model_source", "platform", "device", "batch_size", "precision", "mode"]
 EXCLUDE = set(DIMS + ["case_name", "case_dir"])
 
-# ---------------- KPI Profile（核心泛化点） ----------------
+# ---------------- KPI Profile (core generalization point) ----------------
 PROFILES = {
     "benchmark_app": {
         "name": "benchmark_app",
         "kpis": [
-            {"col": "kpi_throughput_fps",    "label": "吞吐",    "unit": "fps", "goal": "max"},
-            {"col": "kpi_latency_median_ms", "label": "时延P50", "unit": "ms",  "goal": "min"},
+            {"col": "kpi_throughput_fps",    "label": "Throughput",  "unit": "fps", "goal": "max"},
+            {"col": "kpi_latency_median_ms", "label": "Latency P50", "unit": "ms",  "goal": "min"},
         ],
         "primary_throughput": "kpi_throughput_fps",
         "power_col": "cpu_package_power_w_median",
     },
-    # 供扩展：GenAI 类 benchmark（本 CSV 无这些列，仅示例）
+    # For extension: GenAI-type benchmark (this CSV has no such columns, example only)
     "genai": {
         "name": "genai",
         "kpis": [
-            {"col": "kpi_throughput_tokens_s", "label": "吞吐",            "unit": "t/s", "goal": "max"},
-            {"col": "kpi_first_latency_ms", "label": "时延",            "unit": "ms",   "goal": "min"}
+            {"col": "kpi_throughput_tokens_s", "label": "Throughput",  "unit": "t/s", "goal": "max"},
+            {"col": "kpi_first_latency_ms", "label": "Latency",       "unit": "ms",   "goal": "min"}
         ],
         "primary_throughput": "kpi_throughput_tokens_s",
         "power_col": "cpu_package_power_w_median",
@@ -59,7 +59,7 @@ def resolve_profile(profile, columns):
     return profile
 
 
-# ---------------- 基础工具 ----------------
+# ---------------- Basic utilities ----------------
 def _median(vals):
     v = sorted(x for x in vals if x is not None)
     if not v:
@@ -90,14 +90,14 @@ def cfg_label(rec):
     return "/".join(str(p) for p in parts if p not in (None, ""))
 
 
-# ---------------- 加载 + 折叠 + CV ----------------
+# ---------------- Load + fold + CV ----------------
 def load_records(csv_path, primary_col):
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
     if not rows:
-        raise SystemExit("CSV 为空")
+        raise SystemExit("CSV is empty")
     cols = list(rows[0].keys())
-    dims = [d for d in DIMS if d in cols]          # 仅保留 CSV 中存在的候选维度
+    dims = [d for d in DIMS if d in cols]          # keep only candidate dimensions present in the CSV
     metrics = [c for c in cols if c not in EXCLUDE]
 
     buckets = OrderedDict()
@@ -112,7 +112,7 @@ def load_records(csv_path, primary_col):
         rec = dict(zip(dims, key))
         for m in metrics:
             rec[m] = _median(b[m])
-        # 重复次数 & 主吞吐 CV（用未折叠的原始值）
+        # repeat count & primary-throughput CV (using the un-folded raw values)
         pv = [x for x in b.get(primary_col, []) if x is not None] if primary_col in b else []
         rec["_n_runs"] = len(pv)
         if len(pv) >= 2 and statistics.mean(pv) != 0:
@@ -123,18 +123,18 @@ def load_records(csv_path, primary_col):
     return records, metrics, len(rows), dims
 
 
-# ---------------- 派生指标 ----------------
+# ---------------- Derived metrics ----------------
 DERIVED = [
-    ("d_cv_throughput_pct", "主吞吐CV",       "%"),
-    ("d_speedup_vs_fp32",   "相对fp32加速",   "x"),
-    ("d_rel_best_prec",     "相对最优(精度)", "x"),
-    ("d_speedup_vs_cpu",    "相对CPU加速",    "x"),
-    ("d_rel_best_device",   "相对最优(设备)", "x"),
-    ("d_bs_tp_gain_pct",    "bs8吞吐增益",    "%"),
-    ("d_bs_lat_cost_pct",   "bs8时延代价",    "%"),
-    ("d_rel_best_batch",    "相对最优(批)",   "x"),
-    ("d_perf_per_watt",     "能效",           "fps/W"),
-    ("d_temp_headroom_c",   "温度余量",       "℃"),
+    ("d_cv_throughput_pct", "Primary throughput CV", "%"),
+    ("d_speedup_vs_fp32",   "Speedup vs fp32",       "x"),
+    ("d_rel_best_prec",     "Rel. best (precision)", "x"),
+    ("d_speedup_vs_cpu",    "Speedup vs CPU",        "x"),
+    ("d_rel_best_device",   "Rel. best (device)",    "x"),
+    ("d_bs_tp_gain_pct",    "bs8 throughput gain",   "%"),
+    ("d_bs_lat_cost_pct",   "bs8 latency cost",      "%"),
+    ("d_rel_best_batch",    "Rel. best (batch)",     "x"),
+    ("d_perf_per_watt",     "Efficiency",            "fps/W"),
+    ("d_temp_headroom_c",   "Temp headroom",         "℃"),
 ]
 
 
@@ -152,34 +152,34 @@ def add_derived(records, profile):
             r.setdefault(name, None)
         m, d, b, p = r.get("model_name"), r.get("device"), r.get("batch_size"), r.get("precision")
         v = r.get(tp)
-        # perf/watt：整机封装功耗作统一分母
+        # perf/watt: whole-package power as the unified denominator
         pw = r.get(power)
         if v is not None and pw not in (None, 0):
             r["d_perf_per_watt"] = v / pw
-        # 温度余量
+        # temperature headroom
         tj, tc = r.get("cpu_package_tjmax_c_median"), r.get("cpu_package_temp_c_median")
         if tj is not None and tc is not None:
             r["d_temp_headroom_c"] = tj - tc
-        # 精度：vs fp32（严格；基线缺则 null） + 相对本组最优（抗缺失）
+        # precision: vs fp32 (strict; null if baseline missing) + relative to group best (robust to missing)
         base = g(m, d, b, "fp32")
         if v is not None and base is not None and base.get(tp) not in (None, 0):
             r["d_speedup_vs_fp32"] = v / base[tp]
         best = _max_none([g(m, d, b, pp) and g(m, d, b, pp).get(tp) for pp in _vals(records, "precision")])
         if v is not None and best not in (None, 0):
             r["d_rel_best_prec"] = v / best
-        # 设备：vs cpu（严格基线） + 相对本组最优（抗缺失，归一化 0-1）
+        # device: vs cpu (strict baseline) + relative to group best (robust to missing, normalized 0-1)
         cpu = g(m, "cpu", b, p)
         if v is not None and cpu is not None and cpu.get(tp) not in (None, 0):
             r["d_speedup_vs_cpu"] = v / cpu[tp]
         bestd = _max_none([g(m, dd, b, p) and g(m, dd, b, p).get(tp) for dd in _vals(records, "device")])
         if v is not None and bestd not in (None, 0):
             r["d_rel_best_device"] = v / bestd
-        # 批：相对本组最优（归一化 0-1）
+        # batch: relative to group best (normalized 0-1)
         bestb = _max_none([g(m, d, bb, p) and g(m, d, bb, p).get(tp) for bb in _vals(records, "batch_size")])
         if v is not None and bestb not in (None, 0):
             r["d_rel_best_batch"] = v / bestb
 
-    # 批大小：bs8 相对 bs1（增益/代价挂在 bs8 行）
+    # batch size: bs8 vs bs1 (gain/cost attached to the bs8 row)
     for r in records:
         if r.get("batch_size") != "bs8":
             continue
@@ -208,7 +208,7 @@ def _max_none(xs):
     return max(xs) if xs else None
 
 
-# ---------------- 面板 spec 辅助 ----------------
+# ---------------- Panel spec helpers ----------------
 def panel(rows, cols, metric, how="median", filters=None, title=None, highlight=None):
     remain_field=set(DIMS) - set(rows) - set(cols) - set(filters.keys() if filters else [])
     p = {"rows": rows + list(remain_field), "cols": cols, "metric": metric, "how": how, "filters": filters or {}}
@@ -233,7 +233,7 @@ def _fmt(v, unit=""):
     return s
 
 
-# ---------------- 结论生成 L0–L6 ----------------
+# ---------------- Conclusion generation L0-L6 ----------------
 def build_conclusions(records, metrics, profile, n_raw):
     tp = profile["primary_throughput"]
     C = []
@@ -242,48 +242,48 @@ def build_conclusions(records, metrics, profile, n_raw):
         C.append({"id": cid, "category": cat, "severity": sev,
                   "title": title, "detail": detail, "panels": panels})
     '''
-    # ---- L0 覆盖 & 可信度 ----
+    # ---- L0 coverage & credibility ----
     failed = [r for r in records if r.get(tp) is None]
     total = len(records)
     if failed:
         by_dev = _count(failed, "device")
         by_prec = _count(failed, "precision")
-        add("L0-coverage", "L0 覆盖", "warn" if failed else "good",
-            "%d/%d 个 config 未跑通（无主KPI）" % (len(failed), total),
-            "按设备: %s ; 按精度: %s" % (by_dev, by_prec),
+        add("L0-coverage", "L0 Coverage", "warn" if failed else "good",
+            "%d/%d configs did not complete (no primary KPI)" % (len(failed), total),
+            "by device: %s ; by precision: %s" % (by_dev, by_prec),
             [panel(["model_name", "precision"], ["device", "batch_size"], tp, "count",
-                   title="覆盖矩阵（有值=1，空=未跑通）")])
+                   title="Coverage matrix (has value=1, empty=not completed)")])
     else:
-        add("L0-coverage", "L0 覆盖", "good", "全部 %d 个 config 均跑通" % total, "", [])
+        add("L0-coverage", "L0 Coverage", "good", "All %d configs completed" % total, "", [])
 
     shaky = [r for r in records if (r.get("d_cv_throughput_pct") or 0) > 5]
     if shaky:
         worst = max(shaky, key=lambda r: r["d_cv_throughput_pct"])
-        add("L0-stability", "L0 覆盖", "warn",
-            "%d 个 config 重复测试抖动 >5%%（数据慎用）" % len(shaky),
-            "最抖: %s CV=%s" % (cfg_label(worst), _fmt(worst["d_cv_throughput_pct"], "%")),
+        add("L0-stability", "L0 Coverage", "warn",
+            "%d configs show repeated-test jitter >5%% (use data with caution)" % len(shaky),
+            "most jittery: %s CV=%s" % (cfg_label(worst), _fmt(worst["d_cv_throughput_pct"], "%")),
             [panel(["model_name", "precision"], ["device", "batch_size"],
-                   "d_cv_throughput_pct", "max", title="重复测试 CV%（越低越稳）", highlight="max")])
+                   "d_cv_throughput_pct", "max", title="Repeated-test CV% (lower is more stable)", highlight="max")])
     else:
-        add("L0-stability", "L0 覆盖", "good", "所有 config 重复测试 CV ≤5%，数据稳定", "", [])
+        add("L0-stability", "L0 Coverage", "good", "All configs have repeated-test CV <=5%, data is stable", "", [])
 
-    # ---- L1 主 KPI 排名（profile 驱动，每 KPI 一条 + 能效） ----
+    # ---- L1 primary KPI ranking (profile-driven, one per KPI + efficiency) ----
     kpi_specs = [k for k in profile["kpis"] if k["col"] in metrics] + \
-                [{"col": "d_perf_per_watt", "label": "能效", "unit": "fps/W", "goal": "max"}]
+                [{"col": "d_perf_per_watt", "label": "Efficiency", "unit": "fps/W", "goal": "max"}]
     for k in kpi_specs:
         col, goal, unit = k["col"], k["goal"], k["unit"]
         cand = [r for r in records if r.get(col) is not None]
         if not cand:
             continue
         best = (max if goal == "max" else min)(cand, key=lambda r: r[col])
-        add("L1-best-" + col, "L1 排名", "good",
-            "「%s」最优: %s = %s" % (k["label"], cfg_label(best), _fmt(best[col], unit)),
-            "goal=%s（%s）" % (goal, "越大越好" if goal == "max" else "越小越好"),
+        add("L1-best-" + col, "L1 Ranking", "good",
+            "「%s」 best: %s = %s" % (k["label"], cfg_label(best), _fmt(best[col], unit)),
+            "goal=%s (%s)" % (goal, "higher is better" if goal == "max" else "lower is better"),
             [panel(["model_name", "precision"], ["device", "batch_size"], col, "median",
-                   title="%s 全景（高亮%s）" % (k["label"], "最优"),
+                   title="%s overview (highlight %s)" % (k["label"], "best"),
                    highlight="max" if goal == "max" else "min")])
 
-    # 各模型最佳主-吞吐配置（一条，多面板）
+    # best primary-throughput config per model (one conclusion, multiple panels)
     models = _vals(records, "model_name")
     lines, pans = [], []
     for mdl in models:
@@ -291,26 +291,26 @@ def build_conclusions(records, metrics, profile, n_raw):
         if not cand:
             continue
         b = max(cand, key=lambda r: r[tp])
-        lines.append("%s→%s/%s/%s(%s)" % (mdl, b["device"], b["precision"], b["batch_size"], _fmt(b[tp])))
+        lines.append("%s->%s/%s/%s(%s)" % (mdl, b["device"], b["precision"], b["batch_size"], _fmt(b[tp])))
         pans.append(panel(["device", "precision"], ["batch_size"], tp, "median",
-                          filters={"model_name": mdl}, title="%s 最佳吞吐配置" % mdl, highlight="max"))
+                          filters={"model_name": mdl}, title="%s best throughput config" % mdl, highlight="max"))
     if pans:
-        add("L1-best-per-model", "L1 排名", "info",
-            "各模型最佳吞吐配置", " ; ".join(lines), pans)
+        add("L1-best-per-model", "L1 Ranking", "info",
+            "Best throughput config per model", " ; ".join(lines), pans)
 
-    # 设备排名（按主吞吐在多少 (模型,精度,批) 组合上夺冠）
+    # device ranking (by how many (model,precision,batch) combos each device wins on primary throughput)
     wins = _device_wins(records, tp)
     if wins:
-        rank = " > ".join("%s(%d胜)" % (d, n) for d, n in wins)
-        add("L1-device-rank", "L1 排名", "info",
-            "设备吞吐排名: %s" % rank, "统计各设备在多少组合上吞吐第一",
+        rank = " > ".join("%s(%d wins)" % (d, n) for d, n in wins)
+        add("L1-device-rank", "L1 Ranking", "info",
+            "Device throughput ranking: %s" % rank, "counts how many combos each device tops in throughput",
             [panel(["model_name", "precision"], ["device"], tp, "median",
-                   title="设备 × 模型/精度 吞吐", highlight="max")])
+                   title="Device x model/precision throughput", highlight="max")])
     '''
-    # ---- L2 精度/量化 ----
-    add("L2-quant-overall", "L2 精度", "info", "量化精度/加速概览", "",
-        [panel(["model_name", "device"], ["precision"], tp, "median", title="吞吐 × 精度"),
-         panel(["model_name", "device"], ["precision"], "d_rel_best_prec", "median", title="相对最优精度 (0-1)")] )
+    # ---- L2 precision/quantization ----
+    add("L2-quant-overall", "L2 Precision", "info", "Quantization precision/speedup overview", "",
+        [panel(["model_name", "device"], ["precision"], tp, "median", title="Throughput x precision"),
+         panel(["model_name", "device"], ["precision"], "d_rel_best_prec", "median", title="Rel. best precision (0-1)")] )
     '''
     for prec in [p for p in _vals(records, "precision") if p != "fp32"]:
         pairs = [r["d_speedup_vs_fp32"] for r in records
@@ -320,17 +320,17 @@ def build_conclusions(records, metrics, profile, n_raw):
         if gm is None:
             continue
         sev = "good" if gm > 1.05 else "warn" if gm < 0.95 else "info"
-        add("L2-quant-" + prec, "L2 精度", "info",
-            "%s 相对 fp32 几何平均 %s（基于 %d/%d 组两端齐全）" % (prec, _fmt(gm, "x"), len(pairs), denom),
-            "缺 fp32 基线的组已剔除，不外溢污染",
+        add("L2-quant-" + prec, "L2 Precision", "info",
+            "%s geometric mean vs fp32 %s (based on %d/%d groups with both ends present)" % (prec, _fmt(gm, "x"), len(pairs), denom),
+            "groups missing the fp32 baseline are dropped, no cross-contamination",
             [panel(["model_name", "device"], ["precision"], tp, "median",
-                   title="吞吐 × 精度"),
+                   title="Throughput x precision"),
              panel(["model_name", "device"], ["precision"], "d_speedup_vs_fp32", "median",
-                   title="相对fp32加速 ×", highlight="max"),
+                   title="Speedup vs fp32 x", highlight="max"),
              panel(["model_name", "device"], ["precision"], "d_rel_best_prec", "median",
-                   title="相对最优精度 (0-1)", highlight="max")])
+                   title="Rel. best precision (0-1)", highlight="max")])
     
-    # 量化收益按设备排序
+    # quantization gain sorted by device
     dev_gain = []
     for dev in _vals(records, "device"):
         pr = [r["d_speedup_vs_fp32"] for r in records
@@ -341,16 +341,16 @@ def build_conclusions(records, metrics, profile, n_raw):
     if len(dev_gain) >= 2:
         dev_gain.sort(key=lambda x: -x[1])
         txt = " > ".join("%s %s" % (d, _fmt(g, "x")) for d, g in dev_gain)
-        add("L2-quant-by-device", "L2 精度", "info",
-            "int8 量化收益按设备: %s" % txt, "各设备 int8 相对 fp32 的几何平均加速",
+        add("L2-quant-by-device", "L2 Precision", "info",
+            "int8 quantization gain by device: %s" % txt, "geometric mean int8 speedup vs fp32 per device",
             [panel(["device"], ["model_name"], "d_speedup_vs_fp32", "median",
-                   filters={"precision": "int8"}, title="int8 加速 × 设备", highlight="max")])
+                   filters={"precision": "int8"}, title="int8 speedup x device", highlight="max")])
     '''
-    # ---- L3 设备对比（vs cpu） ----
-    add("L3-dev-overall", "L3 设备", "info", "设备对比概览", "",
-        [panel(["model_name", "precision"], ["device"], tp, "median", title="吞吐 × 设备"),
+    # ---- L3 device comparison (vs cpu) ----
+    add("L3-dev-overall", "L3 Device", "info", "Device comparison overview", "",
+        [panel(["model_name", "precision"], ["device"], tp, "median", title="Throughput x device"),
          panel(["model_name", "precision"], ["device"], "d_rel_best_device", "median",
-               title="相对最优设备 (0-1)", highlight="max")])
+               title="Rel. best device (0-1)", highlight="max")])
     '''
     for dev in [d for d in _vals(records, "device") if d != "cpu"]:
         sp = [r["d_speedup_vs_cpu"] for r in records
@@ -358,20 +358,20 @@ def build_conclusions(records, metrics, profile, n_raw):
         gm = _geomean(sp)
         if gm is None:
             continue
-        add("L3-dev-" + dev, "L3 设备", "good" if gm > 1 else "info",
-            "%s 相对 CPU 平均 %s（int8, 基于 %d 组）" % (dev.upper(), _fmt(gm, "x"), len(sp)),
-            "同 (模型,精度,批) 内比较",
-            [panel(["model_name", "precision"], ["device"], tp, "median", title="吞吐 × 设备"),
+        add("L3-dev-" + dev, "L3 Device", "good" if gm > 1 else "info",
+            "%s averages %s vs CPU (int8, based on %d groups)" % (dev.upper(), _fmt(gm, "x"), len(sp)),
+            "compared within the same (model,precision,batch)",
+            [panel(["model_name", "precision"], ["device"], tp, "median", title="Throughput x device"),
              panel(["model_name", "precision"], ["device"], "d_speedup_vs_cpu", "median",
-                   filters={"precision": "int8"}, title="相对CPU加速 ×", highlight="max"),
+                   filters={"precision": "int8"}, title="Speedup vs CPU x", highlight="max"),
              panel(["model_name", "precision"], ["device"], "d_rel_best_device", "median",
-                   title="相对最优设备 (0-1)", highlight="max")])
+                   title="Rel. best device (0-1)", highlight="max")])
     '''
-    # ---- L4 批大小 ----
-    add("L4-batch-overall", "L4 批大小", "info", "批大小对比概览", "",
-        [panel(["model_name", "device"], ["batch_size"], tp, "median", title="吞吐 × 批大小"),
+    # ---- L4 batch size ----
+    add("L4-batch-overall", "L4 Batch size", "info", "Batch size comparison overview", "",
+        [panel(["model_name", "device"], ["batch_size"], tp, "median", title="Throughput x batch size"),
          panel(["model_name", "device"], ["batch_size"], "d_rel_best_batch", "median",
-               title="相对最优批 (0-1)", highlight="max")])
+               title="Rel. best batch (0-1)", highlight="max")])
     '''
     tg = _geomean([1 + (r["d_bs_tp_gain_pct"] / 100.0) for r in records if r.get("d_bs_tp_gain_pct") is not None])
     lc = [r["d_bs_lat_cost_pct"] for r in records if r.get("d_bs_lat_cost_pct") is not None]
@@ -380,19 +380,19 @@ def build_conclusions(records, metrics, profile, n_raw):
         lc_med = _median(lc)
         lat = next((k["col"] for k in profile["kpis"] if k["goal"] == "min"), None)
         pans = [panel(["model_name", "device"], ["batch_size"], tp, "median",
-                      title="吞吐 × 批大小", highlight="max"),
+                      title="Throughput x batch size", highlight="max"),
                 panel(["model_name", "device"], ["batch_size"], "d_rel_best_batch", "median",
-                      title="相对最优批 (0-1)", highlight="max")]
+                      title="Rel. best batch (0-1)", highlight="max")]
         if lat:
             pans.append(panel(["model_name", "device"], ["batch_size"], lat, "median",
-                              title="时延 × 批大小", highlight="min"))
-        add("L4-batch", "L4 批大小", "info",
-            "bs8 相对 bs1: 吞吐 %s%s，时延 %s" % ("+" if gain_pct >= 0 else "", _fmt(gain_pct, "%"),
+                              title="Latency x batch size", highlight="min"))
+        add("L4-batch", "L4 Batch size", "info",
+            "bs8 vs bs1: throughput %s%s, latency %s" % ("+" if gain_pct >= 0 else "", _fmt(gain_pct, "%"),
                                               ("+" + _fmt(lc_med, "%")) if (lc_med or 0) >= 0 else _fmt(lc_med, "%")),
-            "吞吐-时延权衡；几何平均吞吐增益 / 中位时延代价",
+            "throughput-latency tradeoff; geometric mean throughput gain / median latency cost",
             pans)
     '''
-    '''    # ---- L5 能效 ----
+    '''    # ---- L5 efficiency ----
     eff = [r for r in records if r.get("d_perf_per_watt") is not None]
     if eff:
         be = max(eff, key=lambda r: r["d_perf_per_watt"])
@@ -404,34 +404,34 @@ def build_conclusions(records, metrics, profile, n_raw):
         dev_eff.sort(key=lambda x: -x[1])
         lead = ""
         if len(dev_eff) >= 2 and dev_eff[-1][1] > 0:
-            lead = "；%s 能效领先 %s %s" % (dev_eff[0][0].upper(), dev_eff[-1][0].upper(),
+            lead = "; %s leads %s in efficiency by %s" % (dev_eff[0][0].upper(), dev_eff[-1][0].upper(),
                                         _fmt(dev_eff[0][1] / dev_eff[-1][1], "x"))
-        add("L5-efficiency", "L5 能效", "good",
-            "最省电: %s = %s" % (cfg_label(be), _fmt(be["d_perf_per_watt"], "fps/W")) + lead,
-            "能效 = 主吞吐 / 整机封装功耗(W)",
+        add("L5-efficiency", "L5 Efficiency", "good",
+            "Most power-efficient: %s = %s" % (cfg_label(be), _fmt(be["d_perf_per_watt"], "fps/W")) + lead,
+            "efficiency = primary throughput / whole-package power (W)",
             [panel(["model_name", "device"], ["precision"], "d_perf_per_watt", "median",
-                   title="能效 fps/W（高亮最优）", highlight="max")])
+                   title="Efficiency fps/W (highlight best)", highlight="max")])
     '''
-    # ---- L6 硬件瓶颈信号（阈值触发） ----
+    # ---- L6 hardware bottleneck signals (threshold-triggered) ----
     _signal(records, C, add, "d_temp_headroom_c", lambda r: r.get("d_temp_headroom_c") is not None and r["d_temp_headroom_c"] < 5,
-            "L6 瓶颈", "warn", "触及温度墙", "温度余量<5℃，疑降频",
+            "L6 Bottleneck", "warn", "Hitting the thermal wall", "temp headroom <5℃, likely throttling",
             panel(["model_name", "precision"], ["device", "batch_size"], "d_temp_headroom_c", "min",
-                  title="温度余量 ℃（越低越危险）", highlight="min"))
+                  title="Temp headroom ℃ (lower is more dangerous)", highlight="min"))
     _signal(records, C, add, "gpu_busy",
             lambda r: r.get("device") == "gpu" and (r.get("gpu_compute_busy_percent_median") or 0) < 95,
-            "L6 瓶颈", "info", "GPU 存在计算引擎未满载(<95%)", "GPU 计算可能未充分利用",
+            "L6 Bottleneck", "info", "GPU compute engine not fully loaded (<95%)", "GPU compute may be underutilized",
             panel(["model_name", "precision"], ["precision"], "gpu_compute_busy_percent_median",
-                  "median", filters={"device": "gpu"}, title="GPU 计算引擎占用%", highlight="min"))
+                  "median", filters={"device": "gpu"}, title="GPU compute engine busy%", highlight="min"))
     _signal(records, C, add, "npu_util",
             lambda r: r.get("device") == "npu" and (r.get("npu_utilization_percent_median") is not None) and r["npu_utilization_percent_median"] < 95,
-            "L6 瓶颈", "info", "NPU 存在利用率偏低(<95%)", "NPU 计算可能未充分利用",
+            "L6 Bottleneck", "info", "NPU utilization is low (<95%)", "NPU compute may be underutilized",
             panel(["model_name", "precision"], ["precision"], "npu_utilization_percent_median",
-                  "median", filters={"device": "npu"}, title="NPU 利用率%", highlight="min"))
+                  "median", filters={"device": "npu"}, title="NPU utilization%", highlight="min"))
     _signal(records, C, add, "mem_bw",
             lambda r: (r.get("memory_bandwidth_percent_median") or 0) > 80,
-            "L6 瓶颈", "warn", "内存带宽占用>80%", "疑访存瓶颈",
+            "L6 Bottleneck", "warn", "Memory bandwidth usage >80%", "likely memory-access bottleneck",
             panel(["model_name", "device"], ["precision", "batch_size"], "memory_bandwidth_percent_median",
-                  "median", title="内存带宽占用%", highlight="max"))
+                  "median", title="Memory bandwidth usage%", highlight="max"))
 
     return C
 
@@ -441,8 +441,8 @@ def _signal(records, C, add, cid, pred, cat, sev, title, detail, pan):
     if not hit:
         return
     examples = ", ".join(cfg_label(r) for r in hit[:4]) + (" …" if len(hit) > 4 else "")
-    add("L6-" + cid, cat, sev, "%s（%d 个 config）" % (title, len(hit)),
-        detail + " | 例: " + examples, [pan])
+    add("L6-" + cid, cat, sev, "%s (%d configs)" % (title, len(hit)),
+        detail + " | e.g.: " + examples, [pan])
 
 
 def _count(recs, dim):
@@ -466,9 +466,9 @@ def _device_wins(records, tp):
     return sorted(wins.items(), key=lambda x: -x[1])
 
 
-# ---------------- 对外主入口 ----------------
+# ---------------- Public main entry ----------------
 def enrich(csv_path, profile=None):
-    # 先读一遍列名以定 profile 与 primary
+    # read the header once to decide profile and primary
     with open(csv_path, newline="") as f:
         header = next(csv.reader(f))
     prof = resolve_profile(profile, header)
@@ -480,25 +480,25 @@ def enrich(csv_path, profile=None):
     derived_names = [n for n, _, _ in DERIVED]
     metrics = base_metrics + derived_names
 
-    # 分组（含"派生分析"）
-    label_map = {"kpi": "KPI 性能", "cpu": "CPU 功耗/频率/热", "gpu": "GPU 监控",
-                 "npu": "NPU", "memory": "内存", "d": "派生分析"}
+    # grouping (including "derived analysis")
+    label_map = {"kpi": "KPI Performance", "cpu": "CPU Power/Freq/Thermal", "gpu": "GPU Monitoring",
+                 "npu": "NPU", "memory": "Memory", "d": "Derived Analysis"}
     groups = {}
     for m in metrics:
         groups.setdefault(label_map.get(m.split("_")[0], m.split("_")[0]), []).append(m)
 
-    # 单位表（供前端 fmt）
+    # unit table (for frontend fmt)
     units = {n: u for n, _, u in DERIVED}
     for k in prof["kpis"]:
         units[k["col"]] = k["unit"]
 
-    # 剔除整列空值的维度：只有存在非空取值的维度才最终落到透视 / HTML
+    # drop all-empty dimensions: only dimensions with at least one non-empty value reach the pivot / HTML
     effective_dims = [d for d in dims if any(r.get(d) not in (None, "") for r in records)]
     dim_values = {d: sorted({r[d] for r in records if r.get(d) not in (None, "")})
                   for d in effective_dims}
     conclusions = build_conclusions(records, metrics, prof, n_raw)
 
-    # 输出 records 时去掉内部字段
+    # strip internal fields when outputting records
     clean = []
     for r in records:
         clean.append({k: v for k, v in r.items() if not k.startswith("_")})
@@ -517,9 +517,9 @@ def main():
     inp = sys.argv[1] if len(sys.argv) > 1 else "windowed_metric_medians.csv"
     prof = sys.argv[2] if len(sys.argv) > 2 else None
     if not os.path.exists(inp):
-        raise SystemExit("找不到输入文件: " + inp)
+        raise SystemExit("Input file not found: " + inp)
     res = enrich(inp, prof)
-    print("profile = %s | %d 原始行 -> %d config | %d 指标(含%d派生) | %d 条结论" % (
+    print("profile = %s | %d raw rows -> %d config | %d metrics (incl. %d derived) | %d conclusions" % (
         res["profile"]["name"], res["n_raw"], len(res["data"]),
         len(res["metrics"]), len(DERIVED), len(res["conclusions"])))
     print("-" * 70)
@@ -527,16 +527,16 @@ def main():
     for c in res["conclusions"]:
         if c["category"] != cat:
             cat = c["category"]
-            print("\n【%s】" % cat)
+            print("\n[%s]" % cat)
         print("  %s %s" % (SEV_MARK.get(c["severity"], "·"), c["title"]))
         if c["detail"]:
             print("      %s" % c["detail"])
         if c["panels"]:
-            print("      面板×%d" % len(c["panels"]))
+            print("      panels x%d" % len(c["panels"]))
     out = os.path.join(os.path.dirname(os.path.abspath(inp)), "conclusions.json")
     with open(out, "w") as f:
         json.dump({"profile": res["profile"], "conclusions": res["conclusions"]}, f, ensure_ascii=False, indent=2)
-    print("\n已写出:", out)
+    print("\nWritten:", out)
 
 
 if __name__ == "__main__":

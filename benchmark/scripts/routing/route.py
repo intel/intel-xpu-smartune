@@ -388,6 +388,32 @@ def _passthrough_bench_model_inputs(routes: List[Dict], models: List[Dict]) -> N
             _passthrough_model_input(route, model_input)
 
 
+def _requested_build_formats(build) -> List[str]:
+    """Split a route's `build` field ("int4" / "fp16,int4" / [..]) into formats."""
+    if isinstance(build, str):
+        return [v.strip() for v in build.split(',') if v.strip()]
+    if isinstance(build, (list, tuple)):
+        return [str(v).strip() for v in build if str(v).strip()]
+    return []
+
+
+def _filter_bench_routes_by_build(result: Dict) -> None:
+    """Keep only benchmark routes whose precision was requested via `build`.
+
+    A model dir can hold several built precisions (int4_ov, int8_ov, ...), but the
+    user only selected some via `build` in model_input. Match each route's
+    precision base (int4_ov -> int4) against the requested formats and drop the
+    rest so gen_wrapper generates scripts for exactly what was asked for.
+    """
+    kept = []
+    for route in result['routes']:
+        formats = _requested_build_formats(route.get('build'))
+        precision = route.get('parameters', {}).get('precision', '')
+        if not formats or not precision or precision.split('_', 1)[0] in formats:
+            kept.append(route)
+    result['routes'] = kept
+
+
 def route_benchmark_from_dir(models_dir: str,
                              allowed_safe_names: Optional[set] = None) -> Dict:
     """
@@ -606,6 +632,9 @@ def main():
         # benchmark routes: every non-id/type model_input field (args, ...) lands
         # on the route top-level, where gen_wrapper.py reads it.
         _passthrough_bench_model_inputs(result['routes'], models)
+        # User selected specific precisions via `build`; drop the other precisions
+        # that also exist in the IR tree so gen_wrapper only sees what was asked.
+        _filter_bench_routes_by_build(result)
     elif args.models_json:
         with open(args.models_json) as f:
             models = json.load(f).get('models', [])

@@ -36,6 +36,7 @@ import type {
   BenchEnvData,
   BenchJob,
   BenchModelsData,
+  BenchModelMemory,
   BenchPrecision,
   BenchMatrixData,
   BenchResultsData,
@@ -501,6 +502,15 @@ export const api = {
   // which is small enough to filter in the browser and saves a request per
   // keystroke. The server still accepts search/limit for other callers.
   getBenchModels: () => get<BenchModelsData>('/bench/models'),
+  // One model's weight/KV-cache footprint, computed on first request and cached
+  // server-side. The list is served without it (search_models --no-memory) so the
+  // tab loads fast; the drawer asks for a model's block the first time it opens.
+  // `memory` is null when the footprint is unavailable (offline, or unreadable
+  // config) -- the same "unknown" the UI already renders for a v1 cache.
+  getBenchModelMemory: (model: string) =>
+    get<{ model: string; memory: BenchModelMemory | null }>(
+      `/bench/models/memory?model=${encodeURIComponent(model)}`,
+    ),
   // A refusal comes back as a 200 with `reason` set -- not being able to search
   // is a state of the machine, not a failed request.
   refreshBenchModels: () =>

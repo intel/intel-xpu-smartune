@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 
 # Side venvs (one per pinned transformers version) live under the multi-version
 # env tree that uv_build_envs.sh builds -- PYENV_VERSION_DIR in
-# configs/global_vars.sh, i.e. ${DIR_ENV_ROOT}/.gen/multi_env/python_version.
+# env/global_vars.sh, i.e. ${DIR_ENV_ROOT}/.gen/multi_env/python_version.
 # SmarTune relocates DIR_ENV_ROOT away from /tmp; the fallback mirrors the shell
 # default for callers that did not source global_vars.sh.
 DEFAULT_PYTHON_VERSION_ROOT = os.environ.get(

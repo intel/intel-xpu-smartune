@@ -38,7 +38,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CMD="${1:-build}"
 ARG="${2:-}"
 set --
-source "${SCRIPT_DIR}/configs/global_vars.sh" >/dev/null 2>&1
+source "${SCRIPT_DIR}/env/global_vars.sh" >/dev/null 2>&1
 
 # ---- Version matrix (editable) ----
 # OV_VERSIONS is intentionally EMPTY: OpenVINO versions are no longer pre-built as

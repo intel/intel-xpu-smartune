@@ -7,7 +7,7 @@
 # carries two placeholders: the model-selection JSON and the stage to run. We
 # substitute those, write the result under the runtime tree (NOT into the vendor
 # drop -- BENCH_SRC_ROOT in the template is what lets the rendered script still
-# find configs/global_vars.sh), and hand it to the shared single-slot job manager.
+# find env/global_vars.sh), and hand it to the shared single-slot job manager.
 
 import json
 import re
@@ -198,6 +198,18 @@ def normalize_request(
             # requests that differ only in checkbox order render the same script.
             ordered = [p for p in VALID_PRECISIONS if p in requested]
             entry["build"] = ",".join(ordered)
+
+        # Benchmark device selection, always stamped onto the entry. This is the
+        # only channel now -- there is no BENCH_DEVICES env fallback in gen_wrapper
+        # anymore -- so the field must be present on every entry: it travels
+        # models_input.json -> route.py's passthrough -> gen_wrapper's _device_loop.
+        # A per-model `device` narrows this model to a subset; absent, it inherits
+        # the run-wide selection.
+        device = item.get("device")
+        entry["device"] = (
+            normalize_devices(device, stage) if device is not None
+            else list(picked_devices)
+        )
 
         # Optional free-form extra arguments, appended to every benchmark run_case
         # for this model (see gen_wrapper.py). Kept on the model input JSON entry
@@ -550,11 +562,12 @@ def start_run(
     # both ways rather than only for the single case, so the values a group does
     # not pin are still the request's rather than absent.
     extra_env = {"BENCH_RUN_NAME": run_name}
-    # Read by gen_wrapper.py when it emits each case wrapper's device loop. Only
-    # the benchmark stage has devices to sweep; a build fetches weights, which
-    # are the same file whatever runs them.
+    # Devices are no longer passed through the environment: each model entry in
+    # models_input.json carries its own `device`, which route.py forwards onto the
+    # route and gen_wrapper reads per case. Only the OpenVINO version still rides
+    # the env, since run_template.sh (not the generator) is what consumes it. Only
+    # the benchmark stage needs it; a build fetches weights with the `hf` CLI.
     if stage in ("benchmark", "all"):
-        extra_env["BENCH_DEVICES"] = " ".join(devices)
         # run_template.sh reads this to build (on demand) and activate the chosen
         # OpenVINO column for this run's process. normalize_ov guaranteed it is a
         # valid X.Y.Z for these stages.

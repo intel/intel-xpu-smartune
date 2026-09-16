@@ -58,6 +58,16 @@ _REPORT_NAMES = ("pivot_report.html", "report.html")
 # Written by benchmark/scripts/analysis/export_windowed_metric_medians.py.
 _MEDIANS_NAME = "windowed_metric_medians.csv"
 
+# What a run was measured with, written by run_template.sh into each run
+# directory it produced (from BENCH_RUN_META, which runner.py renders per group).
+#
+# Nothing else in the tree records it. The OpenVINO version is chosen per run and
+# is the one thing about a run that cannot be recovered afterwards from its
+# artifacts -- not from the directory name, not from summary.tsv, not from the
+# medians CSV -- and a comparison between two jobs is meaningless without it.
+# Absent for every run measured before this file existed, which reads as unknown.
+_RUN_META_NAME = "run_meta.json"
+
 # The pivot report's machine-readable half, written next to the HTML. Carries the
 # same cases as the medians CSV plus the derived comparisons (speedup vs CPU,
 # performance per watt, ...) already computed across the whole backend -- which is
@@ -426,6 +436,27 @@ def _read_dimensions(run_dir: Path) -> Dict[str, Dict[str, str]]:
     ])
 
 
+def _run_meta(run_dir: Path) -> dict:
+    """What this run was asked for: its OpenVINO version and devices.
+
+    Read from the run directory only, never from the backend directory above it
+    (unlike every other artifact here): it describes one run, and the directory
+    above holds all of them. An unreadable or oddly-shaped file is treated as
+    absent -- this is decoration on a results row, not something worth failing a
+    whole reading of the tree over.
+    """
+    path = run_dir / _RUN_META_NAME
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError) as exc:
+        logger.warning(f"Unreadable benchmark run metadata {path}: {exc}")
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _pivot_payload(run_dir: Path) -> dict:
     """pivot_report.json for this run's backend, or an empty mapping."""
     path = _artifact(run_dir, _PIVOT_JSON_NAME)
@@ -687,9 +718,18 @@ def collect(backend: Optional[str] = None) -> dict:
                 run_dir.name,
                 (r.get("dimensions", {}).get("device") or r.get("device") or "" for r in rows),
             )
+            meta = _run_meta(run_dir)
             runs.append({
                 "backend": name,
                 "run": run_dir.name,
+                # What this run was measured with, when it recorded it. The
+                # OpenVINO version is the interesting half: one press of Run can
+                # now sweep several of them (one per model), so it is no longer
+                # implied by the job.
+                "ov": str(meta.get("ov") or "") or None,
+                "devices_requested": [
+                    str(d) for d in (meta.get("devices") or []) if str(d)
+                ],
                 # Which invocation produced this directory. Several run
                 # directories -- one per device -- share one job.
                 "job": job,
@@ -770,6 +810,11 @@ def matrix(backend: Optional[str] = None) -> dict:
                 # folds by; `run` remains the directory, i.e. one device of it.
                 "job": run["job"],
                 "job_started_at": run["job_started_at"],
+                # The OpenVINO version this case was measured against, or null
+                # for a run made before run_meta.json was written. Null is shown
+                # as unknown rather than guessed: the tree holds no other trace
+                # of it.
+                "ov": run["ov"],
                 # When the run that produced this case last wrote its summary.
                 # The run directory name is timestamped by runner.py and would
                 # usually sort the same way, but it is a name, not a clock: a
@@ -817,6 +862,10 @@ def matrix(backend: Optional[str] = None) -> dict:
             "backends": axis("backend"),
             "runs": axis("run"),
             "jobs": jobs,
+            # Only the versions actually recorded. A tree measured entirely
+            # before run_meta.json existed offers no choice here rather than an
+            # "unknown" one -- there is nothing to narrow to.
+            "ovs": sorted({r["ov"] for r in rows if r["ov"]}),
         },
         "metrics": _sorted_metric_meta(metric_keys),
         "primary_metric": data["primary_metric"],
@@ -880,10 +929,19 @@ _AGGREGATOR_PATH = env.SRC_ROOT / "scripts" / "analysis" / "export_windowed_metr
 # response from carrying an hour of samples that would land on a 700px chart.
 _TIMELINE_MAX_POINTS = 1500
 
-# A run directory as runner.py names it: "<timestamp>_<run_id>_<DEVICE>". The
-# run id is what ties it back to the sampling CSV -- the same derivation
-# run_template.sh does with sed when it re-aggregates an earlier run.
-_RUN_ID_RE = re.compile(r"^\d{8}_\d{6}_([0-9a-f]+)_[A-Za-z]+$")
+# A run directory as runner.py names it: "<timestamp>_<run_id>_<DEVICE>", or
+# "<timestamp>_<run_id>_g<n>_<DEVICE>" when one press of Run split into several
+# groups (one per OpenVINO version / device set). The run id is what ties it
+# back to the sampling CSV -- the same derivation run_template.sh does with sed
+# when it re-aggregates an earlier run.
+#
+# The group suffix has to be optional rather than ignored: all of a run's groups
+# share one run id and therefore one sampling CSV, which is correct -- they run
+# in sequence under a single sampler thread, and each case is sliced out of it by
+# timestamp. Without the "_g<n>" branch every multi-group run looked like it had
+# no samples at all, while its medians -- aggregated in-run from the same CSV,
+# passed by path rather than looked up -- were there the whole time.
+_RUN_ID_RE = re.compile(r"^\d{8}_\d{6}_([0-9a-f]+)(?:_g\d+)?_[A-Za-z]+$")
 
 _aggregator = None
 
@@ -1095,3 +1153,61 @@ def delete_cases(case_dirs: Sequence[str]) -> dict:
     count = sum(len(cases) for cases in removed.values())
     logger.info(f"Deleted {count} benchmark case(s), {runs_removed} run directory(ies)")
     return {"removed": count, "runs_removed": runs_removed, "skipped": skipped}
+
+
+def delete_job(job: str) -> dict:
+    """Remove every run directory one press of Run produced.
+
+    Whole directories, not the case list `delete_cases` would take: a job is
+    "<job>_CPU", "<job>_GPU", "<job>_NPU", and everything in them belongs to
+    that one invocation -- including a failed case that never wrote a log_file
+    and therefore has no case directory to name. Going through delete_cases
+    would leave exactly those behind, as a run directory holding a summary row
+    with no numbers, which is the shape of a job the user just deleted.
+
+    The job name comes from the browser, so it is matched against the names the
+    tree actually holds rather than joined onto a path: an argument of "../.."
+    matches nothing. Skipped directories are reported rather than raised, for
+    the same reason delete_cases reports them -- three of four removed is a
+    better outcome than none.
+    """
+    wanted = str(job or "").strip()
+    if not wanted:
+        return {"job": job, "removed_runs": 0, "removed_cases": 0, "skipped": []}
+
+    root = env.paths()["benchmarks"]
+    removed_runs = 0
+    removed_cases = 0
+    skipped: List[str] = []
+    for name in BACKENDS:
+        backend_dir = root / name
+        if not backend_dir.is_dir():
+            continue
+        for run_dir in sorted(backend_dir.iterdir()):
+            if not run_dir.is_dir() or _job_name(run_dir.name, ()) != wanted:
+                continue
+            # Case directories only for the count -- summary.tsv goes with the
+            # directory, so there is nothing to rewrite.
+            cases = sum(
+                1 for child in run_dir.iterdir()
+                if child.is_dir() and not child.name.startswith(".")
+            )
+            try:
+                shutil.rmtree(run_dir)
+            except OSError as exc:
+                logger.warning(f"Could not remove benchmark run {run_dir}: {exc}")
+                skipped.append(run_dir.name)
+                continue
+            removed_runs += 1
+            removed_cases += cases
+
+    logger.info(
+        f"Deleted benchmark job {wanted}: {removed_runs} run directory(ies), "
+        f"{removed_cases} case(s)"
+    )
+    return {
+        "job": wanted,
+        "removed_runs": removed_runs,
+        "removed_cases": removed_cases,
+        "skipped": skipped,
+    }

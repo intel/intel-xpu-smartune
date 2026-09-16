@@ -247,6 +247,69 @@ def post_models_refresh():
     )
 
 
+@bench_bp.route('/models/local', methods=['DELETE'])
+def delete_model_local():
+    """Give back the disk one model's downloaded weights are holding.
+
+    Per precision, because that is how they were fetched: one directory each,
+    hundreds of megabytes to a couple of gigabytes, and keeping int4 while
+    dropping fp16 is the ordinary request. An absent `precisions` means all of
+    them.
+
+    The model is named by its HuggingFace id, not by a path -- models.delete_local
+    derives the directory the same way the download does and confines it to the
+    models root, so nothing the browser sends can point anywhere else.
+    """
+    body = request.get_json(silent=True) or {}
+    model = body.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return construct_response(
+            retcode=RetCode.ARGUMENT_ERROR, retmsg="model must be a non-empty string",
+        )
+    precisions = body.get("precisions")
+    if precisions is not None and not isinstance(precisions, list):
+        return construct_response(
+            retcode=RetCode.ARGUMENT_ERROR,
+            retmsg="precisions must be a list when given",
+        )
+
+    # A download or a benchmark in flight is reading exactly these files, and the
+    # single job slot means checking it here is checking all of them. The same
+    # 409 a rejected run gets, so the tab reports it the way it already does.
+    current = jobs.manager.current()
+    if current is not None:
+        return _busy_response(jobs.BenchBusy(current))
+
+    try:
+        data = models.delete_local(model, precisions)
+    except Exception:
+        logger.exception("Failed to delete downloaded model weights")
+        return construct_response(
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg="Failed to delete the downloaded weights",
+        )
+
+    if not data["removed"] and not data["skipped"]:
+        # Nothing by that name and precision. Not an error -- another tab may
+        # have removed it a moment ago -- but reporting "freed 0 bytes" as a
+        # success reads as a bug.
+        return construct_response(
+            data=data, retcode=RetCode.NOT_EXISTING,
+            retmsg=f"No downloaded weights found for {data['model']}",
+        )
+
+    # What a model has on disk is read per request, so every open tab has to ask
+    # again before its list is right.
+    events.publish_models()
+    return construct_response(
+        data=data,
+        retmsg=(f"Removed {', '.join(data['removed'])} weights for {data['model']}"
+                if data["removed"] else
+                f"Could not remove {', '.join(data['skipped'])} weights for "
+                f"{data['model']}"),
+    )
+
+
 # --- runs -----------------------------------------------------------------
 
 @bench_bp.route('/run', methods=['POST'])
@@ -482,6 +545,46 @@ def delete_results():
     return construct_response(
         data=data,
         retmsg=f"Removed {data['removed']} benchmark case(s)",
+    )
+
+
+@bench_bp.route('/results/job', methods=['DELETE'])
+def delete_results_job():
+    """Remove everything one press of Run produced.
+
+    The whole job rather than a list of cases: the Results tab lists by job, so
+    that is the unit the operator is looking at when they decide a run was not
+    worth keeping (a misconfigured host, a sweep started against the wrong
+    device). results.delete_job matches the name against the directories that
+    exist, so nothing the browser sends is joined onto a path.
+    """
+    body = request.get_json(silent=True) or {}
+    job = body.get("job")
+    if not isinstance(job, str) or not job.strip():
+        return construct_response(
+            retcode=RetCode.ARGUMENT_ERROR, retmsg="job must be a non-empty string",
+        )
+    try:
+        data = results.delete_job(job)
+    except Exception:
+        logger.exception("Failed to delete a benchmark job")
+        return construct_response(
+            retcode=RetCode.EXCEPTION_ERROR, retmsg="Failed to delete the benchmark job",
+        )
+    if data["removed_runs"] == 0 and not data["skipped"]:
+        # Nothing by that name. Not an error -- another tab may have removed it
+        # a moment ago -- but saying "removed 0" as a success reads as a bug.
+        return construct_response(
+            data=data, retcode=RetCode.NOT_EXISTING,
+            retmsg=f"No benchmark results found for job {job}",
+        )
+    events.publish_results()
+    return construct_response(
+        data=data,
+        retmsg=(
+            f"Removed {data['removed_cases']} case(s) in "
+            f"{data['removed_runs']} run directory(ies)"
+        ),
     )
 
 

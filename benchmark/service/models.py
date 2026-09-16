@@ -19,11 +19,14 @@
 
 import datetime
 import json
+import os
+import shutil
 import subprocess
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from utils.logger import logger
 
@@ -268,15 +271,41 @@ def _model_safe_name(model_id: str) -> str:
     return model_id.replace("/", "_").replace(".", "_")
 
 
-def _downloaded_index() -> Dict[str, Set[str]]:
-    """Weight formats already on disk, keyed by safe model name.
+def _dir_size(path: Path) -> int:
+    """Bytes held by everything under ``path``.
+
+    Per-file lstat rather than du: no subprocess, and a symlink is counted as the
+    link it is instead of the file it points at, so nothing is counted twice. An
+    entry that disappears mid-walk (a download being cleaned up) is skipped --
+    this figure exists to tell a 400 MB directory from a 2 GB one, and being off
+    by a file it could not read does not change that answer.
+    """
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda _exc: None):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _downloaded_index() -> Dict[str, Dict[str, int]]:
+    """Weight formats already on disk with their size, keyed by safe model name.
 
     build_download (benchmark/scripts/generators/gen_wrapper.py) downloads each
     conversion to <models>/<safe_name>/<format>_ov, so the directory layout is the
     record of what has been fetched. Read once per request and intersected with
     the model list, rather than stat-ing a path per model per precision.
+
+    The size is taken on the same pass. It is what makes the list usable for the
+    thing it is now also for -- deciding what to delete -- and one conversion is
+    hundreds of megabytes to a couple of gigabytes, so which one to remove is not
+    a question a count can answer. Walking every file of a full tree measures in
+    tens of milliseconds (800-odd files for 24 GB), which is well inside what a
+    list request can carry.
     """
-    index: Dict[str, Set[str]] = {}
+    index: Dict[str, Dict[str, int]] = {}
     models_dir = env.paths()["models"]
     try:
         model_dirs = list(models_dir.iterdir())
@@ -285,7 +314,7 @@ def _downloaded_index() -> Dict[str, Set[str]]:
     for model_dir in model_dirs:
         if not model_dir.is_dir():
             continue
-        formats = set()
+        formats: Dict[str, int] = {}
         try:
             entries = list(model_dir.iterdir())
         except OSError:
@@ -301,17 +330,21 @@ def _downloaded_index() -> Dict[str, Set[str]]:
                     continue
             except OSError:
                 continue
-            formats.add(entry.name[:-len("_ov")])
+            formats[entry.name[:-len("_ov")]] = _dir_size(entry)
         if formats:
             index[model_dir.name] = formats
     return index
 
 
-def _decorate(model: dict, downloaded: Dict[str, Set[str]]) -> dict:
+def _decorate(model: dict, downloaded: Dict[str, Dict[str, int]]) -> dict:
     """Attach what this deployment knows about a model that HuggingFace does not."""
-    have = downloaded.get(_model_safe_name(model["id"]), set())
+    have = downloaded.get(_model_safe_name(model["id"]), {})
     offered = {v.get("precision") for v in model["variants"] if v.get("precision")}
     model["local"] = {p: (p in have) for p in _PRECISIONS if p in have or p in offered}
+    # Only what is actually there: a precision that is offered but not downloaded
+    # has no size, and reporting it as 0 would read as "already here, costs
+    # nothing" in a list whose point is what is taking up the disk.
+    model["local_bytes"] = {p: have[p] for p in _PRECISIONS if p in have}
     model["precisions"] = [p for p in _PRECISIONS if p in offered]
     model["downloaded"] = bool(have)
     return model
@@ -371,3 +404,94 @@ def load(search: Optional[str] = None, limit: int = 0) -> dict:
         "total": total,
     })
     return state
+
+
+# --- deleting downloaded weights ------------------------------------------
+#
+# The one thing on this tab that takes real disk. A model is fetched once per
+# precision into its own directory, each of them hundreds of megabytes to a
+# couple of gigabytes, and nothing ever removed them -- a machine that has swept
+# a handful of models is tens of gigabytes down with no way back short of an ssh
+# session. So a precision can be given back, on its own: the three conversions of
+# one model are separate downloads of very different sizes, and "keep int4, drop
+# fp16" is the ordinary shape of the request.
+
+
+def delete_local(model_id: str, precisions: Optional[Sequence[str]] = None) -> dict:
+    """Remove downloaded weights for one model, by precision.
+
+    ``precisions`` empty or None means every format on disk for it. Unknown
+    formats are ignored rather than rejected: the caller is a browser holding a
+    list that may be a moment out of date, and the useful answer to "delete the
+    int4 that is no longer there" is that it is gone.
+
+    Nothing the caller sends is joined onto a path. The directory is derived from
+    the model id through _model_safe_name, exactly as the download does, and each
+    candidate is confined under the models root before it is touched -- so a
+    model id of "../../etc" resolves outside, matches nothing, and removes
+    nothing.
+    """
+    wanted_model = str(model_id or "").strip()
+    empty = {"model": wanted_model, "removed": [], "freed_bytes": 0, "skipped": []}
+    if not wanted_model:
+        return empty
+
+    root = env.paths()["models"].resolve()
+    model_dir = root / _model_safe_name(wanted_model)
+    try:
+        resolved_model = model_dir.resolve()
+        resolved_model.relative_to(root)
+    except (OSError, ValueError):
+        logger.warning(f"Rejected a model path outside {root}: {model_id}")
+        return empty
+    if not resolved_model.is_dir():
+        return empty
+
+    on_disk = _downloaded_index().get(resolved_model.name, {})
+    asked = [str(p).strip() for p in (precisions or []) if str(p).strip()]
+    targets = [p for p in _PRECISIONS if p in on_disk and (not asked or p in asked)]
+
+    removed: List[str] = []
+    skipped: List[str] = []
+    freed = 0
+    for precision in targets:
+        path = resolved_model / f"{precision}_ov"
+        try:
+            path.resolve().relative_to(root)
+        except (OSError, ValueError):
+            logger.warning(f"Rejected a weights path outside {root}: {path}")
+            skipped.append(precision)
+            continue
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            logger.warning(f"Could not remove {path}: {exc}")
+            skipped.append(precision)
+            continue
+        removed.append(precision)
+        # Measured before the removal, by the index read above -- there is
+        # nothing left to size afterwards.
+        freed += on_disk.get(precision, 0)
+
+    # The model's own directory goes with its last precision, so a model that has
+    # been fully cleaned up leaves nothing behind that a later read would report
+    # as still downloaded. Anything else in there (a stray log, a half-finished
+    # download) keeps it: this removes weights, not whatever else was put there.
+    if removed:
+        try:
+            if next(resolved_model.iterdir(), None) is None:
+                resolved_model.rmdir()
+        except OSError as exc:
+            logger.debug(f"Left {resolved_model} in place: {exc}")
+
+    if removed:
+        logger.info(
+            f"Deleted {', '.join(removed)} weights for {wanted_model} "
+            f"({freed / float(1 << 30):.2f} GiB)"
+        )
+    return {
+        "model": wanted_model,
+        "removed": removed,
+        "freed_bytes": freed,
+        "skipped": skipped,
+    }

@@ -4,10 +4,19 @@
 // Benchmark tab: browse the models that have an OpenVINO conversion, download
 // one, benchmark it, read the numbers.
 //
-// The page is a model browser (left) plus the selected model and its results
+// The page is a model browser (left) plus the models in play and their results
 // (right). The backend runs at most one job at a time -- setup and runs share a
 // single slot -- so there is no job list: there is what is running now, and
 // there are the results of everything that ran before.
+//
+// The models in play are a strip of tiles (BenchModelTiles), one per ticked
+// model, each carrying its own precisions, devices, OpenVINO version and extra
+// args; this component owns those settings and the drawer that edits them. They
+// used to be one global set, which could not express the thing the page exists
+// for -- this model as int4 on the NPU, that one as fp16 on the CPU. The server
+// takes them per model and groups the models that agree about the two the
+// pipeline cannot vary within one process (benchmark/service/runner.py,
+// run_groups), so a request that disagrees is still one press of Run.
 //
 // Nothing here polls. State arrives on the SSE stream App holds open
 // (hooks/useBenchEvents, benchmark/service/events.py): a snapshot on connect,
@@ -19,17 +28,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Card, Modal, Space, Tabs, Tag, Tooltip, Typography, message } from 'antd'
 import {
-  CheckCircleTwoTone,
-  CloudDownloadOutlined,
   LeftOutlined,
-  PlayCircleOutlined,
   RightOutlined,
+  StopOutlined,
   ToolOutlined,
 } from '@ant-design/icons'
 
 import { api } from '../api/client'
 import type {
-  BenchDevice,
   BenchEnvData,
   BenchJob,
   BenchLogDelta,
@@ -46,13 +52,16 @@ import { useBenchEvent } from '../hooks/useBenchEvents'
 import BenchCaseDrawer from './BenchCaseDrawer'
 import BenchCompare from './BenchCompare'
 import BenchEnvDrawer, { EnvStatusTag, versionSummary } from './BenchEnvDrawer'
-import BenchModelDetail, { applicablePrecisions, missingPrecisions } from './BenchModelDetail'
+import { applicablePrecisions, type ModelParams } from './BenchModelDetail'
+import BenchModelDeleteModal from './BenchModelDeleteModal'
+import BenchModelDrawer from './BenchModelDrawer'
 import BenchModelList, { type ModelFilter } from './BenchModelList'
+import BenchModelTiles from './BenchModelTiles'
 import BenchOutput, { JobStatusTag } from './BenchOutput'
 import BenchResults from './BenchResults'
 import BenchRerunModal, { type RerunConflict } from './BenchRerunModal'
 import { COLORS } from '../styles/theme'
-import { matchesModel } from '../utils/benchMetrics'
+import { formatBytes, matchesModel } from '../utils/benchMetrics'
 
 const { Text, Paragraph } = Typography
 
@@ -86,19 +95,24 @@ interface BenchmarkProps {
  * comparison goes through matchesModel rather than string equality. Failed
  * cases count: a case that ran and produced nothing is still a case on disk,
  * and it is the one most likely to be worth deleting before running again.
+ *
+ * Each model is judged against its own precisions and devices: the settings are
+ * per model now, so a global pair would report conflicts for combinations the
+ * run is not going to measure.
  */
 function findConflicts(
   rows: BenchMatrixRow[],
   ids: string[],
-  precisions: BenchPrecision[],
-  devices: BenchDevice[],
+  params: Record<string, ModelParams>,
 ): RerunConflict[] {
   const conflicts: RerunConflict[] = []
   for (const modelId of ids) {
+    const own = params[modelId]
+    if (!own) continue
     const forModel = rows.filter((row) => matchesModel(row.model, modelId))
     if (forModel.length === 0) continue
-    for (const precision of precisions) {
-      for (const device of devices) {
+    for (const precision of own.precisions) {
+      for (const device of own.devices) {
         const matching = forModel.filter(
           (row) => row.precision === precision && row.device === device,
         )
@@ -146,18 +160,42 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   const [filter, setFilter] = useState<ModelFilter>('all')
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [checkedIds, setCheckedIds] = useState<string[]>([])
-  const [precisions, setPrecisions] = useState<BenchPrecision[]>(['int4'])
-  // All three by default, which is what the pipeline swept before the request
-  // could name devices at all.
-  const [devices, setDevices] = useState<BenchDevice[]>(['cpu', 'gpu', 'npu'])
-  // The OpenVINO version a benchmark builds/runs against. Free text (a version
-  // not yet built is built on demand); seeded from the reference list once the
-  // environment arrives, and only if the user has not typed one.
-  const [ov, setOv] = useState<string>('')
-  // Free-form extra CLI arguments appended to every benchmark run_case. Applies
-  // to the whole run, like `ov` and the device selection; blank by default and
-  // ignored by a pure build/download.
-  const [args, setArgs] = useState<string>('')
+  // Which tiles the Download and Run buttons act on. A subset of checkedIds:
+  // ticking a model on the left brings it into play, ticking its tile says it
+  // is part of the next job -- which is what lets six models be lined up and
+  // two of them measured.
+  const [runIds, setRunIds] = useState<string[]>([])
+  // The model whose drawer is open, or null.
+  const [openModelId, setOpenModelId] = useState<string | null>(null)
+  // The model whose downloaded weights are being deleted, with the precisions
+  // the dialog opens ticked. Held here rather than in either of the two places
+  // that can ask for it -- the list row and the detail pane's tags -- so both
+  // open the same dialog.
+  const [deleting, setDeleting] = useState<
+    { id: string; precisions: BenchPrecision[] } | null
+  >(null)
+
+  // One set of run settings per model, keyed by id.
+  //
+  // These were four pieces of global state, shared by everything selected --
+  // which could not say "this model as int4 on the NPU, that one as fp16 on the
+  // CPU", the thing a page that runs several models at once is for. The
+  // precisions and extra args reach the pipeline on each model's own entry in
+  // the run request; the devices and the OpenVINO version are process-wide down
+  // there, so the server groups the models that agree about them and runs the
+  // groups in sequence (benchmark/service/runner.py, run_groups).
+  const [params, setParams] = useState<Record<string, ModelParams>>({})
+  // What a model gets when it is first ticked: the last settings the user chose,
+  // so a batch does not have to be configured one tile at a time. All three
+  // devices to begin with, which is what the pipeline swept before the request
+  // could name devices at all; the OpenVINO version is seeded once the
+  // environment says which ones are installed.
+  const [defaults, setDefaults] = useState<ModelParams>({
+    precisions: ['int4'],
+    devices: ['cpu', 'gpu', 'npu'],
+    ov: '',
+    args: '',
+  })
 
   const [job, setJob] = useState<BenchJob | null>(null)
   // Mirrors `job` for the log handler, which needs to know which job's log it is
@@ -194,61 +232,21 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
 
   const busy = job?.status === 'running' || !!env?.busy
   const installing = (env?.busy?.kind ?? (job?.status === 'running' ? job.kind : null)) === 'setup'
-  const selected = models.find((m) => m.id === selectedId) ?? null
 
-  // Which models get a detail pane: everything ticked, in list order, plus the
+  // Which models get a tile: everything ticked, in list order, plus the
   // highlighted row if it is not ticked. Clicking a row while a batch is ticked
   // must not hide the batch, and ticking must not lose the row being read.
-  const detailIds = useMemo(() => {
+  const tileIds = useMemo(() => {
     const checked = new Set(checkedIds)
     const ids = models.filter((m) => checked.has(m.id)).map((m) => m.id)
     // A ticked model that is no longer in the list (a refresh dropped it) still
-    // deserves its pane, so anything unaccounted for is appended.
+    // deserves its tile, so anything unaccounted for is appended.
     checkedIds.forEach((id) => {
       if (!ids.includes(id)) ids.push(id)
     })
     if (selectedId && !ids.includes(selectedId)) ids.push(selectedId)
     return ids
   }, [models, checkedIds, selectedId])
-
-  const activeDetailId =
-    selectedId && detailIds.includes(selectedId) ? selectedId : (detailIds[0] ?? null)
-
-  // "Download all" / "Run all" mean the same thing as a model's own two buttons,
-  // decided over the whole batch: the batch can be benchmarked only when every
-  // ticked model already has every ticked precision it offers. A model that is
-  // checked but no longer in the list counts as missing, which is why this
-  // compares lengths rather than just mapping.
-  //
-  // Per model rather than over the set, because what a model offers differs
-  // across the batch: int4 ticked alongside a model published only as fp16 is
-  // not work the batch is waiting on, and counting it kept Run all disabled on
-  // a batch that was ready (see applicablePrecisions).
-  const batchMissing = useMemo<BenchPrecision[]>(() => {
-    const checked = models.filter((m) => checkedIds.includes(m.id))
-    if (checked.length !== checkedIds.length) return precisions
-    const pending = new Set<BenchPrecision>()
-    checked.forEach((model) =>
-      missingPrecisions([model], applicablePrecisions(model, precisions)).forEach((p) =>
-        pending.add(p),
-      ),
-    )
-    return precisions.filter((p) => pending.has(p))
-  }, [models, checkedIds, precisions])
-
-  // The ticked models that have something to do at all. A model offering none
-  // of the ticked precisions contributes no cases, and a batch of nothing but
-  // those has no job in it -- so the two batch buttons go dead rather than
-  // starting a run that would be empty. A ticked id the list no longer holds is
-  // counted in: there is nothing to intersect against, and quietly dropping it
-  // would be worse than letting the server answer for it.
-  const batchSize = useMemo(() => {
-    const byId = new Map(models.map((m) => [m.id, m]))
-    return checkedIds.filter((id) => {
-      const model = byId.get(id)
-      return (model ? applicablePrecisions(model, precisions) : precisions).length > 0
-    }).length
-  }, [models, checkedIds, precisions])
 
   // The versions the dropdown offers, decided by the server, newest first;
   // ov_versions is the fallback for a service too old to send ov_choices.
@@ -257,18 +255,67 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     [env?.ov_choices, env?.ov_versions],
   )
 
-  // A benchmark no longer builds its own runtime, so this gates every Run
-  // button the same way the weights do.
-  const ovInstalled = (env?.ov_versions ?? []).includes(ov.trim())
-
-  // Seed the box once, while the user has not chosen: newest *installed* first,
-  // so a machine with a runtime lands on a selection Run can actually use.
+  // Seed the default OpenVINO version once, while the user has not chosen:
+  // newest *installed* first, so a machine with a runtime lands on a selection
+  // Run can actually use. Only the default -- a tile that already carries a
+  // version was set deliberately and is left alone.
   useEffect(() => {
-    if (ov) return
+    if (defaults.ov) return
     const installed = env?.ov_versions ?? []
-    if (installed.length) setOv(installed[0])
-    else if (ovOptions.length) setOv(ovOptions[0])
-  }, [ov, ovOptions, env?.ov_versions])
+    const seed = installed[0] ?? ovOptions[0]
+    if (seed) setDefaults((prev) => (prev.ov ? prev : { ...prev, ov: seed }))
+  }, [defaults.ov, ovOptions, env?.ov_versions])
+
+  // Give every tile settings, and forget the ones whose tile has gone.
+  //
+  // Derived from tileIds rather than set when a checkbox is clicked: a tile can
+  // also appear because a row was selected, or because a model was ticked
+  // before the list arrived, and a params entry missing for any of those is a
+  // tile with nothing to render.
+  useEffect(() => {
+    setParams((prev) => {
+      const next: Record<string, ModelParams> = {}
+      let changed = tileIds.length !== Object.keys(prev).length
+      tileIds.forEach((id) => {
+        next[id] = prev[id] ?? defaults
+        if (!prev[id]) changed = true
+      })
+      return changed ? next : prev
+    })
+  }, [tileIds, defaults])
+
+  // Settings for every tile, gaps filled. The effect above cannot be relied on
+  // for the render that first shows a tile -- effects run after it, so the tile
+  // would be asked to draw settings that do not exist yet.
+  const tileParams = useMemo(() => {
+    const filled: Record<string, ModelParams> = {}
+    tileIds.forEach((id) => {
+      filled[id] = params[id] ?? defaults
+    })
+    return filled
+  }, [tileIds, params, defaults])
+
+  // A new tile is ticked for the run: putting a model in play and then having to
+  // tick it again to act on it is two clicks for one intent. Unticking is
+  // remembered -- only ids that have never been seen are added.
+  const seenTiles = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    const fresh = tileIds.filter((id) => !seenTiles.current.has(id))
+    seenTiles.current = new Set(tileIds)
+    setRunIds((prev) => {
+      const kept = prev.filter((id) => tileIds.includes(id))
+      const added = fresh.filter((id) => !kept.includes(id))
+      if (!added.length && kept.length === prev.length) return prev
+      // In tile order, so the run request follows what is on screen.
+      return tileIds.filter((id) => kept.includes(id) || added.includes(id))
+    })
+  }, [tileIds])
+
+  /** Change one model's settings, and make them the default for the next tile. */
+  const changeParams = useCallback((id: string, next: ModelParams) => {
+    setParams((prev) => ({ ...prev, [id]: next }))
+    setDefaults(next)
+  }, [])
 
   // --- REST loads ---------------------------------------------------------
 
@@ -628,38 +675,51 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
       if (!ids.length) return
       setStarting(true)
       try {
-        // Extra args only mean anything to a benchmark case; a build never runs
-        // one, so leave them off that request entirely.
-        const extra = args.trim()
         const byId = new Map(models.map((m) => [m.id, m]))
-        // Each model is asked only for the precisions it actually offers. The
-        // tick list is global, so sending it verbatim asked a model published
-        // only as fp16/int8 for an int4 repo that does not exist -- a case that
-        // fails deep in the pipeline instead of never being generated. A model
-        // left with nothing to ask for drops out of the request; one the list no
-        // longer holds keeps the raw selection, there being nothing to narrow it
-        // against.
+        // Each model carries its own settings, and is asked only for the
+        // precisions it actually offers: sending a tick verbatim asked a model
+        // published only as fp16/int8 for an int4 repo that does not exist -- a
+        // case that fails deep in the pipeline instead of never being
+        // generated. A model left with nothing to ask for drops out of the
+        // request; one the list no longer holds keeps its raw selection, there
+        // being nothing to narrow it against.
+        //
+        // Devices and the runtime go per model too. The server groups the models
+        // that agree about them and runs the groups in sequence, which is what
+        // makes "this one on the NPU against 2025.3, that one on the CPU against
+        // 2025.2" one press of Run. Neither means anything to a build: it
+        // fetches weights, which are the same file whatever runs them.
         const payload = ids
           .map((id) => {
             const model = byId.get(id)
+            const own = params[id] ?? defaults
+            const extra = own.args.trim()
             return {
               id,
-              build: model ? applicablePrecisions(model, precisions) : precisions,
-              ...(stage !== 'build' && extra ? { args: extra } : {}),
+              build: model ? applicablePrecisions(model, own.precisions) : own.precisions,
+              ...(stage === 'build'
+                ? {}
+                : {
+                    devices: own.devices,
+                    ov: own.ov,
+                    ...(extra ? { args: extra } : {}),
+                  }),
             }
           })
           .filter((entry) => entry.build.length > 0)
         if (!payload.length) {
-          message.warning('None of the selected models offer the ticked precisions')
+          message.warning('None of the selected models offer the precisions they are set to')
           return
         }
-        // A build fetches weights, which are the same file whatever runs them;
-        // the device and OpenVINO selections are only about the benchmark stage.
+        // The request-level pair is what an entry that named neither falls back
+        // to, server-side. Every entry here names both for a benchmark, so this
+        // only decides what a service too old to read them uses.
+        const first = params[payload[0].id] ?? defaults
         const res = await api.startBenchRun(
           payload,
           stage,
-          stage === 'build' ? undefined : devices,
-          stage === 'build' ? undefined : ov,
+          stage === 'build' ? undefined : first.devices,
+          stage === 'build' ? undefined : first.ov,
         )
         if (res.status === 'conflict') {
           // Two different conflicts arrive on this path. A busy execution slot
@@ -693,7 +753,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         setStarting(false)
       }
     },
-    [args, devices, models, ov, precisions, showBlockedDialog],
+    [defaults, models, params, showBlockedDialog],
   )
 
   /**
@@ -708,16 +768,14 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     (stage: BenchStage, ids: string[]) => {
       if (!ids.length) return
       const conflicts =
-        stage === 'build'
-          ? []
-          : findConflicts(matrix?.rows ?? [], ids, precisions, devices)
+        stage === 'build' ? [] : findConflicts(matrix?.rows ?? [], ids, params)
       if (conflicts.length) {
         setRerun({ stage, ids, conflicts })
         return
       }
       void launchRun(stage, ids)
     },
-    [devices, launchRun, matrix?.rows, precisions],
+    [launchRun, matrix?.rows, params],
   )
 
   const keepAndRun = useCallback(() => {
@@ -772,12 +830,12 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   }, [env?.busy, job])
 
   /**
-   * Unticking a model closes its pane, including when it is the one being read.
+   * Unticking a model removes its tile, including when it is the one selected.
    *
-   * `detailIds` appends the highlighted row to the ticked set, so without this
-   * unticking the model whose row is selected left its pane on screen -- the
+   * `tileIds` appends the highlighted row to the ticked set, so without this
+   * unticking the model whose row is selected left its tile on screen -- the
    * checkbox appeared not to work. The selection moves to whatever is left
-   * rather than to nothing, so the pane area does not empty out mid-batch.
+   * rather than to nothing, so the strip does not empty out mid-batch.
    */
   const changeChecked = useCallback(
     (next: string[]) => {
@@ -789,14 +847,121 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     [checkedIds, selectedId],
   )
 
-  /** The X on a model's tab: the same as unticking it on the left. */
-  const closeDetail = useCallback(
+  /**
+   * Empty the selection: every tile, and the list's ticks with them.
+   *
+   * The highlighted row goes too. It is what puts a tile on screen for a model
+   * that was clicked rather than ticked, so leaving it would clear five tiles
+   * of six and look like the button had missed one. Each model's settings are
+   * dropped with its tile -- the last of them stays on as the default, so
+   * starting again does not start from scratch.
+   */
+  const clearSelection = useCallback(() => {
+    setCheckedIds([])
+    setRunIds([])
+    setSelectedId(null)
+    setOpenModelId(null)
+  }, [])
+
+  /** The X on a tile: the same as unticking the model on the left. */
+  const closeTile = useCallback(
     (id: string) => {
       const next = checkedIds.filter((checked) => checked !== id)
       setCheckedIds(next)
       if (selectedId === id) setSelectedId(next.length ? next[next.length - 1] : null)
+      // The tile is gone, so anything about it that is still on screen has to
+      // go with it.
+      setOpenModelId((open) => (open === id ? null : open))
     },
     [checkedIds, selectedId],
+  )
+
+  /**
+   * Remove one job's results, then re-read the tree.
+   *
+   * The server also announces the change on the stream, which is what updates
+   * every *other* open tab; this awaits its own read so the dialog's spinner
+   * lasts until the table it is over has actually changed.
+   */
+  const deleteJob = useCallback(
+    async (job: string) => {
+      try {
+        const { removed_cases, removed_runs, skipped } = await api.deleteBenchJob(job)
+        if (skipped.length) {
+          message.warning(
+            `Removed ${removed_cases} case(s); ${skipped.length} run directory(ies) could not be removed`,
+          )
+        } else {
+          message.success(
+            `Removed ${removed_cases} case${removed_cases === 1 ? '' : 's'} in ` +
+              `${removed_runs} run director${removed_runs === 1 ? 'y' : 'ies'}`,
+          )
+        }
+        await loadResults()
+      } catch (e) {
+        message.error(e instanceof Error ? e.message : String(e))
+        // Rethrown so the confirmation dialog stays open on a failure: the rows
+        // are still there, and closing it would look like the delete worked.
+        throw e
+      }
+    },
+    [loadResults],
+  )
+
+  const deleteCases = useCallback(
+    async (cases: string[]) => {
+      try {
+        const { removed, skipped } = await api.deleteBenchCases(cases)
+        if (skipped.length) {
+          message.warning(
+            `Removed ${removed} case(s); ${skipped.length} could not be removed`,
+          )
+        } else {
+          message.success(`Removed ${removed} case${removed === 1 ? '' : 's'}`)
+        }
+        await loadResults()
+      } catch (e) {
+        message.error(e instanceof Error ? e.message : String(e))
+        throw e
+      }
+    },
+    [loadResults],
+  )
+
+  /**
+   * Give back the disk one model's downloaded weights are holding.
+   *
+   * The server announces the change on the stream, which is what updates every
+   * other open tab; this awaits its own read so the dialog closes onto a list
+   * that has already lost the weights it just deleted. A failure leaves the
+   * dialog open with its selection, so the same delete can be retried -- 409 is
+   * the one that matters, and it means "a job started while you were reading
+   * this".
+   */
+  const deleteLocalWeights = useCallback(
+    async (model: BenchModel, precisions: BenchPrecision[]) => {
+      try {
+        const { removed, freed_bytes, skipped } = await api.deleteBenchModelLocal(
+          model.id,
+          precisions,
+        )
+        if (skipped.length) {
+          message.warning(
+            `Removed ${removed.join(', ') || 'nothing'}; ${skipped.join(', ')} could not be removed`,
+          )
+        } else {
+          message.success(
+            `Removed ${removed.join(', ')} weights for ${model.id} · freed ${formatBytes(freed_bytes)}`,
+          )
+        }
+        await loadModels()
+        setDeleting(null)
+      } catch (e) {
+        message.error(e instanceof Error ? e.message : String(e))
+        throw e
+      }
+    },
+    [loadModels],
   )
 
   const refreshModelList = useCallback(async () => {
@@ -856,6 +1021,9 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
             checkedIds={checkedIds}
             onCheckedChange={changeChecked}
             onRefreshList={() => void refreshModelList()}
+            // From a row, the question is about the model: every precision it
+            // has on disk arrives ticked, and the dialog is where it narrows.
+            onDeleteLocal={(model) => setDeleting({ id: model.id, precisions: [] })}
           />
         </div>
       ) : null}
@@ -943,68 +1111,17 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
             {/* The count is a fact, not an action. It used to be the label of the
                 button that acted on it, which made one control answer two
                 questions -- how many are picked, and what pressing it does. */}
-            {checkedIds.length > 0 ? (
+            {tileIds.length > 0 ? (
               <>
                 <Tag color="blue" style={{ marginInlineEnd: 0 }}>
-                  Selected {checkedIds.length}
+                  Selected {tileIds.length}
                 </Tag>
-                <Tooltip
-                  title={
-                    batchSize === 0
-                      ? precisions.length
-                        ? 'No selected model is published in the ticked precisions'
-                        : 'Tick a precision to download'
-                      : batchMissing.length
-                        ? `Fetch ${batchMissing.join(', ')} for every selected model, as one job`
-                        : 'Every selected model already has the ticked precisions; this fetches them again'
-                  }
-                >
-                  <Button
-                    size="small"
-                    type={batchMissing.length ? 'primary' : 'default'}
-                    icon={<CloudDownloadOutlined />}
-                    disabled={!env?.ready || busy || batchSize === 0}
-                    loading={starting}
-                    onClick={() => requestRun('build', checkedIds)}
-                  >
-                    Download all
-                  </Button>
-                </Tooltip>
-                <Tooltip
-                  title={
-                    batchSize === 0
-                      ? precisions.length
-                        ? 'No selected model is published in the ticked precisions'
-                        : 'Tick a precision to benchmark'
-                      : batchMissing.length
-                        ? `Download ${batchMissing.join(', ')} first`
-                        : devices.length === 0
-                          ? 'Pick at least one device to benchmark on'
-                          : !ov
-                            ? 'Pick an OpenVINO version to benchmark against'
-                            : !ovInstalled
-                              ? `The OpenVINO ${ov} runtime is not installed — install it first`
-                              : 'Benchmark every selected model, as one job'
-                  }
-                >
-                  <Button
-                    size="small"
-                    type="primary"
-                    icon={<PlayCircleOutlined />}
-                    disabled={
-                      !env?.ready ||
-                      busy ||
-                      batchSize === 0 ||
-                      devices.length === 0 ||
-                      !ovInstalled ||
-                      batchMissing.length > 0
-                    }
-                    loading={starting}
-                    // Never `all`: see BenchModelDetail's header for why a fetch
-                    // must not happen inside a measured run.
-                    onClick={() => requestRun('benchmark', checkedIds)}
-                  >
-                    Run all
+                {/* Empties the strip and the list's ticks. Nothing on disk is
+                    touched -- which is why it sits here, next to the count it
+                    resets, and not near the two buttons that do run things. */}
+                <Tooltip title="Clear the selection — nothing is downloaded, run or deleted">
+                  <Button size="small" type="text" onClick={clearSelection}>
+                    Clear
                   </Button>
                 </Tooltip>
               </>
@@ -1019,6 +1136,18 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
                 <Text type="secondary" style={{ fontSize: 12 }}>
                   {installing ? 'installing the environment' : 'job in progress'}
                 </Text>
+                {/* Next to what it stops. A model's own pane has the same
+                    button, but that one is now behind a tile's drawer -- and
+                    stopping the machine doing something should not require
+                    finding which model it is doing it for. */}
+                <Button
+                  size="small"
+                  danger
+                  icon={<StopOutlined />}
+                  onClick={() => void cancelJob()}
+                >
+                  Cancel
+                </Button>
               </Space>
             )}
             {/* Its own status is the label, so a glance at the corner answers
@@ -1036,82 +1165,26 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
             </Button>
           </div>
 
-          {/* With several models in play, each one keeps its own pane: the
-              precisions it offers and what is already downloaded differ per
-              model, and those are exactly the facts needed before running a
-              batch. One model needs no tab strip. */}
-          {detailIds.length > 1 ? (
-            <Tabs
-              // Editable only for the X: closing a model's pane is the same act
-              // as unticking it, and the tab strip is where the batch is in
-              // front of the user. There is nothing to add, so no add button.
-              type="editable-card"
-              hideAdd
-              size="small"
-              activeKey={activeDetailId ?? undefined}
-              onChange={setSelectedId}
-              onEdit={(key, action) => {
-                if (action === 'remove') closeDetail(String(key))
-              }}
-              items={detailIds.map((id) => {
-                const model = models.find((m) => m.id === id) ?? null
-                return {
-                  key: id,
-                  label: (
-                    <Space size={4}>
-                      {id.split('/').pop()}
-                      {model?.downloaded && <CheckCircleTwoTone twoToneColor="#52c41a" />}
-                    </Space>
-                  ),
-                  children: (
-                    <BenchModelDetail
-                      model={model}
-                      precisions={precisions}
-                      onPrecisionsChange={setPrecisions}
-                      devices={devices}
-                      onDevicesChange={setDevices}
-                      ov={ov}
-                      onOvChange={setOv}
-                      ovChoices={ovOptions}
-                      installedOvs={env?.ov_versions ?? []}
-                      onInstallOv={installOv}
-                      args={args}
-                      onArgsChange={setArgs}
-                      ready={!!env?.ready}
-                      busy={busy}
-                      probing={!!env?.probing}
-                      starting={starting}
-                      onRun={requestRun}
-                      onCancel={() => void cancelJob()}
-                      onOpenEnv={() => setEnvOpen(true)}
-                    />
-                  ),
-                }
-              })}
-            />
-          ) : (
-            <BenchModelDetail
-              model={selected}
-              precisions={precisions}
-              onPrecisionsChange={setPrecisions}
-              devices={devices}
-              onDevicesChange={setDevices}
-              ov={ov}
-              onOvChange={setOv}
-              ovChoices={ovOptions}
-              installedOvs={env?.ov_versions ?? []}
-              onInstallOv={installOv}
-              args={args}
-              onArgsChange={setArgs}
-              ready={!!env?.ready}
-              busy={busy}
-              probing={!!env?.probing}
-              starting={starting}
-              onRun={requestRun}
-              onCancel={() => void cancelJob()}
-              onOpenEnv={() => setEnvOpen(true)}
-            />
-          )}
+          {/* One tile per model in play, each carrying its own settings: what a
+              model offers, what is already downloaded, and what it is set to
+              run as all differ across a batch, and those are exactly the facts
+              needed before starting one. The full detail is in the drawer a
+              tile opens. */}
+          <BenchModelTiles
+            ids={tileIds}
+            models={models}
+            params={tileParams}
+            checked={runIds}
+            onCheckedChange={setRunIds}
+            onOpen={setOpenModelId}
+            onClose={closeTile}
+            installedOvs={env?.ov_versions ?? []}
+            ready={!!env?.ready}
+            busy={busy}
+            starting={starting}
+            onDownload={(ids) => requestRun('build', ids)}
+            onRun={(ids) => requestRun('benchmark', ids)}
+          />
 
           <Card size="small" styles={{ body: { paddingTop: 8 } }}>
             <Tabs
@@ -1127,6 +1200,8 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
                       matrix={matrix}
                       onRefresh={() => void loadResults()}
                       onOpenCase={openCase}
+                      onDeleteJob={deleteJob}
+                      onDeleteCases={deleteCases}
                     />
                   ),
                 },
@@ -1150,6 +1225,40 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
           </Card>
         </Space>
       </div>
+
+      {/* One model's detail and settings. Rendered whenever a tile has been
+          opened at least once, so the drawer animates shut rather than
+          disappearing -- and keyed on nothing, since the params it edits are
+          held here. */}
+      <BenchModelDrawer
+        open={!!openModelId}
+        model={models.find((m) => m.id === openModelId) ?? null}
+        params={(openModelId ? tileParams[openModelId] : undefined) ?? defaults}
+        onParamsChange={(next) => openModelId && changeParams(openModelId, next)}
+        onClose={() => setOpenModelId(null)}
+        ovChoices={ovOptions}
+        installedOvs={env?.ov_versions ?? []}
+        onInstallOv={installOv}
+        ready={!!env?.ready}
+        busy={busy}
+        probing={!!env?.probing}
+        onOpenEnv={() => setEnvOpen(true)}
+        // From a tag, the question is about that one conversion, so it is the
+        // only thing ticked; "delete all" in the same row passes none, which
+        // means everything.
+        onDeleteLocal={(model, precisions) => setDeleting({ id: model.id, precisions })}
+      />
+
+      {/* One dialog for both entry points. Keyed off the id rather than the
+          model object, so it follows the list through a reload instead of
+          holding the copy it was opened with. */}
+      <BenchModelDeleteModal
+        model={deleting ? models.find((m) => m.id === deleting.id) ?? null : null}
+        preselect={deleting?.precisions}
+        busy={busy}
+        onCancel={() => setDeleting(null)}
+        onConfirm={deleteLocalWeights}
+      />
 
       <BenchCaseDrawer
         open={caseOpen}
@@ -1175,8 +1284,10 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         installing={installing}
         onRefresh={() => void loadEnv()}
         // The drawer picks which runtime to install, opening on the version the
-        // tab is set to.
-        ov={ov}
+        // next tile would be set to -- there is no one version the tab is on any
+        // more, and the last one chosen is the best guess at the one being
+        // worked with.
+        ov={defaults.ov}
         ovChoices={ovOptions}
         onSetup={(version) => void startSetup(false, version)}
       />

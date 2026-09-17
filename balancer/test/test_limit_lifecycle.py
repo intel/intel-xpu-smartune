@@ -40,7 +40,7 @@ import balance_service as balance_service_mod  # noqa: E402
 import controller.app_intercept as app_intercept_mod  # noqa: E402
 from controller.app_intercept import AppIntercept  # noqa: E402
 from diagnostics import control_events, control_lifecycle  # noqa: E402
-from monitor.res_monitor import ResourceMonitor  # noqa: E402
+from monitor.res_monitor import ResourceMonitor, _is_identifiable_representative  # noqa: E402
 from balancer.balancer import (  # noqa: E402
     DynamicBalancer,
     LimitedApp,
@@ -339,6 +339,23 @@ class CandidateBatchOwnershipTests(unittest.TestCase):
         self.assertEqual(candidate['public_app_id'], 'optimum-cli')
 
 
+class AutoLimitRestoreFailureTests(unittest.TestCase):
+    """A failed auto-limit restore must remain retryable."""
+
+    def test_failed_restore_keeps_auto_limit_registered(self):
+        b = _balancer()
+        entry = _limited('session-8740.scope', cpu_mem=True)
+        b.all_limits.apps['session-8740.scope'] = entry
+
+        with mock.patch.object(b, '_restore_entry', return_value=False):
+            ok, message = b.restore_auto_limited('session-8740.scope')
+
+        self.assertFalse(ok)
+        self.assertEqual(message, 'Failed to restore resources for this app')
+        self.assertIs(b.all_limits.apps['session-8740.scope'], entry)
+        self.assertEqual(b.all_limits.list_exclusions(), [])
+
+
 class GoneTargetTests(unittest.TestCase):
     """A candidate is a snapshot; the app may have exited before we act on it."""
 
@@ -459,6 +476,76 @@ class GoneTargetTests(unittest.TestCase):
 
 class AutoToManualScopeTests(unittest.TestCase):
     """Taking control must retain exactly the cgroups Auto Control limited."""
+
+    def test_manual_limit_rejects_an_auto_limited_target_cgroup(self):
+        b = _balancer()
+        b.all_limits.apps['session-8740.scope'] = _limited('session-8740.scope', cpu_mem=True)
+        usage = {
+            'cgroup_paths': ['/user.slice/user-1000.slice/session-8740.scope'],
+            'pids': [111],
+        }
+
+        with mock.patch.object(balancer_mod.app_utils, 'get_app_resource_usage', return_value=usage), \
+                mock.patch.object(balancer_mod.app_utils, 'get_cgroup_path_by_pid', return_value=usage['cgroup_paths'][0]), \
+                mock.patch.object(b.control_manager, 'adjust_resources') as adjust, \
+                mock.patch.object(b.io_ctl, 'set_disk_io_throttle') as set_io:
+            result = b.set_resource_limit('optimum-app', 'optimum-cli', 'low')
+
+        self.assertIn('already auto-limited', result['skipped'])
+        adjust.assert_not_called()
+        set_io.assert_not_called()
+        self.assertEqual(b.all_limits.apps['session-8740.scope'].source, 'auto')
+
+    def test_manual_limit_rejects_an_extra_cgroup_of_an_auto_limit(self):
+        b = _balancer()
+        entry = _limited('primary.scope', cpu_mem=True)
+        entry.cgroups = ['primary.scope', 'session-8740.scope']
+        b.all_limits.apps['primary.scope'] = entry
+        usage = {
+            'cgroup_paths': ['/user.slice/user-1000.slice/session-8740.scope'],
+            'pids': [111],
+        }
+
+        with mock.patch.object(balancer_mod.app_utils, 'get_app_resource_usage', return_value=usage), \
+                mock.patch.object(balancer_mod.app_utils, 'get_cgroup_path_by_pid', return_value=usage['cgroup_paths'][0]), \
+                mock.patch.object(b.control_manager, 'adjust_resources') as adjust:
+            result = b.set_resource_limit('optimum-app', 'optimum-cli', 'low')
+
+        self.assertIn('session-8740.scope', result['skipped'])
+        adjust.assert_not_called()
+        self.assertIs(b.all_limits.apps['primary.scope'], entry)
+
+    def test_auto_limit_skips_a_manual_limited_target_cgroup(self):
+        b = _balancer()
+        entry = _limited('session-8740.scope', cpu_mem=True)
+        entry.source = 'manual'
+        b.all_limits.apps['session-8740.scope'] = entry
+        target = {
+            'app': {'name': 'optimum-cli'},
+            'process': {'name': 'optimum-cli'},
+            'extra_cgroups': [],
+        }
+
+        with mock.patch.object(b.control_manager, 'adjust_resources') as adjust, \
+                mock.patch.object(b.io_ctl, 'set_disk_io_throttle') as set_io:
+            b._apply_resource_limits(
+                target, 'session-8740.scope', {'cpu_rate': 0.3, 'mem_rate': 0.1},
+                is_controlled=True,
+            )
+
+        adjust.assert_not_called()
+        set_io.assert_not_called()
+        self.assertIs(b.all_limits.apps['session-8740.scope'], entry)
+
+    def test_bare_shell_yields_to_a_script_representative(self):
+        self.assertFalse(_is_identifiable_representative('bash', 'bash'))
+        self.assertTrue(_is_identifiable_representative(
+            'bash', 'bash /opt/tools/optimum-cli export openvino'))
+
+    def test_bare_python_yields_to_a_script_representative(self):
+        self.assertFalse(_is_identifiable_representative('python3', 'python3 -i'))
+        self.assertTrue(_is_identifiable_representative(
+            'python3', 'python3 /opt/workloads/run.py --fast'))
 
     def test_disk_candidate_uses_the_dominant_pid_not_an_arbitrary_scope_member(self):
         monitor = ResourceMonitor.__new__(ResourceMonitor)
@@ -714,7 +801,8 @@ class AutoToManualScopeTests(unittest.TestCase):
         entry.cgroups = ['bootstrap-one.scope', 'bootstrap-two.scope']
         b.all_limits.apps['bootstrap-one.scope'] = entry
 
-        with mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+        with mock.patch.object(balancer_mod, '_emit_control_events') as emit, \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
                 mock.patch.object(balancer_mod.app_utils, 'callback_manager'):
             ok, message = b.lock_to_manual('bootstrap.id')
 
@@ -723,6 +811,11 @@ class AutoToManualScopeTests(unittest.TestCase):
         self.assertEqual(snapshot['control_status'], 'MANUAL_LIMITED')
         self.assertTrue(snapshot['adopted_from_auto'])
         self.assertEqual(snapshot['cgroups'], ['bootstrap-one.scope', 'bootstrap-two.scope'])
+        self.assertEqual([call.args[0] for call in emit.call_args_list], ['RECOVERED', 'APPLIED'])
+        self.assertNotEqual(
+            emit.call_args_list[0].kwargs['protection_id'],
+            emit.call_args_list[1].kwargs['protection_id'],
+        )
 
     def test_adopt_auto_limit_marks_the_auto_cgroup_scope_for_the_dashboard(self):
         b = _balancer()
@@ -730,7 +823,8 @@ class AutoToManualScopeTests(unittest.TestCase):
         entry.cgroups = ['bootstrap-one.scope', 'bootstrap-two.scope']
         b.all_limits.apps['bootstrap-one.scope'] = entry
 
-        with mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+        with mock.patch.object(balancer_mod, '_emit_control_events') as emit, \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
                 mock.patch.object(balancer_mod.app_utils, 'callback_manager'):
             ok, message = b.adopt_auto_limit(
                 'bootstrap-one.scope', 'bootstrap.id', 'bootstrap', 'low')
@@ -740,6 +834,11 @@ class AutoToManualScopeTests(unittest.TestCase):
         self.assertEqual(snapshot['control_status'], 'MANUAL_LIMITED')
         self.assertTrue(snapshot['adopted_from_auto'])
         self.assertEqual(snapshot['cgroups'], ['bootstrap-one.scope', 'bootstrap-two.scope'])
+        self.assertEqual([call.args[0] for call in emit.call_args_list], ['RECOVERED', 'APPLIED'])
+        self.assertNotEqual(
+            emit.call_args_list[0].kwargs['protection_id'],
+            emit.call_args_list[1].kwargs['protection_id'],
+        )
 
 
 class SeparatedRestoreChannelTests(unittest.TestCase):

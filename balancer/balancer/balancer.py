@@ -5,6 +5,7 @@ import hashlib
 import json
 import os, signal, subprocess, time
 import psutil
+from functools import wraps
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -71,13 +72,42 @@ def _control_resources(parts: dict, resource_parts: dict) -> list:
 
 
 def _emit_control_events(action: str, parts: dict, *, app_id: str, app_name: str,
-                         protection_id: str, attributes: dict) -> None:
+                         protection_id: str, attributes: dict,
+                         control_mode: str = "auto") -> None:
     """Hand a completed limit action to diagnostics as neutral control facts."""
-    resource_parts = (attributes or {}).get("resource_parts") or {}
+    attributes = dict(attributes or {})
+    attributes.setdefault("control_mode", control_mode)
+    attributes.setdefault("priority", "undefined")
+    resource_parts = attributes.get("resource_parts") or {}
     record_control_action(
         action, app_id=app_id, app_name=app_name, protection_id=protection_id,
         resources=_control_resources(parts, resource_parts), facts=attributes,
     )
+
+
+def _emit_auto_handoff_recovery(entry: "LimitedApp") -> None:
+    """Close the auto lifecycle when its live caps become manual-owned."""
+    _emit_control_events(
+        "RECOVERED", entry.limit_parts, app_id=entry.public_app_id,
+        app_name=entry.app_name, protection_id=entry.protection_id,
+        attributes={
+            "app_name": entry.app_name,
+            "priority": entry.priority,
+            "limit_parts": dict(entry.limit_parts),
+            "resource_parts": entry.resource_parts,
+            "cgroups": entry.cgroups,
+            "handoff": "manual",
+        },
+    )
+
+
+def _serialized_limit_operation(operation):
+    """Keep cgroup ownership checks and writes in one atomic operation."""
+    @wraps(operation)
+    def guarded(self, *args, **kwargs):
+        with self.all_limits.operation_lock:
+            return operation(self, *args, **kwargs)
+    return guarded
 
 
 @dataclass
@@ -184,6 +214,7 @@ class LimitRegistry:
         self.is_limited_app_dominant: bool = False
         self.auto_limit_exclusions: "OrderedDict[str, dict]" = OrderedDict()
         self.lock = threading.RLock()
+        self.operation_lock = threading.RLock()
 
     # --- Query helpers (preserve the ordering semantics the callers rely on) ---
     def first_auto(self) -> "Optional[tuple[str, LimitedApp]]":
@@ -1530,7 +1561,8 @@ class DynamicBalancer:
 
         # Snapshot before restore_resources clears the entry's part flags and a
         # full restore may pop it.
-        recover_attrs = {"app_name": app_name, "limit_parts": dict(entry.limit_parts),
+        recover_attrs = {"app_name": app_name, "priority": entry.priority,
+                 "limit_parts": dict(entry.limit_parts),
                          "resource_parts": entry.resource_parts,
                          "cgroups": entry.cgroups, "pids": entry.pids}
         recover_app_id = entry.public_app_id or app_id
@@ -1746,11 +1778,13 @@ class DynamicBalancer:
                 "APPLIED", applied_parts, app_id=public_id, app_name=app_name,
                 protection_id=protection_id,
                 attributes={"app_name": app_name, "reason": limit_reason,
-                            "pressure_level": pressure_level, "limit_rates": limit_rates,
-                            "parts": parts, "resource_parts": resource_parts,
+                            "priority": priority, "pressure_level": pressure_level,
+                            "limit_rates": limit_rates,
+                            "parts": applied_parts, "resource_parts": resource_parts,
                             "cgroups": cgroups, "pids": pids},
             )
 
+    @_serialized_limit_operation
     def _apply_combined_critical_limits(
         self,
         target: dict,
@@ -1774,6 +1808,16 @@ class DynamicBalancer:
         total_mem = self.resource_monitor.get_total_memory()
         logger.info(f"Adjusting resources for app: {app_id}")
         extra_cgroup_ids = target.get('extra_cgroups', [])
+        manual_cgroups = [
+            cgroup_id for cgroup_id in [app_id] + list(extra_cgroup_ids)
+            if self.all_limits.by_any_id(cgroup_id, source="manual") is not None
+        ]
+        if manual_cgroups:
+            logger.info(
+                "Skipped auto limit for %s: cgroup(s) already manual-limited: %s",
+                app_name, ", ".join(manual_cgroups),
+            )
+            return
         per_cg_mem_rss = target.get('per_cgroup_mem_rss', {})
         per_cg_cpu = target.get('per_cgroup_cpu', {})
 
@@ -2115,6 +2159,7 @@ class DynamicBalancer:
             logger.warning(f"[disk-io] could not read stressed disks: {e}")
             return []
 
+    @_serialized_limit_operation
     def _apply_resource_limits(self, target_app, app_id, limit_rates, is_controlled,
                                is_disk_io_stressed=False, pressure_level=""):
         """Apply resource limits (common logic).
@@ -2131,6 +2176,16 @@ class DynamicBalancer:
         logger.info(f"Adjusting resources for app: {app_id}")
 
         extra_cgroup_ids = target_app.get('extra_cgroups', [])
+        manual_cgroups = [
+            cgroup_id for cgroup_id in [app_id] + list(extra_cgroup_ids)
+            if self.all_limits.by_any_id(cgroup_id, source="manual") is not None
+        ]
+        if manual_cgroups:
+            logger.info(
+                "Skipped auto limit for %s: cgroup(s) already manual-limited: %s",
+                app_name, ", ".join(manual_cgroups),
+            )
+            return
         per_cg_mem_rss = target_app.get('per_cgroup_mem_rss', {})
         per_cg_cpu = target_app.get('per_cgroup_cpu', {})
 
@@ -2673,14 +2728,14 @@ class DynamicBalancer:
                 "RECOVERED", restored_parts, app_id=entry.public_app_id,
                 app_name=app_name, protection_id=entry.protection_id,
                 attributes={"app_name": app_name, "limit_parts": entry.limit_parts,
-                            "resource_parts": entry.resource_parts,
+                            "priority": entry.priority, "resource_parts": entry.resource_parts,
                             "cgroups": entry.cgroups, "pids": entry.pids},
             )
             _emit_control_events(
                 "FAILED", failed_parts, app_id=entry.public_app_id,
                 app_name=app_name, protection_id=entry.protection_id,
                 attributes={"app_name": app_name, "limit_parts": entry.limit_parts,
-                            "resource_parts": entry.resource_parts,
+                            "priority": entry.priority, "resource_parts": entry.resource_parts,
                             "cgroups": entry.cgroups, "pids": entry.pids},
             )
 
@@ -3180,6 +3235,7 @@ class DynamicBalancer:
         logger.debug(f"Priority '{priority}' limit rates: {result}")
         return result
 
+    @_serialized_limit_operation
     def set_resource_limit(
             self,
             app_id: str,
@@ -3236,6 +3292,22 @@ class DynamicBalancer:
 
         effective_app_id = effective_app_ids[0]   # primary (lexicographically smallest cgroup)
         extra_effective_ids = effective_app_ids[1:]
+
+        with self.all_limits.lock:
+            auto_limited_cgroups = [
+                cgroup_id for cgroup_id in effective_app_ids
+                if (found := self.all_limits.by_any_id(cgroup_id, source="auto")) is not None
+                and (entry := found[1]) is not None
+                and entry.source == "auto"
+            ]
+        if auto_limited_cgroups:
+            cgroups = ", ".join(auto_limited_cgroups)
+            reason = (
+                f"{app_name} is already auto-limited in cgroup(s): {cgroups}. "
+                "Restore the auto limit or use Take Control before applying a manual limit."
+            )
+            logger.warning(reason)
+            return {"skipped": reason}
 
         # Snapshot only PIDs that belong to the selected effective cgroups.
         # This drives per-row limit-status rendering in the dashboard; if we
@@ -3391,11 +3463,6 @@ class DynamicBalancer:
                 self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
         with self.all_limits.lock:
-            existing = self.all_limits.apps.get(effective_app_id)
-            if existing is not None and existing.source == "auto":
-                self.all_limits.apps.pop(effective_app_id, None)
-                logger.info(f"Removed {app_name} from auto-limited apps (now manually limited)")
-
             if resource_limited or io_limited:
                 limited_at = time.time()
                 self.all_limits.apps[effective_app_id] = LimitedApp(
@@ -3443,21 +3510,29 @@ class DynamicBalancer:
                     "APPLIED", self.all_limits.apps[effective_app_id].limit_parts,
                     app_id=app_id, app_name=app_name,
                     protection_id=self.all_limits.apps[effective_app_id].protection_id,
+                    # limit_rates carries the *actual* applied caps (same field the
+                    # auto path emits) so the dashboard shows real numbers per
+                    # resource; limit_overrides is the user's config intent, kept
+                    # for audit but hidden from the human detail view.
                     attributes={"app_name": app_name, "priority": priority,
+                                "limit_rates": limit_rates,
                                 "limit_overrides": limit_overrides,
+                                "parts": self.all_limits.apps[effective_app_id].limit_parts,
                                 "resource_parts": {'cpu': cpu_quota is not None, 'memory': mem_high is not None},
                                 "cgroups": [effective_app_id] + list(extra_effective_ids),
                                 "pids": selected_scope_pids},
+                    control_mode="manual",
                 )
                 _emit_control_events(
                     "FAILED",
-                    {part: attempted and not self.all_limits.apps[effective_app_id].limit_parts.get(part)
+                    {part: attempted and not {'cpu_mem_limited': resource_limited, 'io_limited': io_limited}.get(part)
                      for part, attempted in attempted_parts.items()},
                     app_id=app_id, app_name=app_name,
                     protection_id=self.all_limits.apps[effective_app_id].protection_id,
                     attributes={"app_name": app_name, "priority": priority,
                                 "resource_parts": {'cpu': cpu_quota is not None, 'memory': mem_high is not None},
                                 "limit_overrides": limit_overrides},
+                    control_mode="manual",
                 )
                 return True
 
@@ -3467,6 +3542,7 @@ class DynamicBalancer:
             protection_id=_protection_id("manual", app_id, effective_app_id, failed_at),
             attributes={"app_name": app_name, "priority": priority,
                         "limit_overrides": limit_overrides},
+            control_mode="manual",
         )
         logger.warning(f"No resource limits successfully applied for {app_name}")
         return False
@@ -3493,6 +3569,7 @@ class DynamicBalancer:
                 limit_parts = entry.limit_parts
                 protection_id = entry.protection_id
                 resource_parts = entry.resource_parts
+                priority = entry.priority
                 self.all_limits.apps.pop(effective_app_id, None)
                 # The user gave the app back; drop the "manual_limit" exemption so the
                 # pressure loop may manage it again.
@@ -3504,6 +3581,7 @@ class DynamicBalancer:
                 app_name, limit_parts = None, {}
                 protection_id = ""
                 resource_parts = {}
+                priority = "undefined"
 
         effective_app_id = effective_app_ids[0]
         extra_effective_ids = effective_app_ids[1:]
@@ -3546,13 +3624,15 @@ class DynamicBalancer:
                 "RECOVERED", restored_parts, app_id=app_id, app_name=app_name or app_id,
                 protection_id=protection_id,
                 attributes={"app_name": app_name, "limit_parts": limit_parts,
-                            "resource_parts": resource_parts},
+                            "priority": priority, "resource_parts": resource_parts},
+                control_mode="manual",
             )
             _emit_control_events(
                 "FAILED", failed_parts, app_id=app_id, app_name=app_name or app_id,
                 protection_id=protection_id,
                 attributes={"app_name": app_name, "limit_parts": limit_parts,
-                            "resource_parts": resource_parts},
+                            "priority": priority, "resource_parts": resource_parts},
+                control_mode="manual",
             )
 
             return restore_success
@@ -3639,6 +3719,16 @@ class DynamicBalancer:
             }
             snapshot.update(self._entry_control_view(entry))
             return snapshot
+
+    def inspect_interrupted_limit(self, cgroups: list) -> dict:
+        """Return the live kernel state for an interrupted control lifecycle."""
+        resources = set()
+        for cgroup in cgroups or []:
+            result = self.control_manager.controller.inspect_cgroup_limits(cgroup)
+            if not result.get("available"):
+                return {"available": False, "resources": []}
+            resources.update(result.get("resources") or [])
+        return {"available": True, "resources": sorted(resources)}
 
     def get_auto_limited_apps(self) -> dict:
         """Every app the pressure loop currently holds a limit on, for the UI.
@@ -3731,8 +3821,18 @@ class DynamicBalancer:
             if found is None:
                 return False, "No auto-limited app found for this id"
             key, entry = found
-            self.all_limits.apps.pop(key, None)
-            self.all_limits.manual_limit_baseline.pop(key, None)
+
+        restored = self._restore_entry(
+            entry, notify=True, notify_status="auto_limit_restored_by_user")
+        if not restored:
+            return False, "Failed to restore resources for this app"
+
+        with self.all_limits.lock:
+            # Retain the entry until cgroup restoration succeeds. Otherwise a transient
+            # write failure leaves a live throttle with no registry entry to retry.
+            if self.all_limits.apps.get(key) is entry:
+                self.all_limits.apps.pop(key, None)
+                self.all_limits.manual_limit_baseline.pop(key, None)
             record = self.all_limits.add_exclusion(entry) if exclude else None
 
         if record is not None:
@@ -3740,11 +3840,6 @@ class DynamicBalancer:
                 "User restored auto-limited app %r (%s); excluded from auto-limit as %s",
                 entry.app_name, entry.public_app_id, record["key"],
             )
-
-        restored = self._restore_entry(
-            entry, notify=True, notify_status="auto_limit_restored_by_user")
-        if not restored:
-            return False, "Failed to restore resources for this app"
 
         # Mirrors the manual restore path: the app we were discounting PSI for is no
         # longer limited, so the dominant-app flag must not outlive it.
@@ -3796,15 +3891,24 @@ class DynamicBalancer:
                     return False, "Take this app under control first, then lock it to manual"
                 entry.is_controlled = True
                 entry.public_app_id = app_id
+            _emit_auto_handoff_recovery(entry)
             # Flip ownership in place; the cgroup caps are deliberately untouched.
             entry.source = "manual"
             entry.state = None
             entry.adopted_from_auto = True
+            entry.limited_at = time.time()
+            entry.protection_id = _protection_id(
+                "manual", entry.public_app_id, _key, entry.limited_at)
             # Keep it out of the auto candidate pool for this run of the service, so
             # the pressure loop never re-grabs an app the operator now owns.
             record = self.all_limits.add_exclusion(entry, reason="manual_limit")
             public_id = entry.public_app_id
             app_name = entry.app_name
+            protection_id = entry.protection_id
+            limit_parts = entry.limit_parts.copy()
+            resource_parts = entry.resource_parts.copy()
+            cgroups = list(entry.cgroups)
+            priority = entry.priority
 
         app_utils.update_app_status(public_id, "a_limited")
         app_utils.callback_manager.send_callback_notification({
@@ -3816,6 +3920,14 @@ class DynamicBalancer:
         logger.info(
             "Locked auto-limited app %r (%s) to manual; cgroup untouched, excluded as %s",
             app_name, public_id, record["key"],
+        )
+        _emit_control_events(
+            "APPLIED", limit_parts, app_id=public_id, app_name=app_name,
+            protection_id=protection_id,
+            attributes={"app_name": app_name, "priority": priority,
+                        "resource_parts": resource_parts,
+                        "cgroups": cgroups, "handoff": "auto"},
+            control_mode="manual",
         )
         return True, "Locked to manual"
 
@@ -3888,13 +4000,21 @@ class DynamicBalancer:
                 entry.app_name = new_app_name
             if priority:
                 entry.priority = priority
+            _emit_auto_handoff_recovery(entry)
             # Hand ownership to manual in the same atomic step (see docstring): flip the
             # source and exclude it from the auto candidate pool. add_exclusion keys off
             # is_controlled/public_app_id, so it must run after the re-tag above.
             entry.source = "manual"
             entry.state = None
             entry.adopted_from_auto = True
+            entry.limited_at = time.time()
+            entry.protection_id = _protection_id("manual", new_app_id, key, entry.limited_at)
             self.all_limits.add_exclusion(entry, reason="manual_limit")
+            protection_id = entry.protection_id
+            limit_parts = entry.limit_parts.copy()
+            resource_parts = entry.resource_parts.copy()
+            cgroups = list(entry.cgroups)
+            entry_priority = entry.priority
 
         app_utils.update_app_status(new_app_id, "a_limited")
         app_utils.callback_manager.send_callback_notification({
@@ -3907,6 +4027,15 @@ class DynamicBalancer:
             "Adopted auto-limit %r into controlled app %s as a manual limit; "
             "cgroup and key untouched, excluded from auto",
             key, new_app_id,
+        )
+        _emit_control_events(
+            "APPLIED", limit_parts, app_id=new_app_id,
+            app_name=new_app_name or entry.app_name, protection_id=protection_id,
+            attributes={"app_name": new_app_name or entry.app_name,
+                        "priority": entry_priority,
+                        "resource_parts": resource_parts, "cgroups": cgroups,
+                        "handoff": "auto"},
+            control_mode="manual",
         )
         return True, "Adopted"
 

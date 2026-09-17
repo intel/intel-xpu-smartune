@@ -10,6 +10,8 @@ import {
   Drawer,
   Empty,
   Input,
+  message,
+  Modal,
   Row,
   Segmented,
   Select,
@@ -19,7 +21,7 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import { LineChartOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
+import { LineChartOutlined, ReloadOutlined, RollbackOutlined, SearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import {
   CartesianGrid,
@@ -42,6 +44,7 @@ import type {
   DiagLogRecord,
   DiagMonitorSample,
   DiagSeverity,
+  LimitSnapshotData,
 } from '../api/types'
 import { COLORS } from '../styles/theme'
 import '../styles/diagnostics.css'
@@ -65,6 +68,13 @@ const WINDOW_SECONDS: Record<Exclude<WindowKey, 'custom' | 'entire'>, number> = 
   '6h': 6 * 60 * 60,
   '24h': 24 * 60 * 60,
 }
+
+// A live window's upper bound tracks "now", but "now" is only known to ±1-2s via the
+// server-clock skew estimate (whole-second Date header, refreshed on drift). Querying
+// [from, now] therefore drops an event stamped in the last second or two -- e.g. the
+// RECOVERED emitted by Resume. Pad the *query* upper bound (not the displayed range)
+// a few minutes ahead so a just-emitted event and skew jitter always fall inside.
+const LIVE_WINDOW_LEAD_SECONDS = 5 * 60
 
 const REFRESH_MILLISECONDS: Record<Exclude<RefreshInterval, 'off'>, number> = {
   '5s': 5000,
@@ -178,6 +188,17 @@ function resourceLabel(resource: string): string {
   return RESOURCE_LABELS[resource] || resource
 }
 
+function limitedResourceLabels(snapshot: LimitSnapshotData): string[] {
+  const resources: string[] = []
+  if (snapshot.effective?.cpu_mem.limited || snapshot.limit_parts?.cpu_mem_limited) {
+    resources.push('CPU and Memory')
+  }
+  if (snapshot.effective?.disk_io.limited || snapshot.limit_parts?.io_limited) {
+    resources.push('Disk I/O')
+  }
+  return resources
+}
+
 function appNameFromEvent(event?: DiagEvent): string | null {
   const appName = event?.attributes?.app_name
   return typeof appName === 'string' && appName.trim() ? appName.trim() : null
@@ -287,6 +308,15 @@ function displayEventSummary(item: DisplayEvent): string {
   return `${item.resources.join(', ')} limits ${action.toLowerCase()} for ${appName}`
 }
 
+// The Type line shows the machine reason-code(s). A merged batch spans several
+// per-resource events, so list every reason-code in it rather than only the
+// representative event's -- otherwise a "cpu, memory" row opens a CPU-only Type.
+function displayEventTypes(item: DisplayEvent): string {
+  const action = protectionAction(item.event)
+  if (!action || item.resources.length < 2) return item.event.event_type
+  return item.resources.map((resource) => `CONTROL_${resource.toUpperCase()}_LIMIT_${action}`).join(', ')
+}
+
 // An auto-limit APPLIED event records the trigger the balancer acted on
 // (attributes.reason + pressure_level, see balancer.py _emit_control_events).
 // Surfacing it puts cause and effect on one row -- unlike the separately-debounced
@@ -306,44 +336,141 @@ interface ResourceControlDetail {
   limit: string
 }
 
-function controlDetailsFromEvent(event: DiagEvent): ResourceControlDetail[] {
-  const attributes = event.attributes
-  const resourceParts = attributes?.resource_parts
-  const limitRates = attributes?.limit_rates
-  if (!resourceParts || typeof resourceParts !== 'object') return []
-
-  const parts = resourceParts as Record<string, unknown>
-  const rates = limitRates && typeof limitRates === 'object' ? limitRates as Record<string, unknown> : null
-  const action = protectionAction(event)
-  const actionLabel = action === 'RECOVERED' ? 'Recovered' : 'Applied'
-  const details: ResourceControlDetail[] = []
-  if (parts.cpu === true) {
-    details.push({ resource: 'CPU', limit: typeof rates?.cpu_rate === 'number' ? `${Math.round(rates.cpu_rate * 100)}% of baseline` : actionLabel })
+// Render one detail row for a single resource. All per-resource events of a batch
+// share the same limit_rates dict (it carries cpu_rate + mem_rate + disk_io_rate
+// together), so any event of the batch can describe every resource in it.
+function resourceControlRow(resource: string, rates: Record<string, unknown> | null, actionLabel: string): ResourceControlDetail | null {
+  if (resource === 'cpu') {
+    return { resource: 'CPU', limit: typeof rates?.cpu_rate === 'number' ? `${Math.round(rates.cpu_rate * 100)}% of baseline` : actionLabel }
   }
-  if (parts.memory === true) {
-    details.push({ resource: 'Memory', limit: typeof rates?.mem_rate === 'number' ? `${Math.round(rates.mem_rate * 100)}% of baseline` : actionLabel })
+  if (resource === 'memory') {
+    return { resource: 'Memory', limit: typeof rates?.mem_rate === 'number' ? `${Math.round(rates.mem_rate * 100)}% of baseline` : actionLabel }
   }
-  if (parts.disk_io === true && rates?.disk_io_rate && typeof rates.disk_io_rate === 'object') {
-    const diskRates = rates.disk_io_rate as Record<string, unknown>
-    const limits = [
-      typeof diskRates.read === 'number' ? `Read ${diskRates.read} MB/s` : null,
-      typeof diskRates.write === 'number' ? `Write ${diskRates.write} MB/s` : null,
-      typeof diskRates.read_iops === 'number' ? `Read ${diskRates.read_iops} IOPS` : null,
-      typeof diskRates.write_iops === 'number' ? `Write ${diskRates.write_iops} IOPS` : null,
-    ].filter(Boolean)
-    details.push({ resource: 'Disk I/O', limit: limits.join(' · ') || '-' })
-  } else if (parts.disk_io === true) {
-    details.push({ resource: 'Disk I/O', limit: actionLabel })
+  if (resource === 'disk_io') {
+    if (rates?.disk_io_rate && typeof rates.disk_io_rate === 'object') {
+      const diskRates = rates.disk_io_rate as Record<string, unknown>
+      const limits = [
+        typeof diskRates.read === 'number' ? `Read ${diskRates.read} MB/s` : null,
+        typeof diskRates.write === 'number' ? `Write ${diskRates.write} MB/s` : null,
+        typeof diskRates.read_iops === 'number' ? `Read ${diskRates.read_iops} IOPS` : null,
+        typeof diskRates.write_iops === 'number' ? `Write ${diskRates.write_iops} IOPS` : null,
+      ].filter(Boolean)
+      return { resource: 'Disk I/O', limit: limits.join(' · ') || actionLabel }
+    }
+    return { resource: 'Disk I/O', limit: actionLabel }
   }
-  return details
+  return null
 }
 
-function isPressureTransitionEvent(event: DiagEvent): boolean {
+// The backend emits a separate CPU / MEMORY / DISK_IO event per capped resource,
+// all sharing one protection_id; the list merges the ones from a single batch into
+// one row (see displayEvents). `resources` is that batch's resource set -- when the
+// detail panel opens a merged row it must describe every resource in the batch, not
+// just the representative event's, so the detail stays consistent with the row.
+function controlDetailsFromEvent(event: DiagEvent, resources?: string[]): ResourceControlDetail[] {
   const attributes = event.attributes
-  const fromLevel = attributes?.from_level
-  const toLevel = attributes?.to_level
-  const score = attributes?.score
-  return typeof fromLevel === 'string' && typeof toLevel === 'string' && typeof score === 'number'
+  const action = protectionAction(event)
+  if (!attributes || action === null) return []
+  const list = (resources && resources.length ? resources : (event.resource_type ? [event.resource_type] : []))
+    .map((resource) => resource.toLowerCase())
+  if (!list.length) return []
+
+  const rates = attributes.limit_rates && typeof attributes.limit_rates === 'object'
+    ? attributes.limit_rates as Record<string, unknown> : null
+  const actionLabel = action === 'RECOVERED' ? 'Recovered' : action === 'FAILED' ? 'Failed' : 'Applied'
+  return list.map((resource) => resourceControlRow(resource, rates, actionLabel)).filter((row): row is ResourceControlDetail => row !== null)
+}
+
+// Attributes already surfaced elsewhere in the detail view (resource-control table,
+// process table) or carrying only the internal control schema -- kept out of the
+// generic key/value table so it shows human-facing context, not duplicated internals.
+const HIDDEN_ATTR_KEYS = new Set(['limit_rates', 'limit_overrides', 'parts', 'resource_parts', 'limit_parts', 'scope_processes'])
+
+const ATTR_LABELS: Record<string, string> = {
+  app_name: 'Application',
+  priority: 'Application priority',
+  reason: 'Trigger',
+  pressure_level: 'Pressure level',
+  from_level: 'From level',
+  to_level: 'To level',
+  score: 'Pressure score',
+  cgroups: 'Cgroups',
+  pids: 'PIDs',
+  boot_id: 'Boot ID',
+  duration_seconds: 'Duration',
+  duration_s: 'Duration',
+}
+
+const REASON_LABELS: Record<string, string> = { disk_pressure: 'Disk pressure', system_pressure: 'System pressure' }
+
+function humanizeAttrKey(key: string): string {
+  return ATTR_LABELS[key] || key.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+function formatAttrValue(key: string, value: unknown): string {
+  if (value == null) return '-'
+  if (key === 'reason' && typeof value === 'string') return REASON_LABELS[value] || value
+  if ((key === 'duration_seconds' || key === 'duration_s') && typeof value === 'number') return formatDuration(value) || `${value}s`
+  if (key === 'pids' && typeof value === 'string') return value.replace(/[{}]/g, '').trim() || '-'
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => (item && typeof item === 'object')
+        ? Object.entries(item as Record<string, unknown>).map(([k, v]) => `${k}: ${v}`).join(', ')
+        : String(item))
+      .join(', ') || '-'
+  }
+  if (typeof value === 'object') {
+    // Render one level of nesting so a nested dict shows its fields instead of
+    // "[object Object]" (e.g. {cpu: {enabled, rate}} -> "Cpu: enabled: true, rate: 0.5").
+    return Object.entries(value as Record<string, unknown>).map(([k, v]) => {
+      const inner = (v && typeof v === 'object')
+        ? Object.entries(v as Record<string, unknown>).map(([ik, iv]) => `${ik}: ${iv}`).join(', ')
+        : String(v)
+      return `${humanizeAttrKey(k)}: ${inner}`
+    }).join(' · ') || '-'
+  }
+  return String(value)
+}
+
+interface AttrRow { key: string; label: string; value: string }
+
+function attributeRows(event: DiagEvent): AttrRow[] {
+  const attributes = event.attributes
+  if (!attributes) return []
+  const rows: AttrRow[] = []
+  for (const [key, value] of Object.entries(attributes)) {
+    if (HIDDEN_ATTR_KEYS.has(key)) continue
+    if (value == null || value === '') continue
+    const formatted = formatAttrValue(key, value)
+    if (!formatted || formatted === '-') continue
+    rows.push({ key, label: humanizeAttrKey(key), value: formatted })
+  }
+  return rows
+}
+
+interface ScopeProcessRow extends ScopeProcess { scope: string }
+
+function scopeProcessRows(event: DiagEvent): ScopeProcessRow[] {
+  const scopeProcesses = event.attributes?.scope_processes
+  if (!scopeProcesses || typeof scopeProcesses !== 'object') return []
+  const rows: ScopeProcessRow[] = []
+  const push = (scope: string, entries: unknown) => {
+    if (!Array.isArray(entries)) return
+    for (const process of entries) {
+      if (!process || typeof process !== 'object') continue
+      const pid = (process as { pid?: unknown }).pid
+      const processName = (process as { process_name?: unknown; name?: unknown }).process_name
+        ?? (process as { name?: unknown }).name
+      const cmdline = (process as { cmdline?: unknown }).cmdline
+      if (typeof pid === 'number' && typeof processName === 'string') {
+        rows.push({ scope, pid, processName, cmdline: typeof cmdline === 'string' ? cmdline : '' })
+      }
+    }
+  }
+  if (Array.isArray(scopeProcesses)) push('', scopeProcesses)
+  else for (const [scope, entries] of Object.entries(scopeProcesses)) push(scope, entries)
+  return rows
 }
 
 function normalizedSeverity(level: string): keyof typeof severityColors {
@@ -539,6 +666,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
   const [eventSource, setEventSource] = useState<string | undefined>(undefined)
   const [eventPage, setEventPage] = useState(1)
   const [showAllActiveControls, setShowAllActiveControls] = useState(false)
+  const [resumingAppId, setResumingAppId] = useState<string | null>(null)
 
   // Object filters — never typed by hand; set only by clicking a related-object
   // chip, surfaced as removable tags.
@@ -553,7 +681,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
   const [groupRepeats, setGroupRepeats] = useState(true)
 
   // Drawers
-  const [selectedEvent, setSelectedEvent] = useState<DiagEvent | null>(null)
+  const [selectedEvent, setSelectedEvent] = useState<DisplayEvent | null>(null)
 
   // Investigation context drawer (the evidence chain for one job/app,
   // assembled read-only by GET /diag/context).
@@ -578,21 +706,28 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
 
   const timeRange = useMemo(() => {
     const now = rangeEndEpoch + (clockSkewSec ?? 0)
+    // `to` is the semantic end shown to the user; `queryTo` is what the fetches use.
+    // They differ only for live windows, whose upper bound tracks "now" and so needs
+    // the lead (see LIVE_WINDOW_LEAD_SECONDS); fixed/historical ends query as-is.
+    const live = (from: number, to: number) => ({ from, to, queryTo: to + LIVE_WINDOW_LEAD_SECONDS })
+    const fixed = (from: number, to: number) => ({ from, to, queryTo: to })
     if (bootScopeEnabled && selectedBoot?.first_ts) {
       const bootFrom = selectedBoot.first_ts
-      const bootTo = selectedBoot.running ? now : selectedBoot.last_ts ?? now
-      if (windowKey === 'entire') return { from: bootFrom, to: bootTo }
+      const running = selectedBoot.running
+      const bootTo = running ? now : selectedBoot.last_ts ?? now
+      const bound = running ? live : fixed
+      if (windowKey === 'entire') return bound(bootFrom, bootTo)
       if (windowKey === 'custom' && bootCustomRange) {
         const from = Math.max(bootFrom, Math.min(bootCustomRange.from, bootTo))
         const to = Math.max(from, Math.min(bootCustomRange.to, bootTo))
-        return { from, to }
+        return fixed(from, to)
       }
       const span = windowKey === 'custom' ? WINDOW_SECONDS['1h'] : WINDOW_SECONDS[windowKey]
-      return { from: Math.max(bootFrom, bootTo - span), to: bootTo }
+      return bound(Math.max(bootFrom, bootTo - span), bootTo)
     }
-    if (windowKey === 'custom' && customRange) return customRange
+    if (windowKey === 'custom' && customRange) return fixed(customRange.from, customRange.to)
     const span = windowKey === 'custom' || windowKey === 'entire' ? WINDOW_SECONDS['1h'] : WINDOW_SECONDS[windowKey]
-    return { from: now - span, to: now }
+    return live(now - span, now)
   }, [windowKey, customRange, rangeEndEpoch, clockSkewSec, bootScopeEnabled, selectedBoot, bootCustomRange])
 
   const updateClockSkew = useCallback(() => {
@@ -622,7 +757,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
         job_id: jobId,
         app_id: appId,
         from: timeRange.from,
-        to: timeRange.to,
+        to: timeRange.queryTo,
         limit: 300,
       }),
       api.getDiagControlLifecycles({ limit: 100 }),
@@ -635,7 +770,24 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
       setEventsError(eventsResult.reason instanceof Error ? eventsResult.reason.message : 'Failed to query diagnostic events')
     }
     if (lifecyclesResult.status === 'fulfilled') {
-      setControlLifecycles(lifecyclesResult.value.lifecycles || [])
+      const lifecycles = lifecyclesResult.value.lifecycles || []
+      const verified = await Promise.all(lifecycles.map(async (lifecycle) => {
+        if (lifecycle.status !== 'requires_verification' || !lifecycle.cgroups?.length) return lifecycle
+        try {
+          const result = await api.getInterruptedLimitStatus({ cgroups: lifecycle.cgroups })
+          if (!result.available) return lifecycle
+          if (result.resources.length === 0) return { ...lifecycle, status: 'recovered', active_resources: [] }
+          return { ...lifecycle, status: 'active', active_resources: result.resources }
+        } catch {
+          return lifecycle
+        }
+      }))
+      // The verification round-trips above are the only async gap after the
+      // initial token check, so a newer refresh can supersede this one while
+      // they're in flight -- recheck before writing, or a stale batch can
+      // overwrite fresher lifecycle state.
+      if (token !== refreshSeq.current) return
+      setControlLifecycles(verified)
     } else {
       setControlLifecycles([])
       setControlLifecyclesError(lifecyclesResult.reason instanceof Error ? lifecyclesResult.reason.message : 'Failed to query protection status')
@@ -675,7 +827,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
         boot_id: bootScopeEnabled ? selectedBoot?.boot_id : undefined,
         keyword: logKeywordRef.current.trim() || undefined,
         from: timeRange.from,
-        to: timeRange.to,
+        to: timeRange.queryTo,
         limit: 800,
       })
       if (token !== logSeq.current) return  // superseded by a newer log query
@@ -767,14 +919,78 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
       const status = controlLifecycleStatus(lifecycle)
       return resources.map((resource) => ({
         key: `${lifecycle.protection_id}:${resource}`,
+        appId: lifecycle.app_id,
+        protectionId: lifecycle.protection_id,
+        hasCgroups: Boolean(lifecycle.cgroups?.length),
         appName,
         resource,
+        // An orphaned requires_verification lifecycle (no cgroups left to check)
+        // can never resolve itself via verification, but resumeControl's
+        // no-live-limit branch already knows how to clear it -- so let it act
+        // as "resumable" too, or the row is stuck forever with no way to dismiss it.
+        isActive: lifecycle.status === 'active' || (lifecycle.status === 'requires_verification' && !lifecycle.cgroups?.length),
         status,
         lastUpdatedAt: lifecycle.last_updated_at,
       }))
     }),
     [currentControlLifecycles],
   )
+
+  const resumeControl = useCallback(async (appId: string, protectionId: string, hasCgroups: boolean) => {
+    setResumingAppId(appId)
+    try {
+      const snapshot = await api.getLimitSnapshot({ app_id: appId })
+      if (!snapshot.limited || !snapshot.source) {
+        if (!hasCgroups) {
+          await api.clearControlLifecycleWithoutRuntimeState({ protection_id: protectionId })
+          message.info('Historical control record cleared; no live limit was found')
+        } else {
+          message.warning('This control is no longer active')
+        }
+        // Advance the live window to now so the just-emitted RECOVERED/cleared
+        // event falls inside it -- the events list is time-bounded (unlike the
+        // lifecycle overview), so without this the record would land past `to`
+        // and the two views disagree. In custom/historical mode this is a no-op
+        // and the awaited reload still refreshes the overview.
+        setRangeEndEpoch(Math.floor(Date.now() / 1000))
+        await loadEventsAndLifecycles()
+        setResumingAppId(null)
+        return
+      }
+      const resources = limitedResourceLabels(snapshot)
+      Modal.confirm({
+        title: 'Resume resources?',
+        content: `This will restore ${resources.join(' and ') || 'the active resource limits'} for ${appId}.`,
+        okText: 'Resume',
+        cancelText: 'Cancel',
+        okButtonProps: { danger: true },
+        onCancel: () => setResumingAppId(null),
+        onOk: async () => {
+          try {
+            if (snapshot.source === 'auto') await api.autoLimitRestore({ app_id: appId })
+            else await api.resourceRestore({ app_id: appId })
+            message.success(`Resources resumed for ${appId}`)
+            // Advance the live window so the RECOVERED event just emitted by the
+            // restore is inside it; otherwise the overview updates but the event
+            // records (time-bounded) miss the new row. See the clear path above.
+            setRangeEndEpoch(Math.floor(Date.now() / 1000))
+            await loadEventsAndLifecycles()
+          } catch (error) {
+            // Surface the failure explicitly -- Modal.confirm swallows a rejected
+            // onOk into a closed dialog otherwise, leaving the user thinking the
+            // resume succeeded when the restore call actually failed.
+            message.error(error instanceof Error ? error.message : 'Failed to resume resources')
+            throw error
+          } finally {
+            setResumingAppId(null)
+          }
+        },
+      })
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Failed to resume resources')
+      setResumingAppId(null)
+    }
+  }, [loadEventsAndLifecycles])
 
   const visibleActiveControlRows = useMemo(
     () => showAllActiveControls ? activeControlRows : activeControlRows.slice(0, 3),
@@ -883,7 +1099,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
         const target = contextTargetForEvent(item.event)
         return (
           <Space size={8}>
-            <Button size='small' onClick={() => setSelectedEvent(item.event)}>
+            <Button size='small' onClick={() => setSelectedEvent(item)}>
               Details
             </Button>
             {target ? (
@@ -1208,6 +1424,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
               <div>
                 <Text strong>Current active controls{controlLifecyclesLoading || controlLifecyclesError ? '' : ` (${activeControlRows.length})`}</Text>
                 <Text className='diagnostics-active-controls-scope' type='secondary'>Host-wide</Text>
+                <Text className='diagnostics-active-controls-scope' type='secondary'>Use Resume to remove this application's active limits. Open Balancer to review or change control settings.</Text>
               </div>
             </div>
             {controlLifecyclesLoading ? (
@@ -1227,6 +1444,19 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
                     <span className='diagnostics-status-label' style={{ color: row.status.color }}>{row.status.label}</span>
                     <span className='diagnostics-active-control-sep'>·</span>
                     <Text type='secondary'>Updated {formatActivityTime(row.lastUpdatedAt)}</Text>
+                    {row.isActive && row.appId ? (
+                      <Tooltip title='Restore all active limits for this application'>
+                        <Button
+                          size='small'
+                          danger
+                          icon={<RollbackOutlined />}
+                          loading={resumingAppId === row.appId}
+                          onClick={() => void resumeControl(row.appId!, row.protectionId, row.hasCgroups)}
+                        >
+                          Resume
+                        </Button>
+                      </Tooltip>
+                    ) : null}
                   </div>
                 ))}
                 {activeControlRows.length > 3 ? (
@@ -1432,19 +1662,24 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
       />
 
       <Drawer title='Event Detail' open={!!selectedEvent} onClose={() => setSelectedEvent(null)} width={700}>
-        {selectedEvent ? (
+        {selectedEvent ? (() => {
+          // Read through the representative event, but describe the whole batch:
+          // Type/Summary/Resource-control cover every resource in selectedEvent.resources
+          // so the detail stays consistent with the merged list row that opened it.
+          const detailEvent = selectedEvent.event
+          return (
           <Space direction='vertical' size={10} style={{ width: '100%' }}>
             <Space wrap>
-              {severityTag(selectedEvent.severity)}
+              {severityTag(detailEvent.severity)}
             </Space>
-            <Text strong>Detected: {dayjs(selectedEvent.ts_utc).format('YYYY-MM-DD HH:mm:ss')}</Text>
-            <Text strong>Category: {categoryLabel(selectedEvent.category)}</Text>
-            <Text strong>Type: {selectedEvent.event_type}</Text>
-            <Text strong>Source: {sourceBucket(selectedEvent.source).label}{selectedEvent.source ? ` (${selectedEvent.source})` : ''}</Text>
+            <Text strong>Detected: {dayjs(detailEvent.ts_utc).format('YYYY-MM-DD HH:mm:ss')}</Text>
+            <Text strong>Category: {categoryLabel(detailEvent.category)}</Text>
+            <Text strong>Type: {displayEventTypes(selectedEvent)}</Text>
+            <Text strong>Source: {sourceBucket(detailEvent.source).label}{detailEvent.source ? ` (${detailEvent.source})` : ''}</Text>
             <Text strong>Summary:</Text>
-            <Text>{selectedEvent.summary}</Text>
+            <Text>{displayEventSummary(selectedEvent)}</Text>
             {(() => {
-              const controlDetails = controlDetailsFromEvent(selectedEvent)
+              const controlDetails = controlDetailsFromEvent(detailEvent, selectedEvent.resources)
               return controlDetails.length ? (
                 <>
                   <Text strong>Resource control:</Text>
@@ -1452,7 +1687,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
                     className='diagnostics-control-details-table'
                     columns={[
                       { title: 'Resource', dataIndex: 'resource', width: 150 },
-                      { title: 'Applied limit', dataIndex: 'limit' },
+                      { title: 'Limit', dataIndex: 'limit' },
                     ]}
                     dataSource={controlDetails}
                     pagination={false}
@@ -1464,18 +1699,56 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
             })()}
             <Text strong>Related objects:</Text>
             <Space size={6} wrap>
-              {selectedEvent.app_id ? <Tag className='diagnostics-related-tag' onClick={() => { setAppId(selectedEvent.app_id || undefined); setSelectedEvent(null) }}>app: {selectedEvent.app_id}</Tag> : null}
-              {selectedEvent.job_id ? <Tag className='diagnostics-related-tag' color='purple' onClick={() => { setJobId(selectedEvent.job_id || undefined); setSelectedEvent(null) }}>job: {selectedEvent.job_id}</Tag> : null}
-              {!selectedEvent.app_id && !selectedEvent.job_id ? <Text type='secondary'>-</Text> : null}
+              {detailEvent.app_id ? <Tag className='diagnostics-related-tag' onClick={() => { setAppId(detailEvent.app_id || undefined); setSelectedEvent(null) }}>app: {detailEvent.app_id}</Tag> : null}
+              {detailEvent.job_id ? <Tag className='diagnostics-related-tag' color='purple' onClick={() => { setJobId(detailEvent.job_id || undefined); setSelectedEvent(null) }}>job: {detailEvent.job_id}</Tag> : null}
+              {!detailEvent.app_id && !detailEvent.job_id ? <Text type='secondary'>-</Text> : null}
             </Space>
-            {!controlDetailsFromEvent(selectedEvent).length && !isPressureTransitionEvent(selectedEvent) ? (
-              <>
-                <Text strong>Attributes:</Text>
-                <pre className='diagnostics-code-block'>{JSON.stringify(selectedEvent.attributes || {}, null, 2)}</pre>
-              </>
-            ) : null}
+            {(() => {
+              const rows = attributeRows(detailEvent)
+              return rows.length ? (
+                <>
+                  <Text strong>Details:</Text>
+                  <Table
+                    className='diagnostics-control-details-table'
+                    columns={[
+                      { title: 'Attribute', dataIndex: 'label', width: 150 },
+                      { title: 'Value', dataIndex: 'value', render: (value: string) => (
+                        <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{value}</span>
+                      ) },
+                    ]}
+                    dataSource={rows}
+                    pagination={false}
+                    rowKey='key'
+                    size='small'
+                  />
+                </>
+              ) : null
+            })()}
+            {(() => {
+              const procRows = scopeProcessRows(detailEvent)
+              return procRows.length ? (
+                <>
+                  <Text strong>Processes:</Text>
+                  <Table
+                    className='diagnostics-control-details-table'
+                    columns={[
+                      { title: 'PID', dataIndex: 'pid', width: 88 },
+                      { title: 'Process', dataIndex: 'processName', width: 130 },
+                      { title: 'Command', dataIndex: 'cmdline', render: (value: string) => (
+                        <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{value || '-'}</span>
+                      ) },
+                    ]}
+                    dataSource={procRows}
+                    pagination={false}
+                    rowKey={(row: ScopeProcessRow) => `${row.scope}:${row.pid}`}
+                    size='small'
+                  />
+                </>
+              ) : null
+            })()}
           </Space>
-        ) : null}
+          )
+        })() : null}
       </Drawer>
 
       <Drawer
@@ -1565,7 +1838,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
                   {contextControlActions.map((item) => {
                     const trigger = limitTrigger(item.event)
                     return (
-                    <div className='diagnostics-evidence-item diagnostics-evidence-item-interactive' key={item.event.event_id} onClick={() => setSelectedEvent(item.event)}>
+                    <div className='diagnostics-evidence-item diagnostics-evidence-item-interactive' key={item.event.event_id} onClick={() => setSelectedEvent(item)}>
                       <Space size={8} wrap>
                         <Text className='diagnostics-evidence-time' type='secondary'>{dayjs(item.event.ts_utc).format('MM-DD HH:mm:ss')}</Text>
                         {severityTag(item.event.severity)}
@@ -1589,7 +1862,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
               {contextData.events.length ? (
                 <div className='diagnostics-evidence-timeline'>
                   {contextData.events.map((ev) => (
-                    <div className='diagnostics-evidence-item diagnostics-evidence-item-interactive' key={ev.event_id} onClick={() => setSelectedEvent(ev)}>
+                    <div className='diagnostics-evidence-item diagnostics-evidence-item-interactive' key={ev.event_id} onClick={() => setSelectedEvent({ event: ev, resources: ev.resource_type ? [ev.resource_type] : [] })}>
                       <Space size={8} wrap>
                         <Text className='diagnostics-evidence-time' type='secondary'>{dayjs(ev.ts_utc).format('MM-DD HH:mm:ss')}</Text>
                         {severityTag(ev.severity)}

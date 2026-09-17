@@ -139,6 +139,7 @@ export type DiagControlLifecycleStatus =
   | 'recovered'
   | 'failed'
   | 'cleared_by_reboot'
+  | 'cleared_without_runtime_state'
   | 'requires_verification'
 
 export interface DiagControlLifecycle {
@@ -153,6 +154,7 @@ export interface DiagControlLifecycle {
   recovered_resources: string[]
   failed_resources: string[]
   active_resources: string[]
+  cgroups?: string[]
   events: DiagEvent[]
 }
 
@@ -269,6 +271,17 @@ export interface EffectiveControl {
     read_iops?: number | null
     write_iops?: number | null
   }
+}
+
+export interface LimitSnapshotData {
+  limited: boolean
+  source: 'auto' | 'manual' | null
+  control_status: ControlStatus
+  effective_app_id?: string
+  pids: number[]
+  cgroups: string[]
+  limit_parts?: { cpu_mem_limited?: boolean; io_limited?: boolean }
+  effective?: EffectiveControl | null
 }
 
 // Pressure detail attached only to AUTO_LIMITED rows, for the drawer.

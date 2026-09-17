@@ -1716,6 +1716,39 @@ def auto_limited_apps():
         )
 
 
+@app.route('/app/limit_snapshot', methods=['POST'])
+def limit_snapshot():
+    """Return the live limit ownership and resources for one app."""
+    try:
+        data = request.get_json() or {}
+        app_id = data.get('app_id', '')
+        if not app_id:
+            return construct_response(
+                data={}, retcode=RetCode.ARGUMENT_ERROR,
+                retmsg='app_id must be provided'
+            )
+        return construct_response(data=_service.get_limit_snapshot(app_id))
+    except Exception as e:
+        logger.error(f"Get limit snapshot failed: {str(e)}")
+        return construct_response(
+            data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e)
+        )
+
+
+@app.route('/app/interrupted_limit_status', methods=['POST'])
+def interrupted_limit_status():
+    """Check whether an interrupted lifecycle still has kernel limits."""
+    try:
+        cgroups = (request.get_json() or {}).get('cgroups') or []
+        if not isinstance(cgroups, list) or not cgroups:
+            return construct_response(data={'available': True, 'resources': []})
+        return construct_response(data=_service.balancer.inspect_interrupted_limit(cgroups))
+    except Exception as e:
+        logger.error(f"Check interrupted limit status failed: {str(e)}")
+        return construct_response(data={'available': False, 'resources': []},
+                                  retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
+
+
 @app.route('/app/auto_limit_restore', methods=['POST'])
 def auto_limit_restore():
     """Restore an auto-limited app on user request and exclude it from future auto-limits.

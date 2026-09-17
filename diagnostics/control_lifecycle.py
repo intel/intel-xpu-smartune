@@ -11,6 +11,7 @@ from diagnostics.system_info import read_boot_id
 _ACTION_SUFFIXES = ("_APPLIED", "_RECOVERED", "_FAILED")
 _RECONCILIATION_EVENT = "CONTROL_LIFECYCLE_REQUIRES_VERIFICATION"
 _REBOOT_CLEARED_EVENT = "CONTROL_LIFECYCLE_CLEARED_BY_REBOOT"
+_RUNTIME_STATE_CLEARED_EVENT = "CONTROL_LIFECYCLE_CLEARED_WITHOUT_RUNTIME_STATE"
 
 
 def _event_boot_id(event):
@@ -69,10 +70,13 @@ def summarize(events):
             status = "recovered"
         if _REBOOT_CLEARED_EVENT in event_types:
             status = "cleared_by_reboot"
+        elif _RUNTIME_STATE_CLEARED_EVENT in event_types:
+            status = "cleared_without_runtime_state"
         elif _RECONCILIATION_EVENT in event_types and status == "active":
             status = "requires_verification"
         first = entries[0]
         last = entries[-1]
+        attributes = first.get("attributes") or {}
         lifecycles.append({
             "protection_id": protection_id,
             "status": status,
@@ -85,6 +89,7 @@ def summarize(events):
             "recovered_resources": recovered,
             "failed_resources": failed,
             "active_resources": active,
+            "cgroups": list(attributes.get("cgroups") or []),
             "events": entries,
         })
     return sorted(lifecycles, key=lambda item: item["last_updated_at"] or "", reverse=True)
@@ -153,3 +158,29 @@ def reconcile_interrupted_lifecycles(current_boot_id=None):
         )
         marked.append(lifecycle["protection_id"])
     return marked
+
+
+def clear_without_runtime_state(protection_id):
+    """Close an orphaned lifecycle that cannot be checked or restored.
+
+    This is only appropriate after the caller has confirmed there is no live
+    runtime limit and the original event did not retain a cgroup target.
+    """
+    from diagnostics import emit_event, event_store
+
+    events = event_store.events_for_protections([protection_id])
+    lifecycles = summarize(events)
+    if len(lifecycles) != 1 or lifecycles[0]["status"] != "active":
+        return False
+    lifecycle = lifecycles[0]
+    if lifecycle["cgroups"]:
+        return False
+    emit_event(
+        _RUNTIME_STATE_CLEARED_EVENT, severity="info", category="platform.control",
+        source="diagnostics", app_id=lifecycle.get("app_id"),
+        protection_id=protection_id, impact="none",
+        summary="Resource limit lifecycle cleared because no runtime state is available",
+        attributes={"active_resources": lifecycle["active_resources"],
+                    "last_updated_at": lifecycle["last_updated_at"]},
+    )
+    return True

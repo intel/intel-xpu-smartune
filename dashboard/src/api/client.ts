@@ -24,6 +24,7 @@ import type {
   SetNetworkPriorityPayload,
   ResourceLimitPayload,
   ResourceLimitProfileData,
+  LimitSnapshotData,
   WeightsTopData,
   PassiveControlData,
   MonitoredSectionsData,
@@ -441,6 +442,12 @@ export const api = {
     post<ResourceLimitProfileData>('/app/resource_limit_profile', payload),
   resourceRestore: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<void>('/app/resource_restore', payload),
+  getLimitSnapshot: (payload: Pick<AppIdPayload, 'app_id'>) =>
+    post<LimitSnapshotData>('/app/limit_snapshot', payload),
+  getInterruptedLimitStatus: (payload: { cgroups: string[] }) =>
+    post<{ available: boolean; resources: string[] }>('/app/interrupted_limit_status', payload),
+  clearControlLifecycleWithoutRuntimeState: (payload: { protection_id: string }) =>
+    post<{ cleared: boolean }>('/diag/control-lifecycles/clear-without-runtime-state', payload),
   getAutoLimitedApps: () => post<AutoLimitedAppsData>('/app/auto_limited_apps'),
   // Lifts a pressure-driven limit and excludes the app from future ones. Not the same as
   // resourceRestore, which only handles manual limits.

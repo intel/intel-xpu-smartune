@@ -31,6 +31,22 @@ from utils.self_ident import is_own_process
 
 _GPU_DRM_DRIVERS = frozenset({'i915', 'xe'})
 _GPU_SAMPLE_INTERVAL = 0.3  # seconds between the two fdinfo snapshots for GPU utilisation
+_BARE_INTERPRETER_RE = re.compile(
+    r'^(?:bash|sh|dash|zsh|fish|tcsh|python(?:\d+(?:\.\d+)*)?|node(?:js)?)$')
+
+
+def _is_identifiable_representative(name, cmdline):
+    """Whether a process has a useful program identity for cgroup attribution."""
+    if not name:
+        return False
+    if not _BARE_INTERPRETER_RE.fullmatch(name.lower()):
+        return True
+    try:
+        tokens = shlex.split(cmdline)
+    except ValueError:
+        tokens = cmdline.split()
+    identity = derived_process_identity({'name': name, 'exe': '', 'cmdline': tokens})
+    return bool(identity and identity != name)
 
 
 def _process_control_flags(pids, name, cmdline):
@@ -501,6 +517,10 @@ class ResourceMonitor:
             'dominant_name': '',
             'dominant_cmdline': '',
             'dominant_metric': 0.0,  # highest individual contribution seen so far
+            'representative_pid': None,
+            'representative_name': '',
+            'representative_cmdline': '',
+            'representative_metric': 0.0,
         })
 
         # Cache the PID list and Process objects for each cgroup
@@ -604,6 +624,12 @@ class ResourceMonitor:
                         cgroup_data[cgroup_path]['dominant_pid'] = pid
                         cgroup_data[cgroup_path]['dominant_name'] = proc_name
                         cgroup_data[cgroup_path]['dominant_cmdline'] = proc_cmdline
+                    if (_is_identifiable_representative(proc_name, proc_cmdline)
+                            and metric > cgroup_data[cgroup_path]['representative_metric']):
+                        cgroup_data[cgroup_path]['representative_metric'] = metric
+                        cgroup_data[cgroup_path]['representative_pid'] = pid
+                        cgroup_data[cgroup_path]['representative_name'] = proc_name
+                        cgroup_data[cgroup_path]['representative_cmdline'] = proc_cmdline
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
 
@@ -721,6 +747,9 @@ class ResourceMonitor:
                 # was recorded, to ensure consistent output across calls.
                 dominant_name = data['dominant_name'] or min(data['names'], default='unknown')
                 dominant_cmdline = data['dominant_cmdline'] or min(data['cmdlines'], default='')
+                representative_name = data['representative_name'] or dominant_name
+                representative_cmdline = data['representative_cmdline'] or dominant_cmdline
+                representative_pid = data['representative_pid'] or data['dominant_pid']
 
                 processes.append({
                     'pids': list(data['pids']),
@@ -748,9 +777,9 @@ class ResourceMonitor:
                     'io_per_disk': self._per_disk_rates(data['io_per_device'], io_window),
                     'names': list(data['names']),
                     'cmdlines': list(data['cmdlines']),
-                    'dominant_pid': data['dominant_pid'],
-                    'dominant_name': dominant_name,
-                    'dominant_cmdline': dominant_cmdline,
+                    'dominant_pid': representative_pid,
+                    'dominant_name': representative_name,
+                    'dominant_cmdline': representative_cmdline,
                 })
 
         # logger.debug(f"Aggregated processes by cgroup: {processes}")

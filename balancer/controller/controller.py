@@ -3,6 +3,7 @@
 
 import os
 import pwd
+import re
 import subprocess # nosec
 import time
 from subprocess import check_output # nosec
@@ -33,6 +34,39 @@ class Controller:
         except Exception:
             pass
         return ""
+
+    def inspect_cgroup_limits(self, cgroup_id: str) -> dict:
+        """Read active v2 resource limits for one systemd cgroup."""
+        if not cgroup_id or not re.fullmatch(r"[A-Za-z0-9._@:-]+", cgroup_id):
+            return {"available": False, "resources": []}
+        for root, directories, _ in os.walk(self.cgroup_mount):
+            if cgroup_id not in directories:
+                continue
+            path = os.path.join(root, cgroup_id)
+            try:
+                with open(os.path.join(path, "cpu.max"), encoding="utf-8") as handle:
+                    cpu_limited = handle.read().split()[0] != "max"
+                with open(os.path.join(path, "memory.high"), encoding="utf-8") as handle:
+                    memory_limited = handle.read().strip() != "max"
+                with open(os.path.join(path, "io.max"), encoding="utf-8") as handle:
+                    io_limited = any(
+                        value != "max"
+                        for line in handle
+                        for field in line.split()[1:]
+                        if field.split("=", 1)[0] in {"rbps", "wbps", "riops", "wiops"}
+                        for value in [field.split("=", 1)[1]]
+                    )
+            except (OSError, IndexError):
+                return {"available": False, "resources": []}
+            resources = []
+            if cpu_limited:
+                resources.append("cpu")
+            if memory_limited:
+                resources.append("memory")
+            if io_limited:
+                resources.append("disk_io")
+            return {"available": True, "resources": resources}
+        return {"available": True, "resources": []}
 
     def get_cpu_max(self):
         cpu_max = None

@@ -83,6 +83,24 @@ def get_control_lifecycles():
         return construct_response(retcode=RetCode.EXCEPTION_ERROR, retmsg=str(exc))
 
 
+@diag_bp.route("/control-lifecycles/clear-without-runtime-state", methods=["POST"])
+def clear_control_lifecycle_without_runtime_state():
+    """Close an orphaned control lifecycle after runtime state was checked."""
+    protection_id = (request.get_json(silent=True) or {}).get("protection_id")
+    if not protection_id:
+        return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg="protection_id is required")
+    try:
+        from diagnostics import control_lifecycle
+
+        if not control_lifecycle.clear_without_runtime_state(str(protection_id)):
+            return construct_response(retcode=RetCode.ARGUMENT_ERROR,
+                                      retmsg="Control lifecycle still has recoverable state")
+        return construct_response(data={"cleared": True})
+    except Exception as exc:
+        logger.error("clear_control_lifecycle_without_runtime_state failed: %s", exc)
+        return construct_response(retcode=RetCode.EXCEPTION_ERROR, retmsg=str(exc))
+
+
 @diag_bp.route("/retention", methods=["GET"])
 def get_retention():
     """Return retention coverage for diagnostics evidence sources."""

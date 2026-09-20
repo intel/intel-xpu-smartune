@@ -355,6 +355,11 @@ def delete_model_local():
     # What a model has on disk is read per request, so every open tab has to ask
     # again before its list is right.
     events.publish_models()
+    if data["removed"]:
+        events.notify_action(
+            "model.weights.deleted", model=data["model"],
+            removed=data["removed"], freed_bytes=data["freed_bytes"],
+            skipped=data["skipped"])
     return construct_response(
         data=data,
         retmsg=(f"Removed {', '.join(data['removed'])} weights for {data['model']}"
@@ -694,6 +699,9 @@ def delete_results():
         )
     # Every open tab is showing the rows that just went away.
     events.publish_results()
+    events.notify_action(
+        "benchmark.cases.deleted", removed=data["removed"],
+        runs_removed=data.get("runs_removed", 0), skipped=data.get("skipped"))
     return construct_response(
         data=data,
         retmsg=f"Removed {data['removed']} benchmark case(s)",
@@ -731,6 +739,10 @@ def delete_results_job():
             retmsg=f"No benchmark results found for job {job}",
         )
     events.publish_results()
+    events.notify_action(
+        "benchmark.results.deleted", job=data["job"],
+        removed_runs=data["removed_runs"], removed_cases=data["removed_cases"],
+        skipped=data.get("skipped"))
     return construct_response(
         data=data,
         retmsg=(

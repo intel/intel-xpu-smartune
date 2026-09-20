@@ -40,6 +40,14 @@ from monitor.monitor_api import (
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
 from features import mount_benchmark, mount_dashboard, mount_diagnostics
 from smartune_api import auth_bp, set_benchmark_available, set_diagnostics_available, smartune_bp
+try:
+    from diagnostics.detectors import start_detector_loop
+except ModuleNotFoundError as exc:
+    if exc.name not in {"diagnostics", "diagnostics.detectors"}:
+        raise
+
+    def start_detector_loop():
+        return None
 from utils.logger import get_logger
 logger = get_logger(__name__)
 try:
@@ -106,8 +114,6 @@ def _shutdown_once():
         return
     _shutdown_started = True
     logger.info("Shutting down Monitor Service...")
-    emit_event("PLATFORM_SERVICE_STOPPING", severity="info", category="platform.availability",
-               source="monitor", summary="Monitor service stopping")
     try:
         stop_dynamic_info_collector()
     except Exception as exc:
@@ -116,6 +122,10 @@ def _shutdown_once():
         shutdown_gpu_usage()
     except Exception as exc:
         logger.warning(f"shutdown_gpu_usage failed: {exc}")
+    # Signal that shutdown is complete
+    emit_event("PLATFORM_SERVICE_STOPPED", severity="info", category="platform.availability",
+               source="monitor", summary="Monitor service stopped (API + Dashboard)",
+               attributes={"api_service": "stopped", "dashboard_ui": "stopped"})
 
 
 def _handle_signal(signum, frame):
@@ -161,13 +171,18 @@ def main():
     # not persist, so History would otherwise stay empty here.  No-op when
     # monitored_sections is [].
     _start_dynamic_info_auto_refresh()
+    start_detector_loop()
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
     emit_event("PLATFORM_SERVICE_STARTED", severity="info", category="platform.availability",
-               source="monitor", summary="Monitor service started",
-               attributes={"mode": os.environ.get("SMARTUNE_MODE", "monitor")})
+               source="monitor", summary="Monitor service started (API + Dashboard)",
+               attributes={
+                   "mode": os.environ.get("SMARTUNE_MODE", "monitor"),
+                   "api_service": "started",
+                   "dashboard_ui": "mounted",
+               })
 
     # Packaged (desktop-launched) deployments set SMARTUNE_UI_LEASE so the
     # service stops itself once the last dashboard UI is closed. Left unset in
@@ -192,6 +207,17 @@ def main():
                 threaded=True, ssl_context=ssl_context)
     except (KeyboardInterrupt, SystemExit):
         pass
+    except Exception as exc:
+        # Record uncaught exception as a diagnostic event before cleanup.
+        # Re-raise so process exits with non-zero; systemd's Restart=on-failure will recover.
+        try:
+            emit_event("PLATFORM_SERVICE_CRASHED", severity="critical", category="platform.availability",
+                       impact="failed", source="monitor",
+                       summary="Monitor service crashed with uncaught exception",
+                       attributes={"exception_type": type(exc).__name__, "exception_message": str(exc)[:500]})
+        except Exception:
+            pass  # Best-effort; never let diagnostics itself break crash recovery
+        raise
     finally:
         _shutdown_once()
 

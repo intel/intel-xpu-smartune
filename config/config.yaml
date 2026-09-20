@@ -144,9 +144,11 @@ passive_resource_control:
 # set to [] for pure on-demand (no background collection).
 # Valid: cpu, memory, pressure, network, disk, gpu, npu.
 monitored_sections: [cpu, memory, pressure, network, disk, gpu, npu]
-# Process noise filtered out from both top-resource sampling and the "Add App" wizard.
-# Substring match against lower-cased comm / exe basename. Add app/process names
-# here to hide them from monitoring & the wizard.
+diagnostic_events:
+  RESOURCE_SYSTEM_PRESSURE_CHANGED: true
+  LOG_ERROR: true
+  LOG_EXCEPTION: true
+diagnostic_rules: []
 blacklist: [
   kworker, ksoftirqd, migration, rcu_, watchdog, systemd, dbus-, gdbus,
   gvfs, gvfsd, polkit, snapd, udisks, accounts-daemon, rtkit-, colord,

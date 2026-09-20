@@ -355,3 +355,37 @@ def stream(q: queue.Queue, with_log: bool = False):
 
 def _frame(event: dict) -> str:
     return f"data: {json.dumps(event)}\n\n"
+
+
+# --- action observers -----------------------------------------------------
+#
+# One-off benchmark actions that do NOT go through the job manager -- deleting a
+# model's weights, deleting results -- have no lifecycle for a listener to hang
+# off. Diagnostics still wants them recorded as audit events, so this is the seam
+# it registers on: a plain in-process fan-out, symmetric to
+# jobs.manager.add_listener, that keeps benchmark from importing diagnostics.
+
+_action_listeners = []
+_action_lock = threading.Lock()
+
+
+def add_action_listener(fn) -> None:
+    """Register a callback fired on notify_action. Idempotent per function."""
+    with _action_lock:
+        if fn not in _action_listeners:
+            _action_listeners.append(fn)
+
+
+def notify_action(action: str, **fields) -> None:
+    """Announce a one-off benchmark action to registered listeners. Never raises.
+
+    Best-effort by design: the action has already happened by the time this is
+    called (a delete is done), so an audit sink that is slow or broken must not
+    turn a completed user action into a failed request."""
+    with _action_lock:
+        targets = list(_action_listeners)
+    for fn in targets:
+        try:
+            fn(action, fields)
+        except Exception:
+            logger.exception("Benchmark action listener failed for %s", action)

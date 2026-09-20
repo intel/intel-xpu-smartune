@@ -79,6 +79,11 @@ class Config:
     # monitors (feeds the live cache + history). None = monitor all sections;
     # [] = pure on-demand (no background collector). See DYNAMIC_INFO_SECTIONS.
     monitored_sections: list = None
+    # Per-event diagnostics collection switches. Disabled events are not stored
+    # and therefore cannot produce derived alerts or Insights.
+    diagnostic_events: dict = None
+    # User-defined, source-constrained log rules that emit diagnostics events.
+    diagnostic_rules: list = None
     # Settings for the vendored model-benchmark toolchain (see benchmark/service/env.py):
     # enabled, env_root, hf_token, hf_endpoint, network_profile, http_proxy,
     # https_proxy, no_proxy. Absent/None means "enabled with defaults".

@@ -39,6 +39,19 @@ export interface DiagEventsData {
   count: number
 }
 
+export interface DiagEventCatalogEntry {
+  event_type: string
+  label: string
+  description: string
+  domain: 'compute' | 'data-path' | 'services' | 'hardware' | 'platform' | 'other'
+  configurable: boolean
+  default_enabled: boolean
+}
+
+export interface DiagEventCatalogData {
+  events: DiagEventCatalogEntry[]
+}
+
 export interface DiagEventQuery {
   event_id?: string
   severity?: string
@@ -109,12 +122,46 @@ export interface DiagContextQuery {
   app_id?: string
   from?: number
   to?: number
+  findings_only?: boolean
+}
+
+export interface DiagFinding {
+  id: string
+  title: string
+  severity: DiagSeverity | string
+  confidence: number
+  category: string
+  observation: string
+  related_event_ids: string[]
+  recommendations?: string[]
+  validation_steps?: string[]
+  time_window?: { from?: number | null; to?: number | null } | null
 }
 
 export interface DiagMonitorSample {
   collected_at?: string | null
   ts_epoch: number
   data?: Record<string, unknown> | null
+}
+
+export interface DiagMonitorMetricsData {
+  monitor: { series: DiagMonitorSample[]; count: number }
+}
+
+export interface DiagResourceUtilization {
+  label: string
+  value: number
+  peak: number
+  count: number
+}
+
+export interface DiagResourceTrendPoint {
+  ts_epoch: number
+  values: Record<string, number>
+}
+
+export interface DiagResourceUtilizationData {
+  monitor: { resources: DiagResourceUtilization[]; trend: DiagResourceTrendPoint[]; count: number }
 }
 
 export interface DiagContextData {
@@ -127,11 +174,44 @@ export interface DiagContextData {
   alerts: DiagAlert[]
   metrics: {
     monitor: { series: DiagMonitorSample[]; count: number }
-    benchmark: { kpi: Record<string, unknown> | null; series: unknown[]; run: string | null }
+    benchmark: {
+      kpi: Record<string, unknown> | null
+      series: unknown[]
+      run: string | null
+      // Where the summary below came from: the live artifact tree ("disk"), or
+      // the copy frozen on the job's completion event ("persisted") because the
+      // tree was deleted from the Results tab. null when nothing was found.
+      source?: 'disk' | 'persisted' | null
+      // Compact, self-contained KPI summary, the same shape from either source.
+      summary?: DiagBenchSummary | null
+    }
     window: { from: number | null; to: number | null }
   }
   logs: DiagLogsData
-  findings: unknown[]
+  findings: DiagFinding[]
+}
+
+// One measured case of a persisted benchmark summary. Mirrors
+// benchmark/service/results.result_snapshot.
+export interface DiagBenchCase {
+  case: string
+  model: string
+  device: string
+  precision: string
+  status: string
+  metrics: Record<string, number>
+  failure_reason?: string | null
+}
+
+// The KPI numbers of a finished benchmark job, condensed so they outlive the
+// on-disk run directory. Rendered in the investigation drawer.
+export interface DiagBenchSummary {
+  run_name: string
+  counts: { ok: number; failed: number }
+  meta: { ov: string[]; devices: string[]; backends: string[] }
+  cases: DiagBenchCase[]
+  metrics: BenchMetricMeta[]
+  primary_metric?: string | null
 }
 
 export type DiagControlLifecycleStatus =
@@ -179,9 +259,45 @@ export interface DiagAlert {
   fire_count: number
   last_event_id: string | null
   acknowledged_at: string | null
+  silenced_until: string | null
+  silence_reason: string | null
+  status: 'active' | 'resolved' | string
+  resolved_at: string | null
+  resolved_event_id: string | null
+  scope: string | null
   severity: DiagSeverity | string
   event_type: string
   summary: string | null
+}
+
+export interface DiagAlertsData {
+  alerts: DiagAlert[]
+  count: number
+}
+
+export interface DiagDigest {
+  period: {
+    kind: 'day' | 'week' | 'boot' | 'range' | string
+    from: number | null
+    to: number | null
+    boot_id: string | null
+  }
+  generated_at: string
+  event_stats: {
+    total: number
+    by_severity: Record<DiagSeverity, number>
+  }
+  alert_summary: DiagAlert[]
+  range_alerts: DiagAlert[]
+  config_changes: Array<{ revision_id?: string; [key: string]: unknown }>
+  benchmark_regressions: unknown[]
+  active_alerts: DiagAlert[]
+  comparison?: {
+    previous_period?: {
+      total: number
+      by_severity: Record<DiagSeverity, number>
+    }
+  } | null
 }
 
 export interface DiskDeviceData {

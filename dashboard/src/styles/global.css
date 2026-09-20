@@ -1,4 +1,69 @@
-@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+/* Compact, opaque surface for the header's current-alert preview. */
+.app-alert-center {
+  width: 360px;
+  max-width: calc(100vw - 24px);
+  padding: 12px 0;
+  border: 1px solid #2d3149;
+  border-radius: 4px;
+  background: #1a1d2e;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.38);
+}
+
+.app-alert-center__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px 10px;
+}
+
+.app-alert-center__count,
+.app-alert-center__item-meta {
+  color: #8e9ab3 !important;
+  font-size: 12px;
+}
+
+.app-alert-center__list {
+  max-height: 344px;
+  overflow-y: auto;
+}
+
+.app-alert-center__item {
+  display: block;
+  width: 100%;
+  padding: 10px 16px;
+  border: 0;
+  border-top: 1px solid #2d3149;
+  background: transparent;
+  color: #d9d9d9;
+  cursor: pointer;
+  text-align: left;
+}
+
+.app-alert-center__item:hover,
+.app-alert-center__item:focus-visible {
+  background: #1e2235;
+  outline: 1px solid #5794f2;
+  outline-offset: -1px;
+}
+
+.app-alert-center__item-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.app-alert-center__item-meta {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.app-alert-center__footer {
+  margin-top: 4px;
+  padding: 8px 16px 0;
+  border-top: 1px solid #2d3149;
+}
 
 :root {
   --perf-bg: #0b0f14;

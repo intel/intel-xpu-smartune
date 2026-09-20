@@ -53,9 +53,14 @@ import type {
   DiagBootsData,
   DiagContextData,
   DiagContextQuery,
+  DiagDigest,
+  DiagMonitorMetricsData,
+  DiagResourceUtilizationData,
   DiagEvent,
   DiagEventQuery,
   DiagEventsData,
+  DiagEventCatalogData,
+  DiagAlertsData,
   DiagControlLifecycleQuery,
   DiagControlLifecyclesData,
   DiagLogQuery,
@@ -309,6 +314,12 @@ export const api = {
     const data = await get<DiagEventsData>(`/diag/events?event_id=${encodeURIComponent(eventId)}&limit=1`)
     return data.events?.[0] ?? null
   },
+  getDiagAlerts: (active = true, limit = 100, notifyable = false) =>
+    get<DiagAlertsData>(`/diag/alerts?active=${active ? 'true' : 'false'}&limit=${limit}&notifyable=${notifyable ? 'true' : 'false'}`),
+  acknowledgeDiagAlert: (dedupKey: string) =>
+    post<{ acknowledged: boolean }>(`/diag/alerts/${encodeURIComponent(dedupKey)}/acknowledge`),
+  silenceDiagAlert: (dedupKey: string, minutes: 30 | 120) =>
+    post<{ silenced_until: string }>(`/diag/alerts/${encodeURIComponent(dedupKey)}/silence`, { minutes }),
   getDiagLogs: (params: DiagLogQuery = {}) => {
     const q = new URLSearchParams()
     for (const [k, v] of Object.entries(params)) {
@@ -334,6 +345,10 @@ export const api = {
     return get<DiagControlLifecyclesData>(`/diag/control-lifecycles${suffix}`)
   },
   getDiagBoots: (limit = 15) => get<DiagBootsData>(`/diag/boots?limit=${limit}`),
+  getDiagMonitorMetrics: (from: number, to: number) =>
+    get<DiagMonitorMetricsData>(`/diag/monitor-metrics?from=${from}&to=${to}`),
+  getDiagResourceUtilization: (from: number, to: number) =>
+    get<DiagResourceUtilizationData>(`/diag/monitor-metrics?from=${from}&to=${to}&summary=resource-utilization`),
   getDiagContext: (params: DiagContextQuery = {}) => {
     const q = new URLSearchParams()
     for (const [k, v] of Object.entries(params)) {
@@ -343,6 +358,8 @@ export const api = {
     const suffix = q.toString() ? `?${q.toString()}` : ''
     return get<DiagContextData>(`/diag/context${suffix}`)
   },
+  getDiagReport: (from: number, to: number) =>
+    get<DiagDigest>(`/diag/digest?from=${from}&to=${to}`),
   getAppResourceStats: (n = 10) => get<AppResourceStatsData>(`/monitor/app_resource_stats?n=${n}`),
   getAppDiskIoStats: (n = 10) => get<AppDiskIoStatsData>(`/monitor/app_disk_io_stats?n=${n}`),
   getProcesses: (gpu = false, io = false) => {
@@ -740,6 +757,7 @@ export const api = {
     }>('/bench/results/job', { job }),
 
   getConfig: <T>(section: string) => get<T>(`/monitor/config/${section}`),
+  getDiagEventCatalog: () => get<DiagEventCatalogData>('/diag/event-catalog'),
   updateConfig: <T extends { updated_at?: number }>(
     section: string,
     values: Record<string, unknown>,

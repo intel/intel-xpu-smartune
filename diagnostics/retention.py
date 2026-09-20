@@ -42,7 +42,7 @@ def run_cleanup(days=None):
     return {
         "retention_days": days,
         "events_deleted": OperationalEvent.delete_older_than(days),
-        "acknowledged_alerts_deleted": AlertState.delete_acknowledged_older_than(days),
+        "resolved_alerts_deleted": AlertState.delete_resolved_older_than(days),
     }
 
 
@@ -53,8 +53,8 @@ def status():
         "retention_days": days,
         "retention_setting": "snapshot_retention_days",
         "event_ledger": "expired after retention period, except unresolved control lifecycles",
-        "acknowledged_alerts": "expired after retention period",
-        "unacknowledged_alerts": "retained until acknowledged",
+        "resolved_alerts": "expired after retention period",
+        "active_alerts": "retained until resolved",
         "monitor_snapshots": "managed separately by monitor history retention",
         "raw_logs": "managed by their source retention policies",
     }

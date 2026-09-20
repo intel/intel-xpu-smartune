@@ -875,6 +875,96 @@ def matrix(backend: Optional[str] = None) -> dict:
     }
 
 
+# Persisted summary
+#
+# Everything above reads the artifact tree live, which is the right answer while
+# a job's results are on disk. But a job deleted from the Results tab has its run
+# directories removed (delete_job / delete_cases), and then there is nothing left
+# to read -- a diagnostic looking at that job weeks later sees a lifecycle event
+# with no numbers. result_snapshot condenses a finished run into the few facts
+# worth outliving its files, so diagnostics can persist them into the job's
+# completion event and read them back after the tree is gone.
+
+
+def result_snapshot(run_name: Optional[str]) -> Optional[dict]:
+    """A compact, self-contained KPI summary for one finished run/job.
+
+    Only the headline facts are kept -- per-case KPI medians and their derived
+    comparisons, pass/fail counts, and the reason a case that did not run failed
+    -- not the sampling timeline or the raw logs, which stay on disk until the
+    job is deleted and are gone with it. A few KB, safe to store on an event.
+
+    None when nothing was measured under ``run_name`` (a build/download stage, or
+    a run whose aggregation never produced medians): there is no summary worth
+    persisting, so the caller stores nothing rather than an empty husk.
+
+    Built on ``collect`` so the persisted numbers are exactly the ones the
+    Results tab showed -- a snapshot that disagreed with the live table would be
+    worse than none.
+    """
+    wanted = str(run_name or "").strip()
+    if not wanted:
+        return None
+
+    data = collect()
+    cases: List[dict] = []
+    ok = failed = 0
+    ovs: Set[str] = set()
+    devices: Set[str] = set()
+    backends: Set[str] = set()
+    for run in data["runs"]:
+        # A run directory is "<run_name>[_g<n>]_<DEVICE>"; the job's run_name is
+        # the prefix every device and group share. Match on that prefix rather
+        # than the folded job name so a build-split run (one group per OpenVINO
+        # version) still collapses into a single summary.
+        if run["run"] != wanted and not run["run"].startswith(f"{wanted}_"):
+            continue
+        if run.get("ov"):
+            ovs.add(run["ov"])
+        backends.add(run["backend"])
+        for row in run["rows"]:
+            dims = row.get("dimensions") or {}
+            device = (dims.get("device") or row.get("device") or "").lower()
+            if device:
+                devices.add(device)
+            status = row.get("status") or ""
+            if status == "ok":
+                ok += 1
+            elif status.startswith("failed"):
+                failed += 1
+            precision = dims.get("precision") or _precision_of(row.get("quant") or "")
+            label = " · ".join(p for p in (row.get("model") or "", device, precision) if p)
+            case = {
+                "case": label or (row.get("model") or run["run"]),
+                "model": row.get("model") or "",
+                "device": device,
+                "precision": precision,
+                "status": status,
+                "metrics": row.get("metrics") or {},
+            }
+            if row.get("failure_reason"):
+                case["failure_reason"] = row["failure_reason"]
+            cases.append(case)
+
+    if not cases:
+        return None
+
+    return {
+        "run_name": wanted,
+        "counts": {"ok": ok, "failed": failed},
+        "meta": {
+            "ov": sorted(ovs),
+            "devices": sorted(devices),
+            "backends": sorted(backends),
+        },
+        "cases": cases,
+        # Descriptors for only the metrics this run produced, so the UI can label
+        # axes and units from the persisted copy without the live tree.
+        "metrics": _sorted_metric_meta({k for c in cases for k in c["metrics"]}),
+        "primary_metric": data["primary_metric"],
+    }
+
+
 def read_case_log(log_path: str, max_bytes: int = 256 * 1024) -> Optional[str]:
     """Tail a per-case benchmark.log referenced by a summary row.
 

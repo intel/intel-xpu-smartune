@@ -95,4 +95,5 @@ def record_control_action(action, *, app_id, app_name, protection_id,
             impact=impact, resource_type=resource.lower(), protection_id=protection_id,
             summary=f"{resource.replace('_', ' ').title()} limit {action.lower()} for {app_name}",
             attributes=attributes,
+            identity=f"{protection_id}:{action}:{resource}",
         )

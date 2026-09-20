@@ -1,4 +1,4 @@
-import React, { useCallback, useContext, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Modal,
   Tabs,
@@ -10,11 +10,14 @@ import {
   Spin,
   Card,
   Form,
+  Input,
   InputNumber,
   Radio,
   Switch,
+  Select,
   Row,
   Col,
+  Collapse,
   Divider,
   Tooltip,
   Tag,
@@ -34,6 +37,10 @@ import {
   RightOutlined,
   DownOutlined,
   ExperimentOutlined,
+  BellOutlined,
+  DeleteOutlined,
+  FilterOutlined,
+  PlusOutlined,
 } from '@ant-design/icons'
 import { api } from '../api/client'
 import type {
@@ -42,11 +49,63 @@ import type {
   LimitPriority,
   LimitPolicyData,
   DiskMedia,
+  DiagEventCatalogEntry,
 } from '../api/types'
 import { COLORS } from '../styles/theme'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 
 const { Text } = Typography
+
+type DiagnosticEventsConfig = Record<string, boolean> & { updated_at?: number }
+
+interface DiagnosticRule {
+  id: string
+  name: string
+  enabled: boolean
+  source: 'journal' | 'smartune'
+  service?: string | null
+  message_pattern: string
+  severity: 'info' | 'warning' | 'error' | 'critical'
+  category?: string
+  domain: 'compute' | 'data-path' | 'services' | 'hardware' | 'platform' | 'other'
+  event_kind: 'pressure' | 'control' | 'hardware-fault' | 'lifecycle' | 'availability' | 'configuration' | 'observability' | 'status'
+  fatal_signatures?: ('oom' | 'kernel-panic' | 'gpu-hang')[]
+}
+
+const DIAGNOSTIC_DOMAIN_OPTIONS = [
+  { value: 'compute', label: 'Compute devices' },
+  { value: 'data-path', label: 'Memory, storage & network' },
+  { value: 'services', label: 'Services & jobs' },
+  { value: 'hardware', label: 'Host system' },
+  { value: 'platform', label: 'SmarTune' },
+  { value: 'other', label: 'Other' },
+]
+
+const DIAGNOSTIC_DOMAIN_LABELS = Object.fromEntries(
+  DIAGNOSTIC_DOMAIN_OPTIONS.map((option) => [option.value, option.label]),
+) as Record<string, string>
+
+const DIAGNOSTIC_EVENT_KIND_OPTIONS = [
+  { value: 'pressure', label: 'Pressure' },
+  { value: 'control', label: 'Control action' },
+  { value: 'hardware-fault', label: 'Hardware fault' },
+  { value: 'lifecycle', label: 'Lifecycle' },
+  { value: 'availability', label: 'Availability' },
+  { value: 'configuration', label: 'Configuration change' },
+  { value: 'observability', label: 'Monitoring issue' },
+  { value: 'status', label: 'Status' },
+]
+
+const DIAGNOSTIC_FATAL_SIGNATURE_OPTIONS = [
+  { value: 'oom', label: 'OOM' },
+  { value: 'kernel-panic', label: 'Kernel panic' },
+  { value: 'gpu-hang', label: 'GPU hang' },
+]
+
+interface DiagnosticRulesConfig {
+  rules: DiagnosticRule[]
+  updated_at?: number
+}
 
 interface Props {
   visible: boolean
@@ -491,6 +550,228 @@ function MonitoredSectionsCard() {
         </Button>
       </Spin>
     </Card>
+  )
+}
+
+function DiagnosticsEventsPanel() {
+  const [eventOptions, setEventOptions] = useState<DiagEventCatalogEntry[]>([])
+  const [openEventDomains, setOpenEventDomains] = useState<string[]>([])
+
+  const eventOptionsByDomain = useMemo(() => {
+    const grouped = new Map<string, DiagEventCatalogEntry[]>()
+    for (const event of eventOptions) {
+      const domain = event.domain || 'other'
+      const entries = grouped.get(domain) || []
+      entries.push(event)
+      grouped.set(domain, entries)
+    }
+    return DIAGNOSTIC_DOMAIN_OPTIONS
+      .filter((domain) => grouped.has(domain.value))
+      .map((domain) => ({
+        label: domain.label,
+        events: grouped.get(domain.value)!,
+      }))
+  }, [eventOptions])
+
+  useEffect(() => {
+    void api.getDiagEventCatalog()
+      .then((data) => {
+        const events = data.events ?? []
+        setEventOptions(events)
+        setOpenEventDomains([...new Set(events.map((event) => event.domain || 'other'))])
+      })
+      .catch((error) => {
+        message.error('Failed to load diagnostic event catalog')
+        console.error(error)
+      })
+  }, [])
+
+  return (
+    <FormCard
+      title="Built-in diagnostic events"
+      description="Choose which future diagnostic events SmarTune records. Disabled events are not stored and cannot create Insights or Alerts; existing history is not removed."
+      scope="diagnostic_events"
+      load={async () => {
+        const config = await api.getConfig<DiagnosticEventsConfig>('diagnostic_events')
+        return { values: config, updatedAt: config.updated_at }
+      }}
+      save={(values, updatedAt) => {
+        const { updated_at: _updatedAt, ...eventSettings } = values
+        return api.updateConfig('diagnostic_events', eventSettings, updatedAt)
+      }}
+      currentToValues={(current) => current}
+    >
+      <Alert
+        type="info"
+        showIcon
+        message="Changes apply to newly observed events"
+        description="Required events are always recorded and cannot be disabled."
+        style={{ marginBottom: 16 }}
+      />
+      <Collapse
+        activeKey={openEventDomains}
+        onChange={(keys) => setOpenEventDomains(Array.isArray(keys) ? keys : [keys])}
+        items={eventOptionsByDomain.map((domain) => ({
+          key: domain.label,
+          label: domain.label,
+          children: (
+            <Row gutter={[16, 12]}>
+              {domain.events.map((event) => (
+                <Col key={event.event_type} xs={24} md={12}>
+                  <Form.Item name={event.event_type} valuePropName="checked" style={{ marginBottom: 0 }}>
+                    <Checkbox disabled={!event.configurable}>
+                      <Space direction="vertical" size={0}>
+                        <Text>{event.label}{!event.configurable ? ' (required)' : ''}</Text>
+                        <Text type="secondary" style={{ fontSize: 12 }}>{event.description}</Text>
+                      </Space>
+                    </Checkbox>
+                  </Form.Item>
+                </Col>
+              ))}
+            </Row>
+          ),
+        }))}
+      />
+    </FormCard>
+  )
+}
+
+function newDiagnosticRule(): DiagnosticRule {
+  return {
+    id: `custom-${Date.now().toString(36)}`,
+    name: 'New diagnostic rule',
+    enabled: true,
+    source: 'journal',
+    service: undefined,
+    message_pattern: '',
+    severity: 'error',
+    category: 'service.custom',
+    domain: 'services',
+    event_kind: 'status',
+    fatal_signatures: [],
+  }
+}
+
+function DiagnosticRuleLabel({ label, tooltip }: { label: string; tooltip: string }) {
+  return (
+    <Space size={4}>
+      <span>{label}</span>
+      <Tooltip title={tooltip}>
+        <QuestionCircleOutlined style={{ color: COLORS.textMuted }} />
+      </Tooltip>
+    </Space>
+  )
+}
+
+function DiagnosticRulesPanel() {
+  return (
+    <FormCard
+      title="Custom diagnostic rules"
+      description="Create rules for supported log sources. A match creates a diagnostic event; Alerts and Advice use separate built-in policies."
+      scope="diagnostic_rules"
+      load={async () => {
+        const config = await api.getConfig<DiagnosticRulesConfig>('diagnostic_rules')
+        return { values: { rules: config.rules ?? [] }, updatedAt: config.updated_at }
+      }}
+      save={(values, updatedAt) => api.updateConfig('diagnostic_rules', values, updatedAt)}
+      currentToValues={(current) => ({
+        rules: ((current.rules as DiagnosticRule[] | undefined) ?? []).map((rule) => ({
+          ...rule,
+          domain: rule.domain || 'services',
+          event_kind: rule.event_kind || 'status',
+          fatal_signatures: rule.fatal_signatures || [],
+        })),
+      })}
+    >
+      <Alert
+        type="info"
+        showIcon
+        message="Rules run against new log records"
+        description="Use a specific case-insensitive message phrase and optional service name to avoid noisy matches. Sources are limited to SmartTune logs and the system journal."
+        style={{ marginBottom: 16 }}
+      />
+      <Form.List name="rules">
+        {(fields, { add, remove }) => (
+          <Space direction="vertical" size={16} style={{ width: '100%' }}>
+            {fields.map((field, index) => (
+              <div key={field.key} style={{ borderTop: index ? `1px solid ${COLORS.border}` : undefined, paddingTop: index ? 16 : 0 }}>
+                <Row gutter={[12, 0]} align="middle">
+                  <Col flex="none">
+                    <Form.Item name={[field.name, 'enabled']} valuePropName="checked" style={{ marginBottom: 12 }}>
+                      <Switch checkedChildren="On" unCheckedChildren="Off" />
+                    </Form.Item>
+                  </Col>
+                  <Col flex="auto">
+                    <Form.Item
+                      label={<DiagnosticRuleLabel label="Rule name" tooltip="A readable name shown in the event summary and diagnostic views. It does not affect matching." />}
+                      name={[field.name, 'name']}
+                      rules={[{ required: true, max: 80 }]}
+                      style={{ marginBottom: 12 }}
+                    >
+                      <Input maxLength={80} placeholder="Redis connection failures" />
+                    </Form.Item>
+                  </Col>
+                  <Col flex="none">
+                    <Button type="text" danger icon={<DeleteOutlined />} onClick={() => remove(field.name)}>
+                      Remove
+                    </Button>
+                  </Col>
+                </Row>
+                <Row gutter={[12, 0]}>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      label={<DiagnosticRuleLabel label="Rule ID" tooltip="A unique, stable identifier used to create the custom event type and prevent duplicate events for the same log record. Changing it creates a different event type. Use lowercase letters, numbers, and hyphens." />}
+                      name={[field.name, 'id']}
+                      rules={[{ required: true, pattern: /^[a-z][a-z0-9-]{0,63}$/, message: 'Use lowercase letters, numbers, and hyphens.' }]}
+                    >
+                      <Input maxLength={64} />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item label={<DiagnosticRuleLabel label="Source" tooltip="The log stream to inspect. The rule only evaluates records from this source." />} name={[field.name, 'source']} rules={[{ required: true }]}>
+                      <Select options={[{ value: 'journal', label: 'System journal' }, { value: 'smartune', label: 'SmarTune logs' }]} />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item label={<DiagnosticRuleLabel label="Service (optional)" tooltip="Match only records from this exact service or logger name. Leave empty to match every service in the selected source." />} name={[field.name, 'service']}>
+                      <Input maxLength={128} placeholder="api.service" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={12}>
+                    <Form.Item label={<DiagnosticRuleLabel label="Message contains" tooltip="A required case-insensitive phrase. A matching log message creates a diagnostic event using the settings below." />} name={[field.name, 'message_pattern']} rules={[{ required: true, max: 256 }]}>
+                      <Input maxLength={256} placeholder="connection refused to redis" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={12} md={6}>
+                    <Form.Item label={<DiagnosticRuleLabel label="Severity" tooltip="The severity assigned to every event created by this rule. It does not filter log records by their original severity." />} name={[field.name, 'severity']} rules={[{ required: true }]}>
+                      <Select options={['info', 'warning', 'error', 'critical'].map((value) => ({ value, label: value }))} />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item label={<DiagnosticRuleLabel label="Domain" tooltip="The diagnostic area used to group the created event in the Diagnostics view." />} name={[field.name, 'domain']} rules={[{ required: true }]}>
+                      <Select options={DIAGNOSTIC_DOMAIN_OPTIONS} />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item label={<DiagnosticRuleLabel label="Event kind" tooltip="The event classification used to group and filter the created event in the Diagnostics view." />} name={[field.name, 'event_kind']} rules={[{ required: true }]}>
+                      <Select options={DIAGNOSTIC_EVENT_KIND_OPTIONS} />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item label={<DiagnosticRuleLabel label="Fatal signatures (optional)" tooltip="Labels the created event as a known fatal condition for Fatal filtering and analysis. It does not change matching or severity." />} name={[field.name, 'fatal_signatures']}>
+                      <Select mode="multiple" options={DIAGNOSTIC_FATAL_SIGNATURE_OPTIONS} />
+                    </Form.Item>
+                  </Col>
+                </Row>
+              </div>
+            ))}
+            <Button type="dashed" icon={<PlusOutlined />} onClick={() => add(newDiagnosticRule())}>
+              Add diagnostic rule
+            </Button>
+          </Space>
+        )}
+      </Form.List>
+    </FormCard>
   )
 }
 
@@ -1687,6 +1968,19 @@ const SETTINGS_TABS: SettingsTabDef[] = [
     icon: <ApiOutlined />,
     panel: <NetworkPanel />,
     balancerOnly: true,
+  },
+  {
+    key: 'diagnostics_events',
+    title: 'Built-in Events',
+    icon: <BellOutlined />,
+    panel: <DiagnosticsEventsPanel />,
+    group: 'Diagnostics',
+  },
+  {
+    key: 'diagnostic_rules',
+    title: 'Custom Rules',
+    icon: <FilterOutlined />,
+    panel: <DiagnosticRulesPanel />,
   },
 ]
 

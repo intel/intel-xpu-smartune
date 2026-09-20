@@ -20,7 +20,7 @@ import re
 import threading
 import time
 
-from diagnostics import emit_event
+from diagnostics import custom_rules, emit_event
 from diagnostics import detector_state
 from diagnostics.sources import LogQueryFilter, get_source
 from utils.logger import get_logger
@@ -53,15 +53,12 @@ class _BoundedSeen:
 # Per-source scan caps. A saturated scan is logged (never silently truncated) so a
 # burst that exceeds the cap is visible rather than mistaken for full coverage.
 _SMARTUNE_SCAN_LIMIT = 500
-_BENCHMARK_SCAN_LIMIT = 2000
 _JOURNAL_SCAN_LIMIT = 500
 _SEEN_MAX = 8192
 
 _CURSOR_LOCK = threading.Lock()
 _cursor_epoch = 0.0  # only smartune lines strictly newer than this are considered
 _smartune_seen = _BoundedSeen(_SEEN_MAX)
-_benchmark_seen = _BoundedSeen(_SEEN_MAX)
-_benchmark_cursor_epoch = 0.0
 _journal_cursor_epoch = 0.0
 _journal_seen = _BoundedSeen(_SEEN_MAX)
 
@@ -74,22 +71,19 @@ _INITIAL_BACKFILL_SECONDS = 15 * 60
 
 def initialize_cursors(now=None):
     """Restore source cursors or select a bounded first-deployment backfill."""
-    global _cursor_epoch, _benchmark_cursor_epoch, _journal_cursor_epoch
+    global _cursor_epoch, _journal_cursor_epoch
     now = time.time() if now is None else now
     fallback = max(0.0, now - _INITIAL_BACKFILL_SECONDS)
     with _CURSOR_LOCK:
         _cursor_epoch = detector_state.load_cursor("smartune") or fallback
-        _benchmark_cursor_epoch = detector_state.load_cursor("benchmark") or fallback
         _journal_cursor_epoch = detector_state.load_cursor("journal") or fallback
-    return {"smartune": _cursor_epoch, "benchmark": _benchmark_cursor_epoch,
-            "journal": _journal_cursor_epoch}
+    return {"smartune": _cursor_epoch, "journal": _journal_cursor_epoch}
 
 
 def run_once(min_level="error"):
     """Scan sources once and emit abnormal events. Returns emitted count."""
     emitted = 0
     emitted += _scan_smartune(min_level=min_level)
-    emitted += _scan_benchmark_nonzero_exit()
     emitted += _scan_journal()
     return emitted
 
@@ -122,6 +116,7 @@ def _scan_smartune(min_level="error"):
     # ``<= since`` test would silently drop the boundary siblings.
     records.sort(key=lambda r: r.ts_epoch)
     emitted = 0
+    rules = custom_rules.configured_rules("smartune")
     high_water = since
     for rec in records:
         if rec.ts_epoch < since:
@@ -131,7 +126,8 @@ def _scan_smartune(min_level="error"):
             continue
         _smartune_seen.add(signature)
         high_water = max(high_water, rec.ts_epoch)
-        if _emit_for_record(rec):
+        emitted += custom_rules.emit_matches(rec, rules, str(signature))
+        if _emit_for_record(rec, identity=signature):
             emitted += 1
 
     with _CURSOR_LOCK:
@@ -146,90 +142,7 @@ def _smartune_signature(rec):
     return (round(rec.ts_epoch, 3), rec.logger, line_no, (rec.message or "")[:200])
 
 
-_EXIT_RE = re.compile(r"finished\s*\(exit\s*(-?\d+)\)", re.IGNORECASE)
-
-
-def _scan_benchmark_nonzero_exit():
-    """Scan benchmark run logs for terminal non-zero exits and emit events.
-
-    Uses process-memory signatures to avoid re-emitting the same log line every
-    loop iteration.
-    """
-    global _benchmark_cursor_epoch
-    src = get_source("benchmark")
-    if src is None or not src.available():
-        return 0
-    with _CURSOR_LOCK:
-        since = _benchmark_cursor_epoch
-    try:
-        recs = src.query(LogQueryFilter(
-            min_level="info", start_time=int(since) if since else None,
-            allow_unscoped=True, limit=_BENCHMARK_SCAN_LIMIT)) or []
-    except Exception as exc:
-        logger.warning("benchmark detector scan failed: %s", exc)
-        return 0
-
-    if len(recs) >= _BENCHMARK_SCAN_LIMIT:
-        logger.warning("benchmark detector scan hit the %d-record cap; some run-log "
-                       "lines may be deferred to a later scan", _BENCHMARK_SCAN_LIMIT)
-    emitted = 0
-    high_water = since
-    for rec in recs:
-        # Benchmark ts is the coarse file mtime shared by every line in a run, so a
-        # strict ``<= since`` would drop later lines of an already-seen file; the
-        # per-line signature below is the real dedup, the cursor only bounds reads.
-        if rec.ts_epoch < since:
-            continue
-        high_water = max(high_water, rec.ts_epoch)
-        msg = rec.message or ""
-        m = _EXIT_RE.search(msg)
-        if not m:
-            continue
-        try:
-            rc = int(m.group(1))
-        except (TypeError, ValueError):
-            continue
-        if rc == 0:
-            continue
-        line_no = (rec.fields or {}).get("line")
-        sig = f"{rec.logger}:{line_no}:{rc}"
-        if sig in _benchmark_seen:
-            continue
-        _benchmark_seen.add(sig)
-
-        summary = f"Benchmark run {rec.logger} finished with non-zero exit {rc}"
-        ev = emit_event(
-            "WORKLOAD_BENCHMARK_FAILED",
-            severity="error",
-            category="workload.benchmark",
-            impact="failed",
-            summary=summary,
-            source="detector",
-            job_id=_job_id_from_runlog(rec.logger),
-            attributes={
-                "run_log": rec.logger,
-                "line": line_no,
-                "returncode": rc,
-                "excerpt": msg[:500],
-            },
-        )
-        if ev is not None:
-            emitted += 1
-    with _CURSOR_LOCK:
-        _benchmark_cursor_epoch = max(_benchmark_cursor_epoch, high_water)
-        detector_state.save_cursor("benchmark", _benchmark_cursor_epoch)
-    return emitted
-
-
-def _job_id_from_runlog(run_log_name):
-    if not isinstance(run_log_name, str):
-        return None
-    if run_log_name.startswith("run_") and run_log_name.endswith(".log"):
-        return run_log_name[len("run_"):-len(".log")]
-    return None
-
-
-def _emit_for_record(rec):
+def _emit_for_record(rec, identity=None):
     """Turn one ERROR/CRITICAL smartune record into an event. Detector-sourced,
     so ``source='detector'`` distinguishes it from a direct business emit."""
     severity = "critical" if (rec.level or "").upper() == "CRITICAL" else "error"
@@ -245,6 +158,7 @@ def _emit_for_record(rec):
         attributes={"logger": rec.logger, "level": rec.level,
                     "excerpt": (rec.message or "")[:2000]},
         ts_utc=rec.ts_iso or None,
+        identity=identity,
     )
     return ev is not None
 
@@ -275,10 +189,19 @@ def _scan_journal():
     with _CURSOR_LOCK:
         since = _journal_cursor_epoch
     try:
-        records = src.query(LogQueryFilter(
+        query_filter = LogQueryFilter(
             start_time=int(since) if since else None,
             end_time=int(time.time()), allow_unscoped=True,
+            limit=_JOURNAL_SCAN_LIMIT)
+        # Scan kernel records separately so a busy userspace journal cannot
+        # push OOM kills, panics, or GPU hangs beyond the generic result cap.
+        kernel_records = src.query(LogQueryFilter(
+            start_time=query_filter.start_time,
+            end_time=query_filter.end_time,
+            allow_unscoped=True,
+            kernel_only=True,
             limit=_JOURNAL_SCAN_LIMIT)) or []
+        records = kernel_records + (src.query(query_filter) or [])
     except Exception as exc:
         logger.warning("journal detector scan failed: %s", exc)
         return 0
@@ -287,13 +210,18 @@ def _scan_journal():
         logger.warning("journal detector scan hit the %d-record cap; a burst of kernel "
                        "faults larger than one scan window may be deferred", _JOURNAL_SCAN_LIMIT)
     emitted = 0
+    rules = custom_rules.configured_rules("journal")
     high_water = since
     for rec in sorted(records, key=lambda record: record.ts_epoch):
         high_water = max(high_water, rec.ts_epoch)
-        identity = (rec.fields or {}).get("cursor") or f"{rec.ts_epoch}:{rec.logger}:{rec.message}"
+        # Use cursor if available, otherwise build an identity from metadata + truncated message
+        # to keep dedup_key bounded (rest of codebase truncates excerpts to [:500] or [:2000]).
+        msg_trunc = (rec.message or "")[:120] if rec.message else ""
+        identity = (rec.fields or {}).get("cursor") or f"{rec.ts_epoch}:{rec.logger}:{msg_trunc}"
         if identity in _journal_seen:
             continue
         _journal_seen.add(identity)
+        emitted += custom_rules.emit_matches(rec, rules, str(identity))
         message = rec.message or ""
         panic = _KERNEL_PANIC_RE.search(message)
         if panic:
@@ -305,7 +233,7 @@ def _scan_journal():
                     "raw_message": message[:2000],
                     "boot_id": (rec.fields or {}).get("boot_id"),
                     "journal_cursor": (rec.fields or {}).get("cursor"),
-                }, ts_utc=rec.ts_iso or None,
+                }, ts_utc=rec.ts_iso or None, identity=identity,
             )
             emitted += int(event is not None)
             continue
@@ -313,13 +241,14 @@ def _scan_journal():
         if gpu_hang:
             event = emit_event(
                 "DEVICE_GPU_HANG", severity="error", category="device.gpu",
+                resource_type="gpu",
                 impact="degraded", summary="GPU hang recorded by the system journal",
                 source="journal", attributes={
                     "source_event_code": "journal.gpu_hang",
                     "raw_message": message[:2000],
                     "boot_id": (rec.fields or {}).get("boot_id"),
                     "journal_cursor": (rec.fields or {}).get("cursor"),
-                }, ts_utc=rec.ts_iso or None,
+                }, ts_utc=rec.ts_iso or None, identity=identity,
             )
             emitted += int(event is not None)
             continue
@@ -334,7 +263,7 @@ def _scan_journal():
                     "boot_id": (rec.fields or {}).get("boot_id"),
                     "journal_cursor": (rec.fields or {}).get("cursor"),
                     "excerpt": (rec.message or "")[:500],
-                }, ts_utc=rec.ts_iso or None,
+                }, ts_utc=rec.ts_iso or None, identity=identity,
             )
             emitted += int(event is not None)
             continue
@@ -349,7 +278,7 @@ def _scan_journal():
                     "boot_id": (rec.fields or {}).get("boot_id"),
                     "journal_cursor": (rec.fields or {}).get("cursor"),
                     "excerpt": (rec.message or "")[:500],
-                }, ts_utc=rec.ts_iso or None,
+                }, ts_utc=rec.ts_iso or None, identity=identity,
             )
             emitted += int(event is not None)
 

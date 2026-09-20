@@ -7,6 +7,7 @@ import {
   Col,
   Collapse,
   DatePicker,
+  Dropdown,
   Drawer,
   Empty,
   Input,
@@ -21,44 +22,135 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import { LineChartOutlined, ReloadOutlined, RollbackOutlined, SearchOutlined } from '@ant-design/icons'
+import { BellOutlined, BulbOutlined, ClockCircleOutlined, DownOutlined, DownloadOutlined, FileTextOutlined, InfoCircleOutlined, LineChartOutlined, ReloadOutlined, RollbackOutlined, SearchOutlined, UpOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import {
+  Bar,
+  BarChart,
+  Brush,
   CartesianGrid,
+  Cell,
+  ComposedChart,
+  LabelList,
   Legend,
   Line,
   LineChart,
+  Pie,
+  PieChart,
+  ReferenceArea,
+  ReferenceLine,
   ResponsiveContainer,
+  Scatter,
+  ScatterChart,
   Tooltip as RechartsTooltip,
   XAxis,
   YAxis,
 } from 'recharts'
 import { api, getLatestServerTime } from '../api/client'
+import { indexMetrics, formatWithUnit, metricLabel } from '../utils/benchMetrics'
 import type {
+  DiagBenchCase,
   DiagBoot,
   DiagContextData,
   DiagContextQuery,
+  DiagDigest,
   DiagAlert,
   DiagControlLifecycle,
   DiagEvent,
+  DiagFinding,
   DiagLogRecord,
-  DiagMonitorSample,
+  DiagResourceUtilization,
+  DiagResourceTrendPoint,
   DiagSeverity,
   LimitSnapshotData,
 } from '../api/types'
 import { COLORS } from '../styles/theme'
 import '../styles/diagnostics.css'
 
+// Benchmark KPI results for the investigated job, rendered in the investigation
+// drawer. The numbers arrive on the diagnostics context whether the run is still
+// on disk ("disk") or was deleted from the Results tab and read back from the
+// copy frozen on its completion event ("persisted") -- the point of the feature
+// is that a deleted job still shows here, just without its logs and timeline.
+function BenchmarkResultsSection({
+  bench,
+}: {
+  bench: DiagContextData['metrics']['benchmark']
+}) {
+  const summary = bench.summary
+  if (!summary || !summary.cases?.length) return null
+  const index = indexMetrics(summary.metrics)
+  const columns = [
+    {
+      title: 'Case',
+      key: 'case',
+      fixed: 'left' as const,
+      render: (_: unknown, row: DiagBenchCase) => (
+        <div>
+          <Typography.Text style={{ color: COLORS.text }}>{row.case || row.model}</Typography.Text>
+          {row.failure_reason ? (
+            <div>
+              <Typography.Text type='danger' style={{ fontSize: 12 }}>{row.failure_reason}</Typography.Text>
+            </div>
+          ) : null}
+        </div>
+      ),
+    },
+    {
+      title: 'Status',
+      key: 'status',
+      render: (_: unknown, row: DiagBenchCase) => (
+        <Tag color={row.status === 'ok' ? COLORS.green : COLORS.orange}>{row.status || '-'}</Tag>
+      ),
+    },
+    ...summary.metrics.map((meta) => ({
+      title: metricLabel(meta.key, index),
+      key: meta.key,
+      align: 'right' as const,
+      render: (_: unknown, row: DiagBenchCase) => {
+        const value = row.metrics?.[meta.key]
+        return typeof value === 'number' ? formatWithUnit(value, meta) : '-'
+      },
+    })),
+  ]
+  return (
+    <div className='diagnostics-investigation-section'>
+      <div className='diagnostics-investigation-section-header'>
+        <Typography.Text className='diagnostics-investigation-heading' strong>Benchmark results</Typography.Text>
+        {bench.source === 'persisted' ? (
+          <Tag color={COLORS.orange}>Persisted summary · logs deleted</Tag>
+        ) : bench.source === 'disk' ? (
+          <Tag color={COLORS.green}>Live</Tag>
+        ) : null}
+      </div>
+      <Space size={6} wrap style={{ marginBottom: 8 }}>
+        <Tag color={COLORS.green}>{summary.counts.ok} ok</Tag>
+        {summary.counts.failed ? <Tag color={COLORS.orange}>{summary.counts.failed} failed</Tag> : null}
+        {summary.meta.ov?.map((ov) => <Tag key={`ov-${ov}`}>OV {ov}</Tag>)}
+        {summary.meta.devices?.map((device) => <Tag key={`dev-${device}`}>{device.toUpperCase()}</Tag>)}
+      </Space>
+      <Table
+        size='small'
+        rowKey={(row, i) => `${row.case}-${i}`}
+        columns={columns}
+        dataSource={summary.cases}
+        pagination={false}
+        scroll={{ x: 'max-content' }}
+      />
+    </div>
+  )
+}
+
 const { Text } = Typography
 
 interface Props {
   active: boolean
+  openAlertsSignal?: number
   onOpenHistory: (range: { from: number; to: number }) => void
 }
 
 type WindowKey = '15m' | '1h' | '6h' | '24h' | 'custom' | 'entire'
 type RefreshInterval = 'off' | '5s' | '10s' | '30s'
-type EventActivityKey = 'all' | 'protection' | 'system' | 'benchmark'
 
 const ALL = '__all__'
 
@@ -75,6 +167,7 @@ const WINDOW_SECONDS: Record<Exclude<WindowKey, 'custom' | 'entire'>, number> = 
 // RECOVERED emitted by Resume. Pad the *query* upper bound (not the displayed range)
 // a few minutes ahead so a just-emitted event and skew jitter always fall inside.
 const LIVE_WINDOW_LEAD_SECONDS = 5 * 60
+const INVESTIGATION_EVENT_WINDOW_SECONDS = 5 * 60
 
 const REFRESH_MILLISECONDS: Record<Exclude<RefreshInterval, 'off'>, number> = {
   '5s': 5000,
@@ -82,11 +175,13 @@ const REFRESH_MILLISECONDS: Record<Exclude<RefreshInterval, 'off'>, number> = {
   '30s': 30000,
 }
 
+const DIAGNOSTIC_ERROR_COLOR = '#f06b7b'
+
 const severityColors: Record<string, string> = {
   debug: COLORS.textMuted,
   info: COLORS.accent,
   warning: COLORS.yellow,
-  error: COLORS.orange,
+  error: DIAGNOSTIC_ERROR_COLOR,
   critical: COLORS.red,
 }
 
@@ -108,6 +203,65 @@ const CATEGORY_LABELS: Record<string, string> = {
   'workload.benchmark': 'Benchmark',
   service: 'Service',
 }
+
+const EVENT_DOMAIN_OPTIONS = [
+  { value: 'compute', label: 'Compute & accelerators' },
+  { value: 'data-path', label: 'Memory, storage & network' },
+  { value: 'services', label: 'Services & workloads' },
+  { value: 'hardware', label: 'Host system' },
+  { value: 'platform', label: 'Platform management' },
+  { value: 'other', label: 'Other' },
+] as const
+
+const EVENT_DOMAIN_CATALOG = [
+  { label: 'Compute & accelerators', description: 'CPU, GPU/XPU and NPU performance, pressure or faults.' },
+  { label: 'Memory, storage & network', description: 'Memory pressure, OOM, disk I/O, network and PCIe issues.' },
+  { label: 'Services & workloads', description: 'Service lifecycle and benchmark job results.' },
+  { label: 'Host system', description: 'System pressure, OS, kernel, drivers, temperature, power and device faults.' },
+  { label: 'Platform management', description: 'SmarTune limits, monitoring, configuration and service availability.' },
+  { label: 'Other', description: 'Events that cannot yet be mapped to a known domain.' },
+] as const
+
+const domainDonutColors: Record<string, string> = {
+  'Compute & accelerators': COLORS.accent,
+  'Memory, storage & network': '#6cc6d8',
+  'Services & workloads': COLORS.green,
+  'Host system': COLORS.yellow,
+  'Platform management': '#b18be8',
+  Other: COLORS.textMuted,
+}
+
+const EVENT_KIND_OPTIONS = [
+  { value: 'pressure', label: 'Pressure' },
+  { value: 'control', label: 'Control action' },
+  { value: 'hardware-fault', label: 'Hardware fault' },
+  { value: 'lifecycle', label: 'Lifecycle' },
+  { value: 'availability', label: 'Availability' },
+  { value: 'configuration', label: 'Configuration' },
+  { value: 'observability', label: 'Observability' },
+  { value: 'status', label: 'Status' },
+] as const
+
+type EventDomain = typeof EVENT_DOMAIN_OPTIONS[number]['value']
+type EventKind = typeof EVENT_KIND_OPTIONS[number]['value']
+type FatalSignature = 'oom' | 'kernel-panic' | 'gpu-hang'
+
+const FATAL_SIGNATURE_OPTIONS: { value: FatalSignature; label: string }[] = [
+  { value: 'oom', label: 'OOM' },
+  { value: 'kernel-panic', label: 'Kernel panic' },
+  { value: 'gpu-hang', label: 'GPU hang' },
+]
+
+const ALERT_POLICY_SUMMARIES = [
+  { eventType: 'PLATFORM_KERNEL_PANIC', severity: 'critical', behavior: 'Kernel panic; requires manual investigation.' },
+  { eventType: 'RESOURCE_MEMORY_OOM_KILL', severity: 'critical', behavior: 'Kernel OOM kill; requires manual investigation.' },
+  { eventType: 'DEVICE_GPU_HANG', severity: 'critical', behavior: 'GPU hang; requires manual investigation.' },
+  { eventType: 'PLATFORM_SERVICE_CRASHED', severity: 'critical', behavior: 'Resolves when the service starts.' },
+  { eventType: 'PLATFORM_SYSTEMD_RESTART_LOOP', severity: 'error', behavior: 'Resolves after 120 seconds without a new observation; escalates after 3 fires in 5 minutes.' },
+  { eventType: 'CONTROL_CPU_LIMIT_FAILED', severity: 'error', behavior: 'Resolves when the CPU limit recovers.' },
+  { eventType: 'CONTROL_MEMORY_LIMIT_FAILED', severity: 'error', behavior: 'Resolves when the memory limit recovers.' },
+  { eventType: 'CONTROL_DISK_IO_LIMIT_FAILED', severity: 'error', behavior: 'Resolves when the disk I/O limit recovers.' },
+] as const
 
 // The two event filters answer DIFFERENT questions and must not be conflated:
 //   * category -> WHAT the event is about (the reason-code subject domain)
@@ -149,26 +303,57 @@ function sourceBucket(source?: string | null): { key: string; label: string } {
   return SOURCE_BUCKET_BY_SOURCE[source] || OTHER_BUCKET
 }
 
-const EVENT_ACTIVITY_LABELS: Record<EventActivityKey, string> = {
-  all: 'All records',
-  protection: 'Resource control',
-  system: 'System events',
-  benchmark: 'Benchmark runs',
-}
-
 function categoryLabel(cat?: string | null): string {
   if (!cat) return '-'
   return CATEGORY_LABELS[cat] || cat
 }
 
-// Every event rolls up into exactly one activity bucket, so the three specific tabs
-// partition "All records" (their counts sum to it). Control and benchmark are the two
-// explicit interventions; everything else -- system pressure, device faults, kernel/OS
-// faults, service health -- is a system event, refined further by the Category filter.
-function eventActivityKey(event: DiagEvent): Exclude<EventActivityKey, 'all'> {
-  if (event.category === 'platform.control') return 'protection'
-  if (event.category === 'workload.benchmark') return 'benchmark'
-  return 'system'
+function eventAttributeString(event: DiagEvent, name: string): string | null {
+  const value = event.attributes?.[name]
+  return typeof value === 'string' ? value : null
+}
+
+function eventAttributeStrings(event: DiagEvent, name: string): string[] {
+  const value = event.attributes?.[name]
+  return Array.isArray(value) && value.every((item) => typeof item === 'string') ? value : []
+}
+
+function eventDomain(event: DiagEvent): EventDomain {
+  const configuredDomain = eventAttributeString(event, 'domain')
+  if (EVENT_DOMAIN_OPTIONS.some((option) => option.value === configuredDomain)) return configuredDomain as EventDomain
+  const type = event.event_type.toUpperCase()
+  if (type.includes('OOM') || event.category === 'resource.memory') return 'data-path'
+  if (type.includes('KERNEL_PANIC') || event.category === 'device.thermal' || event.category === 'device.power' || event.category === 'device.pcie') return 'hardware'
+  if (event.category === 'resource.cpu' || event.category === 'device.gpu' || event.category === 'device.npu') return 'compute'
+  if (event.category === 'resource.system') return 'hardware'
+  if (event.category === 'resource.disk_io' || event.category === 'resource.network') return 'data-path'
+  if (event.category === 'workload.benchmark' || event.category === 'service') return 'services'
+  if (event.category.startsWith('platform.')) return 'platform'
+  return 'other'
+}
+
+function eventKind(event: DiagEvent): EventKind {
+  const configuredKind = eventAttributeString(event, 'event_kind')
+  if (EVENT_KIND_OPTIONS.some((option) => option.value === configuredKind)) return configuredKind as EventKind
+  const type = event.event_type.toUpperCase()
+  if (event.category === 'resource.system' || type.includes('OOM')) return 'pressure'
+  if (event.category === 'platform.control' || type.startsWith('CONTROL_')) return 'control'
+  if (event.category === 'device.thermal' || event.category === 'device.power' || event.category === 'device.pcie' || type.includes('PANIC') || type.includes('HANG')) return 'hardware-fault'
+  if (event.category === 'platform.availability') return 'availability'
+  if (event.category === 'platform.config') return 'configuration'
+  if (event.category === 'platform.observability') return 'observability'
+  if (event.category === 'workload.benchmark' || event.category === 'service' || type.includes('START') || type.includes('STOP') || type.includes('RESTART') || type.includes('CRASH')) return 'lifecycle'
+  return 'status'
+}
+
+function eventDomainLabel(event: DiagEvent): string {
+  const domain = eventDomain(event)
+  return EVENT_DOMAIN_OPTIONS.find((option) => option.value === domain)?.label || 'Other'
+}
+
+function eventKindLabel(event: DiagEvent): string {
+  const kind = eventKind(event)
+  return EVENT_KIND_OPTIONS.find((option) => option.value === kind)?.label || 'Status'
 }
 
 function controlLifecycleStatus(lifecycle: DiagControlLifecycle): { label: string; color: string } {
@@ -275,6 +460,13 @@ function protectionAction(event: DiagEvent): string | null {
 interface DisplayEvent {
   event: DiagEvent
   resources: string[]
+}
+
+function displayEventKey(item: DisplayEvent): string {
+  const action = protectionAction(item.event)
+  return action
+    ? `${item.event.protection_id}:${action}:${item.event.ts_utc.slice(0, 19)}`
+    : item.event.event_id
 }
 
 function displayEvents(events: DiagEvent[]): DisplayEvent[] {
@@ -482,6 +674,172 @@ function normalizedSeverity(level: string): keyof typeof severityColors {
   return 'info'
 }
 
+const EVENT_TIMELINE_LABEL_WIDTH = 176
+const EVENT_TIMELINE_LEFT_GUTTER = 12
+const EVENT_TIMELINE_PLOT_LEFT = EVENT_TIMELINE_LABEL_WIDTH + EVENT_TIMELINE_LEFT_GUTTER
+
+type EventLane = string
+
+interface EventTimelinePoint {
+  x: number
+  y: number
+  lane: EventLane
+  item: DisplayEvent
+  items: DisplayEvent[]
+  from: number
+  to: number
+}
+
+interface EventBrushRange {
+  startIndex: number
+  endIndex: number
+}
+
+interface EventZoomSelection {
+  from: number
+  to: number
+}
+
+function eventLane(event: DiagEvent): EventLane {
+  return eventDomainLabel(event)
+}
+
+function severityRank(level: string): number {
+  const severity = normalizedSeverity(level)
+  if (severity === 'critical') return 4
+  if (severity === 'error') return 3
+  if (severity === 'warning') return 2
+  if (severity === 'info') return 1
+  return 0
+}
+
+function isOomEvent(event: DiagEvent): boolean {
+  const text = `${event.event_type || ''} ${event.summary || ''}`.toLowerCase()
+  return /\boom\b/.test(text) || /out[-\s]?of[-\s]?memory/.test(text)
+}
+
+function isPanicEvent(event: DiagEvent): boolean {
+  const text = `${event.event_type || ''} ${event.summary || ''}`.toLowerCase()
+  return /kernel\s+panic/.test(text) || /\bpanic\b/.test(text)
+}
+
+function isGpuHangEvent(event: DiagEvent): boolean {
+  const text = `${event.event_type || ''} ${event.summary || ''}`.toLowerCase()
+  return /gpu\s+hang/.test(text) || /device_gpu_hang/.test(text)
+}
+
+function hasFatalSignature(event: DiagEvent, signature: FatalSignature): boolean {
+  if (eventAttributeStrings(event, 'fatal_signatures').includes(signature)) return true
+  if (signature === 'oom') return isOomEvent(event)
+  if (signature === 'kernel-panic') return isPanicEvent(event)
+  return isGpuHangEvent(event)
+}
+
+function formatDiagnosticValue(value: unknown): string {
+  if (value === null || value === undefined) return 'None'
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return JSON.stringify(value)
+}
+
+function configChangeEntries(changeSummary: unknown): Array<{ scope: string; field: string; change: string; previous: unknown; current: unknown }> {
+  if (!changeSummary || typeof changeSummary !== 'object') return []
+  const summary = changeSummary as Record<string, unknown>
+  return ['hw', 'sw'].flatMap((scope) => {
+    const changes = summary[scope]
+    if (!Array.isArray(changes)) return []
+    return changes.flatMap((change) => {
+      if (!change || typeof change !== 'object') return []
+      const entry = change as Record<string, unknown>
+      return [{
+        scope: scope === 'hw' ? 'Hardware' : 'Software',
+        field: typeof entry.field === 'string' ? entry.field : 'Unknown field',
+        change: typeof entry.change === 'string' ? entry.change : 'changed',
+        previous: entry.previous,
+        current: entry.current,
+      }]
+    })
+  })
+}
+
+function eventTimelinePoints(items: DisplayEvent[], rangeFrom: number, rangeTo: number): {
+  lanes: EventLane[]
+  laneCounts: Map<EventLane, number>
+  points: EventTimelinePoint[]
+} {
+  const grouped = new Map<EventLane, DisplayEvent[]>()
+  for (const item of items) {
+    const event = item.event
+    const lane = eventLane(event)
+    const entries = grouped.get(lane) || []
+    entries.push(item)
+    grouped.set(lane, entries)
+  }
+  const lanes = Array.from(grouped.keys()).sort((left, right) => {
+    const leftIndex = EVENT_DOMAIN_OPTIONS.findIndex((option) => option.label === left)
+    const rightIndex = EVENT_DOMAIN_OPTIONS.findIndex((option) => option.label === right)
+    return (leftIndex === -1 ? EVENT_DOMAIN_OPTIONS.length : leftIndex)
+      - (rightIndex === -1 ? EVENT_DOMAIN_OPTIONS.length : rightIndex)
+      || left.localeCompare(right)
+  })
+  const bucketSeconds = Math.max(1, Math.ceil((rangeTo - rangeFrom) / 120))
+  return {
+    lanes,
+    laneCounts: new Map(lanes.map((lane) => [lane, grouped.get(lane)?.length || 0])),
+    points: lanes.flatMap((lane, y) => {
+      const laneItems = (grouped.get(lane) || [])
+        .map((item) => ({ item, x: dayjs(item.event.ts_utc).unix() }))
+        .filter(({ x }) => Number.isFinite(x))
+        .sort((left, right) => left.x - right.x)
+      const buckets = new Map<number, Array<{ item: DisplayEvent; x: number }>>()
+      for (const entry of laneItems) {
+        const bucket = Math.floor((entry.x - rangeFrom) / bucketSeconds)
+        const cluster = buckets.get(bucket) || []
+        cluster.push(entry)
+        buckets.set(bucket, cluster)
+      }
+      return Array.from(buckets.values()).map((cluster) => ({
+        x: cluster.reduce((sum, entry) => sum + entry.x, 0) / cluster.length,
+        y,
+        lane,
+        item: cluster.reduce((highest, entry) =>
+          severityRank(entry.item.event.severity) > severityRank(highest.event.severity) ? entry.item : highest,
+        cluster[0].item),
+        items: cluster.map((entry) => entry.item),
+        from: cluster[0].x,
+        to: cluster[cluster.length - 1].x,
+      }))
+    }),
+  }
+}
+
+function eventTimelineTooltip({ active, payload }: {
+  active?: boolean
+  payload?: Array<{ payload?: unknown }>
+}) {
+  const point = payload?.map((entry) => entry.payload).find((entry): entry is EventTimelinePoint => {
+    const candidate = entry as Partial<EventTimelinePoint> | undefined
+    return typeof candidate?.x === 'number' && !!candidate.item && Array.isArray(candidate.items)
+  })
+  if (!active || !point || typeof point.x !== 'number' || !point.item) return null
+  return (
+    <div className='diagnostics-event-tooltip'>
+      <Text strong>
+        {dayjs.unix(point.from).format('MM-DD HH:mm:ss')}
+        {point.to !== point.from ? ` - ${dayjs.unix(point.to).format('MM-DD HH:mm:ss')}` : ''}
+      </Text>
+      <Text type='secondary'>{point.lane}</Text>
+      {point.items.length > 1 ? <Text type='secondary'>{point.items.length} events in this burst</Text> : null}
+      {point.items.slice(0, 6).map((item) => (
+        <div className='diagnostics-event-tooltip-item' key={item.event.event_id}>
+          {severityTag(item.event.severity)}
+          <Text className='diagnostics-event-tooltip-summary'>{displayEventSummary(item)}</Text>
+        </div>
+      ))}
+      {point.items.length > 6 ? <Text type='secondary'>Select to inspect all {point.items.length} events</Text> : null}
+    </div>
+  )
+}
+
 function severityTag(level: string) {
   const normalized = normalizedSeverity(level)
   const color = severityColors[normalized] || COLORS.textMuted
@@ -593,7 +951,7 @@ interface PressurePoint {
 // a /diag/context response (they carry ts_epoch + raw dynamic-snapshot data). The
 // system score is 0-1 (scaled here); disk and network are already percent-scaled.
 // A channel missing from a sample is null so its line gaps instead of reading zero.
-function monitorPressurePoints(samples: DiagMonitorSample[]): PressurePoint[] {
+function monitorPressurePoints(samples: DiagContextData['metrics']['monitor']['series']): PressurePoint[] {
   const pct = (value: unknown, scale = 1): number | null =>
     typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(100, value * scale)) : null
   const out: PressurePoint[] = []
@@ -607,6 +965,15 @@ function monitorPressurePoints(samples: DiagMonitorSample[]): PressurePoint[] {
     out.push({ ts: sample.ts_epoch, system, disk, network })
   }
   return out.sort((a, b) => a.ts - b.ts)
+}
+
+function resourceUtilizationColor(label: string): string {
+  if (label === 'CPU') return COLORS.accent
+  if (label === 'Memory') return COLORS.green
+  if (label === 'NPU') return COLORS.orange
+  if (label === 'Disk') return COLORS.yellow
+  if (label === 'Network') return '#6cc6d8'
+  return '#b18be8'
 }
 
 // The scope kinds /diag/context accepts, used to drive the investigation drawer.
@@ -624,7 +991,7 @@ function contextTargetForEvent(event: DiagEvent): ContextTarget | null {
   return null
 }
 
-export default function Diagnostics({ active, onOpenHistory }: Props) {
+export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }: Props) {
   // Data
   const [events, setEvents] = useState<DiagEvent[]>([])
   const [controlLifecycles, setControlLifecycles] = useState<DiagControlLifecycle[]>([])
@@ -653,18 +1020,25 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
   const [customRange, setCustomRange] = useState<{ from: number; to: number } | null>(null)
 
   // Boot scope changes the range anchor without replacing the duration presets.
-  const [bootScopeEnabled, setBootScopeEnabled] = useState(false)
+  const [bootScopeEnabled] = useState(true)
   const [boots, setBoots] = useState<DiagBoot[]>([])
   const [selectedBootId, setSelectedBootId] = useState<string | null>(null)
   const [bootCustomRange, setBootCustomRange] = useState<{ from: number; to: number } | null>(null)
   const [bootsLoading, setBootsLoading] = useState(false)
   const [refreshInterval, setRefreshInterval] = useState<RefreshInterval>('off')
-  const [eventActivity, setEventActivity] = useState<EventActivityKey>('all')
   const [eventKeyword, setEventKeyword] = useState('')
   const [eventSeverity, setEventSeverity] = useState<string | undefined>(undefined)
-  const [eventCategory, setEventCategory] = useState<string | undefined>(undefined)
+  const [eventDomainFilter, setEventDomainFilter] = useState<EventDomain | undefined>(undefined)
+  const [eventKindFilter, setEventKindFilter] = useState<EventKind | undefined>(undefined)
+  const [eventFatalSignature, setEventFatalSignature] = useState<FatalSignature | undefined>(undefined)
+  const [eventLaneFilter, setEventLaneFilter] = useState<EventLane | undefined>(undefined)
   const [eventSource, setEventSource] = useState<string | undefined>(undefined)
   const [eventPage, setEventPage] = useState(1)
+  const [timelineEventKeys, setTimelineEventKeys] = useState<string[] | null>(null)
+  const [eventBrushRange, setEventBrushRange] = useState<EventBrushRange | null>(null)
+  const [eventZoomRange, setEventZoomRange] = useState<EventZoomSelection | null>(null)
+  const [eventZoomSelection, setEventZoomSelection] = useState<EventZoomSelection | null>(null)
+  const [suppressEventTooltip, setSuppressEventTooltip] = useState(false)
   const [showAllActiveControls, setShowAllActiveControls] = useState(false)
   const [resumingAppId, setResumingAppId] = useState<string | null>(null)
 
@@ -675,6 +1049,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
 
   // Log-search panel (secondary)
   const [logsOpen, setLogsOpen] = useState(false)
+  const [eventRecordsOpen, setEventRecordsOpen] = useState(true)
   const [logSource, setLogSource] = useState<string | undefined>(undefined)
   const [logKeyword, setLogKeyword] = useState('')
   const [logLevel, setLogLevel] = useState<string | undefined>(undefined)
@@ -689,15 +1064,63 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
   const [contextData, setContextData] = useState<DiagContextData | null>(null)
   const [contextLoading, setContextLoading] = useState(false)
   const [contextError, setContextError] = useState<string | null>(null)
+  const [rangeFindings, setRangeFindings] = useState<DiagFinding[]>([])
+  const [rangeResourceUtilization, setRangeResourceUtilization] = useState<DiagResourceUtilization[]>([])
+  const [rangeResourceTrend, setRangeResourceTrend] = useState<DiagResourceTrendPoint[]>([])
+  const [rangeMonitorSampleCount, setRangeMonitorSampleCount] = useState(0)
+  const [rangeMonitorLoading, setRangeMonitorLoading] = useState(false)
+  const [resourceLanesOpen, setResourceLanesOpen] = useState(true)
+  const [activeResourceTrendLabels, setActiveResourceTrendLabels] = useState<Set<string>>(
+    () => new Set(['CPU', 'Memory', 'iGPU', 'dGPU', 'GPU0']),
+  )
+  const [reportResourceTrendLabels, setReportResourceTrendLabels] = useState<Set<string>>(
+    () => new Set(),
+  )
+  const [alerts, setAlerts] = useState<DiagAlert[]>([])
+  const [alertsLoading, setAlertsLoading] = useState(false)
+  const [insightsOpen, setInsightsOpen] = useState(false)
+  const [reportOpen, setReportOpen] = useState(false)
+  const [report, setReport] = useState<DiagDigest | null>(null)
+  const [reportEvents, setReportEvents] = useState<DiagEvent[]>([])
+  const [reportFindings, setReportFindings] = useState<DiagFinding[]>([])
+  const [reportResourceUtilization, setReportResourceUtilization] = useState<DiagResourceUtilization[]>([])
+  const [reportResourceTrend, setReportResourceTrend] = useState<DiagResourceTrendPoint[]>([])
+  const [reportResourceSampleCount, setReportResourceSampleCount] = useState(0)
+  const [reportLoading, setReportLoading] = useState(false)
+  const [reportError, setReportError] = useState<string | null>(null)
+  const [reportRange, setReportRange] = useState<{ from: number; to: number } | null>(null)
+  const [alertsOpen, setAlertsOpen] = useState(false)
+  const [alertFilter, setAlertFilter] = useState<'range' | 'all' | 'needs_attention' | 'acknowledged' | 'silenced' | 'resolved'>('all')
+  const [alertActionKey, setAlertActionKey] = useState<string | null>(null)
   const wasActive = useRef(false)
-  // Monotonic token so an older in-flight refresh (superseded by a tab switch,
-  // interval tick or filter change) cannot land its response after a newer one
-  // and desync the view.
-  const refreshSeq = useRef(0)
+  const activeControlsRef = useRef<HTMLDivElement>(null)
+  const eventsTableRef = useRef<HTMLDivElement>(null)
+  const eventZoomDraggedRef = useRef(false)
+  // Independent monotonic tokens prevent older event or lifecycle requests from
+  // landing after a newer refresh without making the fast event list wait for
+  // slower lifecycle reconstruction and cgroup verification.
+  const eventsRefreshSeq = useRef(0)
+  const controlLifecyclesRefreshSeq = useRef(0)
   // Logs fetch on Search/refresh, not per keystroke: the keyword lives in a ref so
   // typing does not change loadLogs' identity (and so does not trigger a refetch).
   const logSeq = useRef(0)
+  const reportSeq = useRef(0)
   const logKeywordRef = useRef(logKeyword)
+
+  const resetEventViewForTimeRange = () => {
+    setEventKeyword('')
+    setEventSeverity(undefined)
+    setEventDomainFilter(undefined)
+    setEventKindFilter(undefined)
+    setEventFatalSignature(undefined)
+    setEventLaneFilter(undefined)
+    setEventSource(undefined)
+    setTimelineEventKeys(null)
+    setEventBrushRange(null)
+    setEventZoomRange(null)
+    setEventZoomSelection(null)
+    setEventPage(1)
+  }
 
   const selectedBoot = useMemo(
     () => boots.find((b) => b.boot_id === selectedBootId) ?? null,
@@ -740,37 +1163,38 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
     })
   }, [])
 
-  // The overview counts (from events) and the "active now" summary (from control
-  // lifecycles) are two regions of the same header, so they must move together:
-  // fetch both in one coordinated pass, apply their results atomically, and drop
-  // the whole batch if a newer refresh has already superseded it. This removes the
-  // stagger (each fetch flipping its own loading flag at a different time) and the
-  // out-of-order races that made the header disagree with the table.
-  const loadEventsAndLifecycles = useCallback(async () => {
-    const token = ++refreshSeq.current
+  const loadEvents = useCallback(async () => {
+    const token = ++eventsRefreshSeq.current
     setEventsLoading(true)
-    setControlLifecyclesLoading(true)
     setEventsError(null)
-    setControlLifecyclesError(null)
-    const [eventsResult, lifecyclesResult] = await Promise.allSettled([
-      api.getDiagEvents({
+    try {
+      const result = await api.getDiagEvents({
         job_id: jobId,
         app_id: appId,
         from: timeRange.from,
         to: timeRange.queryTo,
-        limit: 300,
-      }),
-      api.getDiagControlLifecycles({ limit: 100 }),
-    ])
-    if (token !== refreshSeq.current) return
-    if (eventsResult.status === 'fulfilled') {
-      setEvents(eventsResult.value.events || [])
-    } else {
+        limit: 100,
+      })
+      if (token !== eventsRefreshSeq.current) return
+      setEvents(result.events || [])
+    } catch (error) {
+      if (token !== eventsRefreshSeq.current) return
       setEvents([])
-      setEventsError(eventsResult.reason instanceof Error ? eventsResult.reason.message : 'Failed to query diagnostic events')
+      setEventsError(error instanceof Error ? error.message : 'Failed to query diagnostic events')
+    } finally {
+      if (token === eventsRefreshSeq.current) setEventsLoading(false)
+      updateClockSkew()
     }
-    if (lifecyclesResult.status === 'fulfilled') {
-      const lifecycles = lifecyclesResult.value.lifecycles || []
+  }, [jobId, appId, timeRange, updateClockSkew])
+
+  const loadControlLifecycles = useCallback(async () => {
+    const token = ++controlLifecyclesRefreshSeq.current
+    setControlLifecyclesLoading(true)
+    setControlLifecyclesError(null)
+    try {
+      const result = await api.getDiagControlLifecycles({ limit: 100 })
+      if (token !== controlLifecyclesRefreshSeq.current) return
+      const lifecycles = result.lifecycles || []
       const verified = await Promise.all(lifecycles.map(async (lifecycle) => {
         if (lifecycle.status !== 'requires_verification' || !lifecycle.cgroups?.length) return lifecycle
         try {
@@ -782,20 +1206,21 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
           return lifecycle
         }
       }))
-      // The verification round-trips above are the only async gap after the
-      // initial token check, so a newer refresh can supersede this one while
-      // they're in flight -- recheck before writing, or a stale batch can
-      // overwrite fresher lifecycle state.
-      if (token !== refreshSeq.current) return
+      if (token !== controlLifecyclesRefreshSeq.current) return
       setControlLifecycles(verified)
-    } else {
+    } catch (error) {
+      if (token !== controlLifecyclesRefreshSeq.current) return
       setControlLifecycles([])
-      setControlLifecyclesError(lifecyclesResult.reason instanceof Error ? lifecyclesResult.reason.message : 'Failed to query protection status')
+      setControlLifecyclesError(error instanceof Error ? error.message : 'Failed to query protection status')
+    } finally {
+      if (token === controlLifecyclesRefreshSeq.current) setControlLifecyclesLoading(false)
     }
-    setEventsLoading(false)
-    setControlLifecyclesLoading(false)
-    updateClockSkew()
-  }, [jobId, appId, timeRange, updateClockSkew])
+  }, [])
+
+  const loadEventsAndLifecycles = useCallback(
+    () => Promise.all([loadEvents(), loadControlLifecycles()]),
+    [loadEvents, loadControlLifecycles],
+  )
 
   const loadBoots = useCallback(async () => {
     setBootsLoading(true)
@@ -848,17 +1273,19 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
   }, [logSource, logLevel, jobId, bootScopeEnabled, selectedBoot, timeRange, updateClockSkew])
 
 
-  // Event investigations end at the event timestamp, then look back across the
-  // selected duration so the evidence predates the observed symptom.
+  // An investigation focuses on the immediate evidence surrounding its anchor;
+  // a selected boot can span months and would hide the causal signal.
   const openContext = useCallback(async (target: ContextTarget, anchorEvent?: DiagEvent) => {
     setContextTarget(target)
     setContextData(null)
     setContextError(null)
     setContextLoading(true)
     try {
-      const duration = timeRange.to - timeRange.from
       const anchorTime = anchorEvent ? dayjs(anchorEvent.ts_utc).unix() : timeRange.to
-      const params: DiagContextQuery = { from: anchorTime - duration, to: anchorTime }
+      const params: DiagContextQuery = {
+        from: anchorTime - INVESTIGATION_EVENT_WINDOW_SECONDS,
+        to: anchorTime + INVESTIGATION_EVENT_WINDOW_SECONDS,
+      }
       if (target.kind === 'job') params.job_id = target.value
       else params.app_id = target.value
       setContextData(await api.getDiagContext(params))
@@ -868,7 +1295,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
     } finally {
       setContextLoading(false)
     }
-  }, [timeRange])
+  }, [timeRange.to])
 
   // Land the drawer's scope onto the main view: set the matching object filter,
   // reveal the events + logs that back it, then close the drawer.
@@ -878,15 +1305,6 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
     setLogsOpen(true)
     setContextTarget(null)
   }, [])
-
-  const eventActivityCounts = useMemo(() => {
-    const displayed = displayEvents(events)
-    const counts: Record<EventActivityKey, number> = { all: displayed.length, protection: 0, system: 0, benchmark: 0 }
-    for (const item of displayed) {
-      counts[eventActivityKey(item.event)] += 1
-    }
-    return counts
-  }, [events])
 
   // Count in resources, not protections, so this KPI reads in the same unit as the
   // per-resource "Current active controls" list below (one app capping CPU + Disk
@@ -997,42 +1415,35 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
     [activeControlRows, showAllActiveControls],
   )
 
-  const visibleEvents = useMemo(
-    () => eventActivity === 'all' ? events : events.filter((event) => eventActivityKey(event) === eventActivity),
-    [eventActivity, events],
-  )
+  const eventDomainOptions = useMemo(() => {
+    const present = new Set(events.map(eventDomain))
+    return [{ label: 'All domains', value: ALL }, ...EVENT_DOMAIN_OPTIONS.filter((option) => present.has(option.value))]
+  }, [events])
 
-  // Grouped by domain prefix (Platform / Resource / Device / …) so the ~14 raw
-  // codes read as a small subject taxonomy. Derived from the events the active
-  // tab actually shows, so the list never offers a category with zero rows.
-  const eventCategoryOptions = useMemo(() => {
-    const byGroup = new Map<string, { label: string; value: string }[]>()
-    for (const category of new Set(visibleEvents.map((event) => event.category).filter(Boolean))) {
-      const group = categoryGroup(category!)
-      const items = byGroup.get(group) || []
-      items.push({ label: categoryLabel(category), value: category! })
-      byGroup.set(group, items)
-    }
-    const groups = CATEGORY_GROUP_ORDER
-      .filter((group) => byGroup.has(group))
-      .map((group) => ({ label: group, options: byGroup.get(group)!.sort((a, b) => a.label.localeCompare(b.label)) }))
-    return [{ label: 'All categories', value: ALL }, ...groups]
-  }, [visibleEvents])
+  const eventKindOptions = useMemo(() => {
+    const present = new Set(events.map(eventKind))
+    return [{ label: 'All event kinds', value: ALL }, ...EVENT_KIND_OPTIONS.filter((option) => present.has(option.value))]
+  }, [events])
 
   // Collapsed to the trust-oriented origin buckets, again only those present.
   const eventSourceOptions = useMemo(() => {
-    const present = new Set(visibleEvents.map((event) => sourceBucket(event.source).key))
+    const present = new Set(events.map((event) => sourceBucket(event.source).key))
     const buckets = [...SOURCE_BUCKETS, OTHER_BUCKET]
       .filter((bucket) => present.has(bucket.key))
       .map((bucket) => ({ label: bucket.label, value: bucket.key }))
     return [{ label: 'All sources', value: ALL }, ...buckets]
-  }, [visibleEvents])
+  }, [events])
 
   const filteredEvents = useMemo(() => {
     const keyword = eventKeyword.trim().toLowerCase()
-    return visibleEvents.filter((event) => {
-      if (eventSeverity && normalizedSeverity(event.severity) !== eventSeverity) return false
-      if (eventCategory && event.category !== eventCategory) return false
+    return events.filter((event) => {
+      const severity = normalizedSeverity(event.severity)
+      if (eventSeverity === 'important' && !['warning', 'error', 'critical'].includes(severity)) return false
+      if (eventSeverity && eventSeverity !== 'important' && severity !== eventSeverity) return false
+      if (eventDomainFilter && eventDomain(event) !== eventDomainFilter) return false
+      if (eventKindFilter && eventKind(event) !== eventKindFilter) return false
+      if (eventFatalSignature && !hasFatalSignature(event, eventFatalSignature)) return false
+      if (eventLaneFilter && eventLane(event) !== eventLaneFilter) return false
       if (eventSource && sourceBucket(event.source).key !== eventSource) return false
       if (!keyword) return true
       return [
@@ -1045,16 +1456,224 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
         appNameFromEvent(event),
       ].some((value) => value?.toLowerCase().includes(keyword))
     })
-  }, [eventCategory, eventKeyword, eventSeverity, eventSource, visibleEvents])
+  }, [eventDomainFilter, eventFatalSignature, eventKeyword, eventKindFilter, eventLaneFilter, eventSeverity, eventSource, events])
 
-  const displayedEvents = useMemo(() => displayEvents(filteredEvents), [filteredEvents])
+  const timelineDisplayedEvents = useMemo(() => displayEvents(filteredEvents), [filteredEvents])
+
+  const displayedEvents = useMemo(() => {
+    if (!timelineEventKeys) return timelineDisplayedEvents
+    const selected = new Set(timelineEventKeys)
+    return timelineDisplayedEvents.filter((item) => selected.has(displayEventKey(item)))
+      .sort((left, right) => left.event.ts_utc.localeCompare(right.event.ts_utc))
+  }, [timelineDisplayedEvents, timelineEventKeys])
+
+  const allDisplayedEvents = useMemo(() => displayEvents(events), [events])
+
+  const eventBrushPoints = useMemo(() => {
+    const steps = 120
+    const duration = timeRange.to - timeRange.from
+    return Array.from({ length: steps + 1 }, (_, index) => ({
+      x: timeRange.from + duration * index / steps,
+    }))
+  }, [timeRange.from, timeRange.to])
+
+  useEffect(() => {
+    setEventBrushRange(null)
+    setEventZoomRange(null)
+    setEventZoomSelection(null)
+  }, [eventBrushPoints])
+
+  const eventViewRange = useMemo(() => {
+    if (eventZoomRange) return eventZoomRange
+    if (!eventBrushRange || eventBrushPoints.length === 0) return { from: timeRange.from, to: timeRange.to }
+    const clamp = (index: number) => Math.max(0, Math.min(index, eventBrushPoints.length - 1))
+    const from = eventBrushPoints[clamp(eventBrushRange.startIndex)]?.x
+    const to = eventBrushPoints[clamp(eventBrushRange.endIndex)]?.x
+    if (from === undefined || to === undefined || to <= from) return { from: timeRange.from, to: timeRange.to }
+    return { from, to }
+  }, [eventBrushPoints, eventBrushRange, eventZoomRange, timeRange.from, timeRange.to])
+
+  const resourceTrendLabels = useMemo(() => {
+    const available = new Set<string>()
+    for (const point of rangeResourceTrend) {
+      Object.keys(point.values).forEach((label) => available.add(label))
+    }
+    return ['CPU', 'Memory', ...Array.from(available).filter((label) => label === 'iGPU' || label === 'dGPU' || label.startsWith('GPU')), 'NPU', 'Disk', 'Network']
+      .filter((label, index, labels) => available.has(label) && labels.indexOf(label) === index)
+  }, [rangeResourceTrend])
+
+  const activeResourceTrendSeries = useMemo(
+    () => resourceTrendLabels.filter((label) => activeResourceTrendLabels.has(label)),
+    [activeResourceTrendLabels, resourceTrendLabels],
+  )
+
+  const visibleResourceTrend = useMemo(() => rangeResourceTrend.filter((point) => (
+    point.ts_epoch >= eventViewRange.from && point.ts_epoch <= eventViewRange.to
+  )), [eventViewRange.from, eventViewRange.to, rangeResourceTrend])
+
+  const overviewTimelineEvents = useMemo(
+    () => allDisplayedEvents.filter((item) => {
+      const timestamp = dayjs(item.event.ts_utc).unix()
+      return timestamp >= eventViewRange.from && timestamp <= eventViewRange.to
+    }),
+    [allDisplayedEvents, eventViewRange.from, eventViewRange.to],
+  )
+
+  const visibleTimelineEvents = useMemo(
+    () => timelineDisplayedEvents.filter((item) => {
+      const timestamp = dayjs(item.event.ts_utc).unix()
+      return timestamp >= eventViewRange.from && timestamp <= eventViewRange.to
+    }),
+    [eventViewRange.from, eventViewRange.to, timelineDisplayedEvents],
+  )
+
+  const eventTimeline = useMemo(
+    () => eventTimelinePoints(visibleTimelineEvents, eventViewRange.from, eventViewRange.to),
+    [eventViewRange.from, eventViewRange.to, visibleTimelineEvents],
+  )
+
+  const handleEventBrushChange = useCallback((range: { startIndex?: number; endIndex?: number }) => {
+    if (range.startIndex === undefined || range.endIndex === undefined) return
+    setEventZoomRange(null)
+    setEventBrushRange({ startIndex: range.startIndex, endIndex: range.endIndex })
+  }, [])
+
+  const beginEventZoom = useCallback((state: { xValue?: unknown }) => {
+    if (typeof state.xValue !== 'number' || !Number.isFinite(state.xValue)) return
+    eventZoomDraggedRef.current = false
+    setSuppressEventTooltip(true)
+    setEventZoomSelection({ from: state.xValue, to: state.xValue })
+  }, [])
+
+  const updateEventZoom = useCallback((state: { xValue?: unknown }) => {
+    if (typeof state.xValue !== 'number' || !Number.isFinite(state.xValue)) return
+    setEventZoomSelection((selection) => selection ? { ...selection, to: state.xValue as number } : null)
+  }, [])
+
+  const finishEventZoom = useCallback(() => {
+    if (!eventZoomSelection) return
+    const from = Math.min(eventZoomSelection.from, eventZoomSelection.to)
+    const to = Math.max(eventZoomSelection.from, eventZoomSelection.to)
+    setEventZoomSelection(null)
+    if (to - from < Math.max(1, (eventViewRange.to - eventViewRange.from) / 500)) {
+      setSuppressEventTooltip(false)
+      return
+    }
+    eventZoomDraggedRef.current = true
+    setEventZoomRange({ from, to })
+    const duration = timeRange.to - timeRange.from
+    const lastIndex = eventBrushPoints.length - 1
+    const toIndex = (timestamp: number) => Math.max(0, Math.min(lastIndex,
+      Math.round((timestamp - timeRange.from) / duration * lastIndex)))
+    setEventBrushRange({ startIndex: toIndex(from), endIndex: toIndex(to) })
+    window.setTimeout(() => { eventZoomDraggedRef.current = false }, 0)
+  }, [eventBrushPoints.length, eventViewRange.from, eventViewRange.to, eventZoomSelection, timeRange.from, timeRange.to])
+
+  const resetEventZoom = useCallback(() => {
+    setEventZoomSelection(null)
+    setEventZoomRange(null)
+    setEventBrushRange(null)
+  }, [])
+
+  const selectTimelineCluster = useCallback((point: EventTimelinePoint) => {
+    setTimelineEventKeys(point.items.map(displayEventKey))
+    setEventPage(1)
+    window.setTimeout(() => eventsTableRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0)
+  }, [])
+
+  const eventActivityTick = useCallback((ts: number) => {
+    const duration = eventViewRange.to - eventViewRange.from
+    return dayjs.unix(ts).format(duration <= 24 * 60 * 60 ? 'HH:mm' : 'MM-DD HH:mm')
+  }, [eventViewRange.from, eventViewRange.to])
+
+  const eventOverview = useMemo(() => {
+    const severityCounts: Record<keyof typeof severityColors, number> = {
+      debug: 0,
+      info: 0,
+      warning: 0,
+      error: 0,
+      critical: 0,
+    }
+    let oom = 0
+    let panic = 0
+    let gpuHang = 0
+    const laneCounts = new Map<string, number>()
+    const laneSeverityCounts = new Map<string, Record<'info' | 'warning' | 'error' | 'critical', number>>()
+    for (const item of overviewTimelineEvents) {
+      const severity = normalizedSeverity(item.event.severity)
+      severityCounts[severity] += 1
+      if (isOomEvent(item.event)) oom += 1
+      if (isPanicEvent(item.event)) panic += 1
+      if (isGpuHangEvent(item.event)) gpuHang += 1
+      const lane = eventLane(item.event)
+      laneCounts.set(lane, (laneCounts.get(lane) || 0) + 1)
+      const counts = laneSeverityCounts.get(lane) || { info: 0, warning: 0, error: 0, critical: 0 }
+      if (severity !== 'debug') counts[severity as keyof typeof counts] += 1
+      laneSeverityCounts.set(lane, counts)
+    }
+    const total = overviewTimelineEvents.length
+    const categories = Array.from(laneCounts, ([lane, count]) => ({ lane, count, severityCounts: laneSeverityCounts.get(lane) }))
+      .sort((left, right) => right.count - left.count || left.lane.localeCompare(right.lane))
+    return { total, categories, severityCounts, incidents: { oom, panic, gpuHang } }
+  }, [overviewTimelineEvents])
+
+  const overviewDomains = useMemo(() => {
+    const domainEvents = eventSeverity && eventSeverity !== 'important'
+      ? overviewTimelineEvents.filter((item) => normalizedSeverity(item.event.severity) === eventSeverity)
+      : overviewTimelineEvents
+    const counts = new Map<string, { count: number; severityCounts: Record<'info' | 'warning' | 'error' | 'critical', number> }>()
+    for (const item of domainEvents) {
+      const lane = eventLane(item.event)
+      const current = counts.get(lane) || { count: 0, severityCounts: { info: 0, warning: 0, error: 0, critical: 0 } }
+      current.count += 1
+      const severity = normalizedSeverity(item.event.severity)
+      if (severity !== 'debug') current.severityCounts[severity as keyof typeof current.severityCounts] += 1
+      counts.set(lane, current)
+    }
+    return EVENT_DOMAIN_CATALOG.map((domain) => ({
+      ...domain,
+      count: counts.get(domain.label)?.count || 0,
+      severityCounts: counts.get(domain.label)?.severityCounts || { info: 0, warning: 0, error: 0, critical: 0 },
+    })).sort((left, right) => right.count - left.count || left.label.localeCompare(right.label))
+  }, [eventSeverity, overviewTimelineEvents])
+
+  const domainEventTotal = useMemo(
+    () => overviewDomains.reduce((total, domain) => total + domain.count, 0),
+    [overviewDomains],
+  )
+
+  const domainBarData = useMemo(() => (
+    overviewDomains
+      .map((domain) => ({ name: domain.label, value: domain.count, color: domainDonutColors[domain.label] }))
+  ), [overviewDomains])
+
+  const severityDonutData = useMemo(() => {
+    return [
+      { name: 'Info', value: eventOverview.severityCounts.info, color: COLORS.accent },
+      { name: 'Warning', value: eventOverview.severityCounts.warning, color: COLORS.yellow },
+      { name: 'Error', value: eventOverview.severityCounts.error, color: DIAGNOSTIC_ERROR_COLOR },
+      { name: 'Critical', value: eventOverview.severityCounts.critical, color: COLORS.red },
+    ].filter((item) => item.value > 0)
+  }, [eventOverview.severityCounts.critical, eventOverview.severityCounts.error, eventOverview.severityCounts.info, eventOverview.severityCounts.warning])
+
+  const selectEventDomain = (domainLabel: string) => {
+    setEventLaneFilter(eventLaneFilter === domainLabel ? undefined : domainLabel)
+    setTimelineEventKeys(null)
+    setEventPage(1)
+  }
+
+  const latestBenchmarkEvent = useMemo(
+    () => events.find((event) => event.category === 'workload.benchmark') ?? null,
+    [events],
+  )
 
   // Memoized so the render functions are not rebuilt on every parent re-render
   // (refresh tick, filter keystroke); only ``openContext`` changing rebuilds them.
   const eventColumns = useMemo(() => [
     { title: 'Time', width: 170, render: (_: unknown, item: DisplayEvent) => dayjs(item.event.ts_utc).format('MM-DD HH:mm:ss') },
     { title: 'Severity', width: 120, render: (_: unknown, item: DisplayEvent) => severityTag(item.event.severity) },
-    { title: 'Category', width: 170, render: (_: unknown, item: DisplayEvent) => categoryLabel(item.event.category) },
+    { title: 'Domain', width: 190, render: (_: unknown, item: DisplayEvent) => eventDomainLabel(item.event) },
+    { title: 'Event kind', width: 150, render: (_: unknown, item: DisplayEvent) => eventKindLabel(item.event) },
     { title: 'Source', width: 130, render: (_: unknown, item: DisplayEvent) => (
       <Tooltip title={item.event.source || undefined}>{sourceBucket(item.event.source).label}</Tooltip>
     ) },
@@ -1136,7 +1755,42 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
     () => monitorPressurePoints(contextData?.metrics?.monitor?.series ?? []),
     [contextData],
   )
+  const averageResourceUtilization = useMemo(() => rangeResourceUtilization.map((resource) => ({
+    ...resource,
+    color: resourceUtilizationColor(resource.label),
+  })), [rangeResourceUtilization])
   const contextAlerts = contextData?.alerts ?? []
+  const rangeAlerts = useMemo(() => alerts.filter((alert) => {
+    const timestamp = dayjs(alert.last_fired_at).unix()
+    return Number.isFinite(timestamp) && timestamp >= timeRange.from && timestamp <= timeRange.to
+  }), [alerts, timeRange.from, timeRange.to])
+  const currentAlerts = useMemo(
+    () => alerts.filter((alert) => alert.status === 'active'),
+    [alerts],
+  )
+  const currentlySilenced = useCallback((alert: DiagAlert) =>
+    !!alert.silenced_until && dayjs(alert.silenced_until).isAfter(dayjs()), [])
+  const displayedAlerts = useMemo(() => {
+    if (alertFilter === 'range') return rangeAlerts
+    if (alertFilter === 'needs_attention') {
+      return currentAlerts.filter((alert) => !alert.acknowledged_at && !currentlySilenced(alert))
+    }
+    if (alertFilter === 'acknowledged') {
+      return currentAlerts.filter((alert) => !!alert.acknowledged_at && !currentlySilenced(alert))
+    }
+    if (alertFilter === 'silenced') return currentAlerts.filter(currentlySilenced)
+    if (alertFilter === 'resolved') return rangeAlerts.filter((alert) => alert.status === 'resolved')
+    const resolvedInRange = rangeAlerts.filter((alert) => alert.status === 'resolved')
+    return [...currentAlerts, ...resolvedInRange]
+  }, [alertFilter, currentAlerts, currentlySilenced, rangeAlerts])
+  const alertFilterLabel = {
+    range: 'Selected time range',
+    all: 'Current + resolved',
+    needs_attention: 'Needs attention',
+    acknowledged: 'Acknowledged',
+    silenced: 'Silenced',
+    resolved: 'Resolved',
+  }[alertFilter]
   const contextControlActions = useMemo(
     () => displayEvents(contextData?.control_actions ?? []),
     [contextData],
@@ -1146,10 +1800,321 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
     setRangeEndEpoch(Math.floor(Date.now() / 1000))
   }, [])
 
+  const reportQueryRange = reportRange ?? { from: timeRange.from, to: timeRange.to }
+  const reportDisplayedEvents = useMemo(() => displayEvents(reportEvents), [reportEvents])
+  const rangeEventTimesById = useMemo(() => new Map(
+    events.map((event) => [event.event_id, event.ts_utc]),
+  ), [events])
+  const rangeAdviceTimeLabel = useCallback((advice: DiagFinding) => {
+    const relatedTimes = advice.related_event_ids
+      .map((eventId) => rangeEventTimesById.get(eventId))
+      .filter((timestamp): timestamp is string => Boolean(timestamp))
+      .map((timestamp) => dayjs(timestamp))
+      .sort((left, right) => left.valueOf() - right.valueOf())
+    if (relatedTimes.length) {
+      const first = relatedTimes[0].format('MMM D, HH:mm:ss')
+      const latest = relatedTimes[relatedTimes.length - 1].format('MMM D, HH:mm:ss')
+      return first === latest ? `Observed ${first}` : `Observed ${first} - ${latest}`
+    }
+    const from = advice.time_window?.from
+    const to = advice.time_window?.to
+    if (typeof from === 'number' && typeof to === 'number') {
+      return `Observed ${dayjs.unix(from).format('MMM D, HH:mm')} - ${dayjs.unix(to).format('MMM D, HH:mm')}`
+    }
+    return 'Derived from selected-range telemetry'
+  }, [rangeEventTimesById])
+  const reportEventOverview = useMemo(() => {
+    const severityCounts: Record<keyof typeof severityColors, number> = { debug: 0, info: 0, warning: 0, error: 0, critical: 0 }
+    const laneCounts = new Map<string, number>()
+    const laneSeverityCounts = new Map<string, Record<'info' | 'warning' | 'error' | 'critical', number>>()
+    for (const item of reportDisplayedEvents) {
+      const severity = normalizedSeverity(item.event.severity)
+      severityCounts[severity] += 1
+      const lane = eventLane(item.event)
+      laneCounts.set(lane, (laneCounts.get(lane) || 0) + 1)
+      const counts = laneSeverityCounts.get(lane) || { info: 0, warning: 0, error: 0, critical: 0 }
+      if (severity !== 'debug') counts[severity as keyof typeof counts] += 1
+      laneSeverityCounts.set(lane, counts)
+    }
+    const categories = Array.from(laneCounts, ([lane, count]) => ({ lane, count, severityCounts: laneSeverityCounts.get(lane) }))
+      .sort((left, right) => right.count - left.count || left.lane.localeCompare(right.lane))
+    return { total: reportDisplayedEvents.length, severityCounts, categories }
+  }, [reportDisplayedEvents])
+  const reportOverviewDomains = useMemo(() => {
+    const counts = new Map<string, { count: number; severityCounts: Record<'info' | 'warning' | 'error' | 'critical', number> }>()
+    for (const item of reportDisplayedEvents) {
+      const lane = eventLane(item.event)
+      const current = counts.get(lane) || { count: 0, severityCounts: { info: 0, warning: 0, error: 0, critical: 0 } }
+      current.count += 1
+      const severity = normalizedSeverity(item.event.severity)
+      if (severity !== 'debug') current.severityCounts[severity as keyof typeof current.severityCounts] += 1
+      counts.set(lane, current)
+    }
+    return EVENT_DOMAIN_CATALOG.map((domain) => ({
+      ...domain,
+      count: counts.get(domain.label)?.count || 0,
+      severityCounts: counts.get(domain.label)?.severityCounts || { info: 0, warning: 0, error: 0, critical: 0 },
+    })).sort((left, right) => right.count - left.count || left.label.localeCompare(right.label))
+  }, [reportDisplayedEvents])
+  const reportDomainEventTotal = useMemo(
+    () => reportOverviewDomains.reduce((total, domain) => total + domain.count, 0),
+    [reportOverviewDomains],
+  )
+  const reportTimeline = useMemo(
+    () => eventTimelinePoints(reportDisplayedEvents, reportQueryRange.from, reportQueryRange.to),
+    [reportDisplayedEvents, reportQueryRange.from, reportQueryRange.to],
+  )
+  const reportEventTimesById = useMemo(() => new Map(
+    reportEvents.map((event) => [event.event_id, event.ts_utc]),
+  ), [reportEvents])
+  const reportAdviceTimeLabel = useCallback((advice: DiagFinding) => {
+    const relatedTimes = advice.related_event_ids
+      .map((eventId) => reportEventTimesById.get(eventId))
+      .filter((timestamp): timestamp is string => Boolean(timestamp))
+      .map((timestamp) => dayjs(timestamp))
+      .sort((left, right) => left.valueOf() - right.valueOf())
+    if (relatedTimes.length) {
+      const first = relatedTimes[0].format('MMM D, HH:mm:ss')
+      const latest = relatedTimes[relatedTimes.length - 1].format('MMM D, HH:mm:ss')
+      return first === latest ? `Observed ${first}` : `Observed ${first} - ${latest}`
+    }
+    const from = advice.time_window?.from
+    const to = advice.time_window?.to
+    if (typeof from === 'number' && typeof to === 'number') {
+      return `Observed ${dayjs.unix(from).format('MMM D, HH:mm')} - ${dayjs.unix(to).format('MMM D, HH:mm')}`
+    }
+    return 'Derived from report-range telemetry'
+  }, [reportEventTimesById])
+  const reportAvailableResourceTrendLabels = useMemo(() => {
+    const available = new Set<string>()
+    for (const point of reportResourceTrend) Object.keys(point.values).forEach((label) => available.add(label))
+    return ['CPU', 'Memory', ...Array.from(available).filter((label) => label === 'iGPU' || label === 'dGPU' || label.startsWith('GPU')), 'NPU', 'Disk', 'Network']
+      .filter((label, index, labels) => available.has(label) && labels.indexOf(label) === index)
+  }, [reportResourceTrend])
+  const reportResourceTrendSeries = useMemo(
+    () => reportAvailableResourceTrendLabels.filter((label) => reportResourceTrendLabels.has(label)),
+    [reportAvailableResourceTrendLabels, reportResourceTrendLabels],
+  )
+  const reportAverageResourceUtilization = useMemo(() => reportResourceUtilization.map((resource) => ({
+    ...resource,
+    color: resourceUtilizationColor(resource.label),
+  })), [reportResourceUtilization])
+  const reportEventActivityTick = useCallback((ts: number) => {
+    const duration = reportQueryRange.to - reportQueryRange.from
+    return dayjs.unix(ts).format(duration <= 24 * 60 * 60 ? 'HH:mm' : 'MM-DD HH:mm')
+  }, [reportQueryRange.from, reportQueryRange.to])
+
+  const loadReport = useCallback(async () => {
+    const token = ++reportSeq.current
+    setReportLoading(true)
+    setReportError(null)
+    try {
+      const [digest, eventData, findingsData, resourceData] = await Promise.all([
+        api.getDiagReport(reportQueryRange.from, reportQueryRange.to),
+        api.getDiagEvents({ from: reportQueryRange.from, to: reportQueryRange.to, limit: 5000 }),
+        api.getDiagContext({ from: reportQueryRange.from, to: reportQueryRange.to, findings_only: true }),
+        api.getDiagResourceUtilization(reportQueryRange.from, reportQueryRange.to),
+      ])
+      if (token !== reportSeq.current) return
+      const resourceTrend = resourceData.monitor.trend || []
+      const resourceLabels = new Set(resourceTrend.flatMap((point) => Object.keys(point.values)))
+      setReport(digest)
+      setReportEvents(eventData.events || [])
+      setReportFindings(findingsData.findings || [])
+      setReportResourceUtilization(resourceData.monitor.resources || [])
+      setReportResourceTrend(resourceTrend)
+      setReportResourceSampleCount(resourceData.monitor.count || 0)
+      setReportResourceTrendLabels(resourceLabels)
+    } catch (error) {
+      if (token !== reportSeq.current) return
+      setReport(null)
+      setReportEvents([])
+      setReportFindings([])
+      setReportResourceUtilization([])
+      setReportResourceTrend([])
+      setReportResourceSampleCount(0)
+      setReportError(error instanceof Error ? error.message : 'Failed to generate report')
+    } finally {
+      if (token === reportSeq.current) setReportLoading(false)
+    }
+  }, [reportQueryRange.from, reportQueryRange.to])
+
+  const openReport = useCallback(() => {
+    setReportRange({ from: timeRange.from, to: timeRange.to })
+    setReportResourceTrendLabels(new Set())
+    setReportOpen(true)
+    setReport(null)
+    setReportError(null)
+  }, [resourceTrendLabels, timeRange.from, timeRange.to])
+
+  useEffect(() => {
+    if (reportOpen) void loadReport()
+  }, [loadReport, reportOpen])
+
+  const reportPayload = useMemo(() => {
+    if (!report) return null
+    return {
+      ...report,
+      report_snapshot: {
+        overview: {
+          total_events: reportEventOverview.total,
+          errors: reportEventOverview.severityCounts.error + reportEventOverview.severityCounts.critical,
+          affected_domains: reportEventOverview.categories.length,
+        },
+        events_by_severity: reportEventOverview.severityCounts,
+        events_by_domain: reportOverviewDomains.map((domain) => ({ domain: domain.label, count: domain.count })),
+        event_activity: {
+          filtered_event_count: reportDisplayedEvents.length,
+          timeline_event_count: reportTimeline.points.length,
+          range: reportQueryRange,
+        },
+        alerts: {
+          range_activity: report.range_alerts.length,
+          active_currently: report.active_alerts.length,
+          alert_summary_count: report.alert_summary.length,
+        },
+        advices: reportFindings.map((finding) => ({
+          id: finding.id,
+          severity: finding.severity,
+          title: finding.title,
+          confidence: finding.confidence,
+          observation: finding.observation,
+          recommendation: finding.recommendations?.[0] ?? null,
+          validation_step: finding.validation_steps?.[0] ?? null,
+        })),
+      },
+    }
+  }, [report, reportDisplayedEvents.length, reportEventOverview, reportFindings, reportOverviewDomains, reportQueryRange, reportTimeline.points.length])
+
+  const reportSeverityDonutData = useMemo(() => {
+    if (!report) return []
+    return [
+      { name: 'Info', value: report.event_stats.by_severity.info, color: COLORS.accent },
+      { name: 'Warning', value: report.event_stats.by_severity.warning, color: COLORS.yellow },
+      { name: 'Error', value: report.event_stats.by_severity.error, color: DIAGNOSTIC_ERROR_COLOR },
+      { name: 'Critical', value: report.event_stats.by_severity.critical, color: COLORS.red },
+    ]
+  }, [report])
+
+  const downloadReport = useCallback(() => {
+    if (!reportPayload) return
+    const url = URL.createObjectURL(new Blob([JSON.stringify(reportPayload, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    }))
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `diagnostics-report-${dayjs.unix(reportQueryRange.from).format('YYYYMMDD-HHmm')}-${dayjs.unix(reportQueryRange.to).format('YYYYMMDD-HHmm')}.json`
+    document.body.appendChild(anchor)
+    anchor.click()
+    document.body.removeChild(anchor)
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }, [reportPayload, reportQueryRange.from, reportQueryRange.to])
+
   useEffect(() => {
     if (active && !wasActive.current) setRangeEndEpoch(Math.floor(Date.now() / 1000))
     wasActive.current = active
   }, [active])
+
+  useEffect(() => {
+    if (!active) return undefined
+    let cancelled = false
+    api.getDiagContext({ from: timeRange.from, to: timeRange.to, findings_only: true })
+      .then((data) => {
+        if (!cancelled) setRangeFindings(data.findings || [])
+      })
+      .catch(() => {
+        if (!cancelled) setRangeFindings([])
+      })
+    return () => { cancelled = true }
+  }, [active, timeRange.from, timeRange.to])
+
+  useEffect(() => {
+    if (!active) return undefined
+    let cancelled = false
+    setRangeMonitorLoading(true)
+    api.getDiagResourceUtilization(timeRange.from, timeRange.to)
+      .then((data) => {
+        if (!cancelled) {
+          setRangeResourceUtilization(data.monitor.resources || [])
+          setRangeResourceTrend(data.monitor.trend || [])
+          setRangeMonitorSampleCount(data.monitor.count || 0)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRangeResourceUtilization([])
+          setRangeResourceTrend([])
+          setRangeMonitorSampleCount(0)
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setRangeMonitorLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [active, timeRange.from, timeRange.to])
+
+  useEffect(() => {
+    if (!active) return undefined
+    let cancelled = false
+    setAlertsLoading(true)
+    api.getDiagAlerts(false, 300)
+      .then((data) => {
+        if (!cancelled) setAlerts(data.alerts || [])
+      })
+      .catch(() => {
+        if (!cancelled) setAlerts([])
+      })
+      .finally(() => {
+        if (!cancelled) setAlertsLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [active, rangeEndEpoch])
+
+  const investigateFinding = useCallback((finding: DiagFinding) => {
+    const event = events.find((item) => finding.related_event_ids?.includes(item.event_id))
+    const target = event ? contextTargetForEvent(event) : null
+    if (event && target) void openContext(target, event)
+  }, [events, openContext])
+
+  const investigateAlert = useCallback(async (alert: DiagAlert) => {
+    if (!alert.last_event_id) return
+    const event = await api.getDiagEvent(alert.last_event_id)
+    if (!event) return
+    const target = contextTargetForEvent(event)
+    if (target) void openContext(target, event)
+    else setSelectedEvent(displayEvents([event])[0])
+  }, [openContext])
+
+  const refreshAlerts = useCallback(async () => {
+    const data = await api.getDiagAlerts(false, 300)
+    setAlerts(data.alerts || [])
+  }, [])
+
+  const acknowledgeAlert = useCallback(async (alert: DiagAlert) => {
+    setAlertActionKey(alert.dedup_key)
+    try {
+      await api.acknowledgeDiagAlert(alert.dedup_key)
+      await refreshAlerts()
+      message.success('Alert acknowledged')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Unable to acknowledge alert')
+    } finally {
+      setAlertActionKey(null)
+    }
+  }, [refreshAlerts])
+
+  const silenceAlert = useCallback(async (alert: DiagAlert, minutes: 30 | 120) => {
+    setAlertActionKey(alert.dedup_key)
+    try {
+      await api.silenceDiagAlert(alert.dedup_key, minutes)
+      await refreshAlerts()
+      message.success(`Alert silenced for ${minutes === 30 ? '30 minutes' : '2 hours'}`)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Unable to silence alert')
+    } finally {
+      setAlertActionKey(null)
+    }
+  }, [refreshAlerts])
 
   // Keep the fetch-time keyword current without making it a loadLogs dependency.
   useEffect(() => { logKeywordRef.current = logKeyword }, [logKeyword])
@@ -1192,112 +2157,137 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
     setLogsOpen(true)
   }, [bootScopeEnabled, boots.length, bootsLoading, loadBoots])
 
+  useEffect(() => {
+    if (!openAlertsSignal) return
+    setAlertFilter('needs_attention')
+    setAlertsOpen(true)
+  }, [openAlertsSignal])
+
   return (
     <Card className='diagnostics-page'>
       <div className='diagnostics-toolbar'>
         <Row className='diagnostics-filter-row' gutter={[8, 8]} align='middle' justify='space-between'>
           <Col flex='auto'>
-            <Space className='diagnostics-filter-group' wrap size={8}>
-              <Space className='diagnostics-range-controls' wrap size={8}>
-                <Text className='diagnostics-control-label' strong>Select time range</Text>
+            <div className='diagnostics-time-selection'>
+              <Space className='diagnostics-boot-controls' wrap size={8}>
+                <Tooltip title='Choose the boot cycle that bounds all time ranges. The latest boot is selected automatically.'>
+                  <Text className='diagnostics-control-label' strong>Boot cycle</Text>
+                </Tooltip>
+                <Select
+                  aria-label='Boot cycle'
+                  className='diagnostics-boot-select'
+                  placeholder='Select a boot cycle'
+                  loading={bootsLoading}
+                  value={selectedBootId ?? undefined}
+                  onChange={(value) => {
+                    setSelectedBootId(value)
+                    setBootCustomRange(null)
+                    resetEventViewForTimeRange()
+                  }}
+                  options={boots.map((b) => ({ label: formatBootLabel(b), value: b.boot_id }))}
+                  notFoundContent={bootsLoading ? 'Loading…' : 'No boot sessions (journald unavailable)'}
+                />
+              </Space>
+              <Space className='diagnostics-window-controls' wrap size={8}>
+                <Tooltip title='Select how far back to look from now, or from the selected boot end time for a completed boot.'>
+                  <Text className='diagnostics-control-label' strong>Time range</Text>
+                </Tooltip>
                 <Segmented
+                  className='diagnostics-time-range-segmented'
                   value={windowKey}
-                  onChange={(value) => setWindowKey(value as WindowKey)}
-                  options={bootScopeEnabled ? [
+                  onChange={(value) => {
+                    setWindowKey(value as WindowKey)
+                    resetEventViewForTimeRange()
+                  }}
+                  options={[
                     { label: '15m', value: '15m' },
                     { label: '1h', value: '1h' },
                     { label: '6h', value: '6h' },
                     { label: '24h', value: '24h' },
-                    { label: 'Custom', value: 'custom' },
-                    { label: 'Entire boot', value: 'entire' },
-                  ] : [
-                    { label: '15m', value: '15m' },
-                    { label: '1h', value: '1h' },
-                    { label: '6h', value: '6h' },
-                    { label: '24h', value: '24h' },
+                    { label: 'All', value: 'entire' },
                     { label: 'Custom', value: 'custom' },
                   ]}
                 />
-                <Button
-                  className='diagnostics-boot-toggle'
-                  type={bootScopeEnabled ? 'primary' : 'default'}
-                  onClick={() => {
-                    setBootScopeEnabled((enabled) => !enabled)
-                    if (windowKey === 'entire') setWindowKey('1h')
-                  }}
-                >
-                  Boot
-                </Button>
-                {windowKey === 'custom' ? (
-                  <DatePicker.RangePicker
-                    showTime={{ format: 'HH:mm' }}
-                    format='MM-DD HH:mm'
-                    value={(bootScopeEnabled ? bootCustomRange : customRange)
-                      ? [dayjs.unix((bootScopeEnabled ? bootCustomRange : customRange)!.from), dayjs.unix((bootScopeEnabled ? bootCustomRange : customRange)!.to)]
-                      : null}
-                    disabledDate={bootScopeEnabled && selectedBoot?.first_ts ? (date) => {
-                      const from = dayjs.unix(selectedBoot.first_ts!).startOf('day')
-                      const to = dayjs.unix(selectedBoot.running ? rangeEndEpoch + (clockSkewSec ?? 0) : selectedBoot.last_ts ?? rangeEndEpoch).endOf('day')
-                      return date.endOf('day').isBefore(from) || date.startOf('day').isAfter(to)
-                    } : undefined}
-                    onChange={(vals) => {
-                      if (vals && vals[0] && vals[1]) {
-                        const range = { from: vals[0].unix(), to: vals[1].unix() }
-                        if (bootScopeEnabled) setBootCustomRange(range)
-                        else setCustomRange(range)
-                      } else {
-                        if (bootScopeEnabled) setBootCustomRange(null)
-                        else setCustomRange(null)
-                      }
-                    }}
-                  />
-                ) : null}
-                {bootScopeEnabled ? (
-                  <Select
-                    aria-label='Boot session'
-                    className='diagnostics-boot-select'
-                    placeholder='Select a boot session'
-                    loading={bootsLoading}
-                    value={selectedBootId ?? undefined}
-                    onChange={(value) => {
-                      setSelectedBootId(value)
-                      setBootCustomRange(null)
-                    }}
-                    options={boots.map((b) => ({ label: formatBootLabel(b), value: b.boot_id }))}
-                    notFoundContent={bootsLoading ? 'Loading…' : 'No boot sessions (journald unavailable)'}
-                  />
-                ) : null}
-                {bootScopeEnabled && !selectedBoot ? (
-                  <Text className='diagnostics-range-summary' type='warning'>Select a boot session (showing the selected recent range)</Text>
-                ) : bootScopeEnabled && selectedBoot && !selectedBoot.first_ts ? (
-                  <Text className='diagnostics-range-summary' type='warning'>This boot has no known time bounds; showing the selected recent range</Text>
-                ) : bootScopeEnabled && windowKey === 'custom' && !bootCustomRange ? (
-                  <Text className='diagnostics-range-summary' type='warning'>Select a range within this boot (showing the last hour)</Text>
-                ) : !bootScopeEnabled && windowKey === 'custom' && !customRange ? (
-                  <Text className='diagnostics-range-summary' type='warning'>Select a custom range (showing the last hour)</Text>
-                ) : (
-                  <Text className='diagnostics-range-summary' type='secondary'>
-                    {dayjs.unix(timeRange.from).format('MM-DD HH:mm:ss')} - {dayjs.unix(timeRange.to).format('MM-DD HH:mm:ss')}
-                    {bootScopeEnabled && selectedBoot ? ` · ${formatBootLabel(selectedBoot)}` : ''}
-                  </Text>
-                )}
               </Space>
-            </Space>
+              {windowKey === 'custom' ? (
+                <DatePicker.RangePicker
+                  className='diagnostics-custom-range'
+                  showTime={{ format: 'HH:mm' }}
+                  format='MM-DD HH:mm'
+                  value={bootCustomRange ? [dayjs.unix(bootCustomRange.from), dayjs.unix(bootCustomRange.to)] : null}
+                  disabledDate={selectedBoot?.first_ts ? (date) => {
+                    const from = dayjs.unix(selectedBoot.first_ts!).startOf('day')
+                    const to = dayjs.unix(selectedBoot.running ? rangeEndEpoch + (clockSkewSec ?? 0) : selectedBoot.last_ts ?? rangeEndEpoch).endOf('day')
+                    return date.endOf('day').isBefore(from) || date.startOf('day').isAfter(to)
+                  } : undefined}
+                  onChange={(vals) => {
+                    const range = vals && vals[0] && vals[1]
+                      ? { from: vals[0].unix(), to: vals[1].unix() }
+                      : null
+                    setBootCustomRange(range)
+                    setCustomRange(range)
+                    resetEventViewForTimeRange()
+                  }}
+                />
+              ) : null}
+            </div>
           </Col>
           <Col>
             <Space className='diagnostics-toolbar-actions' size={8} wrap>
-              <Select
-                aria-label='Auto refresh interval'
-                className='diagnostics-refresh-select'
-                value={refreshInterval}
-                onChange={(value) => setRefreshInterval(value)}
-                options={[
-                  { label: 'Refresh off', value: 'off' },
-                  { label: 'Every 5s', value: '5s' },
-                  { label: 'Every 10s', value: '10s' },
-                  { label: 'Every 30s', value: '30s' },
-                ]}
+              <Input.Search
+                allowClear
+                aria-label='Search events and log messages'
+                className='diagnostics-toolbar-search'
+                placeholder='Search events and logs'
+                value={eventKeyword}
+                onChange={(event) => {
+                  setEventKeyword(event.target.value)
+                  setEventPage(1)
+                }}
+                onSearch={(value) => {
+                  setLogKeyword(value)
+                  logKeywordRef.current = value
+                  setLogsOpen(true)
+                  void loadLogs()
+                }}
               />
+              <Tooltip title={`Current alerts${currentAlerts.length ? ` (${currentAlerts.length})` : ''}. Open it to view active alerts, resolved history, and alert policy.`}>
+                <Button
+                  aria-label='Alert history'
+                  icon={<BellOutlined />}
+                  onClick={() => {
+                    setAlertFilter('all')
+                    setAlertsOpen(true)
+                  }}
+                  loading={alertsLoading}
+                />
+              </Tooltip>
+              <Tooltip title={`Advices${rangeFindings.length ? ` (${rangeFindings.length})` : ''}. Advice is generated by deterministic rules from metrics and supported built-in event types; custom-rule events do not independently create advice.`}>
+                <Button aria-label='Advices' icon={<BulbOutlined />} onClick={() => setInsightsOpen(true)} />
+              </Tooltip>
+              <Tooltip title='Diagnostics report'>
+                <Button aria-label='Diagnostics report' icon={<FileTextOutlined />} onClick={openReport} />
+              </Tooltip>
+              <Dropdown
+                trigger={['click']}
+                menu={{
+                  selectable: true,
+                  selectedKeys: [refreshInterval],
+                  items: [
+                    { label: 'Refresh off', key: 'off' },
+                    { label: 'Every 5 seconds', key: '5s' },
+                    { label: 'Every 10 seconds', key: '10s' },
+                    { label: 'Every 30 seconds', key: '30s' },
+                  ],
+                  onClick: ({ key }) => setRefreshInterval(key as RefreshInterval),
+                }}
+              >
+                <Tooltip title={`Auto refresh: ${refreshInterval === 'off' ? 'off' : `every ${refreshInterval}`}`}>
+                  <Button icon={<ClockCircleOutlined />}>
+                    {refreshInterval === 'off' ? 'Refresh off' : `Every ${refreshInterval}`}
+                  </Button>
+                </Tooltip>
+              </Dropdown>
               <Tooltip title='Refresh diagnostics'>
                 <Button aria-label='Refresh diagnostics' icon={<ReloadOutlined />} onClick={refreshAll} loading={eventsLoading} />
               </Tooltip>
@@ -1305,6 +2295,9 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
           </Col>
         </Row>
         <Space className='diagnostics-range' wrap size={8}>
+          <Text className='diagnostics-range-summary' type='secondary'>
+            {dayjs.unix(timeRange.from).format('MMM D HH:mm:ss')} - {dayjs.unix(timeRange.to).format('MMM D HH:mm:ss')}
+          </Text>
           {objectFilters.length > 0 ? (
             <Space size={4} wrap>
               <Text type='secondary'>Related to:</Text>
@@ -1325,59 +2318,441 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
         />
       ) : null}
 
-      <section className='diagnostics-overview' aria-label='Diagnostic overview'>
-        <div className='diagnostics-event-activity'>
-          <Text className='diagnostics-overview-heading' type='secondary'>Event activity</Text>
-          <div className='diagnostics-event-metrics' role='tablist' aria-label='Event category'>
-            <button
-              type='button'
-              role='tab'
-              aria-selected={eventActivity === 'all'}
-              className='diagnostics-overview-metric'
-              onClick={() => { setEventActivity('all'); setEventPage(1) }}
-            >
-              <Text className='diagnostics-overview-value'>{(eventsLoading && events.length === 0) || eventsError ? '-' : eventActivityCounts.all}</Text>
-              <Text type='secondary'>All records</Text>
-            </button>
-            <button
-              type='button'
-              role='tab'
-              aria-selected={eventActivity === 'protection'}
-              className='diagnostics-overview-metric'
-              onClick={() => { setEventActivity('protection'); setEventPage(1) }}
-            >
-              <Text className='diagnostics-overview-value'>{eventsLoading && events.length === 0 ? '-' : eventActivityCounts.protection}</Text>
-              <Text type='secondary'>Resource control</Text>
-              {(!controlLifecyclesLoading || controlLifecycles.length > 0) && !controlLifecyclesError ? (
-                <Text className='diagnostics-metric-sub' type={protectionSummary.resourcesNeedingVerification > 0 ? 'warning' : 'secondary'}>
-                  {protectionSummary.activeResources} active now
-                  {protectionSummary.resourcesNeedingVerification > 0 ? ` · ${protectionSummary.resourcesNeedingVerification} need verification` : ''}
-                </Text>
-              ) : null}
-            </button>
-            <button
-              type='button'
-              role='tab'
-              aria-selected={eventActivity === 'system'}
-              className='diagnostics-overview-metric'
-              onClick={() => { setEventActivity('system'); setEventPage(1) }}
-            >
-              <Text className='diagnostics-overview-value'>{eventsLoading && events.length === 0 ? '-' : eventActivityCounts.system}</Text>
-              <Text type='secondary'>System events</Text>
-            </button>
-            <button
-              type='button'
-              role='tab'
-              aria-selected={eventActivity === 'benchmark'}
-              className='diagnostics-overview-metric'
-              onClick={() => { setEventActivity('benchmark'); setEventPage(1) }}
-            >
-              <Text className='diagnostics-overview-value'>{eventsLoading && events.length === 0 ? '-' : eventActivityCounts.benchmark}</Text>
-              <Text type='secondary'>Benchmark runs</Text>
-            </button>
-          </div>
+      <section className='diagnostics-event-overview' aria-label='Selected time range overview'>
+        <div className='diagnostics-overview-header'>
+          <Text className='diagnostics-overview-heading'>Selected time range overview</Text>
         </div>
+        {eventsLoading ? null : eventOverview.total === 0 ? (
+          <div className='diagnostics-overview-empty'>
+            <div>
+              <Text strong>No events in this view</Text>
+              <Text type='secondary'>No diagnostic events were recorded for the current time window and filters.</Text>
+            </div>
+            {eventSeverity || eventDomainFilter || eventKindFilter || eventFatalSignature || eventLaneFilter ? (
+              <Button size='small' onClick={() => {
+                setEventSeverity(undefined)
+                setEventDomainFilter(undefined)
+                setEventKindFilter(undefined)
+                setEventFatalSignature(undefined)
+                setEventLaneFilter(undefined)
+                setTimelineEventKeys(null)
+                setEventPage(1)
+              }}>Clear event filters</Button>
+            ) : null}
+          </div>
+        ) : (
+          <div className='diagnostics-overview-sections'>
+            <div className='diagnostics-overview-summary-strip'>
+              <div className='diagnostics-overview-inline-group' aria-label='Event profile'>
+                <Tooltip title='Show all events in the selected range'>
+                  <button
+                    className='diagnostics-overview-inline-action diagnostics-overview-inline-events'
+                    type='button'
+                    aria-pressed={!eventSeverity && !eventDomainFilter && !eventKindFilter && !eventFatalSignature && !eventLaneFilter && !timelineEventKeys}
+                    onClick={() => {
+                    setEventSeverity(undefined)
+                    setEventDomainFilter(undefined)
+                    setEventKindFilter(undefined)
+                    setEventFatalSignature(undefined)
+                    setEventLaneFilter(undefined)
+                    setTimelineEventKeys(null)
+                    setEventPage(1)
+                    }}
+                  >
+                    <FileTextOutlined /> <strong>{eventOverview.total}</strong> events
+                  </button>
+                </Tooltip>
+                <span className='diagnostics-overview-inline-severity' aria-label='Event severity distribution'>
+                  {[
+                    ['critical', 'Crit', COLORS.red],
+                    ['error', 'Err', DIAGNOSTIC_ERROR_COLOR],
+                    ['warning', 'Warn', COLORS.yellow],
+                    ['info', 'Info', COLORS.accent],
+                  ].map(([severity, label, color]) => {
+                    const count = eventOverview.severityCounts[severity as keyof typeof eventOverview.severityCounts]
+                    return <Tooltip key={severity} title={`Filter events by ${severity} severity`}>
+                      <button
+                        type='button'
+                        className={`diagnostics-overview-inline-action diagnostics-overview-inline-severity-item diagnostics-overview-inline-severity-item--${severity}`}
+                        data-empty={count === 0 || undefined}
+                        data-active={count > 0 || undefined}
+                        aria-pressed={eventSeverity === severity}
+                        onClick={() => {
+                          setEventSeverity(eventSeverity === severity ? undefined : severity)
+                          setEventLaneFilter(undefined)
+                          setTimelineEventKeys(null)
+                          setEventPage(1)
+                        }}
+                      >
+                        <span className='diagnostics-filter-chip-dot' style={{ background: color }} />
+                        <strong>{count}</strong> {label}
+                      </button>
+                    </Tooltip>
+                  })}
+                </span>
+              </div>
+
+              <div className='diagnostics-overview-inline-divider' />
+
+              <Tooltip title='View alerts in the selected range'>
+                <button className='diagnostics-overview-inline-action diagnostics-overview-inline-alert' type='button' onClick={() => {
+                  setAlertFilter('range')
+                  setAlertsOpen(true)
+                }}>
+                  <BellOutlined /> <strong>{alertsLoading ? '-' : rangeAlerts.length}</strong> alerts
+                </button>
+              </Tooltip>
+
+              <div className='diagnostics-overview-inline-divider' />
+
+              <Tooltip title='View advice items for the selected range'>
+                <button className='diagnostics-overview-inline-action' type='button' onClick={() => setInsightsOpen(true)}>
+                  <BulbOutlined /> <strong>{rangeFindings.length}</strong> advice items
+                </button>
+              </Tooltip>
+
+              <div className='diagnostics-overview-inline-divider' />
+
+              <Tooltip title='Domains with at least one event in the selected range. Filter individual domains below.'>
+                <span className='diagnostics-overview-inline-scope'>
+                  <InfoCircleOutlined /> <strong>{eventOverview.categories.length}</strong> affected domain{eventOverview.categories.length === 1 ? '' : 's'}
+                </span>
+              </Tooltip>
+            </div>
+
+          <section className='diagnostics-overview-section diagnostics-overview-domains' aria-label='Event counts by domain'>
+            <div className='diagnostics-overview-section-heading'>
+              <Text className='diagnostics-overview-section-title'>Events by domain ({domainEventTotal})</Text>
+            </div>
+            <div className='diagnostics-domain-distribution'>
+              {overviewDomains.map((domain) => {
+                const percentage = domainEventTotal ? domain.count / domainEventTotal * 100 : 0
+                const severityDescription = [
+                  `${domain.severityCounts.info} info`,
+                  `${domain.severityCounts.warning} warning`,
+                  `${domain.severityCounts.error} error`,
+                  `${domain.severityCounts.critical} critical`,
+                ].join(' · ')
+                return <Tooltip key={domain.label} title={`${domain.description} ${severityDescription}. Click to filter events.`}>
+                  <button
+                    type='button'
+                    className='diagnostics-domain-distribution-row'
+                    data-empty={domain.count === 0 || undefined}
+                    aria-label={`${domain.label}: ${domain.count} events`}
+                    aria-pressed={eventLaneFilter === domain.label}
+                    onClick={() => selectEventDomain(domain.label)}
+                  >
+                    <span className='diagnostics-domain-distribution-label'>{domain.label}</span>
+                    <span className='diagnostics-domain-distribution-track'>
+                      <span className='diagnostics-domain-distribution-fill' style={{ width: `${percentage}%` }}>
+                        {[
+                          ['info', COLORS.accent],
+                          ['warning', COLORS.yellow],
+                          ['error', DIAGNOSTIC_ERROR_COLOR],
+                          ['critical', COLORS.red],
+                        ].map(([severity, color]) => {
+                          const count = domain.severityCounts[severity as keyof typeof domain.severityCounts]
+                          return count ? <span
+                            className='diagnostics-domain-distribution-severity'
+                            key={severity}
+                            style={{ width: `${count / domain.count * 100}%`, background: color }}
+                          /> : null
+                        })}
+                      </span>
+                    </span>
+                    <span className='diagnostics-domain-distribution-value'>{domain.count} ({percentage.toFixed(1)}%)</span>
+                  </button>
+                </Tooltip>
+              })}
+            </div>
+          </section>
+
+          <section className='diagnostics-overview-section diagnostics-overview-utilization' aria-label='Resource average utilization'>
+            <Text className='diagnostics-overview-section-title'>Resource average utilization (%)</Text>
+            {rangeMonitorLoading ? <Text type='secondary'>Loading resource samples...</Text> : averageResourceUtilization.length ? (
+              <div className='diagnostics-utilization-rows'>
+                {averageResourceUtilization.map((resource) => (
+                  <div className='diagnostics-utilization-row' key={resource.label}>
+                    <span className='diagnostics-utilization-label'>{resource.label}</span>
+                    <span className='diagnostics-utilization-track'>
+                      <span className='diagnostics-utilization-average' style={{ width: `${Math.min(100, resource.value)}%`, background: resource.color }} />
+                      <span className='diagnostics-utilization-peak' style={{ left: `${Math.min(100, resource.peak)}%`, borderColor: resource.color }} />
+                    </span>
+                    <span className='diagnostics-utilization-value'>{resource.value.toFixed(1)}% <span>(Peak {resource.peak.toFixed(1)}%)</span></span>
+                  </div>
+                ))}
+              </div>
+            ) : <Text type='secondary'>No resource samples in this range</Text>}
+            <Text className='diagnostics-utilization-caption' type='secondary'>Solid: average · marker: peak · selected range{rangeMonitorSampleCount ? ` · ${rangeMonitorSampleCount} samples` : ''}</Text>
+          </section>
+        </div>
+        )}
+        {activeControlRows.length > 0 || latestBenchmarkEvent ? (
+          <div className='diagnostics-overview-links'>
+            {activeControlRows.length > 0 ? (
+              <Button type='link' onClick={() => activeControlsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>
+                {activeControlRows.length} resource limit{activeControlRows.length === 1 ? '' : 's'} in effect
+              </Button>
+            ) : null}
+            {latestBenchmarkEvent ? (
+              <Button type='link' onClick={() => {
+                const target = contextTargetForEvent(latestBenchmarkEvent)
+                if (target) void openContext(target, latestBenchmarkEvent)
+              }}>
+                Latest benchmark: {displayEventSummary(displayEvents([latestBenchmarkEvent])[0])}
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
       </section>
+
+      {eventsLoading || eventOverview.total > 0 ? (
+      <section className='diagnostics-event-activity' aria-label='Event activity timeline'>
+        <div className='diagnostics-panel-heading'>
+          <Text strong>Event activity</Text>
+          <Space size={8}>
+            {eventBrushRange || eventZoomRange ? (
+              <Tooltip title='Reset zoom'>
+                <Button size='small' type='text' aria-label='Reset event timeline zoom' icon={<RollbackOutlined />} onClick={resetEventZoom} />
+              </Tooltip>
+            ) : null}
+          </Space>
+        </div>
+        {eventsLoading ? null : displayedEvents.length ? (
+          <>
+            <div className='diagnostics-event-timeline diagnostics-event-timeline--selectable' style={{ height: Math.max(220, eventTimeline.lanes.length * 46 + 72) }}>
+              <span className='diagnostics-event-domain-heading'>Domain</span>
+              <ResponsiveContainer width='100%' height='100%'>
+                <ScatterChart
+                  margin={{ top: 8, right: 16, left: EVENT_TIMELINE_LEFT_GUTTER, bottom: 0 }}
+                  onMouseDown={beginEventZoom}
+                  onMouseMove={updateEventZoom}
+                  onMouseUp={finishEventZoom}
+                  onMouseLeave={() => {
+                    eventZoomDraggedRef.current = false
+                    setEventZoomSelection(null)
+                    setSuppressEventTooltip(false)
+                  }}
+                  onDoubleClick={resetEventZoom}
+                >
+                  <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray='3 3' />
+                  <XAxis
+                    type='number'
+                    dataKey='x'
+                    domain={[eventViewRange.from, eventViewRange.to]}
+                    tickFormatter={eventActivityTick}
+                    tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                    minTickGap={36}
+                  />
+                  <YAxis
+                    type='number'
+                    dataKey='y'
+                    yAxisId='domain'
+                    domain={[-0.5, Math.max(0.5, eventTimeline.lanes.length - 0.5)]}
+                    ticks={eventTimeline.lanes.map((_, index) => index)}
+                    tickFormatter={(index) => {
+                      const lane = eventTimeline.lanes[index]
+                      return lane ? `${lane} (${eventTimeline.laneCounts.get(lane) || 0})` : ''
+                    }}
+                    tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                    width={EVENT_TIMELINE_LABEL_WIDTH}
+                    reversed
+                  />
+                  <RechartsTooltip
+                    active={suppressEventTooltip ? false : undefined}
+                    content={eventTimelineTooltip}
+                    allowEscapeViewBox={{ y: true }}
+                    wrapperStyle={{ zIndex: 30 }}
+                  />
+                  <Legend
+                    verticalAlign='top'
+                    align='right'
+                    height={28}
+                    content={() => (
+                      <div className='diagnostics-event-severity-legend' aria-label='Event severity legend'>
+                        <span className='diagnostics-event-severity-legend-title'>Severity</span>
+                        {[
+                          ['Info', COLORS.accent],
+                          ['Warning', COLORS.yellow],
+                          ['Error', DIAGNOSTIC_ERROR_COLOR],
+                          ['Critical', COLORS.red],
+                        ].map(([label, color]) => (
+                          <span className='diagnostics-event-severity-legend-item' key={label}>
+                            <i style={{ backgroundColor: color }} />
+                            {label}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  />
+                  {eventZoomSelection ? (
+                    <ReferenceArea
+                      x1={Math.min(eventZoomSelection.from, eventZoomSelection.to)}
+                      x2={Math.max(eventZoomSelection.from, eventZoomSelection.to)}
+                      fill={COLORS.accent}
+                      fillOpacity={0.16}
+                      stroke={COLORS.accent}
+                      strokeOpacity={0.8}
+                    />
+                  ) : null}
+                  <Scatter
+                    data={eventTimeline.points}
+                    name='Events'
+                    yAxisId='domain'
+                    shape={(shapeProps: unknown) => {
+                      const props = shapeProps as {
+                        payload?: unknown
+                        cx?: number
+                        cy?: number
+                        fill?: string
+                        onMouseEnter?: React.MouseEventHandler<SVGGElement>
+                        onMouseLeave?: React.MouseEventHandler<SVGGElement>
+                      }
+                      const point = props.payload as EventTimelinePoint | undefined
+                      const cx = typeof props.cx === 'number' ? props.cx : 0
+                      const cy = typeof props.cy === 'number' ? props.cy : 0
+                      const fill = typeof props.fill === 'string' ? props.fill : COLORS.accent
+                      if (!point) return <g />
+                      const count = point.items.length
+                      const markerHeight = count === 1 ? 16 : 28
+                      const severityCounts = point.items.reduce<Record<string, number>>((counts, item) => {
+                        const severity = normalizedSeverity(item.event.severity)
+                        counts[severity] = (counts[severity] || 0) + 1
+                        return counts
+                      }, {})
+                      let segmentY = cy - markerHeight / 2
+                      return (
+                        <g
+                          onMouseEnter={props.onMouseEnter}
+                          onMouseLeave={props.onMouseLeave}
+                          onClick={(event) => {
+                            if (eventZoomDraggedRef.current) {
+                              event.stopPropagation()
+                              return
+                            }
+                            selectTimelineCluster(point)
+                          }}
+                          style={{ cursor: 'pointer' }}
+                        >
+                          {(['critical', 'error', 'warning', 'info', 'debug'] as const).map((severity) => {
+                            const severityCount = severityCounts[severity] || 0
+                            if (!severityCount) return null
+                            const height = markerHeight * severityCount / count
+                            const rect = (
+                              <rect
+                                key={severity}
+                                x={cx - (count === 1 ? 2 : 4)}
+                                y={segmentY}
+                                width={count === 1 ? 4 : 8}
+                                height={height}
+                                fill={severityColors[severity] || fill}
+                                stroke={COLORS.panelBg}
+                                strokeWidth={1}
+                              />
+                            )
+                            segmentY += height
+                            return rect
+                          })}
+                          <text x={cx + 7} y={cy + 4} fill={COLORS.text} fontSize={10} fontWeight={600}>{count}</text>
+                          <rect x={cx - 7} y={cy - 18} width={count > 1 ? 28 : 14} height={36} fill='transparent' />
+                        </g>
+                      )
+                    }}
+                  />
+                </ScatterChart>
+              </ResponsiveContainer>
+            </div>
+            <div className='diagnostics-event-brush' aria-label='Event timeline zoom control'>
+              <ResponsiveContainer width='100%' height='100%'>
+                <LineChart data={eventBrushPoints} margin={{ top: 0, right: 16, left: EVENT_TIMELINE_PLOT_LEFT, bottom: 0 }}>
+                  <Line dataKey='x' stroke='transparent' dot={false} isAnimationActive={false} />
+                  <Brush
+                    dataKey='x'
+                    height={28}
+                    stroke={COLORS.accent}
+                    fill={COLORS.bg}
+                    travellerWidth={8}
+                    alwaysShowText
+                    tickFormatter={(timestamp) => eventActivityTick(Number(timestamp))}
+                    {...(eventBrushRange ? {
+                      startIndex: eventBrushRange.startIndex,
+                      endIndex: eventBrushRange.endIndex,
+                    } : {})}
+                    onChange={handleEventBrushChange}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+            {resourceTrendLabels.length > 0 ? (
+              <Collapse
+                className='diagnostics-logs diagnostics-resource-lanes'
+                activeKey={resourceLanesOpen ? ['resource-trends'] : []}
+                onChange={(keys) => setResourceLanesOpen((Array.isArray(keys) ? keys : [keys]).includes('resource-trends'))}
+                items={[
+                  {
+                    key: 'resource-trends',
+                    label: 'Resource trends',
+                    extra: (
+                      <Button
+                        type='text'
+                        size='small'
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setActiveResourceTrendLabels(new Set(resourceTrendLabels))
+                        }}
+                      >
+                        All
+                      </Button>
+                    ),
+                    children: (
+                      <>
+                    <div className='diagnostics-resource-lanes-legend'>
+                      {resourceTrendLabels.map((label, index) => {
+                        const active = activeResourceTrendLabels.has(label)
+                        const dashed = index >= 3
+                        return <button
+                          key={label}
+                          type='button'
+                          className='diagnostics-resource-lane-toggle'
+                          data-active={active || undefined}
+                          onClick={() => setActiveResourceTrendLabels((selected) => {
+                            const next = new Set(selected)
+                            if (next.has(label)) next.delete(label)
+                            else next.add(label)
+                            return next
+                          })}
+                        >
+                          <i style={{ borderTopColor: active ? resourceUtilizationColor(label) : COLORS.textMuted, borderTopStyle: dashed ? 'dashed' : 'solid' }} />
+                          {active ? '' : '+ '}{label}
+                        </button>
+                      })}
+                    </div>
+                    {activeResourceTrendSeries.length ? (
+                      <div className='diagnostics-resource-lanes-chart'>
+                        <ResponsiveContainer width='100%' height='100%'>
+                          <LineChart data={visibleResourceTrend} margin={{ top: 8, right: 16, bottom: 0, left: EVENT_TIMELINE_PLOT_LEFT - 48 }}>
+                            <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray='3 3' vertical={false} />
+                            <XAxis type='number' dataKey='ts_epoch' domain={[eventViewRange.from, eventViewRange.to]} tickFormatter={eventActivityTick} tick={{ fill: COLORS.textMuted, fontSize: 11 }} minTickGap={36} />
+                            <YAxis type='number' domain={[0, 100]} ticks={[0, 50, 100]} width={48} tick={{ fill: COLORS.textMuted, fontSize: 11 }} tickFormatter={(value) => `${value}%`} label={{ value: 'Utilization', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11 }} />
+                            <RechartsTooltip formatter={(value: number) => `${value.toFixed(1)}%`} labelFormatter={(timestamp) => dayjs.unix(Number(timestamp)).format('YYYY-MM-DD HH:mm:ss')} contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }} cursor={{ stroke: COLORS.accent, strokeWidth: 1, strokeDasharray: '4 2' }} allowEscapeViewBox={{ x: true, y: true }} wrapperStyle={{ zIndex: 30 }} />
+                            {eventTimeline.points.map((point) => <ReferenceLine key={`event-${point.x}`} x={point.x} stroke={COLORS.textMuted} strokeOpacity={0.45} strokeDasharray='3 3' />)}
+                            {activeResourceTrendSeries.map((label, index) => <Line key={label} name={label} type='monotone' dataKey={`values.${label}`} stroke={resourceUtilizationColor(label)} strokeDasharray={index >= 3 ? '5 3' : undefined} strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />)}
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    ) : <Text className='diagnostics-resource-lanes-empty' type='secondary'>Select a resource to display its trend</Text>}
+                      </>
+                    ),
+                  },
+                ]}
+              />
+            ) : null}
+          </>
+        ) : (
+          <Empty className='diagnostics-event-activity-empty' image={Empty.PRESENTED_IMAGE_SIMPLE} description='No events in the selected range' />
+        )}
+      </section>
+      ) : null}
 
       {controlLifecyclesError ? (
         <Alert
@@ -1398,81 +2773,62 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
           description={eventsError}
           action={<Button size='small' onClick={loadEventsAndLifecycles}>Retry</Button>}
         />
-      ) : !eventsLoading && events.length === 0 && currentControlLifecycles.length === 0 ? (
-        <Alert
-          className='diagnostics-activity-empty'
-          type='success'
-          showIcon
-          message='No event records in the selected range'
-          description='The system reported no abnormal events for this period. Try widening the time range if you expected activity.'
-        />
       ) : null}
 
 
-      {eventsLoading || events.length > 0 || currentControlLifecycles.length > 0 ? (
-      <Card
-        size='small'
-        title={`Event records · ${EVENT_ACTIVITY_LABELS[eventActivity]} (${eventsLoading ? '-' : displayedEvents.length})`}
-        className='diagnostics-panel'
-      >
-        {/* Current active controls (host-wide point-in-time state), folded above the
-            control event history since the two answer "what is controlled now" and
-            "how did it get here" together. */}
-        {eventActivity === 'protection' ? (
-          <div className='diagnostics-active-controls'>
-            <div className='diagnostics-active-controls-head'>
-              <div>
-                <Text strong>Current active controls{controlLifecyclesLoading || controlLifecyclesError ? '' : ` (${activeControlRows.length})`}</Text>
-                <Text className='diagnostics-active-controls-scope' type='secondary'>Host-wide</Text>
-                <Text className='diagnostics-active-controls-scope' type='secondary'>Use Resume to remove this application's active limits. Open Balancer to review or change control settings.</Text>
-              </div>
+      {activeControlRows.length > 0 ? (
+        <section className='diagnostics-active-controls' ref={activeControlsRef}>
+          <div className='diagnostics-active-controls-head'>
+            <div>
+              <Text strong>Resource limits in effect ({activeControlRows.length})</Text>
+              <Text className='diagnostics-active-controls-scope' type='secondary'>Current host state</Text>
             </div>
-            {controlLifecyclesLoading ? (
-              <Text type='secondary'>Loading…</Text>
-            ) : controlLifecyclesError ? (
-              <Text type='warning'>{controlLifecyclesError}</Text>
-            ) : activeControlRows.length === 0 ? (
-              <Text type='secondary'>No controls are active right now</Text>
-            ) : (
-              <div className='diagnostics-active-controls-list'>
-                {visibleActiveControlRows.map((row) => (
-                  <div className='diagnostics-active-control-row' key={row.key}>
-                    <Text className='diagnostics-active-control-app' ellipsis={{ tooltip: row.appName }}>{row.appName}</Text>
-                    <span className='diagnostics-active-control-sep'>·</span>
-                    <Text type='secondary'>{resourceLabel(row.resource)}</Text>
-                    <span className='diagnostics-active-control-sep'>·</span>
-                    <span className='diagnostics-status-label' style={{ color: row.status.color }}>{row.status.label}</span>
-                    <span className='diagnostics-active-control-sep'>·</span>
-                    <Text type='secondary'>Updated {formatActivityTime(row.lastUpdatedAt)}</Text>
-                    {row.isActive && row.appId ? (
-                      <Tooltip title='Restore all active limits for this application'>
-                        <Button
-                          size='small'
-                          danger
-                          icon={<RollbackOutlined />}
-                          loading={resumingAppId === row.appId}
-                          onClick={() => void resumeControl(row.appId!, row.protectionId, row.hasCgroups)}
-                        >
-                          Resume
-                        </Button>
-                      </Tooltip>
-                    ) : null}
-                  </div>
-                ))}
-                {activeControlRows.length > 3 ? (
-                  <Button
-                    className='diagnostics-active-controls-toggle'
-                    type='link'
-                    size='small'
-                    onClick={() => setShowAllActiveControls((visible) => !visible)}
-                  >
-                    {showAllActiveControls ? 'Show less' : `Show ${activeControlRows.length - 3} more active controls`}
-                  </Button>
+          </div>
+          <div className='diagnostics-active-controls-list'>
+            {visibleActiveControlRows.map((row) => (
+              <div className='diagnostics-active-control-row' key={row.key}>
+                <Text className='diagnostics-active-control-app' ellipsis={{ tooltip: row.appName }}>{row.appName}</Text>
+                <span className='diagnostics-active-control-sep'>·</span>
+                <Text type='secondary'>{resourceLabel(row.resource)}</Text>
+                <span className='diagnostics-active-control-sep'>·</span>
+                <span className='diagnostics-status-label' style={{ color: row.status.color }}>{row.status.label}</span>
+                <span className='diagnostics-active-control-sep'>·</span>
+                <Text type='secondary'>Updated {formatActivityTime(row.lastUpdatedAt)}</Text>
+                {row.isActive && row.appId ? (
+                  <Tooltip title='Restore all active limits for this application'>
+                    <Button size='small' danger icon={<RollbackOutlined />} loading={resumingAppId === row.appId} onClick={() => void resumeControl(row.appId!, row.protectionId, row.hasCgroups)}>Resume</Button>
+                  </Tooltip>
                 ) : null}
               </div>
-            )}
+            ))}
+            {activeControlRows.length > 3 ? (
+              <Button className='diagnostics-active-controls-toggle' type='link' size='small' onClick={() => setShowAllActiveControls((visible) => !visible)}>
+                {showAllActiveControls ? 'Show less' : `Show ${activeControlRows.length - 3} more resource limits`}
+              </Button>
+            ) : null}
           </div>
-        ) : null}
+        </section>
+      ) : null}
+
+      {eventsLoading || events.length > 0 || currentControlLifecycles.length > 0 ? (
+      <div ref={eventsTableRef}>
+      <Collapse
+        className='diagnostics-logs diagnostics-event-records'
+        activeKey={eventRecordsOpen ? ['events'] : []}
+        onChange={(keys) => setEventRecordsOpen((Array.isArray(keys) ? keys : [keys]).includes('events'))}
+        items={[
+          {
+            key: 'events',
+            label: (
+              <Space size={4}>
+                <span>{`Recent events (${eventsLoading ? '-' : displayedEvents.length}${timelineEventKeys ? ' selected' : ''})`}</span>
+                <Tooltip title='Each row is a structured event. Event type is its stable machine identifier; Domain and Event kind only group and filter events. A custom rule creates CUSTOM_RULE::<Rule ID>.'>
+                  <InfoCircleOutlined style={{ color: COLORS.textMuted }} />
+                </Tooltip>
+              </Space>
+            ),
+            children: (
+              <>
         <Space className='diagnostics-event-controls' wrap size={8}>
           <Input.Search
             allowClear
@@ -1494,6 +2850,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
             }}
             options={[
               { label: 'All severities', value: ALL },
+              { label: 'IMPORTANT', value: 'important' },
               { label: 'INFO', value: 'info' },
               { label: 'WARNING', value: 'warning' },
               { label: 'ERROR', value: 'error' },
@@ -1502,13 +2859,24 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
           />
           <Select
             className='diagnostics-category-select'
-            aria-label='Event category'
-            value={eventCategory || ALL}
+            aria-label='Event domain'
+            value={eventDomainFilter || ALL}
             onChange={(value) => {
-              setEventCategory(value === ALL ? undefined : value)
+              setEventDomainFilter(value === ALL ? undefined : value as EventDomain)
+              setEventLaneFilter(undefined)
               setEventPage(1)
             }}
-            options={eventCategoryOptions}
+            options={eventDomainOptions}
+          />
+          <Select
+            className='diagnostics-category-select'
+            aria-label='Event kind'
+            value={eventKindFilter || ALL}
+            onChange={(value) => {
+              setEventKindFilter(value === ALL ? undefined : value as EventKind)
+              setEventPage(1)
+            }}
+            options={eventKindOptions}
           />
           <Select
             className='diagnostics-log-source-select'
@@ -1521,10 +2889,13 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
             options={eventSourceOptions}
           />
           <Text className='diagnostics-event-count' type='secondary'>
-            {eventKeyword || eventSeverity || eventCategory || eventSource
-              ? `${displayedEvents.length} matching of ${displayEvents(visibleEvents).length} ${displayEvents(visibleEvents).length === 1 ? 'event record' : 'event records'}`
+            {eventKeyword || eventSeverity || eventDomainFilter || eventKindFilter || eventFatalSignature || eventSource
+              ? `${displayedEvents.length} matching of ${displayEvents(events).length} ${displayEvents(events).length === 1 ? 'event record' : 'event records'}`
               : `${displayedEvents.length} ${displayedEvents.length === 1 ? 'event record' : 'event records'}`}
           </Text>
+          {timelineEventKeys ? (
+            <Tag closable onClose={() => setTimelineEventKeys(null)} color='blue'>Timeline selection · oldest first</Tag>
+          ) : null}
         </Space>
         <Table
           rowKey='event_id'
@@ -1534,10 +2905,15 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
           size='small'
           className='diagnostics-table diagnostics-events-table'
           scroll={{ x: 1300 }}
-          locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={`No ${EVENT_ACTIVITY_LABELS[eventActivity].toLowerCase()} recorded in the selected range`} /> }}
+          locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description='No events match the selected filters' /> }}
           columns={eventColumns}
         />
-      </Card>
+              </>
+            ),
+          },
+        ]}
+      />
+      </div>
       ) : null}
 
       <Collapse
@@ -1548,8 +2924,8 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
           {
             key: 'logs',
             label: objectFilters.length
-              ? `Logs · filtered by ${objectFilters.map((f) => f.label).join(', ')}`
-              : 'Logs in selected time range',
+              ? `Evidence search · filtered by ${objectFilters.map((f) => f.label).join(', ')}`
+              : 'Evidence search',
             children: (
               <Space direction='vertical' size={10} style={{ width: '100%' }}>
                 <Space className='diagnostics-log-controls' wrap size={8}>
@@ -1660,6 +3036,407 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
           },
         ]}
       />
+
+      <Drawer
+        title={`Advices · selected range${rangeFindings.length ? ` (${rangeFindings.length})` : ''}`}
+        open={insightsOpen}
+        onClose={() => setInsightsOpen(false)}
+        width={560}
+      >
+        {rangeFindings.length ? (
+          <Space direction='vertical' size={16} style={{ width: '100%' }}>
+            {rangeFindings.map((finding) => (
+              <section className='diagnostics-insight-drawer-item' key={finding.id}>
+                <Space size={6} wrap>
+                  {severityTag(finding.severity)}
+                  <Text strong>{finding.title}</Text>
+                </Space>
+                <Text className='diagnostics-report-advice-time' type='secondary'>{rangeAdviceTimeLabel(finding)}</Text>
+                <Text>{finding.observation}</Text>
+                <Text type='secondary'>Evidence confidence {Math.round(finding.confidence * 100)}%</Text>
+                {finding.recommendations?.length ? (
+                  <div>
+                    <Text strong>Recommended next step</Text>
+                    <Text className='diagnostics-drawer-list-item'>{finding.recommendations[0]}</Text>
+                  </div>
+                ) : null}
+                {finding.validation_steps?.length ? (
+                  <div>
+                    <Text strong>Verify</Text>
+                    <Text className='diagnostics-drawer-list-item'>{finding.validation_steps[0]}</Text>
+                  </div>
+                ) : null}
+                <Button type='primary' size='small' icon={<SearchOutlined />} onClick={() => {
+                  investigateFinding(finding)
+                  setInsightsOpen(false)
+                }}>
+                  Investigate
+                </Button>
+              </section>
+            ))}
+          </Space>
+        ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description='No advices for the selected range' />}
+      </Drawer>
+
+      <Drawer
+        title="Diagnostics report"
+        open={reportOpen}
+        onClose={() => setReportOpen(false)}
+        width='min(1180px, calc(100vw - 24px))'
+        extra={(
+          <Tooltip title="Download the complete report as JSON">
+            <Button icon={<DownloadOutlined />} disabled={!reportPayload} onClick={downloadReport}>
+              Download JSON
+            </Button>
+          </Tooltip>
+        )}
+      >
+        <Space direction="vertical" size={16} style={{ width: '100%' }}>
+          <Space wrap>
+            <DatePicker.RangePicker
+              aria-label='Report time range'
+              showTime={{ format: 'HH:mm' }}
+              format='MM-DD-YYYY HH:mm'
+              value={[dayjs.unix(reportQueryRange.from), dayjs.unix(reportQueryRange.to)]}
+              onChange={(values) => {
+                if (!values?.[0] || !values[1]) return
+                setReportRange({ from: values[0].unix(), to: values[1].unix() })
+                setReport(null)
+              }}
+            />
+            <Button loading={reportLoading} onClick={() => void loadReport()}>Refresh</Button>
+          </Space>
+          {reportError ? <Alert type="error" showIcon message={reportError} /> : null}
+          {reportLoading && !report ? <Empty description="Generating report" /> : null}
+          {!report && !reportLoading && !reportError ? (
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Generating report for the selected range" />
+          ) : null}
+          {reportPayload ? (
+            <>
+              <>
+                <div className='diagnostics-overview-summary-strip diagnostics-report-overview-strip'>
+                  <span className='diagnostics-overview-inline-action'><strong>{reportEventOverview.total}</strong> events</span>
+                  {[
+                    ['critical', 'Critical', reportEventOverview.severityCounts.critical, COLORS.red],
+                    ['error', 'Error', reportEventOverview.severityCounts.error, DIAGNOSTIC_ERROR_COLOR],
+                    ['warning', 'Warning', reportEventOverview.severityCounts.warning, COLORS.yellow],
+                    ['info', 'Info', reportEventOverview.severityCounts.info, COLORS.accent],
+                  ].map(([severity, label, count, color]) => <span
+                    className={`diagnostics-overview-inline-severity-item diagnostics-overview-inline-severity-item--${severity}`}
+                    data-empty={count === 0 || undefined}
+                    key={String(label)}
+                  >
+                    <i className='diagnostics-filter-chip-dot' style={{ background: String(color) }} /> <strong>{count}</strong> {label}
+                  </span>)}
+                  <span className='diagnostics-overview-inline-divider' />
+                  <span className='diagnostics-overview-inline-scope diagnostics-overview-inline-alert'>
+                    <BellOutlined /> <strong>{reportPayload.range_alerts.length}</strong> alerts
+                  </span>
+                  <span className='diagnostics-overview-inline-divider' />
+                  <span className='diagnostics-overview-inline-scope'>
+                    <BulbOutlined /> <strong>{reportFindings.length}</strong> advice items
+                  </span>
+                  <span className='diagnostics-overview-inline-divider' />
+                  <span className='diagnostics-overview-inline-scope'>
+                    <InfoCircleOutlined /> <strong>{reportEventOverview.categories.length}</strong> affected domain{reportEventOverview.categories.length === 1 ? '' : 's'}
+                  </span>
+                </div>
+                <div className='diagnostics-report-overview-grid'>
+                  <section className='diagnostics-overview-section diagnostics-overview-domains'>
+                    <Text className='diagnostics-overview-section-title'>Events by domain ({reportDomainEventTotal})</Text>
+                    <div className='diagnostics-domain-distribution'>
+                      {reportOverviewDomains.map((domain) => {
+                        const percentage = reportDomainEventTotal ? domain.count / reportDomainEventTotal * 100 : 0
+                        return <div className='diagnostics-domain-distribution-row' data-empty={domain.count === 0 || undefined} key={domain.label}>
+                          <span className='diagnostics-domain-distribution-label'>{domain.label}</span>
+                          <span className='diagnostics-domain-distribution-track'>
+                            <span className='diagnostics-domain-distribution-fill' style={{ width: `${percentage}%` }}>
+                              {[
+                                ['info', COLORS.accent], ['warning', COLORS.yellow], ['error', DIAGNOSTIC_ERROR_COLOR], ['critical', COLORS.red],
+                              ].map(([severity, color]) => {
+                                const count = domain.severityCounts[severity as keyof typeof domain.severityCounts]
+                                return count ? <span className='diagnostics-domain-distribution-severity' key={severity} style={{ width: `${count / domain.count * 100}%`, background: color }} /> : null
+                              })}
+                            </span>
+                          </span>
+                          <span className='diagnostics-domain-distribution-value'>{domain.count} ({percentage.toFixed(1)}%)</span>
+                        </div>
+                      })}
+                    </div>
+                  </section>
+                  <section className='diagnostics-overview-section diagnostics-overview-utilization'>
+                    <Text className='diagnostics-overview-section-title'>Resource average utilization (%)</Text>
+                    {reportAverageResourceUtilization.length ? <div className='diagnostics-utilization-rows'>
+                      {reportAverageResourceUtilization.map((resource) => <div className='diagnostics-utilization-row' key={resource.label}>
+                        <span className='diagnostics-utilization-label'>{resource.label}</span>
+                        <span className='diagnostics-utilization-track'>
+                          <span className='diagnostics-utilization-average' style={{ width: `${Math.min(100, resource.value)}%`, background: resource.color }} />
+                          <span className='diagnostics-utilization-peak' style={{ left: `${Math.min(100, resource.peak)}%`, borderColor: resource.color }} />
+                        </span>
+                        <span className='diagnostics-utilization-value'>{resource.value.toFixed(1)}% <span>(Peak {resource.peak.toFixed(1)}%)</span></span>
+                      </div>)}
+                    </div> : <Text type='secondary'>No resource samples in this range</Text>}
+                    <Text className='diagnostics-utilization-caption' type='secondary'>Solid: average · marker: peak · {reportResourceSampleCount} samples</Text>
+                  </section>
+                </div>
+              </>
+
+              <section className='diagnostics-report-findings'>
+                <div className='diagnostics-report-findings-heading'>
+                  <div>
+                    <Text strong>Actionable findings</Text>
+                    <Text type='secondary'>Alerts and recommended next steps for this report range</Text>
+                    <Text className='diagnostics-report-findings-range' type='secondary'>
+                      {dayjs.unix(reportQueryRange.from).format('MMM D, YYYY HH:mm')} - {dayjs.unix(reportQueryRange.to).format('MMM D, YYYY HH:mm')}
+                    </Text>
+                  </div>
+                  <Space size={12} wrap>
+                    <Text className='diagnostics-report-finding-count diagnostics-overview-inline-alert'><BellOutlined /> {reportPayload.range_alerts.length} alert{reportPayload.range_alerts.length === 1 ? '' : 's'}</Text>
+                    <Text className='diagnostics-report-finding-count'><BulbOutlined /> {reportFindings.length} advice item{reportFindings.length === 1 ? '' : 's'}</Text>
+                  </Space>
+                </div>
+                <div className='diagnostics-report-findings-grid'>
+                  <section className='diagnostics-report-finding-panel diagnostics-report-alert-panel'>
+                    <div className='diagnostics-report-finding-panel-heading'>
+                      <Text strong>Alert activity</Text>
+                      <Text type='secondary'>Currently active: {reportPayload.active_alerts.length}</Text>
+                    </div>
+                    {reportPayload.alert_summary.length ? (
+                      <Table
+                        size="small"
+                        rowKey="dedup_key"
+                        pagination={false}
+                        dataSource={reportPayload.alert_summary}
+                        columns={[
+                          { title: 'Severity', width: 110, render: (_: unknown, alert: DiagAlert) => severityTag(alert.severity) },
+                          { title: 'Alert', render: (_: unknown, alert: DiagAlert) => alert.summary || alert.event_type },
+                          { title: 'Observed', width: 146, render: (_: unknown, alert: DiagAlert) => <span className='diagnostics-report-alert-time'>First {formatActivityTime(alert.first_fired_at)}<br />Latest {formatActivityTime(alert.last_fired_at)}</span> },
+                          { title: 'Count', dataIndex: 'fire_count', width: 76, align: 'right' as const },
+                        ]}
+                      />
+                    ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No alert activity in the selected range" />}
+                  </section>
+                  <section className='diagnostics-report-finding-panel'>
+                    <div className='diagnostics-report-finding-panel-heading'>
+                      <Text strong>Advice items</Text>
+                      <Text type='secondary'>Derived from this report range</Text>
+                    </div>
+                    {reportFindings.length ? (
+                      <Space direction='vertical' size={6} style={{ width: '100%' }}>
+                        {reportFindings.slice(0, 5).map((advice) => (
+                          <section className='diagnostics-report-advice' key={advice.id}>
+                            <Text strong>{String(advice.severity).toUpperCase()} · {advice.title}</Text>
+                            <Text className='diagnostics-report-advice-time' type='secondary'>{reportAdviceTimeLabel(advice)}</Text>
+                            <Text className='diagnostics-drawer-list-item'>{advice.observation}</Text>
+                            {advice.recommendations?.[0] ? <Text className='diagnostics-drawer-list-item'><strong>Recommended next step:</strong> {advice.recommendations[0]}</Text> : null}
+                            {advice.validation_steps?.[0] ? <Text className='diagnostics-drawer-list-item'><strong>Verify:</strong> {advice.validation_steps[0]}</Text> : null}
+                          </section>
+                        ))}
+                      </Space>
+                    ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description='No advice in range' />}
+                  </section>
+                </div>
+              </section>
+
+              <div>
+                <Text strong>Event activity</Text>
+                <Text className='diagnostics-drawer-list-item' type='secondary'>
+                  {reportDisplayedEvents.length} events, {reportTimeline.points.length} timeline points.
+                </Text>
+                <div className='diagnostics-report-timeline-legend' aria-label='Event severity legend'>
+                  <span>Severity</span>
+                  {[
+                    ['Info', COLORS.accent],
+                    ['Warning', COLORS.yellow],
+                    ['Error', DIAGNOSTIC_ERROR_COLOR],
+                    ['Critical', COLORS.red],
+                  ].map(([label, color]) => <span key={String(label)}><i style={{ background: String(color) }} />{label}</span>)}
+                </div>
+                <div className='diagnostics-report-timeline'>
+                  <ResponsiveContainer width='100%' height='100%'>
+                    <ScatterChart margin={{ top: 12, right: 12, left: EVENT_TIMELINE_LEFT_GUTTER, bottom: 0 }}>
+                      <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray='3 3' />
+                      <XAxis type='number' dataKey='x' domain={[reportQueryRange.from, reportQueryRange.to]} tickFormatter={reportEventActivityTick} tick={{ fill: COLORS.textMuted, fontSize: 10 }} minTickGap={36} />
+                      <YAxis type='number' dataKey='y' domain={[-0.5, Math.max(0.5, reportTimeline.lanes.length - 0.5)]} ticks={reportTimeline.lanes.map((_, index) => index)} tickFormatter={(index) => reportTimeline.lanes[index] || ''} tick={{ fill: COLORS.textMuted, fontSize: 10 }} width={EVENT_TIMELINE_LABEL_WIDTH} reversed />
+                      <RechartsTooltip content={eventTimelineTooltip} allowEscapeViewBox={{ y: true }} wrapperStyle={{ zIndex: 30 }} />
+                      <Scatter
+                        data={reportTimeline.points}
+                        name='Events'
+                        shape={(shapeProps: unknown) => {
+                          const props = shapeProps as { payload?: unknown; cx?: number; cy?: number }
+                          const point = props.payload as EventTimelinePoint | undefined
+                          if (!point || typeof props.cx !== 'number' || typeof props.cy !== 'number') return <g />
+                          return <circle cx={props.cx} cy={props.cy} r={4} fill={severityColors[normalizedSeverity(point.item.event.severity)]} />
+                        }}
+                      />
+                    </ScatterChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+
+              <div className='diagnostics-report-resource-trends'>
+                <Text strong>Resource trends</Text>
+                <Text className='diagnostics-drawer-list-item' type='secondary'>Selected report range</Text>
+                <div className='diagnostics-resource-lanes-legend diagnostics-report-resource-legend'>
+                  <button type='button' className='diagnostics-resource-lane-toggle' data-active={reportResourceTrendSeries.length === reportAvailableResourceTrendLabels.length || undefined} onClick={() => setReportResourceTrendLabels(new Set(reportAvailableResourceTrendLabels))}>All</button>
+                  {reportAvailableResourceTrendLabels.map((label, index) => {
+                    const active = reportResourceTrendLabels.has(label)
+                    return <button
+                      key={label}
+                      type='button'
+                      className='diagnostics-resource-lane-toggle'
+                      data-active={active || undefined}
+                      onClick={() => setReportResourceTrendLabels((selected) => {
+                        const next = new Set(selected)
+                        if (next.has(label)) next.delete(label)
+                        else next.add(label)
+                        return next
+                      })}
+                    >
+                      <i style={{ borderTopColor: active ? resourceUtilizationColor(label) : COLORS.textMuted, borderTopStyle: index >= 3 ? 'dashed' : 'solid' }} />
+                      {active ? '' : '+ '}{label}
+                    </button>
+                  })}
+                </div>
+                {reportResourceTrendSeries.length ? <div className='diagnostics-resource-lanes-chart'>
+                  <ResponsiveContainer width='100%' height='100%'>
+                    <LineChart data={reportResourceTrend} margin={{ top: 8, right: 16, bottom: 0, left: EVENT_TIMELINE_PLOT_LEFT - 48 }}>
+                      <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray='3 3' vertical={false} />
+                      <XAxis type='number' dataKey='ts_epoch' domain={[reportQueryRange.from, reportQueryRange.to]} tickFormatter={reportEventActivityTick} tick={{ fill: COLORS.textMuted, fontSize: 11 }} minTickGap={36} />
+                      <YAxis type='number' domain={[0, 100]} ticks={[0, 50, 100]} width={48} tick={{ fill: COLORS.textMuted, fontSize: 11 }} tickFormatter={(value) => `${value}%`} label={{ value: 'Utilization', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11 }} />
+                      <RechartsTooltip formatter={(value: number) => `${value.toFixed(1)}%`} labelFormatter={(timestamp) => dayjs.unix(Number(timestamp)).format('YYYY-MM-DD HH:mm:ss')} contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }} cursor={{ stroke: COLORS.accent, strokeWidth: 1, strokeDasharray: '4 2' }} allowEscapeViewBox={{ x: true, y: true }} wrapperStyle={{ zIndex: 30 }} />
+                      {reportDisplayedEvents.map((item) => <ReferenceLine key={`report-event-${displayEventKey(item)}`} x={dayjs(item.event.ts_utc).unix()} stroke={COLORS.textMuted} strokeOpacity={0.45} strokeDasharray='3 3' />)}
+                      {reportResourceTrendSeries.map((label, index) => <Line key={label} name={label} type='monotone' dataKey={`values.${label}`} stroke={resourceUtilizationColor(label)} strokeDasharray={index >= 3 ? '5 3' : undefined} strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />)}
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div> : <Text className='diagnostics-resource-lanes-empty' type='secondary'>{reportAvailableResourceTrendLabels.length ? 'Select a resource to display its trend' : 'No resource samples in the selected report range'}</Text>}
+              </div>
+
+              <div>
+                <Text strong>Configuration changes in range</Text>
+                {reportPayload.config_changes.length ? (
+                  <Space direction='vertical' size={8} style={{ width: '100%', marginTop: 6 }}>
+                    {reportPayload.config_changes.map((revision, revisionIndex) => {
+                      const entries = configChangeEntries(revision.change_summary)
+                      return <section className='diagnostics-report-config-change' key={String(revision.revision_id || revisionIndex)}>
+                        <Text type='secondary'>
+                          {revision.created_at ? dayjs(String(revision.created_at)).format('MMM D, YYYY HH:mm:ss') : 'Recorded configuration change'}
+                        </Text>
+                        {entries.map((entry, entryIndex) => (
+                          <Text className='diagnostics-drawer-list-item' key={`${entry.scope}-${entry.field}-${entryIndex}`}>
+                            {entry.scope} · {entry.change} · {entry.field}: {formatDiagnosticValue(entry.previous)} → {formatDiagnosticValue(entry.current)}
+                          </Text>
+                        ))}
+                      </section>
+                    })}
+                  </Space>
+                ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description='No configuration changes in range' />}
+              </div>
+
+              <Text type="secondary">Benchmark regressions: {reportPayload.benchmark_regressions.length}</Text>
+              <Text type="secondary">Generated {dayjs(reportPayload.generated_at).format('MMM D, YYYY HH:mm:ss')}</Text>
+            </>
+          ) : null}
+        </Space>
+      </Drawer>
+
+      <Drawer
+        title={`Alert history · ${alertFilterLabel}${displayedAlerts.length ? ` (${displayedAlerts.length})` : ''}`}
+        open={alertsOpen}
+        onClose={() => setAlertsOpen(false)}
+        width={560}
+      >
+        <Collapse
+          className='diagnostics-logs diagnostics-alert-policy'
+          items={[
+            {
+              key: 'alert-policy',
+              label: 'Alert policy (8 event types)',
+              children: (
+                <Space direction='vertical' size={8} style={{ width: '100%' }}>
+                  <Text type='secondary'>Only these event types create Alerts. Other events, including custom rules, remain diagnostic evidence even when their Severity is error or critical.</Text>
+                  {ALERT_POLICY_SUMMARIES.map((policy) => (
+                    <div key={policy.eventType}>
+                      <Space size={6} wrap>
+                        <Tag color={policy.severity === 'critical' ? COLORS.red : DIAGNOSTIC_ERROR_COLOR}>{policy.severity.toUpperCase()}</Tag>
+                        <Text code>{policy.eventType}</Text>
+                      </Space>
+                      <Text className='diagnostics-drawer-list-item' type='secondary'>{policy.behavior}</Text>
+                    </div>
+                  ))}
+                  <Text type='secondary'>Repeated observations with the same event type and scope are merged. Notifications for the same Alert are cooled down for 5 minutes.</Text>
+                </Space>
+              ),
+            },
+          ]}
+          style={{ marginBottom: 16 }}
+        />
+        <Segmented
+          className='diagnostics-alert-filter'
+          block
+          value={alertFilter}
+          onChange={(value) => setAlertFilter(value as typeof alertFilter)}
+          options={[
+            { label: 'In range', value: 'range' },
+            { label: 'Current + resolved', value: 'all' },
+            { label: 'Needs attention', value: 'needs_attention' },
+            { label: 'Acknowledged', value: 'acknowledged' },
+            { label: 'Silenced', value: 'silenced' },
+            { label: 'Resolved', value: 'resolved' },
+          ]}
+          style={{ marginBottom: 16 }}
+        />
+        {displayedAlerts.length ? (
+          <Space direction='vertical' size={16} style={{ width: '100%' }}>
+            {displayedAlerts.map((alert) => (
+              <section className='diagnostics-insight-drawer-item' key={alert.dedup_key}>
+                <Space size={6} wrap>
+                  {severityTag(alert.severity)}
+                  <Text strong>{alert.summary || alert.event_type}</Text>
+                </Space>
+                <Text type='secondary'>First observed {formatActivityTime(alert.first_fired_at)} · Latest {formatActivityTime(alert.last_fired_at)}</Text>
+                <Text type='secondary'>Observed {alert.fire_count} time{alert.fire_count === 1 ? '' : 's'} · Scope {alert.scope || '-'}</Text>
+                <Text type='secondary'>{alert.status === 'active' ? 'Current' : `Resolved ${formatActivityTime(alert.resolved_at)}`}</Text>
+                {alert.acknowledged_at ? <Tag color={COLORS.green}>Acknowledged</Tag> : null}
+                {alert.silenced_until ? <Tag color={COLORS.yellow}>Silenced until {formatActivityTime(alert.silenced_until)}</Tag> : null}
+                {alert.status === 'active' ? (
+                  <Space size={8} wrap>
+                    <Button
+                      size='small'
+                      disabled={!!alert.acknowledged_at}
+                      loading={alertActionKey === alert.dedup_key}
+                      onClick={() => void acknowledgeAlert(alert)}
+                    >
+                      {alert.acknowledged_at ? 'Acknowledged' : 'Acknowledge'}
+                    </Button>
+                    <Dropdown
+                      trigger={['click']}
+                      disabled={alertActionKey === alert.dedup_key}
+                      menu={{
+                        items: [
+                          { key: '30', label: '30 minutes' },
+                          { key: '120', label: '2 hours' },
+                        ],
+                        onClick: ({ key }) => void silenceAlert(alert, Number(key) as 30 | 120),
+                      }}
+                    >
+                      <Button size='small' loading={alertActionKey === alert.dedup_key}>Silence</Button>
+                    </Dropdown>
+                  </Space>
+                ) : null}
+                {alert.last_event_id ? (
+                  <Button type='primary' size='small' icon={<SearchOutlined />} onClick={() => {
+                    void investigateAlert(alert)
+                    setAlertsOpen(false)
+                  }}>
+                    Investigate
+                  </Button>
+                ) : null}
+              </section>
+            ))}
+          </Space>
+        ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={alertFilter === 'range' || alertFilter === 'resolved' ? 'No alerts in the selected range' : alertFilter === 'needs_attention' ? 'No alerts need attention' : `No ${alertFilterLabel.toLowerCase()} alerts`} />}
+      </Drawer>
 
       <Drawer title='Event Detail' open={!!selectedEvent} onClose={() => setSelectedEvent(null)} width={700}>
         {selectedEvent ? (() => {
@@ -1878,7 +3655,7 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
             </div>
 
             <div className='diagnostics-investigation-section'>
-              <Text className='diagnostics-investigation-heading' strong>Resource pressure (window)</Text>
+              <Text className='diagnostics-investigation-heading' strong>Resource pressure (event window)</Text>
               {contextPressurePoints.length ? (
                 <div className='diagnostics-pressure-chart'>
                   <ResponsiveContainer>
@@ -1902,6 +3679,8 @@ export default function Diagnostics({ active, onOpenHistory }: Props) {
                 <Text type='secondary'>No metric samples in window</Text>
               )}
             </div>
+
+            <BenchmarkResultsSection bench={contextData.metrics.benchmark} />
 
             <div className='diagnostics-investigation-section'>
               <div className='diagnostics-investigation-section-header'>

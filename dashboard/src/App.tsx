@@ -1,8 +1,9 @@
 import React, { useState, useCallback, useEffect } from 'react'
-import { Tabs, Layout, Typography, Space, Alert, Button, notification } from 'antd'
+import { Tabs, Layout, Typography, Space, Alert, Badge, Button, Dropdown, Empty, Tag, notification } from 'antd'
 import {
   DashboardOutlined,
   AlertOutlined,
+  BellOutlined,
   AppstoreOutlined,
   NodeIndexOutlined,
   ControlOutlined,
@@ -27,6 +28,7 @@ import { api, getToken, clearToken, setUnauthorizedHandler, consumeUrlToken, log
 import { GlobalConfigNoticesProvider, useGlobalConfigNotices } from './hooks/useGlobalConfigNotices'
 import { useUiLease } from './hooks/useUiLease'
 import { useBenchEvent, useBenchStream } from './hooks/useBenchEvents'
+import type { DiagAlert } from './api/types'
 
 const { Header, Content } = Layout
 
@@ -85,6 +87,9 @@ export default function App() {
   // valid until the server rejects a request with 401 (handled below).
   const [authed, setAuthed] = useState(() => !!getToken())
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [activeAlertCount, setActiveAlertCount] = useState(0)
+  const [activeAlerts, setActiveAlerts] = useState<DiagAlert[]>([])
+  const [diagnosticsOpenAlertsSignal, setDiagnosticsOpenAlertsSignal] = useState(0)
   // While a bootstrap token from the URL hash (desktop launcher) is being
   // validated, hold rendering so the login gate does not flash before we know
   // whether the auto-login succeeds. Only blocks when such a token is present.
@@ -128,6 +133,27 @@ export default function App() {
         setDiagnosticsEnabled(false)
       })
   }, [authed])
+
+  useEffect(() => {
+    if (!authed || !diagnosticsEnabled) return undefined
+    let cancelled = false
+    const loadAlerts = () => {
+      api.getDiagAlerts(true, 100, true)
+        .then((data) => {
+          if (!cancelled) {
+            setActiveAlerts(data.alerts || [])
+            setActiveAlertCount(data.alerts?.length || 0)
+          }
+        })
+        .catch(() => {})
+    }
+    loadAlerts()
+    const timer = window.setInterval(loadAlerts, 30000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [authed, diagnosticsEnabled])
 
   // Hold an open-UI lease while logged in so the packaged monitor can stop
   // itself once the last dashboard tab is closed. No-op against a server that
@@ -181,6 +207,63 @@ export default function App() {
     clearToken()
     setAuthed(false)
   }, [])
+
+  const openCurrentAlerts = useCallback(() => {
+    setActiveTab('diagnostics')
+    setDiagnosticsOpenAlertsSignal((signal) => signal + 1)
+  }, [])
+
+  const formatAlertTime = useCallback((value: string) => {
+    const date = new Date(value)
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString([], {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    })
+  }, [])
+
+  const alertColor = useCallback((severity: string) => {
+    if (severity === 'critical') return COLORS.red
+    if (severity === 'error') return COLORS.orange
+    if (severity === 'warning') return COLORS.yellow
+    return COLORS.accent
+  }, [])
+
+  const alertCenter = (
+    <div className="app-alert-center">
+      <div className="app-alert-center__header">
+        <Typography.Text strong style={{ color: COLORS.text }}>Alerts</Typography.Text>
+        <Typography.Text className="app-alert-center__count">{activeAlertCount} need attention</Typography.Text>
+      </div>
+      {activeAlerts.length ? (
+        <div className="app-alert-center__list">
+          {activeAlerts.slice(0, 5).map((alert) => (
+            <button
+              key={alert.dedup_key}
+              type="button"
+              onClick={openCurrentAlerts}
+              className="app-alert-center__item"
+            >
+              <div className="app-alert-center__item-title">
+                <Tag color={alertColor(alert.severity)} style={{ marginInlineEnd: 0, textTransform: 'uppercase' }}>{alert.severity}</Tag>
+                <Typography.Text ellipsis style={{ color: COLORS.text, flex: 1, minWidth: 0, fontSize: 13 }}>
+                  {alert.summary || alert.event_type}
+                </Typography.Text>
+              </div>
+              <Typography.Text className="app-alert-center__item-meta">
+                {alert.scope || 'System'} · Latest {formatAlertTime(alert.last_fired_at)}
+              </Typography.Text>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No alerts need attention" style={{ margin: '20px 0' }} />
+      )}
+      <div className="app-alert-center__footer">
+        <Button type="link" size="small" onClick={openCurrentAlerts} style={{ padding: 0 }}>
+          Open alert history
+        </Button>
+      </div>
+    </div>
+  )
 
   // Publish the combined height of the sticky header + sticky tab bar as a CSS
   // variable so per-page sticky toolbars can pin themselves *below* the tab bar
@@ -268,6 +351,7 @@ export default function App() {
             children: (
               <Diagnostics
                 active={activeTab === 'diagnostics'}
+                openAlertsSignal={diagnosticsOpenAlertsSignal}
                 onOpenHistory={(range) => {
                   setHistoryRangeIntent(range)
                   setActiveTab('4')
@@ -403,6 +487,22 @@ export default function App() {
             </Typography.Title>
           </div>
           <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+            {diagnosticsEnabled ? (
+              <Dropdown
+                trigger={['click']}
+                dropdownRender={() => alertCenter}
+                overlayStyle={{ paddingTop: 6 }}
+              >
+                <Button type="text" size="small" style={{ color: COLORS.textMuted }}>
+                  <Space size={6}>
+                    <Badge count={activeAlertCount} size="small" offset={[2, -1]}>
+                      <BellOutlined style={{ color: COLORS.textMuted }} />
+                    </Badge>
+                    Alerts
+                  </Space>
+                </Button>
+              </Dropdown>
+            ) : null}
             <Button
               type="text"
               size="small"

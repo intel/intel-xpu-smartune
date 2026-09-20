@@ -66,15 +66,37 @@ def assemble_context(*, scope_kind, scope_value, start_time=None, end_time=None)
     logs = log_query.query(
         sources=log_sources, start_time=start_time, end_time=end_time,
         job_id=(scope_value if scope_kind == "job_id" else None), limit=200)
-    return {
+    assembled = {
         "scope": scope,
         "window": {"from": start_time, "to": end_time},
         "boot_id": read_boot_id(),
         "events": events,
         "control_actions": control_actions,
         "concurrent_jobs": concurrent_jobs,
-        "alerts": event_store.query_alerts(unacknowledged_only=True, limit=100),
+        "alerts": event_store.query_alerts(active_only=True, limit=100),
         "metrics": metrics_window,
         "logs": logs,
-        "findings": [],
     }
+    from diagnostics import insights
+
+    assembled["findings"] = insights.evaluate_rules(assembled)
+    return assembled
+
+
+def assemble_findings(*, start_time, end_time):
+    """Evaluate window findings with only the evidence required by insight rules."""
+    from diagnostics import event_store, insights, metrics
+
+    events = event_store.query_events(
+        start_time=int(start_time), end_time=int(end_time), limit=500)
+    assembled = {
+        "window": {"from": int(start_time), "to": int(end_time)},
+        "events": events,
+        "control_actions": [
+            event for event in events if event.get("category") == "platform.control"
+        ],
+        "metrics": {
+            "monitor": metrics.read_monitor(int(start_time), int(end_time)),
+        },
+    }
+    return insights.evaluate_rules(assembled)

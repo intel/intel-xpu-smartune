@@ -27,6 +27,14 @@ from monitor.monitor_api import (
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
 from features import mount_benchmark, mount_dashboard, mount_diagnostics
 from smartune_api import auth_bp, smartune_bp, set_balancer_available, set_benchmark_available, set_diagnostics_available
+try:
+    from diagnostics.detectors import start_detector_loop
+except ModuleNotFoundError as exc:
+    if exc.name not in {"diagnostics", "diagnostics.detectors"}:
+        raise
+
+    def start_detector_loop():
+        return None
 from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, fetch_unregistered_apps, get_priority_value, get_app_processes_for_app, get_cgroup_path_by_pid, reconcile_controlled_apps, restore_config_entry, serialize_config_meta
 from utils import quiet_mode
 from utils.http_utils import RetCode, construct_response
@@ -109,6 +117,7 @@ class DynamicService:
         # Begin continuous background collection of the configured
         # monitored_sections (no-op if the operator set it to []).
         _start_dynamic_info_auto_refresh()
+        start_detector_loop()
 
 
     def cancel_relaunch(self, app_id):
@@ -184,8 +193,12 @@ def start_service():
             signal.signal(signal.SIGTERM, _handle_signal)
             _service.start()
             emit_event("PLATFORM_SERVICE_STARTED", severity="info", category="platform.availability",
-                       source="balancer", summary="Balancer service started",
-                       attributes={"mode": os.environ.get("SMARTUNE_MODE", "all")})
+                       source="balancer", summary="SmarTune service started (API + Dashboard)",
+                       attributes={
+                           "mode": os.environ.get("SMARTUNE_MODE", "all"),
+                           "api_service": "started",
+                           "dashboard_ui": "mounted",
+                       })
         else:
             logger.debug("DynamicService already initialized, skipping")
     return _service
@@ -206,8 +219,6 @@ def _shutdown_service_once():
             return
         _shutdown_started = True
 
-    emit_event("PLATFORM_SERVICE_STOPPING", severity="info", category="platform.availability",
-               source="balancer", summary="Balancer service stopping")
     try:
         if _service:
             _service.shutdown()
@@ -218,6 +229,11 @@ def _shutdown_service_once():
         reset_app_status()
     except Exception as exc:
         logger.error(f"Reset app status failed during shutdown: {exc}")
+
+    # Signal that shutdown is complete
+    emit_event("PLATFORM_SERVICE_STOPPED", severity="info", category="platform.availability",
+               source="balancer", summary="SmarTune service stopped (API + Dashboard)",
+               attributes={"api_service": "stopped", "dashboard_ui": "stopped"})
 
 
 def reset_app_status():
@@ -2032,6 +2048,17 @@ def main():
                 threaded=True, ssl_context=ssl_context)
     except KeyboardInterrupt:
         pass
+    except Exception as exc:
+        # Record uncaught exception as a diagnostic event before cleanup.
+        # Re-raise so process exits with non-zero; systemd's Restart=on-failure will recover.
+        try:
+            emit_event("PLATFORM_SERVICE_CRASHED", severity="critical", category="platform.availability",
+                       impact="failed", source="balancer",
+                       summary="Balancer service crashed with uncaught exception",
+                       attributes={"exception_type": type(exc).__name__, "exception_message": str(exc)[:500]})
+        except Exception:
+            pass  # Best-effort; never let diagnostics itself break crash recovery
+        raise
     finally:
         _shutdown_service_once()
 

@@ -4,6 +4,7 @@
 
 import json
 import os
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
@@ -354,6 +355,8 @@ _CONFIG_TS_KEYS = {
     "network_pressure":         "network_pressure_updated_at",
     "network_control":          "network_control_updated_at",
     "limit_policy":             "limit_policy_updated_at",
+    "diagnostic_events":        "diagnostic_events_updated_at",
+    "diagnostic_rules":         "diagnostic_rules_updated_at",
 }
 
 _CONFIG_CONFLICT_MSG = "Configuration was modified by another client; please reload."
@@ -2640,6 +2643,115 @@ def _write_network_control_config(updates):
     return modified
 
 
+def _get_diagnostic_events_config():
+    from diagnostics.event_catalog import defaults
+
+    configured = getattr(_cfg(), "diagnostic_events", None)
+    return {**defaults(), **(configured if isinstance(configured, dict) else {})}
+
+
+def _validate_diagnostic_events_config(body):
+    from diagnostics.event_catalog import defaults
+
+    allowed = set(defaults())
+    updates = {}
+    for event_type, enabled in body.items():
+        if event_type == "expected_updated_at":
+            continue
+        if event_type not in allowed:
+            raise ValueError(f"Unsupported diagnostics event type '{event_type}'")
+        if not isinstance(enabled, bool):
+            raise ValueError(f"{event_type} must be a boolean")
+        updates[event_type] = enabled
+    if not updates:
+        raise ValueError("Provide at least one diagnostics event setting")
+    return updates
+
+
+_CUSTOM_RULE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+_CUSTOM_RULE_CATEGORY_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
+_CUSTOM_RULE_SOURCES = {"journal", "smartune"}
+_CUSTOM_RULE_SEVERITIES = {"info", "warning", "error", "critical"}
+_CUSTOM_RULE_DOMAINS = {"compute", "data-path", "services", "hardware", "platform", "other"}
+_CUSTOM_RULE_EVENT_KINDS = {
+    "pressure", "control", "hardware-fault", "lifecycle", "availability",
+    "configuration", "observability", "status",
+}
+_CUSTOM_RULE_FATAL_SIGNATURES = {"oom", "kernel-panic", "gpu-hang"}
+_MAX_CUSTOM_DIAGNOSTIC_RULES = 32
+_MAX_CUSTOM_RULE_PATTERN_LENGTH = 256
+
+
+def _get_diagnostic_rules_config():
+    rules = getattr(_cfg(), "diagnostic_rules", None)
+    return {"rules": rules if isinstance(rules, list) else []}
+
+
+def _validate_diagnostic_rules_config(body):
+    rules = body.get("rules")
+    if not isinstance(rules, list):
+        raise ValueError("rules must be a list")
+    if len(rules) > _MAX_CUSTOM_DIAGNOSTIC_RULES:
+        raise ValueError(f"At most {_MAX_CUSTOM_DIAGNOSTIC_RULES} diagnostic rules are allowed")
+
+    validated = []
+    ids = set()
+    for index, rule in enumerate(rules, start=1):
+        if not isinstance(rule, dict):
+            raise ValueError(f"Rule {index} must be an object")
+        rule_id = rule.get("id")
+        name = rule.get("name")
+        source = rule.get("source")
+        pattern = rule.get("message_pattern")
+        severity = rule.get("severity")
+        category = rule.get("category", "service.custom")
+        domain = rule.get("domain", "services")
+        event_kind = rule.get("event_kind", "status")
+        fatal_signatures = rule.get("fatal_signatures", [])
+        service = rule.get("service")
+        if not isinstance(rule_id, str) or not _CUSTOM_RULE_ID_RE.fullmatch(rule_id):
+            raise ValueError(f"Rule {index} id must use lowercase letters, numbers, and hyphens")
+        if rule_id in ids:
+            raise ValueError(f"Rule id '{rule_id}' is duplicated")
+        ids.add(rule_id)
+        if not isinstance(name, str) or not name.strip() or len(name) > 80:
+            raise ValueError(f"Rule {index} name must be 1 to 80 characters")
+        if source not in _CUSTOM_RULE_SOURCES:
+            raise ValueError(f"Rule {index} source must be journal or smartune")
+        if not isinstance(pattern, str) or not pattern or len(pattern) > _MAX_CUSTOM_RULE_PATTERN_LENGTH:
+            raise ValueError(f"Rule {index} message pattern must be 1 to {_MAX_CUSTOM_RULE_PATTERN_LENGTH} characters")
+        if severity not in _CUSTOM_RULE_SEVERITIES:
+            raise ValueError(f"Rule {index} severity is invalid")
+        if not isinstance(category, str) or not _CUSTOM_RULE_CATEGORY_RE.fullmatch(category):
+            raise ValueError(f"Rule {index} category is invalid")
+        if domain not in _CUSTOM_RULE_DOMAINS:
+            raise ValueError(f"Rule {index} domain is invalid")
+        if event_kind not in _CUSTOM_RULE_EVENT_KINDS:
+            raise ValueError(f"Rule {index} event kind is invalid")
+        if not isinstance(fatal_signatures, list) or any(signature not in _CUSTOM_RULE_FATAL_SIGNATURES for signature in fatal_signatures):
+            raise ValueError(f"Rule {index} fatal signatures are invalid")
+        if len(set(fatal_signatures)) != len(fatal_signatures):
+            raise ValueError(f"Rule {index} fatal signatures must not contain duplicates")
+        if service is not None and (not isinstance(service, str) or not service.strip() or len(service) > 128):
+            raise ValueError(f"Rule {index} service must be 1 to 128 characters when set")
+        if not isinstance(rule.get("enabled"), bool):
+            raise ValueError(f"Rule {index} enabled must be a boolean")
+        validated.append({
+            "id": rule_id,
+            "name": name.strip(),
+            "enabled": rule["enabled"],
+            "source": source,
+            "service": service.strip() if isinstance(service, str) and service.strip() else None,
+            "message_pattern": pattern.strip(),
+            "severity": severity,
+            "category": category,
+            "domain": domain,
+            "event_kind": event_kind,
+            "fatal_signatures": fatal_signatures,
+        })
+    return {"rules": validated}
+
+
 # section -> {get: ()->dict, validate: (body)->updates, write: (updates)->bool}
 _CONFIG_SPECS = {
     "system_pressure": {
@@ -2666,6 +2778,16 @@ _CONFIG_SPECS = {
         "get": _get_limit_policy_config,
         "validate": _validate_limit_policy_config,
         "write": lambda u: _cfg().set_limit_policy(u),
+    },
+    "diagnostic_events": {
+        "get": _get_diagnostic_events_config,
+        "validate": _validate_diagnostic_events_config,
+        "write": lambda u: _cfg().update_config_section("diagnostic_events", u),
+    },
+    "diagnostic_rules": {
+        "get": _get_diagnostic_rules_config,
+        "validate": _validate_diagnostic_rules_config,
+        "write": lambda u: _cfg().set_list_section("diagnostic_rules", u["rules"]),
     },
 }
 

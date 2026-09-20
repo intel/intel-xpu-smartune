@@ -22,7 +22,7 @@ logger = get_logger(__name__)
 def emit_event(event_type, *, severity="info", category="service", summary=None,
                source=None, app_id=None, job_id=None,
                impact=None, resource_type=None, protection_id=None, episode_id=None,
-               attributes=None, ts_utc=None):
+               attributes=None, ts_utc=None, identity=None, config_revision_id=None):
     """Record a structured operational event. Returns the event dict (or None).
 
     ``event_type`` is the normalized reason_code -- the stable machine key in
@@ -30,13 +30,20 @@ def emit_event(event_type, *, severity="info", category="service", summary=None,
     ``CONTROL_CPU_LIMIT_APPLIED``; ``summary`` is the human sentence.
     ``impact`` / ``resource_type`` / ``protection_id`` / ``episode_id`` are the
     read-model columns. Sensitive values in summary/attributes are scrubbed here
-    so no caller has to. severity>=warning also folds into the alert-dedup
-    state.
+    so no caller has to. Every event reaches the alert policy so an info-level
+    recovery can resolve a matching alert; unmatched events remain ledger-only.
+    ``identity`` is a stable per-fact anchor a producer that might
+    replay the same fact (log/journal scanners) passes to make the write
+    idempotent; ``config_revision_id`` links the event to the hardware/software
+    inventory version active when it happened.
     """
     try:
         # Import lazily so importing emit_event never drags the DB/event stack
         # into a module that only wants the symbol available behind a guard.
-        from diagnostics import alerts, event_store, sanitize
+        from diagnostics import alerts, event_catalog, event_store, sanitize
+
+        if not event_catalog.enabled(event_type):
+            return None
 
         ctx = current_log_context()
         app_id = app_id or ctx.get("app_id")
@@ -51,8 +58,9 @@ def emit_event(event_type, *, severity="info", category="service", summary=None,
             impact=impact, resource_type=resource_type,
             protection_id=protection_id, episode_id=episode_id,
             attributes=attributes, ts_utc=ts_utc,
+            identity=identity, config_revision_id=config_revision_id,
         )
-        if event is not None and alerts.is_alertable(event["severity"]):
+        if event is not None:
             alerts.evaluate(event)
         return event
     except Exception as exc:

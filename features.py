@@ -200,6 +200,11 @@ def mount_diagnostics(app) -> bool:
         start_cleanup_loop()
     except Exception:
         logger.exception("Diagnostics retention cleanup could not be started")
+    try:
+        from diagnostics.alerts import start_expiry_loop
+        start_expiry_loop()
+    except Exception:
+        logger.exception("Diagnostics alert expiry loop could not be started")
     # Background detector: turn newly-arrived ERROR/CRITICAL application-log lines
     # into events. Idempotent + daemon; failure here must not fail the mount.
     try:
@@ -222,4 +227,12 @@ def mount_diagnostics(app) -> bool:
         register_benchmark_listener()
     except Exception:
         logger.exception("Diagnostics benchmark listener could not be registered")
+    # Configuration-revision chain: baseline + a daily recheck for BIOS/DIMM/
+    # disk/driver/firmware drift, both done off the startup path (dmidecode/
+    # lsblk/debugfs reads run after the loop's own settle delay).
+    try:
+        from diagnostics.config_revision import start_config_revision_loop
+        start_config_revision_loop()
+    except Exception:
+        logger.exception("Diagnostics config revision chain could not be started")
     return True

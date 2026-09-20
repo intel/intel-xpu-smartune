@@ -182,8 +182,6 @@ def _build_disk_history(disk: Dict[str, Any]) -> Dict[str, Optional[float]]:
             continue
         util_val = to_float(item.get("utilization"))
         if util_val is not None:
-            if util_val <= 1:
-                util_val *= 100
             util_val = max(0.0, min(util_val, 100.0))
             max_util = util_val if max_util is None else max(max_util, util_val)
 
@@ -202,8 +200,6 @@ def _build_disk_history(disk: Dict[str, Any]) -> Dict[str, Optional[float]]:
             continue
         util = to_float(item.get("utilization"))
         if util is not None:
-            if util <= 1:
-                util *= 100
             util = max(0.0, min(util, 100.0))
         r_kb = to_float(item.get("read_kb_per_sec"))
         w_kb = to_float(item.get("write_kb_per_sec"))

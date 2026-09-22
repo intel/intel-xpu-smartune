@@ -10,7 +10,6 @@ logger = get_logger(__name__)
 from utils.app_utils import write_cgroup_file
 from config.config import b_config
 
-# Reserved
 class MemoryController(ControllerBase):
     def __init__(self, cgroup_mount: str):
         super().__init__(cgroup_mount)
@@ -31,7 +30,7 @@ class MemoryController(ControllerBase):
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
                 return True
-            logger.info(f"Failed to set ManagedOOMMemoryPressure: {result.stderr.strip()}")
+            logger.warning(f"Failed to set ManagedOOMMemoryPressure: {result.stderr.strip()}")
             return False
         except Exception:
             logger.error("Exception occurred while setting ManagedOOMMemoryPressure")
@@ -47,7 +46,6 @@ class MemoryController(ControllerBase):
             logger.error(f"Failed to set {param}={value}: {e}")
             return False
 
-    # Memory-specific methods
     def set_limit(self, cgroup: str, limit_bytes: int) -> bool:
         """Set the hard memory limit (triggers OOM killer when exceeded)."""
         return self.set_parameter(cgroup, "memory.limit_in_bytes", str(limit_bytes))

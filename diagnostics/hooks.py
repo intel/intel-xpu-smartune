@@ -86,7 +86,7 @@ def _on_job(job):
                 if snapshot:
                     attributes["result"] = snapshot
             except Exception as exc:
-                logger.debug("benchmark result snapshot skipped for %s: %s", job.id, exc)
+                logger.warning("Benchmark result snapshot skipped for %s: %s", job.id, exc)
             # Capture environment telemetry snapshot at completion time (thermal/power/pressure).
             try:
                 from diagnostics import metrics as diag_metrics
@@ -94,7 +94,7 @@ def _on_job(job):
                 if env_snapshot:
                     attributes["environment_snapshot"] = env_snapshot
             except Exception as exc:
-                logger.debug("environment snapshot skipped for %s: %s", job.id, exc)
+                logger.warning("Environment snapshot skipped for %s: %s", job.id, exc)
         config_revision_id = None
         if kind == "run":
             try:

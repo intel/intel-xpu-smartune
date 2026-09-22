@@ -88,14 +88,7 @@ const KEY_METRICS = [
   'npu_utilization_percent_median',
 ]
 
-/**
- * A column title, "TTFT (ms)", with its definition on hover.
- *
- * One line, unit in parentheses. The unit used to sit under the name on a
- * second line to keep columns narrow; the names are short enough now (and lower
- * case, so they do not compete with the numbers) that the saving was not worth
- * a header shaped unlike every other header in the product.
- */
+/** Render a metric title with its definition on hover. */
 function MetricHead({ metricKey, index }: { metricKey: string; index: MetricIndex }) {
   const head = (
     <div style={{ textAlign: 'center', lineHeight: 1.25 }}>{metricTitle(metricKey, index)}</div>
@@ -104,13 +97,7 @@ function MetricHead({ metricKey, index }: { metricKey: string; index: MetricInde
   return description ? <Tooltip title={description}>{head}</Tooltip> : head
 }
 
-/**
- * The metric columns.
- *
- * Headers are centred over the column, values right-aligned within it: the
- * header names the column, but the numbers are read down it and digits have to
- * line up for that to work.
- */
+/** Create right-aligned metric columns. */
 function metricColumns(
   keys: string[],
   index: MetricIndex,

@@ -170,7 +170,7 @@ def _new_revision_id() -> str:
 def ensure_baseline():
     """Create revision 1 if no revision exists yet. Called once at diagnostics
     mount; a no-op on every later start since a revision already exists."""
-    from db.DatabaseModel import ConfigRevision
+    from db.DatabaseModel import ConfigRevision, DBStatus
 
     if ConfigRevision.latest() is not None:
         return
@@ -179,12 +179,15 @@ def ensure_baseline():
     sw_status, _ = _classify_and_diff(inventory["sw"], {})
     field_status = {"hw": hw_status, "sw": sw_status}
     revision_id = _new_revision_id()
-    ConfigRevision.insert_revision(
+    status = ConfigRevision.insert_revision(
         revision_id=revision_id, previous_revision_id=None, boot_id=read_boot_id(),
         hw_fingerprint=_fingerprint(hw_status), sw_fingerprint=_fingerprint(sw_status),
         full_inventory={"hw": inventory["hw"], "sw": inventory["sw"]},
         change_summary=None, field_status=field_status,
     )
+    if status != DBStatus.SUCCESS:
+        logger.error("Config revision baseline insert failed: revision=%s status=%s", revision_id, status)
+        return
     logger.info("Config revision baseline created: %s", revision_id)
 
 
@@ -223,7 +226,7 @@ def check_and_record_if_changed():
     changed; an unchanged recheck just reconfirms ``checked_at`` (and persists
     any in-progress miss-streak) on the existing revision. Best-effort: never
     raises into the periodic loop that calls it."""
-    from db.DatabaseModel import ConfigRevision
+    from db.DatabaseModel import ConfigRevision, DBStatus
 
     try:
         latest = ConfigRevision.latest()
@@ -243,21 +246,28 @@ def check_and_record_if_changed():
         ts_utc = now_iso()
 
         if not hw_changes and not sw_changes:
-            ConfigRevision.touch_checked_at(
-                latest.revision_id, ts_utc, field_status={"hw": hw_status, "sw": sw_status})
+            if not ConfigRevision.touch_checked_at(
+                    latest.revision_id, ts_utc, field_status={"hw": hw_status, "sw": sw_status}):
+                logger.warning("Config revision check timestamp update failed: %s", latest.revision_id)
             return
 
         boot_id = read_boot_id()
         time_accuracy = "observed_after_restart" if (latest.boot_id and boot_id and latest.boot_id != boot_id) else "exact"
         revision_id = _new_revision_id()
         field_status = {"hw": hw_status, "sw": sw_status}
-        ConfigRevision.insert_revision(
+        status = ConfigRevision.insert_revision(
             revision_id=revision_id, previous_revision_id=latest.revision_id, boot_id=boot_id,
             hw_fingerprint=_fingerprint(hw_status), sw_fingerprint=_fingerprint(sw_status),
             full_inventory={"hw": inventory["hw"], "sw": inventory["sw"]},
             change_summary={"hw": hw_changes, "sw": sw_changes}, field_status=field_status,
             ts_utc=ts_utc,
         )
+        if status != DBStatus.SUCCESS:
+            logger.error(
+                "Config revision insert failed: previous=%s revision=%s status=%s",
+                latest.revision_id, revision_id, status,
+            )
+            return
         logger.info("Config revision changed: %s -> %s (hw=%d, sw=%d changes)",
                    latest.revision_id, revision_id, len(hw_changes), len(sw_changes))
 
@@ -297,7 +307,10 @@ def start_config_revision_loop():
 
     def loop():
         time.sleep(_INITIAL_DELAY_SEC)
-        ensure_baseline()
+        try:
+            ensure_baseline()
+        except Exception as exc:
+            logger.error("Config revision baseline initialization failed: %s", exc, exc_info=True)
         while True:
             time.sleep(_RECHECK_INTERVAL_SEC)
             try:

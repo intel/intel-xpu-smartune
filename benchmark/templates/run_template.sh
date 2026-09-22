@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 # run_template.sh - parameterized copy of run.sh.
 # benchmark/service/runner.py substitutes two placeholder tokens: the models JSON block
 # (inside the heredoc below) and the pipeline stage (the opt= line below).
-#set -euo pipefail
 
 # 0) Load global variables
 # BENCH_SRC_ROOT lets the caller render this template into a script that lives

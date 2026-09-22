@@ -1,51 +1,7 @@
 // Copyright (c) 2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
-//
-// The models in play, one tile each, with the two buttons that act on them.
-//
-// This used to be a strip of tabs, each holding a full-width detail pane. That
-// arrangement answered "what does this one model offer" well and "what is this
-// batch about to do" not at all: the pane showed one model, the settings behind
-// it were one global set, and the only way to compare what two models were
-// going to be asked for was to click between them. A tile per model says it at a
-// glance -- precision, device, runtime, extra args, all of them this model's own
-// -- and the full detail is one click away in the drawer, which is also where
-// they are changed.
-//
-// Two selections coexist, as they do in the model list on the left. Ticking a
-// model there puts a tile here; the checkbox on the tile decides whether the
-// Download and Run buttons include it. That is what makes it possible to line up
-// six models, get their settings right, and then measure two of them -- without
-// the other four leaving the page. The X on a tile is the other half: it removes
-// the tile, which is the same act as unticking the model on the left.
-//
-// One horizontal row, scrolled rather than wrapped: the tiles are a queue of
-// work in the order the list gave them, and a grid that reflows as models are
-// added loses that order every time it does.
-//
-// The two buttons are the only place either stage is started, for one model or
-// for six.
-//
-// "Download" is the pipeline's build stage. As wired in
-// benchmark/templates/run_template.sh, that stage resolves each requested
-// precision to the matching pre-converted OpenVINO repo and fetches it; nothing
-// is converted locally. The API still calls it `build`, because the vendored
-// pipeline also has real conversion routes behind the same switch.
-//
-// "Run" is the `benchmark` stage, and only that. The API also offers `all`
-// (fetch first, then benchmark) and the page used to pick it automatically when
-// something was missing, but a download that lands inside a measured run holds
-// quiet mode -- and so suspends SmarTune's monitoring -- for however long tens
-// of GB take to arrive, while itself being exactly the kind of load the run is
-// supposed to be measured without. So the two are separate jobs and Run stays
-// disabled until the weights are there. Everything else on this tab is
-// benchmarking, which is why the button does not say so.
-//
-// The chosen OpenVINO runtime gates Run the same way and for the same reason:
-// it used to be built by the run that needed it, inside that same measured
-// window. So by the time Run is clickable there is nothing left to do but
-// measure -- which is what each tile's "ready", or its one blocking reason,
-// reports.
+// Selected benchmark models, their per-model settings, and batch actions.
+// Download and Run are separate so measurement starts only with ready artifacts.
 
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { Badge, Button, Card, Checkbox, Empty, Space, Tag, Tooltip, Typography } from 'antd'

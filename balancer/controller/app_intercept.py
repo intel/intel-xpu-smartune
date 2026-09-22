@@ -60,7 +60,7 @@ class AppIntercept(metaclass=SingletonMeta):
         self.bpf = BPF(src_file=c_src_file, cflags=["-Wno-duplicate-decl-specifier"])
         self.control_manager = ControlManager()
         self.monitored_apps: Set[str] = set()
-        self.handled_processes: Set[int] = set()  # set of already-handled process IDs
+        self.handled_processes: Set[int] = set()
         self.controlled_app_map = []
         self._app_map_index = {}  # index of controlled_app_map for O(1) lookup
         self.relaunch_apps = {}
@@ -475,7 +475,7 @@ class AppIntercept(metaclass=SingletonMeta):
                 f"{len(live_pids)} live PID(s); skipping 'stopped' notification."
             )
         else:
-            logger.debug(f"Monitored process terminated: PID={pid}, app={app_name}")
+            logger.info(f"Monitored process terminated: PID={pid}, app={app_name}")
             app_utils.callback_manager.send_callback_notification({
                 'app_id': app_id,
                 'app_name': app_name,
@@ -484,7 +484,6 @@ class AppIntercept(metaclass=SingletonMeta):
             }, store=True)
         del self.monitored_app_launched[pid]
 
-        # Clean up pending_exit_events
         if pid in self.pending_exit_events:
             del self.pending_exit_events[pid]
 
@@ -506,18 +505,9 @@ class AppIntercept(metaclass=SingletonMeta):
                         for c in self._quick_filter)):
                 return
 
-            # logger.debug(
-            #     "*** Event: PID=%s, type=%s COMM=%s, FILENAME=%s, phase=enter_exec ***",
-            #     pid, type, comm, filename,
-            # )
-
         elif type == 1:  # exec-complete event (launch decisions happen here)
             cmdline_tokens = self._read_proc_cmdline(pid)
             cmdline_pretty = " ".join(cmdline_tokens) if cmdline_tokens else "<unavailable>"
-            #logger.debug(
-            #    "*** Post-Exec Event: PID=%s, type=%s COMM=%s, FILENAME=%s, CMDLINE=%s ***",
-            #    pid, type, comm, filename, cmdline_pretty,
-            #)
 
             # Prevent processing the same process tree more than once
             if self.is_process_handled(pid):
@@ -548,7 +538,6 @@ class AppIntercept(metaclass=SingletonMeta):
                 self.pending_exit_events[pid].cancel()
 
             app_id, app_name, old_comm, old_filename = self.monitored_app_launched[pid]
-            # logger.debug(f"Detected possible exit: PID={pid}, comm={comm}")
 
             # Schedule a deferred check 1.5 s later to confirm the process has exited
             timer = Timer(1.5, self.handle_exit_event, args=[pid, app_id, app_name, old_comm, old_filename])
@@ -587,7 +576,7 @@ class AppIntercept(metaclass=SingletonMeta):
             # Re-check the critical flag: the monitor may have transitioned out
             # of critical between the SIGSTOP in print_event and here.
             if not self._system_critical.is_set():
-                logger.debug(f"System recovered before handling {app_name} (PID: {pid}), resuming")
+                logger.info(f"System recovered before handling {app_name} (PID: {pid}), resuming")
                 os.kill(pid, signal.SIGCONT)
                 app_utils.callback_manager.send_callback_notification({
                     'app_id': app_id,
@@ -608,17 +597,15 @@ class AppIntercept(metaclass=SingletonMeta):
                     {"pid": pid, "comm": comm, "filename": filename, "app_name": app_name, "app_id": app_id})
 
         except Exception as e:
-            logger.debug(f"Error handling {app_name} (PID: {pid}): {str(e)}")
+            logger.error(f"Error handling {app_name} (PID: {pid}): {str(e)}", exc_info=True)
 
     def add_to_monitorlist(self, app_names: Union[str, List[str]]) -> None:
         """Add one or more applications to the monitor list (supports batch operations)."""
         if not app_names:
             return
 
-        # Normalise to a list
         names = [app_names] if isinstance(app_names, str) else app_names
 
-        # Lowercase for comparison
         existing_lower = {name.lower() for name in self.monitored_apps}
 
         added_count = 0
@@ -636,14 +623,14 @@ class AppIntercept(metaclass=SingletonMeta):
             app_str = ', '.join(f"'{name}'" for name in names)
             logger.debug(f"All {len(names)} app(s) [{app_str}] already in monitoring list")
         elif added_count > 0:
-            logger.debug(f"Successfully added {added_count}/{len(names)} new app(s)")
+            logger.info(f"Successfully added {added_count}/{len(names)} new app(s)")
             self._rebuild_match_cache()
 
     def remove_from_monitorlist(self, app_name: str) -> None:
         """Remove one or more applications from the monitor list."""
         if app_name in self.monitored_apps:
             self.monitored_apps.remove(app_name)
-            logger.debug(f"Removed '{app_name}' from monitoring list")
+            logger.info(f"Removed '{app_name}' from monitoring list")
             self._rebuild_match_cache()
         else:
             logger.debug(f"'{app_name}' not found in monitoring list")
@@ -651,7 +638,7 @@ class AppIntercept(metaclass=SingletonMeta):
     def clear_monitorlist(self) -> None:
         """Clear the entire monitor list."""
         self.monitored_apps.clear()
-        logger.debug("Cleared monitoring list")
+        logger.info("Cleared monitoring list")
         self._rebuild_match_cache()
 
     def get_monitored_apps(self) -> List[str]:
@@ -738,7 +725,6 @@ class AppIntercept(metaclass=SingletonMeta):
         detected = []
         detected_app_ids: set[str] = set()
 
-        # --- Pass 1: BPF comm/exe matching (original logic) ---
         if self.monitored_apps:
             try:
                 for proc in psutil.process_iter(['pid', 'name', 'exe']):
@@ -795,8 +781,6 @@ class AppIntercept(metaclass=SingletonMeta):
             except Exception as e:
                 logger.error(f"scan_already_running_apps (pass 1) failed: {e}")
 
-        # --- Pass 2: multi-process apps (process_names) ---
-        # Check apps that have process_names configured and were not found in pass 1.
         try:
             all_controlled = app_utils.get_controlled_apps() or []
             for app in all_controlled:
@@ -807,7 +791,7 @@ class AppIntercept(metaclass=SingletonMeta):
                     continue
                 process_names = app_utils._get_app_process_names(app_id=app_id, app_name=app_name)
                 if not process_names:
-                    continue  # handled by pass 1 (or not monitored at all)
+                    continue
 
                 status = app_utils.check_app_running_status(app_id, app_name, cmdline)
                 if status == "running":
@@ -834,38 +818,30 @@ class AppIntercept(metaclass=SingletonMeta):
     def check_system_resources(self, cpu_threshold: int = 70, mem_threshold: int = 80) -> bool:
         """Check current system resource usage."""
         try:
-            # Get CPU utilisation
             cpu_percent = psutil.cpu_percent(interval=1)
 
-            # Get memory utilisation
             mem_percent = psutil.virtual_memory().percent
 
             logger.debug(f"System status - CPU: {cpu_percent}%, Memory: {mem_percent}%")
 
-            # Check whether usage is below the threshold
             return cpu_percent < cpu_threshold and mem_percent < mem_threshold
 
         except Exception as e:
             logger.debug(f"Error checking system resources: {str(e)}")
-            # Default to allowing startup on error
             return True
 
 
 if __name__ == "__main__":
-    # Initialise BPF
     bpf_monitor = AppIntercept()
 
-    # Add applications to the monitor list
     bpf_monitor.add_to_monitorlist("firefox")
     bpf_monitor.add_to_monitorlist("Calculator")
 
-    # Open the perf buffer
     bpf_monitor.bpf["events"].open_perf_buffer(bpf_monitor.print_event)
     logger.debug(f"Monitoring execve() for: {', '.join(bpf_monitor.get_monitored_apps())}")
 
     while True:
         try:
-            # Handle both trace output and BPF events
             bpf_monitor.bpf.perf_buffer_poll(timeout=100)
         except KeyboardInterrupt:
             logger.debug("\nExiting...")

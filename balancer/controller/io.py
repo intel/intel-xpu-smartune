@@ -95,12 +95,10 @@ class IOController:
             lines = result.stdout.strip().split('\n')
             header = lines[0].split()
 
-            # Parse column indices from header
             name_idx = header.index("NAME")
             type_idx = header.index("TYPE")
             majmin_idx = header.index("MAJ:MIN")
 
-            # Build the filter list
             filter_list = []
             if disk_filter:
                 filter_list = [disk_filter] if isinstance(disk_filter, str) else disk_filter
@@ -119,7 +117,6 @@ class IOController:
                 if disk_type != "disk":
                     continue
 
-                # Optional name filter
                 if filter_list and not any(f in name.lower() for f in filter_list):
                     continue
 
@@ -173,7 +170,7 @@ class IOController:
 
                 logger.info(f"Enabling IO controller at {control_file}")
                 if not self._write_cgroup_file("+io", control_file):
-                    logger.info(f"Failed to enable IO at {control_file}")
+                    logger.warning(f"Failed to enable IO at {control_file}")
                     return False
 
             return os.path.exists(cgroup_path)
@@ -265,7 +262,6 @@ class IOController:
                 if not disk_limits:
                     continue
 
-                # Build the limit string
                 limit_parts = []
                 for key in ["rbps", "wbps", "riops", "wiops"]:
                     if key in disk_limits:
@@ -345,7 +341,6 @@ class IOController:
 
         io_weight_path = self._get_full_cgroup_path(cgroup_id, "io.weight")
 
-        # Ensure the IO controller is enabled
         if not self._ensure_io_enabled(io_weight_path):
             return False
 
@@ -387,9 +382,7 @@ class IOController:
             return None
 
 if __name__ == "__main__":
-    # Example usage
     io_ctl = IOController()
-    # Test setup
     cgroup_id = "vte-spawn-d689ffa6-5446-4dfb-99f3-c4e702c44ebb.scope"
 
     # Test case: compound limit config

@@ -30,9 +30,9 @@ def persist_monitor_snapshot(snapshot_type: str, data: Dict[str, Any]) -> None:
             collected_at=collected_at,
         )
         if result.value != "SUCCESS":
-            logger.debug("Persist %s snapshot failed: %s", snapshot_type, result.value)
+            logger.warning("Persist %s snapshot failed: %s", snapshot_type, result.value)
     except Exception as exc:
-        logger.debug("Persist %s snapshot exception: %s", snapshot_type, exc)
+        logger.warning("Persist %s snapshot exception: %s", snapshot_type, exc)
 
 
 def _build_gpu_usage_history(gpu_usage: Dict[str, Any]) -> Dict[str, Any]:

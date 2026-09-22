@@ -197,18 +197,7 @@ function AdvancedSection({ children }: { children: React.ReactNode }) {
   )
 }
 
-// ---------------------------------------------------------------------------
-// Saving is driven by the dialog footer: each card registers how to validate
-// and persist itself, and the footer buttons drive them.  A Save per card meant
-// editing three cards took three clicks, with no way to tell from the dialog
-// which ones were already written -- Reset stays per card, since reloading one
-// card's server values is genuinely a per-card action.
-//
-// Each card is now a tab of its own, so a handle also records which tab owns it:
-// "Save" writes the tab in view, "Save all" writes every tab the user has
-// touched. Panes are kept mounted once visited (see the Tabs below), so an edit
-// left behind on another tab survives the switch and is still saved.
-// ---------------------------------------------------------------------------
+// Save handles let the footer save the active tab or all touched tabs.
 type SaveOutcome = 'ok' | 'conflict' | 'error'
 
 interface SaveHandle {

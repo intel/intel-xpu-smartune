@@ -114,8 +114,6 @@ class DynamicService:
 
     def start(self):
         self.balancer.start()
-        # Begin continuous background collection of the configured
-        # monitored_sections (no-op if the operator set it to []).
         _start_dynamic_info_auto_refresh()
         start_detector_loop()
 
@@ -230,7 +228,6 @@ def _shutdown_service_once():
     except Exception as exc:
         logger.error(f"Reset app status failed during shutdown: {exc}")
 
-    # Signal that shutdown is complete
     emit_event("PLATFORM_SERVICE_STOPPED", severity="info", category="platform.availability",
                source="balancer", summary="SmarTune service stopped (API + Dashboard)",
                attributes={"api_service": "stopped", "dashboard_ui": "stopped"})
@@ -911,7 +908,6 @@ def new_controlled_app():
                     ),
                 )
 
-        # 1. Persist to config.yaml.
         config_entry = {
             'name': name,
             'id': app_id,
@@ -1256,7 +1252,7 @@ def purge_controlled_app():
                     retmsg="Could not restore active resource limits; the app was not deleted"
                 )
 
-        # 1. Remove from config.yaml (preserves comments via the generic helper).
+        # The helper preserves existing config comments.
         removed_count = b_config.remove_from_list_section(
             'controlled_apps', {'id': app_id}
         )
@@ -1267,8 +1263,8 @@ def purge_controlled_app():
                 retmsg="Failed to remove entry from config.yaml"
             )
 
-        # 2. Restore OOM score (if any) before deleting the DB row, so the
-        #    bookkeeping in adjust_oom_priority sees the priority/cmdline.
+        # Restore OOM score before deleting the DB row because
+        # adjust_oom_priority reads priority/cmdline from that record.
         try:
             db_app = AIAppPriority.query().filter(AIAppPriority.id == app_id).first()
             if db_app is not None:
@@ -1279,14 +1275,13 @@ def purge_controlled_app():
         except Exception as oom_exc:
             logger.warning(f"purge_controlled_app: OOM restore failed (continuing): {oom_exc}")
 
-        # 3. Hard-delete the DB row.
+        # Best-effort: continue monitor cleanup even if DB deletion fails.
         try:
             AIAppPriority.delete_record(id=app_id)
         except Exception as db_exc:
             logger.warning(f"purge_controlled_app: DB delete failed (continuing): {db_exc}")
 
-        # 4. Drop it from the BPF monitor and rebuild its cache so the app
-        #    is no longer watched.
+        # Remove runtime monitoring state after config/DB cleanup.
         if target_name:
             _service.remove_control(target_name)
         _service.rebuild_controlled_map()

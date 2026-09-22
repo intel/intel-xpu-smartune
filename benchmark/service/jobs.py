@@ -1,23 +1,8 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# One-at-a-time background job execution for the benchmark pipeline.
-#
-# Both jobs this package runs -- environment setup (setup_env.sh) and a pipeline
-# run (the rendered run_template.sh) -- are long, chatty subprocesses whose output
-# the dashboard tails incrementally. They also share a hard constraint: only ONE
-# may run at a time. A benchmark run saturates the GPU/NPU and the numbers it
-# produces are meaningless if anything else is competing for the device, and a
-# setup that reinstalls the venv underneath a running pipeline breaks it outright.
-# So the manager below holds a single slot rather than a pool.
-#
-# Each job is a process GROUP (start_new_session=True) so cancelling reaches the
-# whole tree -- optimum-cli, ovms and pip all spawn children that would otherwise
-# survive as orphans holding the GPU.
-#
-# Both also drop to an unprivileged user: this is the one place that spawns the
-# pipeline, so privilege.spawn_kwargs() below covers every job there is. See
-# benchmark/service/privilege.py for who that user is and why.
+# Serialized benchmark job execution with streamed logs and process-group cancellation.
+# All spawned jobs run as the configured unprivileged user.
 
 import os
 import signal

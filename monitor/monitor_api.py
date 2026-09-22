@@ -42,14 +42,8 @@ _resource_monitor = None
 _system_pressure_monitor = None
 _network_config_reload_notifier: Optional[Callable[[], None]] = None
 
-# ---------------------------------------------------------------------------
-# Background auto-refresh cache for /dynamic_info
-# ---------------------------------------------------------------------------
-# A daemon thread pre-collects dynamic_info every _DYNAMIC_INFO_REFRESH_INTERVAL_SEC
-# seconds.  The REST endpoint simply returns the cached value, making each poll
-# response near-instant regardless of how frequently the UI calls it.
-# This is the same pattern used by SystemPressureMonitor._start_auto_refresh.
-_DYNAMIC_INFO_REFRESH_INTERVAL_SEC: float = 2.0   # background collection interval
+# The full dynamic-info snapshot is refreshed in the background for fast polling.
+_DYNAMIC_INFO_REFRESH_INTERVAL_SEC: float = 2.0
 _DYNAMIC_INFO_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
 _DYNAMIC_INFO_CACHE_LOCK = threading.Lock()
 _dynamic_info_refresh_started = False
@@ -59,39 +53,17 @@ _dynamic_info_refresh_start_lock = threading.Lock()
 _dynamic_info_stop_event = threading.Event()
 _dynamic_info_collector_thread = None
 
-# Section-scoped on-demand cache for /dynamic_info?sections=... and
-# /dynamic_info/<section>.  Unlike the full snapshot above, these requests are
-# meant for integrators who only want one hardware block: they collect ONLY the
-# requested sections and never start the full-collection background thread, so
-# polling /dynamic_info/gpu never queries CPU/NPU/disk/etc.  A short per-section
-# TTL coalesces rapid polls so each request doesn't re-fork xpu-smi/npu-smi.
+# Section requests bypass the full collector; the TTL coalesces hardware probes.
 _DYNAMIC_SECTION_TTL_SEC: float = 1.0
 _DYNAMIC_SECTION_CACHE: Dict[str, Dict[str, Any]] = {}  # section -> {"data":..., "ts":...}
 _DYNAMIC_SECTION_CACHE_LOCK = threading.Lock()
-# Sections whose collection needs the ResourceMonitor / SystemPressureMonitor
-# singletons; everything else (cpu/memory/network/gpu/npu) needs neither, so a
-# GPU-only request never constructs those monitors.
+# Only these sections require shared monitor instances.
 _SECTIONS_NEED_RM = frozenset({"disk"})
 _SECTIONS_NEED_SPM = frozenset({"disk", "pressure"})
 
-# ---------------------------------------------------------------------------
-# Background auto-refresh cache for /app_resource_stats and /app_disk_io_stats
-# ---------------------------------------------------------------------------
-# Both endpoints internally invoke ResourceMonitor._get_top_processes, which
-# performs several blocking psutil/time.sleep sampling rounds (CPU+IO+GPU) and
-# costs multiple seconds per call.  Without caching, every dashboard client
-# would trigger its own collection cycle, multiplying CPU/IO load N-fold and
-# making the server feel sluggish as soon as more than one dashboard is open.
-# A single daemon thread refreshes both datasets every
-# _APP_STATS_REFRESH_INTERVAL_SEC seconds; all clients read from the shared
-# cache so the cost is independent of the number of connected dashboards.
+# Share expensive app-stat samples across dashboard clients.
 _APP_STATS_REFRESH_INTERVAL_SEC: float = 2.0
-# If no client has requested app stats within this many seconds, the refresh
-# thread parks itself (cheap blocking wait) until the next request wakes it up.
-# This avoids burning CPU on the expensive _get_top_processes pipeline when
-# nobody is looking at the App Resources tab.  Set just slightly above the
-# client poll interval (5 s) so one missed poll triggers parking but a
-# steady-state client never trips it.
+# Park the refresh loop after inactivity; this exceeds the client poll interval.
 _APP_STATS_IDLE_TIMEOUT_SEC: float = 5.5
 _APP_STATS_CACHE_N: int = 10  # collect up to this many entries; clients receive a slice
 _APP_STATS_CACHE: Dict[str, Any] = {
@@ -238,16 +210,13 @@ def _start_app_stats_auto_refresh() -> None:
                 with _APP_STATS_CACHE_LOCK:
                     _APP_STATS_CACHE["resource"] = None
                     _APP_STATS_CACHE["disk_io"] = None
-                # logger.debug("[poll-debug] app_stats refresher PARK (idle)")
                 # Block until a request handler wakes us up.  No timeout: we
                 # only resume work when someone actually wants the data.
                 _app_stats_request_event.wait()
                 _app_stats_request_event.clear()
-                # logger.debug("[poll-debug] app_stats refresher WAKE")
                 continue
 
             loop_start = time.time()
-            # logger.debug("[poll-debug] app_stats refresh START")
             try:
                 monitor = _get_resource_monitor()
                 resource = monitor.get_app_resource_stats(n=_APP_STATS_CACHE_N)
@@ -259,7 +228,6 @@ def _start_app_stats_auto_refresh() -> None:
             except Exception as exc:
                 logger.debug("app_stats auto-refresh error: %s", exc)
             elapsed = time.time() - loop_start
-            # logger.debug(f"[poll-debug] app_stats refresh END   (took {elapsed:.2f}s)")
             time.sleep(max(0.1, _APP_STATS_REFRESH_INTERVAL_SEC - elapsed))
 
     t = threading.Thread(target=refresh_loop, daemon=True, name="app-stats-refresh")
@@ -736,6 +704,10 @@ class SystemPressureMonitor:
             # Push every transition, not just in/out of critical, so the UI can show
             # a live level without polling.
             if old_level != new_level or old_disk_level != new_disk_level:
+                logger.info(
+                    "Pressure level changed: system=%s->%s disk=%s->%s score=%.3f",
+                    old_level, new_level, old_disk_level, new_disk_level, score,
+                )
                 for cb in self._level_change_listeners:
                     try:
                         cb(new_level, new_disk_level)
@@ -877,7 +849,6 @@ class SystemPressureMonitor:
 def get_app_resource_stats():
     """Return per-application CPU/memory/GPU resource usage (top N by score)."""
     try:
-        # logger.debug(f"[poll-debug] app_resource_stats START client={request.remote_addr}")
         _start_app_stats_auto_refresh()
         n = int(request.args.get('n', 10))
 
@@ -906,7 +877,6 @@ def get_app_resource_stats():
                     _APP_STATS_CACHE["resource"] = apps
                     _APP_STATS_CACHE["ts"] = time.time()
 
-        # logger.debug(f"[poll-debug] app_resource_stats END   client={request.remote_addr}")
         return construct_response(
             data={'apps': apps[:n]},
             retmsg="Successfully retrieved app resource stats"

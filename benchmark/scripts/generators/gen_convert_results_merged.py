@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Merge convert pass results (pass1/pass2/pass3) into a single convert_results.json.
 

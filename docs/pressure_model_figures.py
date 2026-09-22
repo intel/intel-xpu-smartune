@@ -85,21 +85,18 @@ def plot(path, series, xlo, xhi, ylo, yhi, xlabel, ylabel, title,
         s.append(f'<line x1="{ML}" y1="{gy:.1f}" x2="{ML+PW}" y2="{gy:.1f}" stroke="{GRID}"/>')
         s.append(f'<text x="{ML-8}" y="{gy+4:.1f}" font-size="11" text-anchor="end" fill="{TEXT}">{yt:g}</text>')
 
-    # axes
     s.append(f'<line x1="{ML}" y1="{MT+PH}" x2="{ML+PW}" y2="{MT+PH}" stroke="{AXIS}" stroke-width="1.5"/>')
     s.append(f'<line x1="{ML}" y1="{MT}" x2="{ML}" y2="{MT+PH}" stroke="{AXIS}" stroke-width="1.5"/>')
     s.append(f'<text x="{ML+PW/2:.0f}" y="{H-14}" font-size="13" text-anchor="middle" fill="{TEXT}">{xlabel}</text>')
     s.append(f'<text x="18" y="{MT+PH/2:.0f}" font-size="13" text-anchor="middle" fill="{TEXT}" '
              f'transform="rotate(-90 18 {MT+PH/2:.0f})">{ylabel}</text>')
 
-    # vertical reference lines
     for vx, vlabel, vcol in vlines:
         gx = _x(vx, xlo, xhi)
         s.append(f'<line x1="{gx:.1f}" y1="{MT}" x2="{gx:.1f}" y2="{MT+PH}" stroke="{vcol}" '
                  f'stroke-width="1.3" stroke-dasharray="5 4"/>')
         s.append(f'<text x="{gx+4:.1f}" y="{MT+14}" font-size="11" fill="{vcol}">{vlabel}</text>')
 
-    # series
     for entry in series:
         label, pts, col = entry[:3]
         opts = entry[3] if len(entry) > 3 else {}

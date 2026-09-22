@@ -1,13 +1,7 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Render and execute a benchmark pipeline run.
-#
-# The vendored pipeline is driven by benchmark/templates/run_template.sh, which
-# carries two placeholders: the model-selection JSON and the stage to run. We
-# substitute those, write the result under the runtime tree (NOT into the vendor
-# drop -- BENCH_SRC_ROOT in the template is what lets the rendered script still
-# find env/global_vars.sh), and hand it to the shared single-slot job manager.
+# Render benchmark scripts in the runtime tree and submit them to the job manager.
 
 import json
 import re

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 # Advanced-run helpers, sourced by the benchmark commons (genai, app).
 #
 # They wrap the final benchmark command run_case builds with two envelope

@@ -992,7 +992,6 @@ function contextTargetForEvent(event: DiagEvent): ContextTarget | null {
 }
 
 export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }: Props) {
-  // Data
   const [events, setEvents] = useState<DiagEvent[]>([])
   const [controlLifecycles, setControlLifecycles] = useState<DiagControlLifecycle[]>([])
   const [records, setRecords] = useState<DiagLogRecord[]>([])
@@ -1055,7 +1054,6 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
   const [logLevel, setLogLevel] = useState<string | undefined>(undefined)
   const [groupRepeats, setGroupRepeats] = useState(true)
 
-  // Drawers
   const [selectedEvent, setSelectedEvent] = useState<DisplayEvent | null>(null)
 
   // Investigation context drawer (the evidence chain for one job/app,

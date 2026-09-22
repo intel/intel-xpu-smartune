@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Common routing script - unified router for the whole pipeline.
 
@@ -69,20 +72,8 @@ BENCH_TOOL_STRATEGY = {
 def _is_openvino_ir_xml(xml_path: Path) -> bool:
     """Return True if xml_path looks like an OpenVINO IR xml file.
 
-    Only the root element and the first top-level child are read: an IR xml
-    opens with <net ...><layers>, which already tells it apart from anything
-    else that lands in a model directory. This used to be ET.parse() plus a scan
-    of the root's children, which built a DOM for the whole file -- 9.7MB for a
-    Qwen3-27B language model, ~1.0s over a 41MB tree -- to look at a prefix.
-
-    Also checking for <edges>, as the DOM version did, would gain nothing and
-    cost everything: <edges> is the last element in the file, so reaching it
-    means reading all of it, streaming or not.
-
-    Cached because the same paths are re-checked by _count_ir_xml and
-    _find_single_openvino_ir_pair after _iter_model_units has already walked
-    them. Safe for the life of a route.py process, which never rewrites the IR
-    tree it is reading.
+    Detect the ``<net><layers>`` prefix with streaming parsing. Results are safe
+    to cache because this process does not modify the model tree.
     """
     try:
         with xml_path.open('rb') as handle:

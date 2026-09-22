@@ -1663,7 +1663,6 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
   // means every time: there are no /bench routes there, and no runs either.
   const [quietRun, setQuietRun] = useState<BenchQuietModeState | null>(null)
 
-  // Retention settings state
   const [retention, setRetention] = useState<HistoryRetentionData | null>(null)
   const [pendingRetentionDays, setPendingRetentionDays] = useState<number | null>(null)
   const [savingRetention, setSavingRetention] = useState(false)

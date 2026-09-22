@@ -787,7 +787,6 @@ export default function Balance({
   const [error, setError] = useState<string | null>(null)
   const [messageApi, contextHolder] = message.useMessage()
 
-  // Add app form state
   const [wizardOpen, setWizardOpen] = useState(false)
   // Keyword the wizard was opened with from inside this tab.
   // Kept apart from the `registerKeyword` prop, which comes from the Processes tab.

@@ -220,8 +220,7 @@ class LimitRegistry:
     def first_auto(self) -> "Optional[tuple[str, LimitedApp]]":
         """Return the oldest auto-limited (key, LimitedApp), or None.
 
-        Mirrors the previous ``next(iter(auto_limited_apps.items()))``
-        FIFO-head behaviour, now filtered by source over the unified dict.
+        Preserves FIFO-head ordering while filtering unified entries by source.
         """
         for key, app in self.apps.items():
             if app.source == "auto":
@@ -255,8 +254,7 @@ class LimitRegistry:
     def pop_last_auto(self) -> "Optional[tuple[str, LimitedApp]]":
         """Pop and return the most-recently-inserted auto-limited entry.
 
-        Mirrors the previous ``auto_limited_apps.popitem()`` (LIFO tail)
-        used by the combined-policy full-restore path.
+        Preserves LIFO-tail ordering for combined-policy restoration.
         """
         for key in reversed(self.apps):
             if self.apps[key].source == "auto":
@@ -614,13 +612,12 @@ class MaxPriorityQueue:
         self._index = 0  # tie-breaker for equal-priority items
 
     def put(self, item):
-        # Store negated priorities for max-heap; tuples are (neg_priority, index, data)
+        # Negate priority to implement max-heap ordering.
         priority = -item[1]
         heapq.heappush(self._queue.queue, (priority, self._index, item))
         self._index += 1
 
     def get(self):
-        # Restore the original data on pop
         return heapq.heappop(self._queue.queue)[-1]
 
     def remove_if(self, condition_func):
@@ -647,7 +644,7 @@ class MaxPriorityQueue:
         return len(self._queue.queue) == 0
 
     def __str__(self):
-        # Display in descending priority order (stored ascending internally)
+        # Display highest-priority items first.
         items = sorted(((-priority, data) for priority, _, data in self._queue.queue), reverse=True)
         return str([(k, v) for (_, (k, v)) in items])
 
@@ -846,9 +843,8 @@ class DynamicBalancer:
         on ``iops = MB/s * 300``, and scaling them independently would move the block size
         at which the IOPS cap starts to bind.
 
-        ``default`` stays unscaled, matching the previous behaviour, so a disk that appears
-        between this enumeration and the write is capped rather than accidentally freed --
-        and is capped at the loosest value, not at a thumb drive's.
+        ``default`` remains unscaled so disks appearing between enumeration and
+        write are capped at the loosest value.
         """
         base = {
             'rbps': io_limits['read'] * 1024 ** 2,
@@ -2080,6 +2076,21 @@ class DynamicBalancer:
                 }, False)
             else:
                 logger.error(f"Failed to fully restore resources for {app_name}")
+                _emit_control_events(
+                    "FAILED", limit_parts,
+                    app_id=entry.public_app_id or app_id,
+                    app_name=app_name,
+                    protection_id=entry.protection_id,
+                    attributes={
+                        "app_name": app_name,
+                        "priority": entry.priority,
+                        "limit_parts": dict(entry.limit_parts),
+                        "resource_parts": dict(entry.resource_parts),
+                        "cgroups": list(entry.cgroups),
+                        "pids": list(entry.pids),
+                        "restore_type": "full",
+                    },
+                )
                 # pop_last_auto() already removed the entry, so the row is gone either
                 # way -- tell the UI or it lingers until the next unrelated event.
                 self._notify_auto_limit_changed(
@@ -2112,7 +2123,10 @@ class DynamicBalancer:
                 self.app_priority_queue.put((coming_app, priority_num))
                 logger.info(f"_run_handle_loop: Resource insufficient, {coming_app} app added to pending queue")
 
-            except Exception:
+            except queue.Empty:
+                continue
+            except Exception as exc:
+                logger.error("Resource handle loop failed: %s", exc, exc_info=True)
                 time.sleep(2)
         logger.debug("Exiting _run_handle_loop")
 
@@ -2790,9 +2804,8 @@ class DynamicBalancer:
         """Return True if a cgroup directory named *cgroup_id* still exists.
 
         Used before restoring a closed app: if the scope/service is already
-        gone its limit died with it, so restoring is a no-op we skip to avoid
-        noisy systemctl retries. On any lookup error assume it exists so the
-        restore still proceeds (old behaviour).
+        gone its limit died with it, so restoration is skipped to avoid noisy
+        systemctl retries. On lookup errors, assume it exists so restoration proceeds.
         """
         mount = getattr(self.config, "cgroup_mount", "/sys/fs/cgroup")
         try:
@@ -3575,8 +3588,7 @@ class DynamicBalancer:
                 # pressure loop may manage it again.
                 self.all_limits.remove_exclusion(effective_app_id)
             else:
-                # Fallback: treat app_id itself as the effective cgroup id,
-                # matching the previous default when no mapping existed.
+                # Compatibility path for callers that still pass an effective ID.
                 effective_app_ids = [app_id]
                 app_name, limit_parts = None, {}
                 protection_id = ""

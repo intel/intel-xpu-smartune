@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Global variables loader for Python scripts.
 All scripts should use this module to load global variables.

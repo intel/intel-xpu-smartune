@@ -92,7 +92,7 @@ class SmartuneLogSource(LogSource):
                         if flt.accepts(rec):
                             records.append(rec)
             except OSError as exc:
-                logger.debug("smartune source skip %s: %s", path, exc)
+                logger.warning("SmartTune log source skipped %s: %s", path, exc)
             if past_window:
                 break  # this file straddled the lower bound; older files are before it
         # Newest first, capped.

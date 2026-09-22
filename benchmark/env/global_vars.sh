@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 # Global Variables for Model Agentic Framework
 # Source this file in all scripts: source $(dirname $0)/../env/global_vars.sh
 #

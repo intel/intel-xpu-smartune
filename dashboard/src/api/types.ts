@@ -957,9 +957,31 @@ export type BenchJobStatus = 'running' | 'done' | 'failed' | 'cancelled'
 
 // A background job: either the environment setup or a pipeline run. Both are
 // reported with the same shape (benchmark/service/jobs.py Job.to_dict).
+// One benchmark command the plan phase listed, keyed by case_key. The operator
+// edits `command` in the review; `device` and `model` are the row's identity and
+// are shown read-only (benchmark/service/runner.py plan_manifest).
+export interface BenchPlanCommand {
+  case_key: string
+  model: string
+  quant: string
+  task: string
+  device: string
+  model_dir: string
+  command: string
+}
+
+// The plan phase's progress: the print-only job plus the commands it has listed.
+// `ready` flips true once the job has finished, at which point `commands` is the
+// full set to review (benchmark/service/runner.py plan_manifest).
+export interface BenchPlanData {
+  job: BenchJob
+  ready: boolean
+  commands: BenchPlanCommand[]
+}
+
 export interface BenchJob {
   id: string
-  kind: 'setup' | 'run'
+  kind: 'setup' | 'run' | 'plan'
   status: BenchJobStatus
   returncode: number | null
   started_at: number
@@ -1104,6 +1126,17 @@ export interface BenchModelsData extends BenchModelsState {
   models: BenchModel[]
   count: number
   matched: number
+}
+
+// The filesystem downloaded weights land on, as read by GET /bench/models/disk.
+// The figures are null when the volume could not be read at all, which the
+// pre-download check renders as "unknown" rather than as "full".
+export interface BenchDiskData {
+  /** The models root the sizes are about, for the dialog to name. */
+  path: string
+  total_bytes: number | null
+  used_bytes: number | null
+  free_bytes: number | null
 }
 
 // --- /bench/events -------------------------------------------------------

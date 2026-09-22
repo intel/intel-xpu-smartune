@@ -13,6 +13,10 @@ RUN_NAME="${BENCH_RUN_NAME:-TEST}"
 PYTHON_BIN="python"
 BATCH_SIZE=1
 
+# Advanced-run helpers (plan manifest + per-case command override). Sourced by
+# path relative to this file so it resolves wherever the templates tree lives.
+. "$(dirname "${BASH_SOURCE[0]}")/bench_advanced_common.sh"
+
 usage() {
     cat <<'EOF'
 Usage: xxx_wrapper.sh [options]
@@ -103,6 +107,35 @@ run_case() {
     local model_name=$(basename "$(dirname "${model_dir}")")
     local safe_name="${model_name}_${quant}"
     shift 1
+
+    # Identity of this case, shared with the plan manifest and the override files
+    # (bench_advanced_common.sh). DEVICE comes from the enclosing device loop.
+    local case_key="${safe_name}__${quant}__${DEVICE}"
+
+    model_file=$(ls "${model_dir}"/*.xml | head -n 1)
+
+    # The command this case would run. Built first so the plan can print it and the
+    # override can replace it, both before anything is written to disk.
+    local -a cmd=(
+        "benchmark_app"
+        -d "${DEVICE}"
+        -m "${model_file}"
+    )
+    cmd+=("$@")
+
+    # Advanced run: replace the command with the operator's edited one. Bookkeeping
+    # below keys off DEVICE and model_dir, not the command text.
+    if _bench_has_override "${case_key}"; then
+        cmd=(bash -c "$(_bench_override_body "${case_key}")")
+    fi
+
+    # Plan phase: record the command and return before touching the results tree.
+    if [ -n "${BENCH_PRINT_ONLY:-}" ]; then
+        _bench_emit_manifest "${case_key}" "${safe_name}" "${quant}" "benchmark_app" \
+            "${DEVICE}" "${model_dir}" "${cmd[@]}"
+        return 0
+    fi
+
     update_dir
     local case_dir="${RUN_DIR}/${safe_name}"
     mkdir -p "${case_dir}"
@@ -111,14 +144,6 @@ run_case() {
     # summary.tsv points at detail.log (the actual run output + KPI/timing lines
     # written by run_with_metrics); benchmark.log holds only the [INFO] header.
     local detail_log="${case_dir}/detail.log"
-    model_file=$(ls "${model_dir}"/*.xml | head -n 1)
-
-    local -a cmd=(
-        "benchmark_app"
-        -d "${DEVICE}"
-        -m "${model_file}"
-    )
-    cmd+=("$@")
 
     {
         echo "[INFO] Model: ${safe_name}"

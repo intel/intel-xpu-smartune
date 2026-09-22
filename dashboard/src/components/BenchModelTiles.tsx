@@ -86,6 +86,8 @@ interface Props {
   busy: boolean
   starting: boolean
   onDownload: (ids: string[]) => void
+  /** Open the run review -- the memory check and the exact commands, a page per
+   *  model -- for the ticked tiles. The run starts from there, not from here. */
   onRun: (ids: string[]) => void
 }
 
@@ -432,8 +434,11 @@ export default function BenchModelTiles({
         />
       </div>
 
-      {/* The two buttons, bottom right of the strip they act on. Each model's
-          pane has the same pair for itself; these are the batch. */}
+      {/* The two buttons, bottom right of the strip they act on -- the only
+          place either job is started from. Neither runs anything directly:
+          Download opens the disk check, Run opens the run review (the memory
+          check and the exact commands, a page per model) and the run starts
+          from there. */}
       <div
         style={{
           display: 'flex',
@@ -479,7 +484,8 @@ export default function BenchModelTiles({
                   ? blockers
                       .map(({ id, reason }) => `${id.split('/').pop()}: ${reason}`)
                       .join('; ')
-                  : `Benchmark ${runnable.length} model${runnable.length === 1 ? '' : 's'}`
+                  : `Review and benchmark ${runnable.length} model${runnable.length === 1 ? '' : 's'}: ` +
+                    'the memory check and the exact commands, a page per model'
           }
         >
           <Button

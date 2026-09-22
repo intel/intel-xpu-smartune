@@ -12,7 +12,7 @@
 // which is why the version is picked here rather than implied.
 
 import React from 'react'
-import { Alert, Button, Descriptions, Divider, Drawer, Select, Space, Tag, Tooltip, Typography } from 'antd'
+import { Alert, Button, Descriptions, Divider, Drawer, Select, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import { ReloadOutlined, ToolOutlined } from '@ant-design/icons'
 
 import type { BenchEnvData } from '../api/types'
@@ -94,13 +94,12 @@ export function EnvStatusTag({ env, installing }: { env: BenchEnvData | null; in
 }
 
 /**
- * The installed OpenVINO versions and what is actually inside each. Pick a
- * version from the dropdown to see the exact package versions in its venv. Empty
- * until a runtime has been installed (the action at the top of this drawer), so
- * a fresh environment shows no packages here.
+ * The installed OpenVINO versions and the exact openvino package inside each.
+ * One row per built runtime: the version on the left, the resolved openvino
+ * package version on the right. Empty until a runtime has been installed (the
+ * action at the top of this drawer), so a fresh environment shows no rows here.
  */
 function OvReference({ detail }: { detail?: BenchEnvData['ov_versions_detail'] }) {
-  const [selected, setSelected] = React.useState<string | undefined>(undefined)
   const versions = detail ?? []
 
   if (!versions.length) {
@@ -114,38 +113,33 @@ function OvReference({ detail }: { detail?: BenchEnvData['ov_versions_detail'] }
     )
   }
 
-  const active = versions.find((v) => v.version === selected) ?? versions[0]
-  // Only packages that actually resolved a version -- a null means the venv does
-  // not carry that package, which is not worth a row.
-  const packages = Object.entries(active.packages).filter(([, v]) => v) as [string, string][]
+  const rows = versions.map((v) => ({
+    key: v.version,
+    version: v.version,
+    openvino: v.packages.openvino ?? null,
+  }))
 
   return (
     <Field label="OpenVINO versions">
-      <Space direction="vertical" size={8} style={{ width: '100%' }}>
-        <Select
-          size="small"
-          style={{ minWidth: 200 }}
-          value={active.version}
-          onChange={setSelected}
-          options={versions.map((v) => ({ label: v.version, value: v.version }))}
-        />
-        <div>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            Packages of OV {active.version}
-          </Text>
-          <Space direction="vertical" size={4} style={{ width: '100%', marginTop: 4 }}>
-            {packages.length ? (
-              packages.map(([name, version]) => (
-                <Tag key={name} style={{ marginInlineEnd: 0 }}>
-                  {name} {version}
-                </Tag>
-              ))
-            ) : (
-              <Text type="secondary" style={{ fontSize: 12 }}>reading the venv ...</Text>
-            )}
-          </Space>
-        </div>
-      </Space>
+      <Table
+        size="small"
+        pagination={false}
+        dataSource={rows}
+        columns={[
+          {
+            title: 'Version',
+            dataIndex: 'version',
+            key: 'version',
+          },
+          {
+            title: 'openvino',
+            dataIndex: 'openvino',
+            key: 'openvino',
+            render: (v: string | null) =>
+              v ? <Text>{v}</Text> : <Text type="secondary">-</Text>,
+          },
+        ]}
+      />
     </Field>
   )
 }

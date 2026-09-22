@@ -265,6 +265,26 @@ def get_model_memory():
     )
 
 
+@bench_bp.route('/models/disk', methods=['GET'])
+def get_models_disk():
+    """Free space where downloaded weights land, for the pre-download check.
+
+    Its own route rather than a field on GET /bench/env: the figure is only
+    interesting at the moment Download is pressed, and it has to be read then --
+    an env payload cached since the tab opened would answer with the free space
+    of an hour ago. Reading it is a statvfs, so asking per click costs nothing.
+    """
+    try:
+        data = models.disk_usage()
+    except Exception:
+        logger.exception("Failed to read free space for the models directory")
+        return construct_response(
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg="Failed to read free space for the models directory",
+        )
+    return construct_response(data=data, retmsg="Successfully retrieved model disk usage")
+
+
 @bench_bp.route('/models/refresh', methods=['POST'])
 def post_models_refresh():
     """Rebuild the cached model list.
@@ -382,6 +402,104 @@ def post_run():
             retmsg=f"Failed to start the benchmark run: {e}",
         )
     return construct_response(data=job.to_dict(), retmsg="Benchmark run started")
+
+
+@bench_bp.route('/run/plan', methods=['POST'])
+def post_run_plan():
+    """Phase 1 of an advanced run: launch a print-only pass over the same request.
+
+    Renders and runs exactly what ``post_run`` would, but with the plan envelope
+    on, so it lists the per-case benchmark commands without measuring or writing
+    anything. Poll ``GET /run/<run_id>/plan`` for the commands; edit them and send
+    them back to ``POST /run/advanced``. Same request body as ``/run``.
+    """
+    body = request.get_json(silent=True) or {}
+    stage = str(body.get("opt") or body.get("stage") or "all")
+    devices = body.get("devices")
+    ov = body.get("ov")
+    try:
+        job = runner.plan_run(body.get("models") or [], stage, devices, ov)
+    except runner.InvalidRunRequest as e:
+        return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg=str(e))
+    except jobs.BenchBusy as exc:
+        return _busy_response(exc)
+    except RuntimeError as e:
+        return construct_response(retcode=RetCode.NOT_EFFECTIVE, retmsg=str(e))
+    except Exception as e:
+        logger.exception("Failed to start the benchmark plan")
+        return construct_response(
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=f"Failed to start the benchmark plan: {e}",
+        )
+    return construct_response(data=job.to_dict(), retmsg="Benchmark plan started")
+
+
+@bench_bp.route('/run/<run_id>/plan', methods=['GET'])
+def get_run_plan(run_id):
+    """The commands a plan job has produced, and whether it has finished.
+
+    ``ready`` flips true once the plan job leaves RUNNING; until then ``commands``
+    is whatever it has flushed so far. The job's own status rides along so a caller
+    that only polls this endpoint can also see a plan that failed.
+    """
+    job = jobs.manager.get(run_id)
+    if job is None:
+        return construct_response(
+            data=None, retcode=RetCode.NOT_EXISTING,
+            retmsg=f"Unknown benchmark job: {run_id}",
+        )
+    try:
+        manifest = runner.plan_manifest(job)
+    except runner.InvalidRunRequest as e:
+        return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg=str(e))
+    return construct_response(
+        data={"job": job.to_dict(), **manifest},
+        retmsg="Successfully retrieved benchmark plan",
+    )
+
+
+@bench_bp.route('/run/advanced', methods=['POST'])
+def post_run_advanced():
+    """Phase 2 of an advanced run: run the request with the operator's edits.
+
+    Same body as ``/run`` plus ``commands``, a map of case_key -> the command the
+    operator edited in the plan review. It must describe the same models/stage/
+    devices/ov the plan was built from, so the rendered case_keys line up with the
+    keys here; a key that matches no case simply never fires.
+    """
+    body = request.get_json(silent=True) or {}
+    stage = str(body.get("opt") or body.get("stage") or "all")
+    devices = body.get("devices")
+    ov = body.get("ov")
+    commands = body.get("commands") or {}
+    if not isinstance(commands, dict):
+        return construct_response(
+            retcode=RetCode.ARGUMENT_ERROR,
+            retmsg="commands must be an object of case_key -> command",
+        )
+    try:
+        job = runner.start_run(
+            body.get("models") or [], stage, devices, ov, cmd_overrides=commands,
+        )
+    except runner.InvalidRunRequest as e:
+        return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg=str(e))
+    except jobs.BenchBusy as exc:
+        return _busy_response(exc)
+    except runner.QuietModeBlocked as exc:
+        return construct_response(
+            data={"blocked": True, "blockers": exc.blockers},
+            retcode=RetCode.CONFLICT,
+            retmsg=str(exc),
+        )
+    except RuntimeError as e:
+        return construct_response(retcode=RetCode.NOT_EFFECTIVE, retmsg=str(e))
+    except Exception as e:
+        logger.exception("Failed to start the advanced benchmark run")
+        return construct_response(
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=f"Failed to start the advanced benchmark run: {e}",
+        )
+    return construct_response(data=job.to_dict(), retmsg="Advanced benchmark run started")
 
 
 @bench_bp.route('/run', methods=['GET'])

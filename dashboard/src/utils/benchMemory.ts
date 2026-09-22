@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// The memory arithmetic behind the Run preflight dialog: what a
+// The memory arithmetic behind the memory check the run review shows: what a
 // (model, precision) costs to load, how much of a given device's free memory it
 // would take, and how large a context ("window") the remaining memory allows.
 //
@@ -54,22 +54,68 @@ export function modelMaxWindow(mem: BenchModelMemory | null | undefined): number
 }
 
 /**
- * The largest window (in tokens) whose KV cache still fits in `availBytes`,
- * after paying for weights and logits. Clamped at zero (a config that does not
- * even fit its weights supports no window). null when the weights or the
- * per-token KV size are unknown, so the caller can say "unknown" rather than 0.
+ * The context lengths the dialog offers, and the one it opens on.
+ *
+ * A benchmark's own default is a short prompt with 128 new tokens, so 1k is
+ * both the realistic starting point and the length at which the KV cache is
+ * small enough that the bar is honestly mostly weights.
  */
-export function maxWindowForBudget(
-  availBytes: number | null,
+export const WINDOW_CHOICES = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+export const DEFAULT_WINDOW = 1024
+
+/**
+ * How a requirement lands against a budget, in the four words the preflight
+ * dialogs answer in. Shared by the memory check and the disk check so the two
+ * say the same thing about the same situation.
+ *
+ * `full` is over budget outright, `tight` fits with too little left to be
+ * comfortable, `unknown` is a budget that could not be read -- never reported
+ * as a problem, since nothing was measured.
+ */
+export type FitVerdict = 'unknown' | 'fits' | 'tight' | 'full'
+
+/**
+ * How much of a device's free memory a load may take before it counts as tight.
+ *
+ * The estimate leaves out activations and framework overhead (runtime-dependent
+ * and deliberately not guessed), so a load that fills the last sliver of free
+ * memory on paper is one that fails in practice. 85% is where the missing terms
+ * stop being noise.
+ */
+export const MEMORY_BUDGET_RATIO = 0.85
+
+export function memoryVerdict(needed: number | null, availBytes: number | null): FitVerdict {
+  if (needed == null || availBytes == null) return 'unknown'
+  if (needed > availBytes) return 'full'
+  if (needed > availBytes * MEMORY_BUDGET_RATIO) return 'tight'
+  return 'fits'
+}
+
+/**
+ * How many sequences at once the dialog offers, and the one it opens on.
+ *
+ * One, because that is what the generated llm_bench command runs. The rest are
+ * there to answer "and if I batched it" without a second reading of the table:
+ * concurrency multiplies the KV cache and nothing else, so it moves exactly one
+ * part of the bar.
+ */
+export const STREAM_CHOICES = [1, 2, 4, 8, 16]
+export const DEFAULT_STREAMS = 1
+
+/**
+ * KV-cache bytes for `streams` sequences of `window` tokens, or null when the
+ * per-token size is unknown.
+ *
+ * The cache is per token per sequence, so both multiply. Weights do not: one
+ * copy serves every sequence, which is why the bar keeps them apart.
+ */
+export function kvCacheBytes(
   mem: BenchModelMemory | null | undefined,
-  precision: BenchPrecision,
+  window: number,
+  streams = 1,
 ): number | null {
-  if (availBytes == null || !mem?.kv_cache_bytes_per_token) return null
-  const weights = weightsBytes(mem, precision)
-  if (weights == null) return null
-  const forKv = availBytes - weights - (mem.logits_bytes ?? 0)
-  if (forKv <= 0) return 0
-  return Math.floor(forKv / mem.kv_cache_bytes_per_token)
+  if (!mem?.kv_cache_bytes_per_token) return null
+  return mem.kv_cache_bytes_per_token * window * streams
 }
 
 /** e.g. 4831838208 -> "4.8 GB". Sub-GB drops to MB so small models read right. */
@@ -81,17 +127,29 @@ export function formatBytesGB(bytes: number | null | undefined): string {
   return `${mb.toFixed(0)} MB`
 }
 
-/** e.g. 90112 -> "90k", 1200000 -> "1.2M". */
+/**
+ * e.g. 32768 -> "32K", 40960 -> "40K", 131072 -> "128K", 1536 -> "1.5K".
+ *
+ * Context lengths are powers of two and are named as such everywhere they are
+ * published ("32K context", "128K context"), so the K here is 1024 and not
+ * 1000. Dividing by 1000 turned every one of them into an off-by-one oddity --
+ * 32768 printed as "33k" against a model card that calls it 32K.
+ *
+ * A length that is not a whole number of K keeps one decimal rather than being
+ * rounded into a neighbouring power of two.
+ */
 export function formatTokens(n: number | null | undefined): string {
   if (n == null || !Number.isFinite(n)) return 'N/A'
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
-  if (n >= 1000) return `${Math.round(n / 1000)}k`
+  const trim = (value: number) =>
+    Number.isInteger(value) ? `${value}` : value.toFixed(1)
+  if (n >= 1024 * 1024) return `${trim(n / (1024 * 1024))}M`
+  if (n >= 1024) return `${trim(n / 1024)}K`
   return `${Math.round(n)}`
 }
 
 /** One thing a device selection resolves to: a place to run, and its free memory. */
 export interface DeviceTarget {
-  /** Display label, e.g. "CPU", "NPU", "iGPU", "dGPU (card1)". */
+  /** Display label, e.g. "CPU", "NPU", "GPU.0 (iGPU)", "GPU.1 (dGPU)". */
   label: string
   /** Free bytes for this target now, or null when it cannot be read. */
   availBytes: number | null
@@ -103,6 +161,19 @@ export interface DeviceTarget {
 // as SystemOverview.buildGpuDevices uses to tell integrated from discrete.
 const IGPU_PCI = /(^|:)00:02\./
 
+/**
+ * A card key the monitor could name, i.e. one that is a GPU to compute with.
+ *
+ * monitor/metrics/gpu_info.py's card_to_gpu_label() names a DRM card by the
+ * render node it is paired with -- "GPU.0", "GPU.1", matching the order OpenCL
+ * and Level Zero enumerate in -- and returns the raw sysfs name ("card1") when
+ * there is no render node to pair with. A card without a render node cannot run
+ * anything: on a server that is the BMC's display chip, which has no business
+ * being offered as a benchmark target. So the shape of the key is the filter,
+ * and the naming stays where it is decided.
+ */
+const GPU_KEY = /^GPU\.\d+$/
+
 function systemAvailBytes(dyn: DynamicInfoData | null | undefined): number | null {
   const gb = dyn?.memory?.available_gb
   return typeof gb === 'number' ? gb * 1024 ** 3 : null
@@ -112,10 +183,14 @@ function systemAvailBytes(dyn: DynamicInfoData | null | undefined): number | nul
  * The device targets a selected `device` maps to, each with its free memory.
  *
  * CPU and NPU both run out of system RAM, so they report system free memory.
- * A GPU selection expands to one target per card the machine has (the user
- * wants them all shown): an iGPU shares system memory, while a discrete GPU has
- * its own VRAM (free = total - used). A machine with no GPU cards still yields a
- * single "GPU" target off system memory, so the row is never empty.
+ * A GPU selection expands to one target per card that can actually compute (the
+ * user wants them all shown): an iGPU shares system memory, while a discrete GPU
+ * has its own VRAM (free = total - used). A machine with no GPU cards still
+ * yields a single "GPU" target off system memory, so the row is never empty.
+ *
+ * Each target is named by the id the monitor gave the card and what kind of card
+ * it is -- "GPU.1 (dGPU)". The id leads because it is the identity: it is what
+ * the rest of the dashboard keys that card by, and the kind is a property of it.
  */
 export function resolveDeviceTargets(
   device: BenchDevice,
@@ -131,7 +206,15 @@ export function resolveDeviceTargets(
   Object.keys(stat?.gpu?.pci_addresses ?? {}).forEach((k) => cardKeys.add(k))
   Object.keys(dyn?.gpu?.vram ?? {}).forEach((k) => cardKeys.add(k))
 
-  const keys = Array.from(cardKeys).sort()
+  // Numeric ordering, so a machine with ten cards lists GPU.9 before GPU.10.
+  const all = Array.from(cardKeys).sort((a, b) =>
+    a.localeCompare(b, undefined, { numeric: true }),
+  )
+  // Display-only devices drop out here. If that leaves nothing -- an older
+  // monitor, or a naming this does not recognise -- everything is kept: a table
+  // with a questionable row in it is still more use than an empty one.
+  const named = all.filter((key) => GPU_KEY.test(key))
+  const keys = named.length ? named : all
   if (keys.length === 0) {
     // No card metadata at all: fall back to a single system-memory GPU target
     // rather than reporting nothing.
@@ -140,16 +223,19 @@ export function resolveDeviceTargets(
 
   return keys.map((cardKey) => {
     const pci = (stat?.gpu?.pci_addresses?.[cardKey] ?? '').toLowerCase()
-    if (IGPU_PCI.test(pci)) {
-      return { label: 'iGPU', availBytes: systemAvailBytes(dyn), source: 'system' as const }
+    const integrated = IGPU_PCI.test(pci)
+    // friendlyGpuLabel keeps iGPU/dGPU spelled as the rest of the dashboard
+    // spells it; the card's own id is what tells two of the same kind apart.
+    const kind = friendlyGpuLabel(integrated ? 'integrated' : 'discrete', 'GPU')
+    const label = `${cardKey} (${kind})`
+    if (integrated) {
+      // Shares system memory: there is no VRAM figure to read for it.
+      return { label, availBytes: systemAvailBytes(dyn), source: 'system' as const }
     }
     const vram = dyn?.gpu?.vram?.[cardKey] ?? stat?.gpu?.vram?.[cardKey]
     const total = vram?.total_bytes ?? null
     const used = vram?.used_bytes ?? null
     const free = total != null && used != null ? Math.max(0, total - used) : null
-    // friendlyGpuLabel keeps the naming consistent with the rest of the dashboard;
-    // the cardKey disambiguates when there is more than one discrete GPU.
-    const base = friendlyGpuLabel('discrete', 'dGPU')
-    return { label: `${base} (${cardKey})`, availBytes: free, source: 'vram' as const }
+    return { label, availBytes: free, source: 'vram' as const }
   })
 }

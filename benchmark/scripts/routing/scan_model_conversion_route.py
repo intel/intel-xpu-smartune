@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,11 @@ SUPPORTED_OPTIMUM_LIBRARIES = {
     "open_clip",
     "kokoro",
 }
+
+# Per-model-directory cache of the optimum probe result, so repeated routing
+# runs do not pay the multi-second `import optimum` cost again.
+ROUTING_CACHE_FILENAME = "model_routing.json"
+ROUTING_CACHE_SCHEMA_VERSION = 1
 
 
 def _normalize_library_name(library_name: str | None) -> str | None:
@@ -222,14 +228,105 @@ def infer_task(model_name_or_path: str) -> str | None:
     return task_name
 
 
+def _installed_transformers_version() -> str | None:
+    """Read the installed transformers version without importing the package."""
+    try:
+        from importlib.metadata import version
+
+        return version("transformers")
+    except Exception:
+        return None
+
+
+def _routing_cache_path(model_id: Any) -> Path | None:
+    """Cache file inside a local model directory; None for HF model IDs."""
+    try:
+        candidate = Path(model_id).expanduser()
+    except Exception:
+        return None
+    if not candidate.is_dir():
+        return None
+    return candidate / ROUTING_CACHE_FILENAME
+
+
+def _load_routing_cache(cache_file: Path | None) -> tuple[str, str, dict[str, Any]] | None:
+    if cache_file is None or not cache_file.is_file():
+        return None
+
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != ROUTING_CACHE_SCHEMA_VERSION:
+        return None
+    # Version bounds/compatibility are relative to the installed transformers,
+    # so a different environment must re-probe.
+    if payload.get("transformers_version") != _installed_transformers_version():
+        return None
+
+    library_name = payload.get("library")
+    task_name = payload.get("task")
+    version_info = payload.get("version_info")
+    if not isinstance(library_name, str) or not isinstance(task_name, str):
+        return None
+    if not isinstance(version_info, dict):
+        return None
+
+    return library_name, task_name, version_info
+
+
+def _store_routing_cache(
+    cache_file: Path | None,
+    library_name: str,
+    task_name: str,
+    version_info: dict[str, Any],
+) -> None:
+    if cache_file is None:
+        return
+
+    payload = {
+        "schema_version": ROUTING_CACHE_SCHEMA_VERSION,
+        "transformers_version": _installed_transformers_version(),
+        "library": library_name,
+        "task": task_name,
+        "version_info": version_info,
+    }
+
+    tmp_file = cache_file.with_name(f"{cache_file.name}.{os.getpid()}.tmp")
+    try:
+        tmp_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp_file.replace(cache_file)
+    except Exception:
+        # A read-only model directory must not break routing.
+        try:
+            tmp_file.unlink()
+        except Exception:
+            pass
+
+
 def analyze_model_id(model_id: str) -> tuple[str | None, str | None, bool | None, dict[str, Any]]:
     """Infer (library, task, supported) from model_id via optimum behavior.
+
+    For local model directories the probe result is cached in
+    `<model_dir>/model_routing.json` and reused on later calls, which avoids the
+    expensive optimum import.
 
     Returns:
     - (library_name, task_name, True, version_info) when both can be inferred and supported
     - (None, None, False, version_info) otherwise
     """
-    library_name, task_name, version_info, error = _run_optimum_task_probe(model_id)
+    cache_file = _routing_cache_path(model_id)
+    cached = _load_routing_cache(cache_file)
+    if cached is not None:
+        library_name, task_name, version_info = cached
+        if library_name not in SUPPORTED_OPTIMUM_LIBRARIES:
+            return None, None, False, {}
+        return library_name, task_name, True, version_info
+
+    library_name, task_name, version_info, error = _run_optimum_task_probe(str(model_id))
     if error is not None:
         print(f"ERROR: {error}")
         return None, None, False, {}
@@ -238,7 +335,9 @@ def analyze_model_id(model_id: str) -> tuple[str | None, str | None, bool | None
         return None, None, False, {}
 
     if library_name not in SUPPORTED_OPTIMUM_LIBRARIES:
-        return None, None, False, {} 
+        return None, None, False, {}
+
+    _store_routing_cache(cache_file, library_name, task_name, version_info)
 
     return library_name, task_name, True, version_info
 

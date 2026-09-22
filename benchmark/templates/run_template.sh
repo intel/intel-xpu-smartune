@@ -17,11 +17,19 @@ opt="__OPT__"  # build + benchmark stage selection
 # This group's run settings, rendered in by benchmark/service/runner.py.
 #
 # One press of Run can now ask for a different OpenVINO version or a different
-# device set per model, and both of those are process-wide here (the OV venv is
-# activated below; BENCH_DEVICES is read by gen_wrapper.py). So a request that
-# does not agree on them is split into groups, and each group gets its own copy
-# of this script with its own exports -- run in sequence by a driver script, so
-# a group's environment is its own process and never has to be switched.
+# device set per model, and both of those are process-wide here: the OV venv is
+# activated below, and the device sweep is fixed by the models_input.json this
+# script writes. So a request that does not agree on them is split into groups,
+# and each group gets its own copy of this script with its own exports -- run in
+# sequence by a driver script, so a group's environment is its own process and
+# never has to be switched.
+#
+# BENCH_DEVICES is the group's device set as a label: it is what run_meta.json
+# records and what the log shows, and no generator reads it. The devices a case
+# actually runs on come from each model's `device` field in models_input.json
+# (route.py passes it through to gen_wrapper.py's _route_devices), which
+# runner.py fills from the same per-model selection it grouped by -- so the two
+# always agree. They did not always: see normalize_request in runner.py.
 #
 # Empty when there is only one group: the run then inherits BENCH_RUN_NAME and
 # the rest from the job's environment, exactly as it did before groups existed.
@@ -105,24 +113,37 @@ fi
 
 if [ "$opt" == "benchmark" ] || [ "$opt" == "all" ]; then
 # =============== BENCHMARK (GenAI llm_bench) ===============
+begin=$(date +%s)
 python "$SCRIPT_ROUTE" \
   --models-json "$JSON_MODELS_INPUT" \
   --models-dir "$DIR_IR" \
   --output "$DIR_LOGS/benchmark_routing.json"
-
+end=$(date +%s)
+echo "Benchmark duration: $((end - begin)) seconds"
+begin=$(date +%s)
 python "$SCRIPT_GEN_WRAPPER" \
   --routes-json "$DIR_LOGS/benchmark_routing.json" \
   --strategy all \
   --stage benchmark \
   --output-metadata "$DIR_LOGS/benchmark_genai_scripts.json"
+end=$(date +%s)
+echo "GenAI script generation duration: $((end - begin)) seconds"
 
+begin=$(date +%s)
 python "$SCRIPT_EXECUTE_WRAPPER" \
   --scripts-metadata "$DIR_LOGS/benchmark_genai_scripts.json" \
   --timeout "$TIMEOUT_BENCHMARK" \
   --output "$DIR_LOGS/benchmark_genai_results.json"
+end=$(date +%s)
+echo "GenAI benchmark execution duration: $((end - begin)) seconds"
 fi
-
 # =============== Data aggregation ===============
+# Skipped entirely for a plan (print-only) pass: a plan runs route -> gen_wrapper
+# -> run_case with BENCH_PRINT_ONLY set, so run_case writes no summary.tsv or
+# detail.log, and there is nothing to aggregate, pivot or stamp with run metadata.
+# Guarding here (rather than letting each step no-op on an empty tree) is what
+# guarantees a plan leaves the results tree untouched.
+if [ -z "${BENCH_PRINT_ONLY:-}" ]; then
 # BENCH_METRICS_CSV is the run-level sampling CSV (benchmark/service/env.py exports it while
 # benchmark/service/sampler.py writes it). It is absent for a build-only run, or when the
 # sampler could not start; the aggregation still runs and just emits KPIs.
@@ -239,3 +260,4 @@ if [ -n "${BENCH_RUN_META:-}" ] && [ -n "${BENCH_RUN_NAME:-}" ]; then
     done
   done
 fi
+fi  # end: skip aggregation for a print-only plan pass

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Pivot report generator
 Reads windowed_metric_medians.csv and outputs a self-contained interactive HTML.

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 """Analyze OpenVINO XML const element_type distribution for precision validation."""
 
 import argparse

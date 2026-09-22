@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Unified wrapper executor - Execute wrapper scripts with timeout, logging, and validation.
 """
@@ -153,7 +156,6 @@ def main():
         # Execute all scripts
         exec_results = execute_batch_wrappers(scripts, args.timeout)
 
-        # Summary
         success_count = sum(1 for r in exec_results if r['status'] == 'success')
         failed_count = len(exec_results) - success_count
 
@@ -172,7 +174,6 @@ def main():
             'by_strategy': by_strategy,
         }
 
-    # Output
     output_str = json.dumps(result, indent=2)
 
     if args.output:

@@ -31,8 +31,8 @@ class Controller:
                 match = re.search(r'(user-\d+\.slice)', line)
                 if match:
                     return match.group(1).replace('user-', '').replace('.slice', '')
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to resolve user slice UID: %s", exc)
         return ""
 
     def inspect_cgroup_limits(self, cgroup_id: str) -> dict:
@@ -86,12 +86,10 @@ class Controller:
 
     def get_user_scopes(self):
         try:
-            # Run the command and capture output
             path = '/sys/fs/cgroup/user.slice/user-%s.slice/' % self.uid
             result = subprocess.run(['find', path, '-maxdepth', '1', '-type', 'd'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
-            # Split into lines and remove empty lines/headers
             scopes = [line.replace(path, '') for line in result.stdout.splitlines()
                                                  if line.strip() and line.replace(path, '')
                                                                  and not line.endswith('user-%s.slice' % self.uid)
@@ -108,12 +106,10 @@ class Controller:
 
     def get_app_services1(self):
         try:
-            # Run the command and capture output
             path = '/sys/fs/cgroup/user.slice/user-%s.slice/user@%s.service/app.slice/' % (self.uid, self.uid)
             result = subprocess.run(['find', path, '-maxdepth', '1', '-type', 'd'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
-            # Split into lines and remove empty lines/headers
             apps = [line.replace(path, '') for line in result.stdout.splitlines()
                                                if line.strip() and line.replace(path, '')
                                                                and not line.endswith('app.slice')]
@@ -137,7 +133,6 @@ class Controller:
 
             for path in possible_paths:
                 try:
-                    # Run the command and capture output
                     result = subprocess.run(
                         ['find', path, '-maxdepth', '1', '-type', 'd'],
                         stdout=subprocess.PIPE,
@@ -146,7 +141,6 @@ class Controller:
                         check=True
                     )
 
-                    # Process the output for this path
                     path_apps = [
                         line.replace(path, '')
                         for line in result.stdout.splitlines()
@@ -158,13 +152,12 @@ class Controller:
                     apps.extend(path_apps)
 
                 except subprocess.CalledProcessError:
-                    # This path didn't work, try the next one
                     continue
                 except Exception as e:
                     logger.error(f"Unexpected error processing path {path}: {str(e)}")
                     continue
 
-            return list(set(apps))  # Remove duplicates while preserving order
+            return list(set(apps))
 
         except Exception as e:
             logger.error(f"An error occurred in get_app_services(): {str(e)}")
@@ -295,7 +288,6 @@ class Controller:
         :param is_restore: When True, clear all limits and restore defaults
         """
         unit_type = "scope"
-        # Validate parameter ranges
         if cpu_quota is not None and not (1 <= cpu_quota <= 100):
             logger.warning(f"Invalid cpu_quota {cpu_quota}, must be 1-100. no limit for cpu.")
             cpu_quota = None
@@ -308,14 +300,12 @@ class Controller:
             logger.warning(f"Invalid io_weight {io_weight}, no limit for io.")
             io_weight = None
 
-        # If there is nothing to apply (and this is not a restore), skip the systemctl call entirely.
         if not is_restore and cpu_quota is None and mem_high is None and io_weight is None:
             return True
 
         scopes = self.get_user_scopes()
         services = self.get_app_services()
 
-        # On TOS systems, service units use the same command as scopes (no unit_type distinction needed)
         if app_id.endswith('.scope'):
             matching_app = app_id
             if matching_app in scopes:
@@ -337,9 +327,7 @@ class Controller:
             )
             unit_type = 'scope' if matching_app in scopes else 'service'
         else:
-            # Bare process name (e.g. "optimum-cli"): not a systemd unit itself.
-            # Resolve it to the scope/service the process actually runs in so
-            # set-property has a real target instead of a bogus "<name>.service".
+            # systemctl must target the process's containing scope or service.
             matching_app, resolved_type = self._resolve_process_unit(app_id)
             unit_type = resolved_type or 'scope'
 
@@ -348,7 +336,6 @@ class Controller:
             logger.warning(f"No matching unit for {app_id}")
             return False
 
-        # Build systemctl property arguments
         properties = []
         if not is_restore:
             if cpu_quota is not None:
@@ -359,21 +346,15 @@ class Controller:
                 properties.append(f"MemoryHigh={mem_high}M")
             else:
                 properties.append("MemoryHigh=")
-            # IOWeight is intentionally NOT touched here. This project drives
-            # all IO limits through io.max directly (see IOController), and
-            # writing IOWeight (or clearing it) makes systemd asynchronously
-            # detach `io` from the parent slice's cgroup.subtree_control,
-            # which races with concurrent io.max writes and produces EACCES
-            # (the multi-SSD restore failure we hit in 2026-06).
+            # Do not modify IOWeight: it can detach the io controller and race
+            # with IOController io.max writes, causing EACCES.
         else:
-            # Restore: clear CPU/memory limits we may have set above. IOWeight
-            # is omitted for the same reason as in the set branch.
+            # IOWeight remains unchanged; see the io.max constraint above.
             properties.extend([
                 "CPUQuota=",
                 "MemoryHigh=",
             ])
 
-        # Execute command with up to _MAX_RETRIES retries to handle transient dbus timeout issues
         _MAX_RETRIES = 3
         try:
             dbus_address = None
@@ -439,7 +420,6 @@ class Controller:
             logger.error(f"Set resource failed: {str(e)}")
             return False
 
-    # cpu
     def set_cpu_quota(self, app_id: str, cpu_quota: int, is_restore: bool = False):
         if is_restore:
             logger.info(f"Restoring CPU quota for {app_id}")
@@ -453,7 +433,6 @@ class Controller:
             is_restore=is_restore
         )
 
-    # mem
     def set_mem_high(self, app_id: str, mem_high: Optional[str] = None, is_restore: bool = False):
         if is_restore:
             logger.info(f"Restoring memory limit for {app_id}")
@@ -467,7 +446,6 @@ class Controller:
             is_restore=is_restore
         )
 
-    #io
     def set_io_weight(self, app_id: str, io_weight: Optional[int] = None, is_restore: bool = False):
         if is_restore:
             logger.info(f"Restoring IO weight for {app_id}")
@@ -483,7 +461,6 @@ class Controller:
             is_restore=is_restore
         )
 
-    # all
     def set_all_resources(self, app_id: str, cpu_quota: Optional[int] = None, mem_high: Optional[int] = None,
                           io_weight: Optional[int] = None, is_restore: bool = False):
         """Set resource limits for an application (CPU, memory, and IO)."""

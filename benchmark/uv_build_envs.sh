@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 # Build multi-version benchmark environments with uv (co-resolve, hardlink-deduped).
 #
 # Each environment is a COMPLETE venv = base packages + one OpenVINO + one
@@ -40,12 +43,7 @@ ARG="${2:-}"
 set --
 source "${SCRIPT_DIR}/env/global_vars.sh" >/dev/null 2>&1
 
-# ---- Version matrix (editable) ----
-# OV_VERSIONS is intentionally EMPTY: OpenVINO versions are no longer pre-built as
-# a matrix. The version to build now comes from the user's per-run choice on the
-# Models tab (BENCH_OV_VERSION), and `ensure <OV>` builds exactly that column on
-# demand -- see run_template.sh. Only huggingface (the base venv) is built up
-# front, because listing/downloading models needs the `hf` CLI, not OpenVINO.
+# OpenVINO columns are built on demand; only the HuggingFace base venv is prebuilt.
 OV_VERSIONS=()
 TF_VERSIONS=("4.57.0" "5.0.0" "5.2.0" "5.5.0")
 DEFAULT_TF="5.5.0"
@@ -59,9 +57,7 @@ DEFAULT_OV="${OV_VERSIONS[0]:-}"
 # benchmark relinks to a specific OV column for its own process only.
 DOWNLOAD_REQS="${SCRIPT_DIR}/requirements/download.requirements.txt"
 
-# ---- Paths ----
-# Everything the build owns lives under one dir (see global_vars.sh) so the
-# runtime root stays tidy instead of scattering uv_cache/ov_pool/uv_bin at top.
+# Keep build artifacts under the shared runtime tree.
 MULTI_ENV="${PYENV_MULTI_DIR:-${DIR_ENV_ROOT}/.gen/multi_env}"
 export UV_CACHE_DIR="${MULTI_ENV}/uv_cache"   # MUST share FS with OV_POOL for hardlink dedup
 export UV_LINK_MODE="hardlink"

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 
 set -uo pipefail
 
@@ -9,7 +12,6 @@ RESULTS_ROOT="${DIR_BENCHMARKS}/app"
 # One run name per batch, set by benchmark/service/runner.py so every model/device
 # wrapper in a "Run" shares a directory; falls back to TEST for a standalone run.
 RUN_NAME="${BENCH_RUN_NAME:-TEST}"
-#RUN_NAME="TEST"
 PYTHON_BIN="python"
 BATCH_SIZE=1
 

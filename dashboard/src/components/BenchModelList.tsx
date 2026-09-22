@@ -120,15 +120,7 @@ function formatCount(value: number): string {
   return String(value)
 }
 
-/**
- * What to say when there is nothing to list.
- *
- * Nothing here depends on the benchmark environment. It used to: the list was
- * only buildable with the venv's `hf` CLI, so an un-installed machine got an
- * "install the environment first" dead end. The search now falls back to the
- * hub's HTTP API (benchmark/service/search_models.py), which is the right way
- * round -- browsing models is what someone does *before* installing anything.
- */
+/** Render the empty model-list state. */
 function EmptyState({
   busy,
   noneCached,
@@ -169,16 +161,7 @@ export default function BenchModelList({
   onDeleteLocal,
 }: Props) {
   const checked = useMemo(() => new Set(checkedIds), [checkedIds])
-  // Which publishers are open, and the only answer to that question: every
-  // header toggles, all of them, always. Collapsed is the default -- a few
-  // hundred models are forty-odd publishers, and that fits on one screen where
-  // the models never did.
-  //
-  // A group is never *held* open by something else being true. It used to be:
-  // the group of the highlighted model, and every group while a search was
-  // running, were drawn open whatever this set said -- so their headers did
-  // nothing when clicked. What opens a group by itself now writes it into this
-  // set instead (see below), which leaves it collapsible.
+  // The opened set is the single source of truth for publisher expansion.
   const [opened, setOpened] = useState<Set<string>>(new Set())
   // What was open before a search widened it, so clearing the box puts the list
   // back rather than leaving forty groups open.
@@ -275,10 +258,6 @@ export default function BenchModelList({
           value={filter}
           onChange={(value) => onFilterChange(value as ModelFilter)}
         />
-        {/* How much of the list is on screen, and the one control that opens or
-            closes all of it at once. Any mixture in between is a matter of
-            clicking the headers -- nothing here or elsewhere pins a group
-            open. */}
         {groups.length > 0 && (
           <Space size={8} style={{ justifyContent: 'space-between', width: '100%' }}>
             <Text type="secondary" style={{ fontSize: 11 }}>
@@ -297,11 +276,6 @@ export default function BenchModelList({
         )}
       </Space>
 
-      {/* A search takes minutes, and the one started for the user -- at startup,
-          or as soon as an environment setup finishes -- is otherwise invisible:
-          the list sits empty (or stale) with a Refresh button next to it, as if
-          nothing were happening. Said above the list so it is seen whether or
-          not there is already an old list underneath. */}
       {refreshing && (
         <div style={{ padding: '0 12px 8px' }}>
           <Alert
@@ -347,9 +321,6 @@ export default function BenchModelList({
                   <Text style={{ fontSize: 12, flex: 1, minWidth: 0 }} ellipsis title={group.publisher}>
                     {group.publisher}
                   </Text>
-                  {/* How many of this publisher's models are already on the
-                      machine: the one fact that decides whether opening the
-                      group is worth it. */}
                   {group.downloaded > 0 && (
                     <Tooltip
                       title={`${group.downloaded} already downloaded · ${formatBytes(
@@ -361,8 +332,6 @@ export default function BenchModelList({
                         <Text type="secondary" style={{ fontSize: 11 }}>
                           {group.downloaded}
                         </Text>
-                        {/* Collapsed, this is the only thing that says where the
-                            disk went. */}
                         {group.bytes > 0 && (
                           <Text type="secondary" style={{ fontSize: 11 }}>
                             · {formatBytes(group.bytes)}

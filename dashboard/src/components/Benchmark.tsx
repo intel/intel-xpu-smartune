@@ -1,29 +1,6 @@
 // Copyright (c) 2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
-//
-// Benchmark tab: browse the models that have an OpenVINO conversion, download
-// one, benchmark it, read the numbers.
-//
-// The page is a model browser (left) plus the models in play and their results
-// (right). The backend runs at most one job at a time -- setup and runs share a
-// single slot -- so there is no job list: there is what is running now, and
-// there are the results of everything that ran before.
-//
-// The models in play are a strip of tiles (BenchModelTiles), one per ticked
-// model, each carrying its own precisions, devices, OpenVINO version and extra
-// args; this component owns those settings and the drawer that edits them. They
-// used to be one global set, which could not express the thing the page exists
-// for -- this model as int4 on the NPU, that one as fp16 on the CPU. The server
-// takes them per model and groups the models that agree about the two the
-// pipeline cannot vary within one process (benchmark/service/runner.py,
-// run_groups), so a request that disagrees is still one press of Run.
-//
-// Nothing here polls. State arrives on the SSE stream App holds open
-// (hooks/useBenchEvents, benchmark/service/events.py): a snapshot on connect,
-// then job/log/env/models/results events as they happen. REST is used for the
-// three things a push cannot sensibly carry -- the model list, the results
-// tables, and log spans the stream could not deliver contiguously -- and for
-// starting and cancelling jobs.
+// Benchmark workspace for model selection, per-model settings, jobs, and results.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Card, Modal, Space, Tabs, Tag, Tooltip, Typography, message } from 'antd'
@@ -459,14 +436,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     void loadMemoryFor([id])
   }, [openModelId, models, loadMemoryFor])
 
-  // One reading of the results tree, shared by both views below.
-  //
-  // The table used to have its own, grouped by run directory, which was the
-  // right shape only while a run directory meant a device. Now that every run
-  // keeps its own results, the question the table answers -- how did this test
-  // do, across the times it was run -- is answered off the flat matrix like
-  // everything else, and both views cannot disagree about what is on disk
-  // because there is one fetch. /bench/results is still served; nothing reads it.
+  // Both result views use one matrix snapshot.
   const loadResults = useCallback(async () => {
     try {
       setMatrix(await api.getBenchMatrix())
@@ -523,16 +493,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     void loadPreflight()
   }, [loadEnv, loadModels, loadResults, loadPreflight])
 
-  // Open on the model the results below are about.
-  //
-  // Nothing is remembered between restarts, so the tab used to come up with the
-  // upper half empty -- a model pane with no model, above a table full of
-  // results for one. The most recently benchmarked model is both the best guess
-  // at what the reader was last doing and the thing they are looking at.
-  //
-  // Runs once. It fires when the matrix and the model list have both arrived
-  // (either order), and is marked done even when no list entry matches the run's
-  // model, so a later list refresh cannot move a selection the user has made.
+  // Select the newest benchmarked model once both result and model data arrive.
   useEffect(() => {
     if (seededSelection.current || selectedId || models.length === 0) return
     const rows = matrix?.rows ?? []
@@ -542,8 +503,6 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     const match = models.find((model) => matchesModel(newest.model, model.id))
     if (match) setSelectedId(match.id)
   }, [matrix, models, selectedId])
-
-  // --- log assembly -------------------------------------------------------
 
   const appendChunk = useCallback((chunk: string, end: number) => {
     logOffset.current = end

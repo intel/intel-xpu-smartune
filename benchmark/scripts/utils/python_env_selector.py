@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 """Select a Python virtual environment by transformers version bounds."""
 
 from __future__ import annotations

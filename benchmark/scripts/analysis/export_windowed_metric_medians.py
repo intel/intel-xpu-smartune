@@ -1,31 +1,22 @@
 #!/usr/bin/env python3
-"""Turn each benchmark case's detail.log into one row of KPIs plus the hardware
-medians measured while that case was running.
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
-Three steps per case:
+"""Export one summary row per benchmark case from detail.log and metrics CSV.
 
-  1. Scrape the backend's KPIs out of detail.log. Each backend prints a different
-     shape (llm_bench's `[Average] P[n] ...`, benchmark_app's `Throughput: ...
-     FPS`), so there is one parser each.
-  2. Find the measurement window -- preferably the `PIPELINE TIME: ... begin:/end:`
-     markers, otherwise the per-iteration `start:/end:` timestamps with the warm-up
-     iteration dropped. This is what keeps model load and graph compilation out of
-     the power and utilisation figures.
-  3. Slice the run's metrics.csv to that window and take a median per column.
-     Median, not mean, so one scheduling hiccup does not move the number.
+For each case:
+1) Parse backend KPIs from detail.log.
+2) Determine the measurement window (prefer PIPELINE TIME begin/end; fall back
+    to per-iteration timestamps with warm-up excluded).
+3) Slice metrics CSV to that window and compute per-column medians.
 
-The output feeds pivot_report.py / analyze.py, which pivot on the dimension
-columns (model_name / device / precision / batch_size) that strip_precision_suffix
-recovers from the case directory name.
+The output is consumed by pivot_report.py / analyze.py and keyed by
+model_name/device/precision/batch_size derived from the case directory.
 
-SmarTune fork: upstream read five per-case CSVs written by metrics/metrics_collect.sh
-(PTAT, its own gpu_monitor, intel-npu-smi, a memory monitor, and IGT's xe-perf).
-Sampling now happens in-process (benchmark/service/sampler.py) and lands in ONE run-level CSV
-passed as --metrics-csv, so the five blocks collapsed into one. The PTAT columns
-(PL1/PL2, per-core IPC, TJMAX) and the xe-perf EU counters went with them: both
-tools need an out-of-tree install -- an Intel-internal artifactory download and an
-IGT build from an innersource clone -- so neither is shippable. Re-syncing this
-file from upstream is a manual merge, not a copy.
+SmarTune variant: hardware sampling is written in-process to a single run-level
+CSV (benchmark/service/sampler.py) provided via --metrics-csv, rather than
+multiple per-case collector CSVs. Upstream sync for this file requires a manual
+merge of behavior differences.
 """
 
 import argparse
@@ -50,14 +41,11 @@ PIPELINE_TIME_PATTERN = re.compile(
 # Stripping them yields the bare model_name shared across configurations.
 CONFIG_SUFFIX_PATTERN = re.compile(
     r'[_\-](?:'
-    # precision
     r'fp32|fp16|fp64|int8|int4|uint8|uint4|float32|float16|float64|'
     r'bf16|bfloat16|f32|f16|i8|i4|'
-    # device
     r'igpu|dgpu|gpu|cpu|npu|'
     # framework / format marker
     r'ov|'
-    # batch size
     r'(?:bs|batch)[_\-]?\d+'
     r')$',
     re.IGNORECASE,
@@ -116,7 +104,6 @@ GENAI_AVERAGE_PATTERN = re.compile(
 # -- so it is the right figure for a perf/watt column on any device. gpu_power_w
 # is the graphics domain alone.
 METRICS_COLUMNS = {
-    # CPU
     'cpu_usage_pct': 'cpu_usage_percent_median',
     'cpu_p_core_usage_pct': 'cpu_p_core_usage_percent_median',
     'cpu_e_core_usage_pct': 'cpu_e_core_usage_percent_median',
@@ -125,19 +112,16 @@ METRICS_COLUMNS = {
     'cpu_package_power_w': 'cpu_package_power_w_median',
     'cpu_package_temp_c': 'cpu_package_temp_c_median',
     'cpu_package_tjmax_c': 'cpu_package_tjmax_c_median',
-    # Memory
     'memory_used_gb': 'memory_used_gb_median',
     'memory_available_gb': 'memory_available_gb_median',
     'memory_used_pct': 'memory_used_percent_median',
     'memory_bandwidth_gb_s': 'memory_bandwidth_gb_s_median',
     'memory_bandwidth_pct': 'memory_bandwidth_percent_median',
-    # GPU
     'gpu_power_w': 'gpu_power_w_median',
     'gpu_freq_mhz': 'gpu_frequency_mhz_median',
     'gpu_render_busy_pct': 'gpu_render_busy_percent_median',
     'gpu_compute_busy_pct': 'gpu_compute_busy_percent_median',
     'gpu_video_busy_pct': 'gpu_video_busy_percent_median',
-    # NPU
     'npu_utilization_pct': 'npu_utilization_percent_median',
     'npu_power_w': 'npu_power_w_median',
     'npu_frequency_mhz': 'npu_frequency_mhz_median',
@@ -201,7 +185,6 @@ def parse_notebook_kpis(detail_log: Path) -> dict[str, str]:
         r'PIPELINE TIME: Time taken to iteration.*: ([\d.]+) sec'
     )
 
-    # Extract all iteration durations
     iteration_durations = []
     for match in iteration_pattern.finditer(content):
         duration = float(match.group(1))
@@ -210,7 +193,6 @@ def parse_notebook_kpis(detail_log: Path) -> dict[str, str]:
     if not iteration_durations:
         return kpis
 
-    # Calculate statistics
     kpis['kpi_iteration_count'] = str(len(iteration_durations))
     avg_duration = sum(iteration_durations) / len(iteration_durations)
     kpis['kpi_iteration_avg_sec'] = f'{avg_duration:.9f}'

@@ -1,39 +1,26 @@
 #!/usr/bin/env python3
-"""Merge per-run windowed_metric_medians.csv files into one backend-wide table.
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 
-Why this exists
----------------
-export_windowed_metric_medians.py windows each case against ONE hardware
-sampling CSV -- the run-level file benchmark/service/sampler.py wrote while that
-run was going. Pointing it at a whole backend tree therefore only works while
-the tree holds a single run: every case belonging to an *earlier* run has a
-measurement window that lies entirely outside the current run's samples, so
-collect_csv_medians finds nothing in range and writes a blank for every hardware
-column. The KPIs survive (they are scraped from each case's detail.log, which
-never goes stale), which is exactly the symptom that shows up in the dashboard:
-older runs keep their throughput and latency and lose their power, utilisation,
-frequency and memory columns.
+"""Merge per-run windowed_metric_medians.csv files into one backend table.
 
-Since runner.py started giving each run its own results directory, the fix is to
-aggregate each run against its own samples -- into its own directory, which
-benchmark/service/results.py's _artifact already prefers -- and then merge those
-per-run files here into the backend-wide one that pivot_report.py pivots over.
-Old rows are carried through untouched; only the run that just finished is
-recomputed.
+Why this exists:
+- export_windowed_metric_medians.py windows each case against one run-level
+    metrics CSV.
+- Running it over a backend tree with multiple runs can leave older runs with
+    blank hardware medians because their windows are outside the current run's
+    samples.
+- This script merges per-run outputs so each run is aggregated against its own
+    samples.
 
-Merge rule: one row per case, later inputs winning. Callers pass the existing
-backend CSV first and the freshly written per-run files after it, so a case that
-was re-measured takes its new numbers and every other case keeps the ones it
-already had. A row is replaced whole rather than field-merged: a blank column in
-a newer row means "this collector had nothing to say about this case", and
-back-filling it from an older measurement of the same case would invent a
-reading that was never taken.
+Merge semantics:
+- One row per case; later inputs win.
+- Callers pass existing backend CSV first and newer per-run CSVs after it.
+- Rows are replaced as a whole (no field back-fill from older rows).
 
-Rows whose case directory no longer exists are dropped, so deleting a case
-(benchmark/service/results.py's delete_cases) does not leave the report pivoting
-over measurements with nothing behind them. --keep-missing turns that off for a
-tree that has been moved since it was produced, where every recorded case_dir is
-stale but the data is still good.
+Pruning:
+- Rows whose case_dir no longer exists are dropped by default.
+- --keep-missing keeps those rows for moved/offline result trees.
 """
 
 import argparse

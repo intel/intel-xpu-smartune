@@ -1035,6 +1035,29 @@ class SeparatedRestoreChannelTests(unittest.TestCase):
 class CombinedPolicyTests(unittest.TestCase):
     """Combined policy has a single channel and restores both caps together."""
 
+    def test_failed_full_restore_emits_terminal_failure_events(self):
+        b = _balancer()
+        entry = _limited('app.scope', cpu_mem=True, io=True)
+        entry.protection_id = 'protect-1'
+        b.all_limits.apps['app.scope'] = entry
+        b.control_manager.adjust_resources = mock.Mock(return_value=False)
+        state = _state(
+            pressure_start_time=NOW - _MonitorLoopState.STABLE_PERIOD,
+            current_pressure='low',
+        )
+
+        with mock.patch.object(balancer_mod, '_emit_control_events') as emit, \
+                mock.patch.object(b, '_notify_auto_limit_changed'):
+            b._tick_combined_restore(state, 'low')
+
+        emit.assert_called_once()
+        action, parts = emit.call_args.args
+        assert action == 'FAILED'
+        assert parts == {'cpu_mem_limited': True, 'io_limited': True}
+        assert emit.call_args.kwargs['protection_id'] == 'protect-1'
+        assert emit.call_args.kwargs['attributes']['restore_type'] == 'full'
+        assert emit.call_args.kwargs['attributes']['cgroups'] == ['app.scope']
+
     def test_stale_batch_is_resampled(self):
         b = _balancer()
         state = _state(top_consume_apps=[_candidate('old.scope')],

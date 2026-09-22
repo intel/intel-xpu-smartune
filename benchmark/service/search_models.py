@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 """
 search_models.py - Build the model lists the Benchmark tab reads, via the `hf` CLI.
 

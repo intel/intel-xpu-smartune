@@ -72,7 +72,10 @@ def start_cleanup_loop():
         while True:
             try:
                 result = run_cleanup()
-                logger.info("Diagnostics retention cleanup: %s", result)
+                if result["events_deleted"] or result["resolved_alerts_deleted"]:
+                    logger.info("Diagnostics retention cleanup: %s", result)
+                else:
+                    logger.debug("Diagnostics retention cleanup: %s", result)
             except Exception as exc:
                 logger.warning("Diagnostics retention cleanup failed: %s", exc)
             time.sleep(_CLEANUP_INTERVAL_SECONDS)

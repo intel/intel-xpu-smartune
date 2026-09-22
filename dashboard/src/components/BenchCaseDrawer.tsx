@@ -1,19 +1,6 @@
 // Copyright (c) 2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
-//
-// One benchmark case, in full: its KPIs, what the hardware was doing while it
-// ran, and the tail of the log it wrote.
-//
-// The charts elsewhere in this tab are deliberately narrow -- one metric at a
-// time, so configurations can be compared. This is where the rest of what was
-// measured lives, one click from any row or any bar.
-//
-// The hardware readings used to be four tables of medians. A median is one
-// number for a whole case, and it cannot tell a run that ramped from 15 W to
-// 40 W from one that sat at 28 W throughout -- which is the difference between
-// a thermal problem and a steady workload. The samples those medians were taken
-// from are on disk (benchmark/service/sampler.py writes them at 2 Hz), so this
-// plots them and marks the median on the curve rather than reporting it alone.
+// Detailed benchmark case view with KPIs, telemetry, and log output.
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
@@ -56,16 +43,7 @@ import {
 
 const { Text } = Typography
 
-// The handful of numbers worth reading before anything else. Shown as tiles in
-// the order a person asks about them: how much was asked of it, how fast it was
-// overall, then how long the first token took, then the per-token cost, then
-// what it drew to do it.
-//
-// Input length is here rather than in the tables below because throughput and
-// both latencies are read against it -- a 40 tok/s figure means one thing for a
-// 32-token prompt and another for a 1024-token one. Left where it was, it was a
-// single-row "KPI" table under the curve, which is a lot of furniture for one
-// number and puts it nowhere near the numbers it qualifies.
+// Metrics shown before detailed telemetry and logs.
 const HEADLINE_METRICS = [
   'kpi_input_token_size',
   'kpi_throughput_tokens_s',

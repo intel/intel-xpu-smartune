@@ -1,27 +1,10 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Hardware sampling for the duration of a benchmark run.
+# Hardware sampling for benchmark runs.
 #
-# The vendored pipeline used to shell out to metrics/metrics_collect.sh, which
-# launched five `sudo` background samplers (turbostat, its own copy of
-# gpu_monitor.py, intel-npu-smi, a memory monitor, and an IGT perf recorder) and
-# tore them down with `ps aux | grep <pattern> | xargs sudo kill -9`. That pattern
-# kill would have reached SmarTune's own processes, and four of the five samplers
-# duplicated collectors this repo already has. So the sampling moved in here: one
-# thread, no subprocesses, no sudo, reusing monitor/metrics.
-#
-# Output is ONE run-level CSV -- not the per-case files upstream wrote -- because
-# the analysis step slices it by timestamp anyway (see
-# benchmark/scripts/analysis/export_windowed_metric_medians.py). Timestamps are
-# epoch seconds to match the `PIPELINE TIME: ... begin:/end:` markers the pipeline
-# writes into each case's detail.log; the upstream memory monitor recorded
-# perf_counter values instead, which never fell inside a window and so silently
-# contributed nothing.
-#
-# Rows are flushed as they are written: the pipeline runs the aggregation step at
-# the end of the same script this sampler is timing, so the file is read while the
-# thread is still appending to it.
+# Sampling runs in-process with monitor collectors and writes flushed, run-level
+# CSV rows using epoch timestamps compatible with pipeline timing markers.
 
 import csv
 import json
@@ -49,7 +32,6 @@ DEFAULT_PERIOD_S = 0.5
 # than shifting every column after it.
 COLUMNS = (
     "timestamp_s",
-    # CPU
     "cpu_usage_pct",
     "cpu_p_core_usage_pct",
     "cpu_e_core_usage_pct",
@@ -58,19 +40,16 @@ COLUMNS = (
     "cpu_package_power_w",
     "cpu_package_temp_c",
     "cpu_package_tjmax_c",
-    # Memory
     "memory_used_gb",
     "memory_available_gb",
     "memory_used_pct",
     "memory_bandwidth_gb_s",
     "memory_bandwidth_pct",
-    # GPU
     "gpu_power_w",
     "gpu_freq_mhz",
     "gpu_render_busy_pct",
     "gpu_compute_busy_pct",
     "gpu_video_busy_pct",
-    # NPU
     "npu_utilization_pct",
     "npu_power_w",
     "npu_frequency_mhz",
@@ -90,15 +69,8 @@ def _mean(values: List[float]) -> Optional[float]:
 class RunSampler:
     """Samples the platform into a CSV until stopped.
 
-    One instance per run. It owns a private GPUMonitor and a private
-    CpuUsageSampler rather than going through `gpu_perf.get_gpu_usage_output()` /
-    `cpu.get_cpu_dynamic()`: both of those read module-level instances holding
-    delta state for the dashboard's pollers, and a second caller sampling at 2 Hz
-    would consume the baselines the dashboard is about to read (and vice versa).
-    Utilisation would merely get noisy; GPU power, which is an energy counter
-    differenced over dt, would blow up into thousands of watts on a microsecond
-    gap. Everything stateless (frequency, temperature, memory capacity, NPU) goes
-    straight through monitor.metrics' module functions.
+    Each run owns stateful GPU and CPU collectors so benchmark sampling does not
+    consume the dashboard collectors' delta baselines.
     """
 
     def __init__(self, csv_path: Path, period_s: float = DEFAULT_PERIOD_S,

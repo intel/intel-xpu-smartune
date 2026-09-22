@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Common wrapper generator - Generate executable wrapper scripts from routing
 results for every stage (build / benchmark).

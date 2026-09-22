@@ -37,8 +37,6 @@ const PRIORITY_OPTIONS = [
   { value: 'critical', label: 'Critical', color: COLORS.red },
 ]
 
-// Step 1 collapses the old keyword-input + result-table flow into a single
-// type-to-filter view, so the wizard now has three steps instead of four.
 const STEP_PICK = 0
 const STEP_CONFIRM = 1
 const STEP_DONE = 2
@@ -48,15 +46,10 @@ const SEARCH_DEBOUNCE_MS = 300
 export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props) {
   const [step, setStep] = useState(STEP_PICK)
 
-  // Step 1 — app name + live process search/multi-select
   const [appName, setAppName] = useState('')
   const [searchInput, setSearchInput] = useState('')
   const [candidates, setCandidates] = useState<DiscoverCandidate[]>([])
-  // Selected processes form a "basket" that persists across multiple keyword
-  // searches, keyed by pid so a pick stays visible/removable even after the
-  // search that surfaced it has been replaced by a different query.  Only the
-  // pids reach the backend; we keep the full candidate so the basket can show
-  // comm/pid and so we don't need the process to still be in the results.
+  // Retain selected processes across searches so they remain visible and removable.
   const [selected, setSelected] = useState<Record<number, DiscoverCandidate>>({})
   const selectedPids = useMemo(
     () => Object.keys(selected).map(Number),
@@ -67,7 +60,6 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const searchSeq = useRef(0) // protects against out-of-order debounced responses
 
-  // Step 2 — extracted fields the user can still edit before commit
   const [appId, setAppId] = useState('')
   const [priority, setPriority] = useState<string>('low')
   const [remark, setRemark] = useState('')
@@ -81,7 +73,6 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
   const [extracting, setExtracting] = useState(false)
   const [extractError, setExtractError] = useState<string | null>(null)
 
-  // Step 3 — commit
   const [committing, setCommitting] = useState(false)
   const [commitError, setCommitError] = useState<string | null>(null)
   const [committed, setCommitted] = useState(false)

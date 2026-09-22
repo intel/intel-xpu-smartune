@@ -428,26 +428,15 @@ class ResourceMonitor:
             derived_process_identity(info).strip().lower(), '')
 
     def _get_top_processes(self, n=1, samples=3, interval=1.0, mode='default'):
-        """Return the top resource-consuming applications, aggregated per cgroup.
-        :param n: number of top processes to return
-        :param samples: number of sampling rounds for the top process
-        :param interval: sampling interval in seconds
-        :param mode: scoring mode — 'default' ranks by combined CPU+memory score; 'io' ranks by IO throughput
+        """Return the top ``n`` resource consumers aggregated by cgroup.
 
-        In 'io' mode the reported I/O comes from cgroup v2 ``io.stat`` (bytes AND request
-        counts), not from per-PID ``io_counters()``. That is not an optimisation: psutil's
-        ``read_count``/``write_count`` are syscall counts, so the IOPS this method used to
-        report was ~8x low on large buffered writes and worse on async O_DIRECT. See
-        ``monitor/cgroup.py`` for the measurements. Default mode is unchanged.
+        ``default`` ranks CPU and memory usage. ``io`` ranks device I/O from
+        cgroup v2 ``io.stat`` because psutil operation counts are syscalls rather
+        than device requests.
         """
-        # Step 1: Sample candidate processes (weighted, per-process-group)
-        num_candidates = max(n * 3, 9)  # ensures enough candidates to cover at least n distinct cgroups
+        num_candidates = max(n * 3, 9)
         if mode == 'io':
-            # Rank candidates by actual disk IO, not CPU+memory: a low-CPU, high-IO process
-            # (a large sequential writer, a database flushing) never enters a CPU-weighted
-            # candidate set, which would make the whole disk-IO throttle path silently
-            # no-op for exactly the apps it exists to control. The PSI-derived CPU/memory
-            # weights below are irrelevant here, so they are not computed on this path.
+            # CPU/memory ranking can exclude I/O-heavy processes.
             candidate_procs = self._get_disk_io_candidate_processes(num=num_candidates)
         else:
             psi_data = PSIMonitor().get_current_pressure()
@@ -459,23 +448,14 @@ class ResourceMonitor:
                 dynamic_weights=dynamic_weights
             )
 
-        # logger.debug(f"Candidate processes for cgroup aggregation: {candidate_procs}")
-        # Step 2: Collect unique cgroup paths
-        # Exclude '/' (root cgroup): its pids span the entire system process tree, which
-        # would create a spurious "super group" with an artificially high aggregate score.
-        # Our own cgroup is dropped here rather than in each candidate collector: this is
-        # the one place every mode passes through, and it is the set that decides which
-        # cgroups can receive a limit (see _self_cgroup).
+        # Root and SmartTune cgroups must never become limit candidates.
         cgroup_paths = set()
         for proc in candidate_procs:
             cgroup_path = get_cgroup_path_by_pid(proc['pid'])
             if cgroup_path and cgroup_path != '/' and cgroup_path != self._self_cgroup:
                 cgroup_paths.add(cgroup_path)
 
-        # Step 2b: For apps with explicit process_names, scan ALL their running
-        # processes and add their cgroups so they are always included in the
-        # aggregation pass (even when they are not in the top-N candidates).
-        # Build a reverse map: cgroup_path -> app_id for later merging.
+        # Include configured multi-process apps even when none of their PIDs is a top candidate.
         multiapp_cgroup_to_app: dict[str, str] = {}
         if self._multiprocess_apps:
             try:
@@ -493,7 +473,6 @@ class ResourceMonitor:
             except Exception as e:
                 logger.warning(f"Multi-process app scan failed: {e}")
 
-        # Step 3: Aggregate processes per cgroup
         cgroup_data = defaultdict(lambda: {
             'cpu_total': 0,  # sum of CPU usage (%) for all processes
             'mem_percent_total': 0,  # sum of memory usage (%) for all processes
@@ -502,17 +481,13 @@ class ResourceMonitor:
             'io_write_total': 0,   # cumulative IO write bytes delta for all processes
             'io_read_count_total': 0,   # cumulative IO read count delta (for IOPS)
             'io_write_count_total': 0,  # cumulative IO write count delta (for IOPS)
-            # Per-device I/O counts for this window, {"maj:min": {rbytes, wbytes, rios, wios}}.
-            # Populated from cgroup io.stat in 'io' mode only; empty in default mode.
+            # Per-device I/O counts from cgroup io.stat in ``io`` mode.
             'io_per_device': {},
             'count': 0,
             'pids': set(),
             'names': set(),
             'cmdlines': set(),
-            # Dominant process: the single process contributing the most to the mode's metric.
-            # In default mode this is the process with the highest CPU%; in io mode it is the
-            # process with the highest IO delta.  We track this so the UI shows "stress" instead
-            # of an unrelated process like "vte-2.91" that happens to share the same cgroup.
+            # The process with the highest contribution to the selected metric.
             'dominant_pid': None,
             'dominant_name': '',
             'dominant_cmdline': '',
@@ -523,17 +498,12 @@ class ResourceMonitor:
             'representative_metric': 0.0,
         })
 
-        # Cache the PID list and Process objects for each cgroup
         cgroup_pids = {}
         pid_process_map = {}
-        # IO rate is computed as a delta between two snapshots taken io_sample_interval apart.
-        # Using cumulative io_counters directly would give total-lifetime-bytes / elapsed which
-        # produces huge, incorrect values (e.g. hundreds of MB/s for an idle Firefox).
-        io_sample_interval = 0.5  # seconds between the two IO counter snapshots
-        # Each entry: (read_bytes, write_bytes, read_count, write_count) at t0
+        # Rates require two snapshots rather than cumulative process counters.
+        io_sample_interval = 0.5
         pid_io_start: dict[int, tuple[int, int, int, int]] = {}
 
-        # First pass: initialise CPU timers and record initial IO counters (t0)
         for cgroup_path in cgroup_paths:
             pids_in_cgroup = get_pids_in_cgroup(cgroup_path)
             cgroup_pids[cgroup_path] = pids_in_cgroup
@@ -552,29 +522,19 @@ class ResourceMonitor:
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
 
-        # In 'io' mode the reported I/O comes from cgroup v2 io.stat, not from the
-        # per-PID counters read below. The per-PID pass still runs -- it supplies the
-        # names, memory and the dominant process -- but its read_count/write_count are
-        # syscall counts (syscr/syscw), not device requests, and under-report real IOPS
-        # by ~8x on large buffered writes and worse on async O_DIRECT. Bytes agree
-        # between the two sources; only the operation counts diverge. See
-        # monitor/cgroup.py and balancer/test/probe_cgroup_io.py.
+        # Per-PID sampling supplies identity and memory; io.stat supplies device I/O.
         io_stat_t0 = snapshot_cgroup_io(cgroup_pids.keys()) if mode == 'io' else None
 
-        # Sleep covers both CPU and IO measurement intervals
         t0 = time.time()
         time.sleep(io_sample_interval)
         elapsed = time.time() - t0
 
-        # Close the io.stat window right after the sleep, before the (slower) per-PID
-        # pass below. Reading it afterwards would stretch the window by however long
-        # that pass takes while still dividing by `elapsed`, understating every rate.
+        # Close the I/O window before slower per-PID collection changes its duration.
         io_stat_elapsed, io_stat_counts = 0.0, {}
         if mode == 'io':
             io_stat_elapsed, io_stat_counts = io_stat_deltas(
                 *io_stat_t0, *snapshot_cgroup_io(cgroup_pids.keys()))
 
-        # Second pass: read final counters and compute deltas
         for cgroup_path, pids_in_cgroup in cgroup_pids.items():
             for pid in pids_in_cgroup:
                 if pid not in pid_process_map:
@@ -633,12 +593,7 @@ class ResourceMonitor:
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
 
-        # Step 3a: In 'io' mode, replace the per-PID I/O totals with the cgroup io.stat
-        # counts for the same window. Done here -- after the per-PID pass, before the
-        # multi-process merge -- so the merge and the scoring below need no special case:
-        # they keep summing the same four fields, which now hold device-side numbers.
-        # A cgroup absent from io.stat did no I/O this window and is zeroed rather than
-        # left holding syscall-derived values.
+        # Use device I/O counts before merging cgroups and calculating scores.
         if mode == 'io':
             for cgroup_path, data in cgroup_data.items():
                 counts = io_stat_counts.get(cgroup_path) or {}
@@ -648,11 +603,8 @@ class ResourceMonitor:
                 data['io_write_count_total'] = counts.get('wios', 0)
                 data['io_per_device'] = counts.get('per_device', {})
 
-        # Step 3b: Merge cgroup_data entries that belong to the same multi-process app.
-        # Entries whose cgroup_path appears in multiapp_cgroup_to_app are grouped by
-        # app_id; all but the first (primary) cgroup are folded in and deleted.
+        # Merge cgroups belonging to the same configured multi-process app.
         if multiapp_cgroup_to_app:
-            # Group cgroups by app_id
             app_cgroup_groups: dict[str, list] = {}
             for cg, app_id in multiapp_cgroup_to_app.items():
                 app_cgroup_groups.setdefault(app_id, []).append(cg)
@@ -660,10 +612,9 @@ class ResourceMonitor:
             for app_id, cg_list in app_cgroup_groups.items():
                 if len(cg_list) <= 1:
                     continue  # only one cgroup, nothing to merge
-                # Use the lexicographically-first cgroup as the stable primary key
+                # A stable primary key keeps the aggregate identity deterministic.
                 primary = min(cg_list)
-                # Capture per-cgroup breakdown BEFORE merging so the balancer can
-                # distribute limits proportionally (keyed by basename for easy lookup).
+                # The balancer uses this breakdown for proportional limits.
                 per_cg_mem_rss = {
                     os.path.basename(cg): cgroup_data[cg]['mem_rss_total']
                     for cg in cg_list if cg in cgroup_data
@@ -683,9 +634,7 @@ class ResourceMonitor:
                     cgroup_data[primary]['io_write_total'] += d['io_write_total']
                     cgroup_data[primary]['io_read_count_total'] += d['io_read_count_total']
                     cgroup_data[primary]['io_write_count_total'] += d['io_write_count_total']
-                    # Per-device counts merge per device, not by concatenation: a
-                    # multi-cgroup app usually hits the SAME disk from every cgroup, and
-                    # the limit path needs one number per disk to write one io.max line.
+                    # Aggregate matching devices before producing one io.max limit.
                     merged_dev = cgroup_data[primary]['io_per_device']
                     for dev, dev_counts in d['io_per_device'].items():
                         target = merged_dev.setdefault(dev, {k: 0 for k in IO_STAT_FIELDS})
@@ -695,56 +644,40 @@ class ResourceMonitor:
                     cgroup_data[primary]['pids'] |= d['pids']
                     cgroup_data[primary]['names'] |= d['names']
                     cgroup_data[primary]['cmdlines'] |= d['cmdlines']
-                    # Update dominant process: use the entry with the strictly higher metric.
-                    # When metrics are equal we keep the primary cgroup's values, which is
-                    # already deterministic because primary was chosen as min(cg_list).
+                    # Keep the primary cgroup's process when contributions are equal.
                     if d['dominant_metric'] > cgroup_data[primary]['dominant_metric']:
                         cgroup_data[primary]['dominant_metric'] = d['dominant_metric']
                         cgroup_data[primary]['dominant_pid'] = d['dominant_pid']
                         cgroup_data[primary]['dominant_name'] = d['dominant_name']
                         cgroup_data[primary]['dominant_cmdline'] = d['dominant_cmdline']
-                    # Attach extra cgroup paths so callers can apply limits to all of them
                     cgroup_data[primary].setdefault('extra_cgroups', []).append(other)
                     del cgroup_data[other]
-                # Store the per-cgroup breakdown for proportional limit distribution
                 cgroup_data[primary]['per_cgroup_mem_rss'] = per_cg_mem_rss
                 cgroup_data[primary]['per_cgroup_cpu'] = per_cg_cpu
 
-        # Step 4: Compute scores based on the selected mode
         processes = []
         for cgroup_path, data in cgroup_data.items():
             if data['count'] > 0:
-                # 'io' mode divides by the io.stat window, which closed right after the
-                # sleep; default mode divides by the per-PID window. Using one `elapsed`
-                # for both would misdate whichever source it did not come from.
+                # Each source is divided by the duration of its own sampling window.
                 io_window = io_stat_elapsed if mode == 'io' else elapsed
                 if io_window <= 0:
                     io_window = elapsed or io_sample_interval
-                # IO rates: delta bytes / elapsed seconds → MB/s
                 io_read_rate_mb = data['io_read_total'] / io_window / (1024 ** 2)
                 io_write_rate_mb = data['io_write_total'] / io_window / (1024 ** 2)
-                # IOPS. In 'io' mode these are rios/wios -- requests the device actually
-                # saw. In default mode they remain psutil's syscall counts, which is fine
-                # there because nothing ranks or caps on them.
                 io_read_iops = data['io_read_count_total'] / io_window
                 io_write_iops = data['io_write_count_total'] / io_window
                 if mode == 'io':
-                    # IO mode: rank by total read+write throughput and IOPS
-                    # IOPS is scaled down (divided by 1000) to balance with MB/s
-                    # Example: 100 MB/s + 5000 IOPS = 100 + 5 = 105
+                    # Scale IOPS to balance it against throughput in MB/s.
                     score = (io_read_rate_mb + io_write_rate_mb +
                              (io_read_iops + io_write_iops) / 1000)
                 else:
-                    # Default mode: combined CPU + memory score
                     cpu_total_normalized = data['cpu_total'] / self.cpu_cores
                     score = (
                             dynamic_weights['cpu'] * min(cpu_total_normalized, 100) +
                             dynamic_weights['memory'] * min(data['mem_percent_total'], 100)
                     )
 
-                # dominant_name is the process with the highest individual contribution;
-                # fall back to the alphabetically-first name from the set if no dominant
-                # was recorded, to ensure consistent output across calls.
+                # Fall back to a stable name when no dominant process was recorded.
                 dominant_name = data['dominant_name'] or min(data['names'], default='unknown')
                 dominant_cmdline = data['dominant_cmdline'] or min(data['cmdlines'], default='')
                 representative_name = data['representative_name'] or dominant_name
@@ -754,10 +687,7 @@ class ResourceMonitor:
                 processes.append({
                     'pids': list(data['pids']),
                     'cgroup': cgroup_path,
-                    # extra_cgroups is set only for merged multi-process app entries
                     'extra_cgroups': data.get('extra_cgroups', []),
-                    # per-cgroup breakdown (basename -> raw value) for proportional limiting;
-                    # empty dicts for single-cgroup apps.
                     'per_cgroup_mem_rss': data.get('per_cgroup_mem_rss', {}),
                     'per_cgroup_cpu': data.get('per_cgroup_cpu', {}),
                     'score': round(score, 2),
@@ -768,12 +698,7 @@ class ResourceMonitor:
                     'io_write_rate': round(io_write_rate_mb, 4),
                     'io_read_iops': round(io_read_iops, 1),
                     'io_write_iops': round(io_write_iops, 1),
-                    # Per-disk breakdown of this app's I/O, keyed by kernel device name
-                    # ("nvme0n1"), each {read_mb_s, write_mb_s, read_iops, write_iops}.
-                    # Only populated in 'io' mode. This is what lets a cap target the one
-                    # disk the app is hammering instead of every disk on the box, and what
-                    # lets the throttle decision compare an app against the device class
-                    # it is actually loading.
+                    # Per-disk I/O rates are populated only in ``io`` mode.
                     'io_per_disk': self._per_disk_rates(data['io_per_device'], io_window),
                     'names': list(data['names']),
                     'cmdlines': list(data['cmdlines']),
@@ -782,8 +707,6 @@ class ResourceMonitor:
                     'dominant_cmdline': representative_cmdline,
                 })
 
-        # logger.debug(f"Aggregated processes by cgroup: {processes}")
-        # Step 5: Return the highest-scored process information
         return sorted(processes, key=lambda x: x['score'], reverse=True)[:n]
 
     @staticmethod
@@ -937,7 +860,7 @@ class ResourceMonitor:
             if len(selected) >= num:
                 break
 
-        logger.info(
+        logger.debug(
             "[disk-io] candidates (%.1fs window, top %d of %d active): %s",
             interval, len(selected), len(scored),
             ", ".join(f"{p['name']}({p['pid']})={p['io_delta'] / (1024 ** 2):.1f}MB"
@@ -1247,8 +1170,8 @@ class ResourceMonitor:
         mem_total_gb = psutil.virtual_memory().total / (1024 ** 3)
         if processes and (processes[0]['cpu_avg'] < 25  # if CPU usage < 25% per core
                   and processes[0]['mem_rss'] < mem_total_gb * 0.25):  # 25% of total memory (GB)
-            logger.info(f"Top process - {next(iter(processes[0]['names']), 'unknown')} corresponding "
-                        f"app does not meet minimum resource thresholds")
+            logger.debug(f"Top process - {next(iter(processes[0]['names']), 'unknown')} corresponding "
+                     f"app does not meet minimum resource thresholds")
             reach_threshold = False
 
         for process in processes:
@@ -1505,7 +1428,6 @@ class ResourceMonitor:
         """
         results = []
         processes = self._get_top_processes(n=n)
-        # logger.debug(f"App resource stats processes: {processes}")
 
         # Collect all PIDs grouped by cgroup for a single GPU sampling pass.
         # This avoids N separate sleep intervals for N apps.
@@ -1618,7 +1540,6 @@ class ResourceMonitor:
         """
         results = []
         processes = self._get_top_processes(n=n, mode="io")
-        # logger.debug(f"App disk I/O stats processes: {processes}")
 
         for process in processes:
             process_name = process.get('dominant_name') or next(iter(process['names']), 'unknown')

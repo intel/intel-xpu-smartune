@@ -1,33 +1,7 @@
 // Copyright (c) 2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
-//
-// One model's page of the pre-run memory check: for every precision × device
-// the run would sweep it, how much memory the load needs against how much that
-// device has free right now, and how large a context ("window") the free memory
-// would allow. It is a warning, not a gate -- the numbers are estimates, and a
-// device may swap or spill -- so a configuration that does not fit is drawn red
-// rather than disabled.
-//
-// That comparison is one bar per row rather than pairs of numbers, because the
-// question is a comparison and a pair of figures makes the reader do it. The
-// bar is the device's free memory, filled with the weights and with the KV
-// cache; two controls above the table -- context length and how many streams at
-// once -- move the KV part, since that is the only thing they change (one copy
-// of the weights serves every stream). So "what does a longer context cost" and
-// "what would batching cost" are answered by watching one segment grow, and the
-// point where it runs out is the bar turning red.
-//
-// This is a panel and not a dialog, and it is one model and not a table of them:
-// BenchRunReviewModal gives each model its own page, so the context control here
-// stops at THIS model's own limit. It used to be one table for the whole run,
-// with one control bounded by the longest window any model in it supported --
-// which meant a 128K model let a 4K model be asked for a length it could never
-// run at, and every short model spent the table explaining that it had been
-// costed at its own limit instead.
-//
-// Free-memory readings come from the same monitor endpoints System Overview uses
-// (getDynamicInfo memory/gpu + getStaticInfo for the iGPU/dGPU split), passed in
-// by the parent so this component stays a pure render of what it is handed.
+// Per-model memory estimate for selected precision and device combinations.
+// The estimate warns about over-budget configurations without blocking a run.
 
 import React, { useMemo } from 'react'
 import { Alert, Select, Space, Table, Tag, Tooltip, Typography } from 'antd'

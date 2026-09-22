@@ -86,6 +86,10 @@ def record_event(*, event_type, severity, category, summary, source=None,
     if status == DBStatus.ALREADY_EXISTING:
         return None
     if status != DBStatus.SUCCESS:
+        logger.error(
+            "Operational event storage failed: type=%s source=%s status=%s",
+            event_type, source, status,
+        )
         return None
     return {
         "event_id": event_id, "ts_utc": ts_utc, "severity": severity,

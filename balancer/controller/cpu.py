@@ -8,7 +8,6 @@ logger = get_logger(__name__)
 from utils.app_utils import write_cgroup_file
 from config.config import b_config
 
-# Reserved
 class CPUController(ControllerBase):
     def __init__(self, cgroup_mount: str):
         super().__init__(cgroup_mount)
@@ -48,7 +47,6 @@ class CPUController(ControllerBase):
             logger.error(f"Failed to set {param}={value}: {e}")
             return False
 
-    # CPU-specific methods
     def set_cpu_quota(self, cgroup: str, quota_us: int, period_us: int = 100000) -> bool:
         """Set CPU time quota (cfs_quota_us / cfs_period_us)."""
         return (self.set_parameter(cgroup, "cpu.cfs_quota_us", str(quota_us)) and

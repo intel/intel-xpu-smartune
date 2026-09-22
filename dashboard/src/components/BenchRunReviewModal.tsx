@@ -1,40 +1,6 @@
 // Copyright (c) 2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
-//
-// What a press of Run opens: one page per model, each answering the two
-// questions worth asking before a measured run starts -- does this fit the
-// memory the machine has free right now, and what exactly is it going to
-// execute -- with the second one editable.
-//
-// It replaces a pair of buttons. Run used to open a memory check and Advanced
-// run used to open a command review, which made "do I want to edit the
-// commands" a decision taken before either was on screen, and left an advanced
-// run skipping the memory check and the rerun gate entirely. They are one
-// dialog now: editing is something a page offers, not a different way to start.
-//
-// A page per model rather than one long list of everything: the memory estimate
-// has a context-length control, and one control over a table of several models
-// has to stop at the longest window any of them supports -- so a 128K model let
-// a 4K model be asked for a length it could never run at. Per page the control
-// is bounded by that model's own limit (BenchMemoryFitPanel), and the commands
-// under it are only that model's, so a three-model sweep is three short pages
-// instead of one page that has to be scrolled through.
-//
-// The commands come from a print-only PLAN pass the parent starts alongside
-// this dialog (benchmark/service/runner.py plan_run): a run is many commands --
-// one per model × precision × device -- and the final `python benchmark.py ...`
-// line only exists at the bottom of the pipeline, built inside run_case at
-// runtime. The plan runs that same route -> gen -> run_case path with nothing
-// measured and nothing written, and reports the command each case WOULD run.
-//
-// A case's identity -- which model, precision and device it is -- is shown above
-// its box and is not part of what an edit changes: the results directory and the
-// summary row are keyed off the case's DEVICE and model directory, which the
-// pipeline sets from run_case's own arguments, never from the command text. So
-// an edit that changes --device or -m still lands where it was shown; the
-// header is the honest label for where the measurement will be filed, not a
-// constraint the editor has to respect. Only the commands actually changed are
-// sent back, keyed by case_key; an untouched case runs exactly what was shown.
+// Pre-run review for per-model memory estimates and editable planned commands.
 
 import React, { useEffect, useMemo, useState } from 'react'
 import { Alert, Button, Input, Modal, Space, Spin, Tabs, Tag, Tooltip, Typography } from 'antd'

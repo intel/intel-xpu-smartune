@@ -3,20 +3,8 @@
 #
 # Server-sent-event broker for the Benchmark tab.
 #
-# The tab used to poll: GET /bench/env plus GET /bench/run/<id>?offset= every two
-# seconds for as long as a job ran, and a setup runs for an hour. Everything the
-# page needs to know about is generated in THIS process -- the job manager owns
-# the subprocess, sampler.py owns the metrics, models.py owns the search -- so the
-# server can simply say when something changed and the browser can stop asking.
-#
-# This module is that side of it: a fan-out queue per connected browser, plus a
-# log pump that turns the job log file into incremental deltas while a job runs.
-#
-# Why not reuse balance_service.py's /app/events: that route is registered
-# directly on the balancer app, and the benchmark blueprint also mounts on the
-# monitor-only service, where it does not exist. Its payload is app-status shaped
-# and its fan-out lives in utils.app_utils, which the benchmark feature has no
-# business reaching into.
+# Owns per-client fan-out queues and incremental job-log updates so the benchmark
+# blueprint remains available in monitor-only deployments.
 
 import json
 import queue

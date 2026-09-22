@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
 BASE_VENV=${PYENV_VENV_DIR}
 # Side venvs live under the runtime root so they follow DIR_ENV_ROOT wherever
 # SmarTune points it (see env/global_vars.sh); scripts/utils/python_env_selector.py

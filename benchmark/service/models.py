@@ -503,6 +503,48 @@ def ensure_memory(model_id: str) -> Optional[dict]:
     return _memory_of(wanted)
 
 
+# --- disk the next download would land on ---------------------------------
+
+
+def disk_usage() -> dict:
+    """Free space on the filesystem the downloaded weights land on.
+
+    The pre-download check in the dashboard needs one number the browser cannot
+    read for itself: how much room is left where the weights go. That is the
+    models root -- gen_wrapper's `hf download --local-dir <models>/...` writes
+    straight into it, and HF_HOME sits under the same runtime tree, so one
+    filesystem answers for the whole fetch.
+
+    Measured on whichever ancestor exists, so a runtime tree that has not been
+    created yet still reports the volume it is going to be created on rather than
+    nothing. `None` figures mean the filesystem could not be read at all; the
+    dialog renders that as "unknown" and lets the download go ahead, the same way
+    the memory check treats an unreadable device.
+    """
+    models_dir = env.paths()["models"]
+    probe = models_dir
+    # A path that does not exist yet is not a different volume: walk up to the
+    # deepest parent that does, which is the one statvfs would be about anyway.
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        usage = shutil.disk_usage(probe)
+    except OSError as exc:
+        logger.warning(f"Could not read free space for {models_dir}: {exc}")
+        return {
+            "path": str(models_dir),
+            "total_bytes": None,
+            "used_bytes": None,
+            "free_bytes": None,
+        }
+    return {
+        "path": str(models_dir),
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+    }
+
+
 # --- deleting downloaded weights ------------------------------------------
 #
 # The one thing on this tab that takes real disk. A model is fetched once per

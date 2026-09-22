@@ -33,6 +33,7 @@ import argparse
 import json
 import sys
 import xml.etree.ElementTree as ET
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
@@ -64,16 +65,38 @@ BENCH_TOOL_STRATEGY = {
 # =========================================================================== #
 # Shared IR helpers
 # =========================================================================== #
+@lru_cache(maxsize=None)
 def _is_openvino_ir_xml(xml_path: Path) -> bool:
-    """Return True if xml_path looks like an OpenVINO IR xml file."""
+    """Return True if xml_path looks like an OpenVINO IR xml file.
+
+    Only the root element and the first top-level child are read: an IR xml
+    opens with <net ...><layers>, which already tells it apart from anything
+    else that lands in a model directory. This used to be ET.parse() plus a scan
+    of the root's children, which built a DOM for the whole file -- 9.7MB for a
+    Qwen3-27B language model, ~1.0s over a 41MB tree -- to look at a prefix.
+
+    Also checking for <edges>, as the DOM version did, would gain nothing and
+    cost everything: <edges> is the last element in the file, so reaching it
+    means reading all of it, streaming or not.
+
+    Cached because the same paths are re-checked by _count_ir_xml and
+    _find_single_openvino_ir_pair after _iter_model_units has already walked
+    them. Safe for the life of a route.py process, which never rewrites the IR
+    tree it is reading.
+    """
     try:
-        root = ET.parse(xml_path).getroot()
+        with xml_path.open('rb') as handle:
+            seen_root = False
+            for _event, element in ET.iterparse(handle, events=('start',)):
+                if not seen_root:
+                    if element.tag.lower() != 'net':
+                        return False
+                    seen_root = True
+                    continue
+                return element.tag.lower() == 'layers'
     except (ET.ParseError, OSError):
         return False
-    if root.tag.lower() != 'net':
-        return False
-    child_tags = {child.tag.lower() for child in root}
-    return 'layers' in child_tags and 'edges' in child_tags
+    return False  # <net> with no children at all
 
 
 def _count_ir_xml(model_dir: Path) -> int:
@@ -99,30 +122,50 @@ def _find_single_openvino_ir_pair(quantized_path: str) -> Optional[Path]:
     return xml_files[0]
 
 
-def _iter_model_units(models_dir: Path) -> List[Tuple[Path, str, str]]:
+def _unit_name_and_precision(leaf_dir: Path, models_dir: Path) -> Optional[Tuple[str, str]]:
+    """(model_name, precision) for a leaf dir, or None when it is outside models_dir."""
+    try:
+        rel_parts = leaf_dir.relative_to(models_dir).parts
+    except ValueError:
+        return None
+    if len(rel_parts) == 0:
+        return models_dir.name, 'default'
+    if len(rel_parts) == 1:
+        return rel_parts[0], 'default'
+    return rel_parts[0], rel_parts[-1]
+
+
+def _iter_model_units(models_dir: Path,
+                      allowed_safe_names: Optional[set] = None) -> List[Tuple[Path, str, str]]:
     """
     Discover units under a models tree laid out as <model_name>/<precision>/<files>.
     A unit is a leaf directory directly containing at least one valid IR xml.
     Returns sorted (leaf_dir, model_name, precision) tuples.
+
+    allowed_safe_names restricts the walk to those models. Filtering here rather
+    than on the returned list is what keeps it cheap: an unrequested model's xml
+    is skipped before it is opened, instead of being validated and then thrown
+    away. A tree holding several models used to be read in full on every run,
+    however few of them the run had asked for.
     """
     leaf_dirs = set()
     for xml in models_dir.rglob('*.xml'):
-        if xml.is_file() and _is_openvino_ir_xml(xml):
+        if not xml.is_file():
+            continue
+        named = _unit_name_and_precision(xml.parent, models_dir)
+        if named is None:
+            continue
+        if allowed_safe_names is not None and _model_safe_name(named[0]) not in allowed_safe_names:
+            continue
+        if _is_openvino_ir_xml(xml):
             leaf_dirs.add(xml.parent)
 
     units: List[Tuple[Path, str, str]] = []
     for leaf_dir in leaf_dirs:
-        try:
-            rel_parts = leaf_dir.relative_to(models_dir).parts
-        except ValueError:
+        named = _unit_name_and_precision(leaf_dir, models_dir)
+        if named is None:
             continue
-        if len(rel_parts) == 0:
-            model_name, precision = models_dir.name, 'default'
-        elif len(rel_parts) == 1:
-            model_name, precision = rel_parts[0], 'default'
-        else:
-            model_name, precision = rel_parts[0], rel_parts[-1]
-        units.append((leaf_dir, model_name, precision))
+        units.append((leaf_dir, named[0], named[1]))
 
     units.sort(key=lambda item: (item[1], item[2]))
     return units
@@ -432,11 +475,13 @@ def route_benchmark_from_dir(models_dir: str,
             'reason': f'Models directory does not exist or is not a directory: {models_dir}'})
         return result
 
-    units = _iter_model_units(root)
+    units = _iter_model_units(root, allowed_safe_names=allowed_safe_names)
 
     if allowed_safe_names is not None:
+        # units is already restricted to allowed_safe_names, so the names it
+        # does carry are exactly the requested ones that the tree turned out to
+        # have -- the same set the unfiltered walk used to compute.
         found_safe_names = {_model_safe_name(name) for _, name, _ in units}
-        units = [u for u in units if _model_safe_name(u[1]) in allowed_safe_names]
         for missing in sorted(allowed_safe_names - found_safe_names):
             result['failed_models'].append({
                 'model': missing,

@@ -68,10 +68,39 @@ def _version_in_range(version: str, min_version: Optional[str], max_version: Opt
     return True
 
 
+def _read_transformers_version_from_dist_info(venv_dir: Path) -> Optional[str]:
+    """Read the installed transformers version from its .dist-info directory name.
+
+    The version is right there in the metadata uv/pip writes at install time, so
+    reading it costs a directory listing. The subprocess below costs a real
+    `import transformers`, which is ~2.3s per venv -- and _discover_candidate_envs
+    pays it once per candidate, for every route.
+    """
+    for site_packages in venv_dir.glob("lib/python*/site-packages"):
+        for dist_info in site_packages.glob("transformers-*.dist-info"):
+            # "transformers-4.57.0.dist-info" -> "4.57.0". Guard against sibling
+            # distributions whose name merely starts with "transformers-"
+            # (transformers-stream-generator, say), whose stem carries an extra
+            # dash-separated part before the version.
+            stem = dist_info.name[: -len(".dist-info")]
+            version = stem[len("transformers-"):]
+            if "-" in version:
+                continue
+            return _normalize_version(version)
+    return None
+
+
 def _read_transformers_version(venv_dir: Path) -> Optional[str]:
     python_bin = venv_dir / "bin" / "python"
     if not python_bin.exists():
         return None
+
+    version = _read_transformers_version_from_dist_info(venv_dir)
+    if version:
+        return version
+
+    # No dist-info to read (a non-standard layout, or transformers installed
+    # some other way): fall back to asking the interpreter itself.
     try:
         result = subprocess.run(
             [

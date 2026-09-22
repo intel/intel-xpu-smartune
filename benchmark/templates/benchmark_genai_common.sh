@@ -13,6 +13,10 @@ RUN_NAME="${BENCH_RUN_NAME:-TEST}"
 PYTHON_BIN="python"
 BATCH_SIZE=1
 
+# Advanced-run helpers (plan manifest + per-case command override). Sourced by
+# path relative to this file so it resolves wherever the templates tree lives.
+. "$(dirname "${BASH_SOURCE[0]}")/bench_advanced_common.sh"
+
 usage() {
     cat <<'EOF'
 Usage: xxx_wrapper.sh [options]
@@ -113,15 +117,13 @@ run_case() {
     local model_dir="$4"
     shift 4
 
-    update_dir
-    local case_dir="${RUN_DIR}/${safe_name}_${quant}"
-    mkdir -p "${case_dir}"
+    # Identity of this case, shared with the plan manifest and the override files
+    # (bench_advanced_common.sh). DEVICE comes from the enclosing device loop
+    # gen_wrapper.py emits, so it is set by the time run_case is called.
+    local case_key="${safe_name}__${quant}__${DEVICE}"
 
-    local log_file="${case_dir}/benchmark.log"
-    # summary.tsv points at detail.log (the actual run output + KPI/timing lines
-    # written by run_with_metrics); benchmark.log holds only the [INFO] header.
-    local detail_log="${case_dir}/detail.log"
-
+    # The command this case would run. Built first so the plan can print it and the
+    # override can replace it, both before anything is written to disk.
     local -a cmd=(
         "${PYTHON_BIN}" "${BENCHMARK_PY}"
         --device "${DEVICE}"
@@ -131,6 +133,33 @@ run_case() {
         -m "${model_dir}"
     )
     cmd+=("$@")
+
+    # Advanced run: the operator edited this case in the plan review. Replace the
+    # command wholesale with what they submitted, run through `bash -c` so any
+    # shell they typed is honoured. --device and -m are theirs to change too; the
+    # bookkeeping below keys off DEVICE and model_dir, not the command text, so a
+    # changed command never desyncs the results directory.
+    if _bench_has_override "${case_key}"; then
+        cmd=(bash -c "$(_bench_override_body "${case_key}")")
+    fi
+
+    # Plan phase: record the command and return before update_dir. Nothing under
+    # the results tree is created -- no RUN_DIR, summary.tsv, case_dir or
+    # detail.log -- so a plan leaves the disk exactly as it found it.
+    if [ -n "${BENCH_PRINT_ONLY:-}" ]; then
+        _bench_emit_manifest "${case_key}" "${safe_name}" "${quant}" "${task}" \
+            "${DEVICE}" "${model_dir}" "${cmd[@]}"
+        return 0
+    fi
+
+    update_dir
+    local case_dir="${RUN_DIR}/${safe_name}_${quant}"
+    mkdir -p "${case_dir}"
+
+    local log_file="${case_dir}/benchmark.log"
+    # summary.tsv points at detail.log (the actual run output + KPI/timing lines
+    # written by run_with_metrics); benchmark.log holds only the [INFO] header.
+    local detail_log="${case_dir}/detail.log"
 
     {
         echo "[INFO] Model: ${safe_name}"

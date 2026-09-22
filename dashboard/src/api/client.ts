@@ -34,12 +34,14 @@ import type {
   WizardCommitData,
   BenchActionResult,
   BenchDevice,
+  BenchDiskData,
   BenchEnvData,
   BenchJob,
   BenchModelsData,
   BenchModelMemory,
   BenchPrecision,
   BenchMatrixData,
+  BenchPlanData,
   BenchResultsData,
   BenchTimelineData,
   BenchRunsData,
@@ -583,6 +585,9 @@ export const api = {
     get<{ model: string; memory: BenchModelMemory | null }>(
       `/bench/models/memory?model=${encodeURIComponent(model)}`,
     ),
+  // Free space where the weights land, read at the moment Download is pressed
+  // (the pre-download disk check). A statvfs server-side, so per-click is fine.
+  getBenchDisk: () => get<BenchDiskData>('/bench/models/disk'),
   // A refusal comes back as a 200 with `reason` set -- not being able to search
   // is a state of the machine, not a failed request.
   refreshBenchModels: () =>
@@ -625,6 +630,53 @@ export const api = {
     devices?: BenchDevice[],
     ov?: string,
   ) => postBench<BenchJob>('/bench/run', { models, opt, devices, ov }),
+
+  // Advanced run, phase 1: a print-only pass that lists the exact benchmark
+  // commands this request would run, without measuring or writing anything. Send
+  // the SAME arguments you would give startBenchRun; poll getBenchPlan with the
+  // returned job id, then submit the (edited) commands to startBenchAdvancedRun.
+  planBenchRun: (
+    models: {
+      id: string
+      build?: BenchPrecision[]
+      args?: string
+      devices?: BenchDevice[]
+      ov?: string
+    }[],
+    opt: BenchStage,
+    devices?: BenchDevice[],
+    ov?: string,
+  ) => postBench<BenchJob>('/bench/run/plan', { models, opt, devices, ov }),
+
+  // Advanced run, phase 1 poll: the commands the plan job has listed so far and
+  // whether it has finished. Drive the review modal off `ready`.
+  getBenchPlan: (runId: string) =>
+    get<BenchPlanData>(`/bench/run/${encodeURIComponent(runId)}/plan`),
+
+  // Advanced run, phase 2: a normal measured run whose per-case commands are
+  // replaced by the operator's edits. `commands` maps a case_key (from the plan)
+  // to its full command; an omitted or emptied case keeps what the plan showed.
+  // The models/opt/devices/ov MUST match the plan so the case_keys line up.
+  startBenchAdvancedRun: (
+    models: {
+      id: string
+      build?: BenchPrecision[]
+      args?: string
+      devices?: BenchDevice[]
+      ov?: string
+    }[],
+    opt: BenchStage,
+    commands: Record<string, string>,
+    devices?: BenchDevice[],
+    ov?: string,
+  ) =>
+    postBench<BenchJob>('/bench/run/advanced', {
+      models,
+      opt,
+      devices,
+      ov,
+      commands,
+    }),
   getBenchRuns: () => get<BenchRunsData>('/bench/run'),
   getBenchRun: (runId: string, offset?: number) =>
     get<BenchJob>(

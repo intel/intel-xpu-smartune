@@ -36,6 +36,8 @@ import {
 
 import { api } from '../api/client'
 import type {
+  BenchDevice,
+  BenchDiskData,
   BenchEnvData,
   BenchJob,
   BenchLogDelta,
@@ -43,6 +45,7 @@ import type {
   BenchMatrixRow,
   BenchModel,
   BenchModelsState,
+  BenchPlanCommand,
   BenchPrecision,
   BenchPreflightBlocker,
   BenchPreflightData,
@@ -54,7 +57,9 @@ import { useBenchEvent } from '../hooks/useBenchEvents'
 import BenchCaseDrawer from './BenchCaseDrawer'
 import BenchCompare from './BenchCompare'
 import BenchEnvDrawer, { EnvStatusTag, versionSummary } from './BenchEnvDrawer'
-import BenchMemoryPreflightModal, { type MemoryPreflightItem } from './BenchMemoryPreflightModal'
+import BenchDiskPreflightModal from './BenchDiskPreflightModal'
+import { type MemoryPreflightItem } from './BenchMemoryFitPanel'
+import BenchRunReviewModal from './BenchRunReviewModal'
 import BenchModelDetail, { missingPrecisions } from './BenchModelDetail'
 import { applicablePrecisions, type ModelParams } from './BenchModelDetail'
 import BenchModelDeleteModal from './BenchModelDeleteModal'
@@ -65,6 +70,7 @@ import BenchOutput, { JobStatusTag } from './BenchOutput'
 import BenchResults from './BenchResults'
 import BenchRerunModal, { type RerunConflict } from './BenchRerunModal'
 import { COLORS } from '../styles/theme'
+import type { DiskPreflightItem } from '../utils/benchDisk'
 import { formatBytes, matchesModel } from '../utils/benchMetrics'
 
 const { Text, Paragraph } = Typography
@@ -85,6 +91,38 @@ interface PendingRun {
   stage: BenchStage
   ids: string[]
   conflicts: RerunConflict[]
+  /** The command edits the review was left with, carried through the gate so
+   *  answering it does not lose them. Empty for a download. */
+  edits: Record<string, string>
+}
+
+/** The models array a run request carries; identical for a run and its plan. */
+type BenchRunPayload = Parameters<typeof api.startBenchAdvancedRun>[0]
+
+/**
+ * A benchmark waiting on its review: the request that was planned, the
+ * print-only plan job the commands come from, and the commands it has listed
+ * so far.
+ *
+ * Every measured run goes through this now -- the review is where Run leads,
+ * and the only place a run is started from. The same payload/devices/ov are
+ * sent again when it starts, so the case_keys the commands were rendered under
+ * match the ones the run produces and an edit lands on the case it was shown
+ * under.
+ */
+interface RunReviewState {
+  /** Which review session this is, so a late reply cannot land on a later one. */
+  seq: number
+  ids: string[]
+  payload: BenchRunPayload
+  devices: BenchDevice[]
+  ov: string
+  /** The plan job, or null while it is being asked for. */
+  jobId: string | null
+  ready: boolean
+  commands: BenchPlanCommand[]
+  /** Why there are no commands to show, when that is the answer. */
+  error: string | null
 }
 
 interface BenchmarkProps {
@@ -232,15 +270,36 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   // here while they answer what should happen to the previous results.
   const [rerun, setRerun] = useState<PendingRun | null>(null)
   const [discarding, setDiscarding] = useState(false)
-  // A benchmark the user asked for, parked while the memory preflight dialog
-  // shows how the selected configs fit the machine's current free memory. Holds
-  // the model ids; the info fetched for the dialog and whether it is in flight
-  // travel alongside so the dialog is a pure render of what it is handed.
-  const [memPreflight, setMemPreflight] = useState<{ ids: string[] } | null>(null)
+  // A benchmark the user asked for, parked while the run review shows -- a page
+  // per model -- how the selected configs fit the machine's current free memory
+  // and what each case will actually execute. The memory readings and whether
+  // they are in flight travel alongside, so the dialog is a pure render of what
+  // it is handed.
+  const [runReview, setRunReview] = useState<RunReviewState | null>(null)
+  // Mirrors `runReview` for launchRun: it needs the planned request, and a
+  // dependency on the review would rebuild the callback on every poll that
+  // delivers another command. `reviewSeq` numbers the review sessions, so a
+  // reply from a plan the user has already backed out of cannot land on the
+  // next one.
+  const reviewRef = useRef<RunReviewState | null>(null)
+  const reviewSeq = useRef(0)
+  useEffect(() => {
+    reviewRef.current = runReview
+  }, [runReview])
   const [memInfo, setMemInfo] = useState<{ dyn: DynamicInfoData | null; stat: StaticInfoData | null }>(
     { dyn: null, stat: null },
   )
   const [memLoading, setMemLoading] = useState(false)
+  // The same arrangement for a download, parked while the disk preflight dialog
+  // shows what the fetch will write against the free space where it lands.
+  const [diskPreflight, setDiskPreflight] = useState<{ ids: string[] } | null>(null)
+  const [diskInfo, setDiskInfo] = useState<BenchDiskData | null>(null)
+  const [diskLoading, setDiskLoading] = useState(false)
+  // Whether the per-model weight sizes the dialog prices the download with are
+  // still being fetched. Separate from `diskLoading`: the free-space reading is
+  // immediate, a footprint the list was served without is a hub round trip, and
+  // the dialog is more useful showing the first while it waits for the second.
+  const [diskPricing, setDiskPricing] = useState(false)
   const [mainTab, setMainTab] = useState<MainTab>('results')
   const [starting, setStarting] = useState(false)
   const [siderOpen, setSiderOpen] = useState(true)
@@ -249,6 +308,8 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   // holding automatic limits on an app -- so the answer is shown here, before
   // the click, rather than being an error the Run button returns.
   const [preflight, setPreflight] = useState<BenchPreflightData | null>(null)
+  // Covers the moment between the review's Run and the job actually starting.
+  const [launching, setLaunching] = useState(false)
 
   const busy = job?.status === 'running' || !!env?.busy
   const installing = (env?.busy?.kind ?? (job?.status === 'running' ? job.kind : null)) === 'setup'
@@ -353,36 +414,50 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     }
   }, [])
 
-  // Fill in a model's memory footprint when its drawer opens. The list is served
-  // without one (fast, no per-repo hub calls); the server computes and caches a
-  // model's block on first request, and the result is merged into the in-memory
-  // list so the drawer -- and the pre-run memory preflight -- can read it, and so
-  // a reopen is instant. `models` is a dependency so this retries once the list
-  // has actually loaded when a drawer is opened before then.
+  /**
+   * Fill in the memory footprints of a set of models, at most once each.
+   *
+   * The list is served without them (fast, no per-repo hub calls); the server
+   * computes and caches a model's block on first request, and the result is
+   * merged into the in-memory list so everything that reads a footprint -- the
+   * drawer, the pre-run memory check, the pre-download disk check, which reads
+   * the same weight sizes -- gets it, and a second read is free.
+   *
+   * Resolves once every id has been answered, so a caller that is about to
+   * render those numbers can wait for them. Ids already asked for this session
+   * cost nothing and are not re-asked, including the ones that came back
+   * "unknown" -- indistinguishable from "not yet fetched" on the model alone,
+   * which is why `memoryFetched` exists.
+   */
+  const loadMemoryFor = useCallback(async (ids: string[]) => {
+    await Promise.all(
+      ids.map(async (id) => {
+        if (memoryFetched.current.has(id)) return
+        memoryFetched.current.add(id)
+        try {
+          const res = await api.getBenchModelMemory(id)
+          if (!res.memory) return
+          setModels((prev) =>
+            prev.map((m) => (m.id === id ? { ...m, memory: res.memory } : m)),
+          )
+        } catch {
+          // Leave it "unknown"; the guard above keeps a reopen from re-asking.
+        }
+      }),
+    )
+  }, [])
+
+  // The drawer's own footprint, fetched when it opens. `models` is a dependency
+  // so this retries once the list has actually loaded when a drawer is opened
+  // before then.
   useEffect(() => {
     const id = openModelId
     if (!id) return
     const model = models.find((m) => m.id === id)
     if (!model) return // list not loaded yet; this effect re-runs when it is
     if (model.memory) return // already enriched (an object is present)
-    if (memoryFetched.current.has(id)) return // asked already this session
-    memoryFetched.current.add(id)
-    let cancelled = false
-    void (async () => {
-      try {
-        const res = await api.getBenchModelMemory(id)
-        if (cancelled || !res.memory) return
-        setModels((prev) =>
-          prev.map((m) => (m.id === id ? { ...m, memory: res.memory } : m)),
-        )
-      } catch {
-        // Leave it "unknown"; the guard above keeps a reopen from re-asking.
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [openModelId, models])
+    void loadMemoryFor([id])
+  }, [openModelId, models, loadMemoryFor])
 
   // One reading of the results tree, shared by both views below.
   //
@@ -719,59 +794,86 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     [onOpenBalance],
   )
 
+  // The run request for a set of model ids, or null when none of them offer the
+  // precisions they are set to. Shared by the plan and the run it becomes, so
+  // the commands reviewed are rendered from exactly what the run sends.
+  //
+  // Each model carries its own settings, and is asked only for the precisions it
+  // actually offers: sending a tick verbatim asked a model published only as
+  // fp16/int8 for an int4 repo that does not exist -- a case that fails deep in
+  // the pipeline instead of never being generated. A model left with nothing to
+  // ask for drops out of the request; one the list no longer holds keeps its raw
+  // selection, there being nothing to narrow it against.
+  //
+  // Devices and the runtime go per model too. The server groups the models that
+  // agree about them and runs the groups in sequence, which is what makes "this
+  // one on the NPU against 2025.3, that one on the CPU against 2025.2" one press
+  // of Run. Neither means anything to a build: it fetches weights, which are the
+  // same file whatever runs them.
+  const buildRunPayload = useCallback(
+    (stage: BenchStage, ids: string[]) => {
+      const byId = new Map(models.map((m) => [m.id, m]))
+      const payload = ids
+        .map((id) => {
+          const model = byId.get(id)
+          const own = params[id] ?? defaults
+          const extra = own.args.trim()
+          return {
+            id,
+            build: model ? applicablePrecisions(model, own.precisions) : own.precisions,
+            ...(stage === 'build'
+              ? {}
+              : {
+                  devices: own.devices,
+                  ov: own.ov,
+                  ...(extra ? { args: extra } : {}),
+                }),
+          }
+        })
+        .filter((entry) => entry.build.length > 0)
+      if (!payload.length) return null
+      // The request-level pair is what an entry that named neither falls back to,
+      // server-side. Every entry here names both for a benchmark, so this only
+      // decides what a service too old to read them uses.
+      const first = params[payload[0].id] ?? defaults
+      return { payload, first }
+    },
+    [defaults, models, params],
+  )
+
   // Send the run. Nothing is asked here -- whether the user has already answered
   // for the results this repeats is decided by requestRun, above it.
+  //
+  // `edits` are the commands the review was left with, changed cases only. With
+  // any of them the run goes to the advanced endpoint, which is an ordinary
+  // measured run whose cases read their command from a file instead of building
+  // it (benchmark/service/runner.py start_run, cmd_overrides); with none it is
+  // the plain endpoint, exactly as before the review existed. A benchmark sends
+  // the request the plan was rendered from rather than rebuilding it, so an
+  // edit keyed by case_key lands on the case it was shown under.
   const launchRun = useCallback(
-    async (stage: BenchStage, ids: string[]) => {
+    async (stage: BenchStage, ids: string[], edits: Record<string, string> = {}) => {
       if (!ids.length) return
       setStarting(true)
+      setLaunching(true)
       try {
-        const byId = new Map(models.map((m) => [m.id, m]))
-        // Each model carries its own settings, and is asked only for the
-        // precisions it actually offers: sending a tick verbatim asked a model
-        // published only as fp16/int8 for an int4 repo that does not exist -- a
-        // case that fails deep in the pipeline instead of never being
-        // generated. A model left with nothing to ask for drops out of the
-        // request; one the list no longer holds keeps its raw selection, there
-        // being nothing to narrow it against.
-        //
-        // Devices and the runtime go per model too. The server groups the models
-        // that agree about them and runs the groups in sequence, which is what
-        // makes "this one on the NPU against 2025.3, that one on the CPU against
-        // 2025.2" one press of Run. Neither means anything to a build: it
-        // fetches weights, which are the same file whatever runs them.
-        const payload = ids
-          .map((id) => {
-            const model = byId.get(id)
-            const own = params[id] ?? defaults
-            const extra = own.args.trim()
-            return {
-              id,
-              build: model ? applicablePrecisions(model, own.precisions) : own.precisions,
-              ...(stage === 'build'
-                ? {}
-                : {
-                    devices: own.devices,
-                    ov: own.ov,
-                    ...(extra ? { args: extra } : {}),
-                  }),
-            }
-          })
-          .filter((entry) => entry.build.length > 0)
-        if (!payload.length) {
+        const built = buildRunPayload(stage, ids)
+        if (!built) {
           message.warning('None of the selected models offer the precisions they are set to')
           return
         }
-        // The request-level pair is what an entry that named neither falls back
-        // to, server-side. Every entry here names both for a benchmark, so this
-        // only decides what a service too old to read them uses.
-        const first = params[payload[0].id] ?? defaults
-        const res = await api.startBenchRun(
-          payload,
-          stage,
-          stage === 'build' ? undefined : first.devices,
-          stage === 'build' ? undefined : first.ov,
-        )
+        const planned = stage === 'benchmark' ? reviewRef.current : null
+        const payload = planned?.payload ?? built.payload
+        const devices = planned ? planned.devices : built.first.devices
+        const ov = planned ? planned.ov : built.first.ov
+        const res = Object.keys(edits).length
+          ? await api.startBenchAdvancedRun(payload, 'benchmark', edits, devices, ov)
+          : await api.startBenchRun(
+              payload,
+              stage,
+              stage === 'build' ? undefined : devices,
+              stage === 'build' ? undefined : ov,
+            )
         if (res.status === 'conflict') {
           // Two different conflicts arrive on this path. A busy execution slot
           // is a "try again in a minute" and a toast says it fine. A quiet-mode
@@ -796,62 +898,120 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         message.success(
           stage === 'build'
             ? `Downloading ${ids.length === 1 ? ids[0] : `${ids.length} models`}`
-            : 'Benchmark run started',
+            : Object.keys(edits).length
+              ? `Benchmark run started with ${Object.keys(edits).length} edited command` +
+                `${Object.keys(edits).length === 1 ? '' : 's'}`
+              : 'Benchmark run started',
         )
+        // The review has served its purpose; anything that did not start leaves
+        // it up, so the commands are still there to try again with.
+        if (stage === 'benchmark') setRunReview(null)
       } catch (e) {
         message.error(e instanceof Error ? e.message : String(e))
       } finally {
         setStarting(false)
+        setLaunching(false)
       }
     },
-    [defaults, models, params, showBlockedDialog],
+    [buildRunPayload, showBlockedDialog],
   )
 
   /**
-   * The rerun-conflict gate, past the memory dialog.
+   * The rerun-conflict gate, past the review.
    *
    * A benchmark that would repeat measurements already on disk stops here and
    * asks first -- see BenchRerunModal for why the answer is not obvious. A
    * download has nothing to repeat: the weights are either present or not, and
    * the pipeline decides that per precision.
+   *
+   * The command edits travel through the gate rather than being applied before
+   * it: answering "keep" or "discard" must not cost the operator the commands
+   * they just edited. An advanced run used to skip this gate entirely, which is
+   * one of the things merging the two buttons fixes.
    */
   const proceedRun = useCallback(
-    (stage: BenchStage, ids: string[]) => {
+    (stage: BenchStage, ids: string[], edits: Record<string, string> = {}) => {
       if (!ids.length) return
       const conflicts =
         stage === 'build' ? [] : findConflicts(matrix?.rows ?? [], ids, params)
       if (conflicts.length) {
-        setRerun({ stage, ids, conflicts })
+        setRerun({ stage, ids, conflicts, edits })
         return
       }
-      void launchRun(stage, ids)
+      void launchRun(stage, ids, edits)
     },
     [launchRun, matrix?.rows, params],
   )
 
   /**
-   * What the Run buttons call.
+   * What the Run and Download buttons call.
    *
-   * A measured run is shown a memory preflight first: for the selected models,
-   * precisions and devices, does each config fit the memory that is free right
-   * now, and how large a context would? It is a warning, not a gate -- the
-   * numbers are estimates -- so the dialog's Run continues to the rerun gate.
-   * A download skips it: it moves weights, not a running model, and its memory
-   * cost is disk, not RAM/VRAM.
+   * A measured run opens the review: a page per model saying whether its
+   * configurations fit the memory free right now, and what command each of its
+   * cases will actually execute. Both are best-effort reads that the dialog
+   * waits for rather than the user -- the memory figures come from the same
+   * monitor endpoints System Overview uses, and the commands from a print-only
+   * PLAN pass of this very request (api.planBenchRun), which is the only way to
+   * know them: the pipeline builds each command at the bottom, inside run_case.
+   * The review's Run continues to the rerun gate.
+   *
+   * A download is shown the same kind of thing about the resource it actually
+   * spends: disk. Its cost is the weight files of each precision it does not
+   * already have, against the free space where they land -- which is worth
+   * knowing before tens of gigabytes are started, because a volume that fills
+   * up partway leaves a half-fetched directory that reads as downloaded.
    */
   const requestRun = useCallback(
     (stage: BenchStage, ids: string[]) => {
       if (!ids.length) return
       if (stage === 'build') {
-        proceedRun(stage, ids)
+        // The free-space reading is a statvfs and lands at once; the per-model
+        // sizes may need a hub round trip each, so they are not waited for here
+        // -- the dialog opens on the disk figure and prices the rows as the
+        // footprints arrive. Both are best-effort: a reading that cannot be
+        // taken shows as unknown rather than holding up the download.
+        const unpriced = ids.filter((id) => !models.find((m) => m.id === id)?.memory)
+        setDiskInfo(null)
+        setDiskLoading(true)
+        setDiskPricing(unpriced.length > 0)
+        setDiskPreflight({ ids })
+        void (async () => {
+          try {
+            setDiskInfo(await api.getBenchDisk())
+          } catch {
+            setDiskInfo(null)
+          } finally {
+            setDiskLoading(false)
+          }
+        })()
+        void loadMemoryFor(unpriced).finally(() => setDiskPricing(false))
         return
       }
-      // Open the dialog immediately with a spinner, then fill it in. The reads
-      // are best-effort: the same monitor endpoints System Overview uses, and a
-      // failure just leaves the figures as "N/A" rather than blocking the run.
+      // The request the plan is rendered from, and the one the run will send.
+      // Built here rather than at launch so the commands under review and the
+      // commands that run come from the same object.
+      const built = buildRunPayload('benchmark', ids)
+      if (!built) {
+        message.warning('None of the selected models offer the precisions they are set to')
+        return
+      }
+      const seq = (reviewSeq.current += 1)
+      // Open the dialog immediately with its spinners, then fill it in. The
+      // memory reads are best-effort: a failure just leaves the figures as
+      // "N/A" rather than blocking the run.
       setMemInfo({ dyn: null, stat: null })
       setMemLoading(true)
-      setMemPreflight({ ids })
+      setRunReview({
+        seq,
+        ids,
+        payload: built.payload,
+        devices: built.first.devices,
+        ov: built.first.ov,
+        jobId: null,
+        ready: false,
+        commands: [],
+        error: null,
+      })
       void (async () => {
         try {
           const [dyn, stat] = await Promise.all([
@@ -865,17 +1025,64 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
           setMemLoading(false)
         }
       })()
+      // What the table prices each model with. The list is served without
+      // footprints, so a model never opened in its drawer has none yet; each is
+      // a hub round trip, so they are not waited for -- the rows fill in as
+      // they arrive, exactly as the download's disk check does it.
+      void loadMemoryFor(ids.filter((id) => !models.find((m) => m.id === id)?.memory))
+      // The plan holds the single execution slot while it runs, which is why
+      // the review's Run waits for it: there is nothing to start until it is
+      // done either way. A refusal here is the same refusal a run would get --
+      // a busy slot, or a quiet-mode block naming the apps to go and resolve.
+      void (async () => {
+        const stale = () => reviewSeq.current !== seq
+        try {
+          const res = await api.planBenchRun(
+            built.payload,
+            'benchmark',
+            built.first.devices,
+            built.first.ov,
+          )
+          if (stale()) return
+          if (res.status === 'conflict') {
+            setRunReview(null)
+            const blocked = (res.data as { blockers?: BenchPreflightBlocker[] })?.blockers
+            if (blocked?.length) showBlockedDialog(blocked)
+            else message.warning(res.message)
+            return
+          }
+          if (res.status !== 'ok' || !res.data) {
+            setRunReview((prev) =>
+              prev && prev.seq === seq
+                ? { ...prev, ready: true, error: 'Could not prepare the commands' }
+                : prev,
+            )
+            return
+          }
+          setRunReview((prev) =>
+            prev && prev.seq === seq ? { ...prev, jobId: res.data!.id } : prev,
+          )
+        } catch (e) {
+          if (stale()) return
+          const reason = e instanceof Error ? e.message : String(e)
+          setRunReview((prev) =>
+            prev && prev.seq === seq ? { ...prev, ready: true, error: reason } : prev,
+          )
+        }
+      })()
     },
-    [proceedRun],
+    // Neither branch runs anything itself: both park the request on a dialog,
+    // and it is that dialog's confirm that reaches proceedRun.
+    [buildRunPayload, loadMemoryFor, models, showBlockedDialog],
   )
 
-  // The models the parked benchmark is about, each with the precisions it will
-  // actually be asked for: its own tick list narrowed to what it offers, the
-  // same narrowing launchRun applies when it builds the request.
-  const memPreflightItems = useMemo<MemoryPreflightItem[]>(() => {
-    if (!memPreflight) return []
+  // One page of the review per model, each with the precisions it will actually
+  // be asked for: its own tick list narrowed to what it offers, the same
+  // narrowing buildRunPayload applies when it builds the request.
+  const reviewItems = useMemo<MemoryPreflightItem[]>(() => {
+    if (!runReview) return []
     const byId = new Map(models.map((m) => [m.id, m]))
-    return memPreflight.ids
+    return runReview.ids
       .map((id) => byId.get(id))
       .filter((m): m is BenchModel => !!m)
       .map((model) => {
@@ -887,18 +1094,42 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         }
       })
       .filter((entry) => entry.precisions.length > 0)
-  }, [memPreflight, models, params, defaults])
+  }, [runReview, models, params, defaults])
 
-  const confirmMemPreflight = useCallback(() => {
-    const pending = memPreflight
-    setMemPreflight(null)
-    if (pending) proceedRun('benchmark', pending.ids)
-  }, [memPreflight, proceedRun])
+  const confirmReview = useCallback(
+    (edits: Record<string, string>) => {
+      if (runReview) proceedRun('benchmark', runReview.ids, edits)
+    },
+    [runReview, proceedRun],
+  )
+
+  // The same for the parked download, minus the devices: which device will run
+  // the model has nothing to do with what its weights take on disk. The
+  // precisions are narrowed exactly as buildRunPayload narrows them, so the
+  // dialog prices the fetch the request will actually make.
+  const diskPreflightItems = useMemo<DiskPreflightItem[]>(() => {
+    if (!diskPreflight) return []
+    const byId = new Map(models.map((m) => [m.id, m]))
+    return diskPreflight.ids
+      .map((id) => byId.get(id))
+      .filter((m): m is BenchModel => !!m)
+      .map((model) => ({
+        model,
+        precisions: applicablePrecisions(model, (params[model.id] ?? defaults).precisions),
+      }))
+      .filter((entry) => entry.precisions.length > 0)
+  }, [diskPreflight, models, params, defaults])
+
+  const confirmDiskPreflight = useCallback(() => {
+    const pending = diskPreflight
+    setDiskPreflight(null)
+    if (pending) proceedRun('build', pending.ids)
+  }, [diskPreflight, proceedRun])
 
   const keepAndRun = useCallback(() => {
     const pending = rerun
     setRerun(null)
-    if (pending) void launchRun(pending.stage, pending.ids)
+    if (pending) void launchRun(pending.stage, pending.ids, pending.edits)
   }, [launchRun, rerun])
 
   const discardAndRun = useCallback(async () => {
@@ -925,7 +1156,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
       }
       setRerun(null)
       await loadResults()
-      void launchRun(pending.stage, pending.ids)
+      void launchRun(pending.stage, pending.ids, pending.edits)
     } catch (e) {
       // The old results are still there, so the run is not started: the user
       // asked for a clean slate and did not get one.
@@ -934,6 +1165,57 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
       setDiscarding(false)
     }
   }, [launchRun, loadResults, rerun])
+
+  // Poll the plan job until it finishes, filling the review with the commands
+  // it lists. Keyed on the job id and the ready flag, not the whole `runReview`
+  // object, so a command update does not tear down and restart the timer (which
+  // would busy-loop the endpoint). The interval clears itself the moment the
+  // plan reports ready.
+  useEffect(() => {
+    if (!runReview || runReview.ready || !runReview.jobId) return
+    const jobId = runReview.jobId
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const data = await api.getBenchPlan(jobId)
+        if (cancelled) return
+        // A plan that ended other than cleanly failed in the pipeline; say so
+        // rather than leaving an empty review up with a live Run button.
+        const failed =
+          data.ready && data.job.status !== 'done'
+            ? data.job.status === 'cancelled'
+              ? 'The command plan was cancelled'
+              : 'The command plan failed; check the Logs tab'
+            : null
+        setRunReview((prev) =>
+          prev && prev.jobId === jobId
+            ? { ...prev, ready: data.ready, commands: data.commands, error: failed }
+            : prev,
+        )
+        if (failed) message.error(failed)
+      } catch (e) {
+        if (!cancelled) message.error(e instanceof Error ? e.message : String(e))
+      }
+    }
+    void poll()
+    const timer = window.setInterval(poll, 1200)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runReview?.jobId, runReview?.ready])
+
+  const cancelReview = useCallback(() => {
+    const jobId = runReview?.jobId
+    // A late plan reply must not reopen what was just closed.
+    reviewSeq.current += 1
+    setRunReview(null)
+    // The plan holds the single execution slot until it finishes. Backing out
+    // before then cancels it so the slot frees at once; a plan that has already
+    // ended just 404s here, which is harmless.
+    if (jobId) void api.cancelBenchRun(jobId).catch(() => {})
+  }, [runReview])
 
   const cancelJob = useCallback(async () => {
     const target = env?.busy ?? job
@@ -1384,14 +1666,33 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         onClose={() => setCaseOpen(false)}
       />
 
-      <BenchMemoryPreflightModal
-        open={!!memPreflight}
-        items={memPreflightItems}
+      <BenchDiskPreflightModal
+        open={!!diskPreflight}
+        items={diskPreflightItems}
+        disk={diskInfo}
+        loading={diskLoading}
+        pricing={diskPricing}
+        onDownload={confirmDiskPreflight}
+        onCancel={() => setDiskPreflight(null)}
+      />
+
+      {/* The run review. Keyed on the session, so each press of Run starts from
+          a clean dialog -- and so it is NOT reset when the rerun gate hides it
+          for a moment: the edits and the per-model context choices are still
+          there if that gate is cancelled. */}
+      <BenchRunReviewModal
+        key={runReview?.seq ?? 'none'}
+        open={!!runReview && !rerun}
+        items={reviewItems}
         dynamicInfo={memInfo.dyn}
         staticInfo={memInfo.stat}
-        loading={memLoading}
-        onRun={confirmMemPreflight}
-        onCancel={() => setMemPreflight(null)}
+        memLoading={memLoading}
+        planLoading={!!runReview && !runReview.ready}
+        planError={runReview?.error ?? null}
+        commands={runReview?.commands ?? []}
+        working={launching}
+        onRun={confirmReview}
+        onCancel={cancelReview}
       />
 
       <BenchRerunModal

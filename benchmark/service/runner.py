@@ -12,6 +12,7 @@
 import json
 import re
 import shlex
+import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +60,23 @@ _MAX_ARGS_LEN = 512
 
 # Guards a single request from queueing an unbounded amount of GPU-hours.
 _MAX_MODELS = 32
+
+# Advanced run: the operator reviews the plan's commands and may edit them, then
+# each edited command is written to a per-case file the commons run verbatim.
+#
+# The case_key is the identity the commons stamp on every case
+# ("<safe_name>__<quant>__<DEVICE>", see benchmark/templates/bench_advanced_common.sh)
+# and the plan manifest reports back. It becomes a filename under the overrides
+# directory, so it is validated against exactly that shape -- this is the boundary
+# that stops a crafted key ("../../etc/x") from escaping the directory. The three
+# fields themselves are model_safe_name / a directory basename / a device, none of
+# which can contain a slash.
+_CASE_KEY_RE = re.compile(r"^[A-Za-z0-9][\w.+-]*__[\w.+-]+__[A-Za-z0-9]+$")
+
+# A single override command is a benchmark invocation, not a program. Bounds one
+# request; the command still runs as the same unprivileged pipeline user as every
+# other benchmark subprocess, so this is a sanity limit, not a security control.
+_MAX_OVERRIDE_LEN = 8192
 
 
 class InvalidRunRequest(ValueError):
@@ -200,17 +218,36 @@ def normalize_request(
             ordered = [p for p in VALID_PRECISIONS if p in requested]
             entry["build"] = ",".join(ordered)
 
-        # Benchmark device selection, always stamped onto the entry. This is the
-        # only channel now -- there is no BENCH_DEVICES env fallback in gen_wrapper
-        # anymore -- so the field must be present on every entry: it travels
-        # models_input.json -> route.py's passthrough -> gen_wrapper's _device_loop.
-        # A per-model `device` narrows this model to a subset; absent, it inherits
-        # the run-wide selection.
-        device = item.get("device")
-        entry["device"] = (
-            normalize_devices(device, stage) if device is not None
-            else list(picked_devices)
+        # This model's device selection: read once, used for both jobs it has.
+        #
+        # It decides what the pipeline actually sweeps -- entry["device"] ->
+        # models_input.json -> route.py's passthrough -> gen_wrapper's
+        # _route_devices, which is the only channel there is (BENCH_DEVICES is
+        # exported per group for the log and for run_meta.json, and read by no
+        # generator) -- and, as entry["_devices"] below, which group the model
+        # lands in.
+        #
+        # Those two used to be read from different keys, `device` here and
+        # `devices` there, and the page only ever sends `devices`. So the sweep
+        # silently fell back to the run-wide selection -- which Benchmark.tsx
+        # fills from the FIRST model in the payload -- while the grouping alone
+        # saw the real choice: "this model on CPU, that one on GPU" rendered two
+        # groups whose exported BENCH_DEVICES were right and whose models_input
+        # .json both said CPU, and the GPU half of the request was measured on
+        # the CPU. One read keeps the split and the sweep describing the same
+        # request.
+        #
+        # `device` is still accepted as an alias -- it is the name the pipeline's
+        # own JSON uses, so a hand-written request may well spell it that way.
+        # Absent both, the model inherits the run-wide selection.
+        requested_devices = item.get("devices")
+        if requested_devices is None:
+            requested_devices = item.get("device")
+        model_devices = (
+            normalize_devices(requested_devices, stage)
+            if requested_devices is not None else list(picked_devices)
         )
+        entry["device"] = list(model_devices)
 
         # Optional free-form extra arguments, appended to every benchmark run_case
         # for this model (see gen_wrapper.py). Kept on the model input JSON entry
@@ -232,15 +269,13 @@ def normalize_request(
             if tokens:
                 entry["args"] = tokens
 
-        # This model's own devices and OpenVINO version, defaulting to the
-        # request's. Only the benchmark stage has either: a build fetches
-        # weights, which are the same file whatever runs them, so both
-        # normalizers return the request-level answer (all devices / None) for
-        # it and the grouping below collapses to one group.
-        entry["_devices"] = (
-            normalize_devices(item.get("devices"), stage)
-            if item.get("devices") is not None else list(picked_devices)
-        )
+        # How to split the run: this model's devices -- the same selection
+        # stamped above, never a second reading of the request -- and its
+        # OpenVINO version, defaulting to the request's. Only the benchmark
+        # stage has either: a build fetches weights, which are the same file
+        # whatever runs them, so the request carries no devices for it and the
+        # grouping below collapses to one group regardless.
+        entry["_devices"] = list(model_devices)
         entry["_ov"] = (
             normalize_ov(item.get("ov"), stage)
             if item.get("ov") is not None else picked_ov
@@ -396,13 +431,54 @@ def render_driver(scripts: Sequence[Tuple[Path, dict]], run_id: str) -> Path:
     return driver_path
 
 
+def _write_cmd_overrides(run_id: str, commands: dict) -> Path:
+    """Write an advanced run's per-case command overrides, return their directory.
+
+    ``commands`` maps a case_key (as the plan manifest reported it) to the full
+    command the operator wants that case to run. Each non-empty command is written
+    to ``<overrides>/<case_key>.cmd``; the commons' run_case reads the file for its
+    own case_key and runs it in place of the command it would have built. A case
+    with no entry here keeps its built command, so the operator only has to submit
+    what they changed.
+
+    The key becomes a filename, so it is validated against the exact shape the
+    commons produce before it is joined to a path -- the security boundary for a
+    value that came back from the browser.
+    """
+    overrides_dir = privilege.ensure_dir(env.paths()["runs"] / f"overrides_{run_id}")
+    for case_key, command in commands.items():
+        key = str(case_key)
+        if not _CASE_KEY_RE.match(key):
+            raise InvalidRunRequest(f"invalid case identifier: {case_key!r}")
+        text = str(command or "")
+        if not text.strip():
+            # An emptied command means "run this case as planned", not "run
+            # nothing": leaving no file makes run_case fall back to its default.
+            continue
+        if len(text) > _MAX_OVERRIDE_LEN:
+            raise InvalidRunRequest(
+                f"command for {key} is too long ({len(text)} > {_MAX_OVERRIDE_LEN} chars)"
+            )
+        cmd_file = overrides_dir / f"{key}.cmd"
+        cmd_file.write_text(text if text.endswith("\n") else text + "\n")
+        cmd_file.chmod(0o644)
+        privilege.chown(cmd_file)
+    return overrides_dir
+
+
 def start_run(
     models: Sequence[dict], stage: str, devices: Optional[Sequence[str]] = None,
-    ov: Optional[str] = None,
+    ov: Optional[str] = None, cmd_overrides: Optional[dict] = None,
 ) -> jobs.Job:
     """Validate, render and launch a pipeline run. Raises InvalidRunRequest,
     jobs.BenchBusy, QuietModeBlocked, or RuntimeError when the environment is
-    not ready."""
+    not ready.
+
+    ``cmd_overrides`` (an advanced run) maps a case_key to a command the operator
+    edited in the plan review; the commons run each in place of the one they would
+    have built. Everything else is a normal measured run -- same rendering, sampler,
+    quiet mode and results -- so the override only changes what each case executes,
+    never how the run is set up or recorded."""
     # Validate the request before probing the environment: a malformed request is
     # malformed regardless of environment state, and reporting *that* is more
     # useful than telling the user to spend an hour on setup first.
@@ -582,6 +658,15 @@ def start_run(
     if metrics_csv:
         extra_env["BENCH_METRICS_CSV"] = str(metrics_csv)
 
+    # Advanced run: point the commons at the operator's edited commands. Written
+    # after the request validated and the slot was reserved, so a rejected run
+    # leaves no override files, and under the same run id as the scripts so the
+    # cleanup below can find them.
+    overrides_dir: Optional[Path] = None
+    if cmd_overrides:
+        overrides_dir = _write_cmd_overrides(run_id, cmd_overrides)
+        extra_env["BENCH_CMD_OVERRIDES"] = str(overrides_dir)
+
     global _live_sampler
     _live_sampler = run_sampler
 
@@ -639,7 +724,175 @@ def start_run(
         for path, _ in rendered:
             path.unlink(missing_ok=True)
         script_path.unlink(missing_ok=True)
+        if overrides_dir is not None:
+            shutil.rmtree(overrides_dir, ignore_errors=True)
         raise
+
+
+def plan_run(
+    models: Sequence[dict], stage: str, devices: Optional[Sequence[str]] = None,
+    ov: Optional[str] = None,
+) -> jobs.Job:
+    """Render and launch a print-only PLAN pass, returning its job.
+
+    Runs the same route -> gen_wrapper -> run_case path a real run would, so the
+    commands it lists are exactly the commands a run would execute -- but with
+    BENCH_PRINT_ONLY set, so each run_case appends its command to a manifest and
+    returns before it writes anything under the results tree, and run_template.sh
+    skips its aggregation. No sampler is started and no quiet-mode hold is taken: a
+    plan measures nothing. The manifest path is on the job meta; read it with
+    ``plan_manifest`` once the job ends. The rendered scripts and the job's own log
+    are removed when it finishes, so a completed plan leaves only the manifest.
+
+    Raises InvalidRunRequest, jobs.BenchBusy, or RuntimeError exactly as start_run
+    does for the same conditions.
+    """
+    entries, stage, devices, ov = normalize_request(models, stage, devices, ov)
+    if stage not in _MEASURED_STAGES:
+        # A build fetches and converts weights; there is no per-case benchmark
+        # command to review, so an advanced run does not apply to it.
+        raise InvalidRunRequest(
+            "an advanced run plans a benchmark; choose the benchmark stage"
+        )
+
+    status = env.probe()
+    if not status["enabled"]:
+        raise RuntimeError("the benchmark feature is disabled")
+    if not status["ready"]:
+        raise RuntimeError(
+            "the benchmark environment is not ready; run the environment setup first"
+        )
+
+    groups = run_groups(entries, stage)
+    for missing in sorted({
+        group["ov"] for group in groups
+        if group["ov"] is not None and group["ov"] not in status["ov_versions"]
+    }):
+        raise RuntimeError(
+            f"OpenVINO {missing} is not installed; install it from the Benchmark tab's "
+            "Environment drawer (or POST /bench/env/setup with that version) "
+            "before benchmarking against it"
+        )
+
+    busy = jobs.manager.current()
+    if busy is not None:
+        raise jobs.BenchBusy(busy)
+
+    run_id = uuid.uuid4().hex[:12]
+    run_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{run_id}"
+    single = len(groups) == 1
+    manifest_path = env.paths()["runs"] / f"plan_{run_id}.jsonl"
+
+    # One rendering per group, exactly as start_run does -- so the case_keys the
+    # manifest reports match the ones a later advanced run will produce.
+    rendered: List[Tuple[Path, dict]] = []
+    for position, group in enumerate(groups, start=1):
+        group["run_name"] = run_name if single else f"{run_name}_g{position}"
+        group["models"] = [entry["id"] for entry in group["entries"]]
+        path, models_json = render_script(
+            group["entries"], stage, run_id,
+            group_env="" if single else _group_env(group, stage, group["run_name"]),
+            suffix="" if single else f"_g{position}",
+        )
+        group["script"] = str(path)
+        group["models_json"] = models_json
+        rendered.append((path, group))
+
+    script_path = rendered[0][0] if single else render_driver(rendered, run_id)
+    log_path = env.paths()["runs"] / f"plan_{run_id}.log"
+
+    extra_env = {
+        "BENCH_RUN_NAME": run_name,
+        "BENCH_PRINT_ONLY": "1",
+        "BENCH_CMD_MANIFEST": str(manifest_path),
+    }
+    # run_template.sh still activates the OpenVINO column to run route/gen_wrapper
+    # in the same interpreter a real run would; the version was checked above.
+    if stage in ("benchmark", "all"):
+        extra_env["BENCH_OV_VERSION"] = ov
+    # Deliberately no BENCH_METRICS_CSV, sampler or quiet-mode hold: nothing is
+    # measured, so nothing has to be held still.
+
+    header = (
+        "=== benchmark plan (print-only, writes no results) ===\n"
+        f"stage  : {stage}\n"
+        f"script : {script_path}\n"
+        + "".join(
+            f"group {position}/{len(groups)}: ov={group['ov'] or '-'} "
+            f"devices={' '.join(group['devices']) or '-'}\n"
+            for position, group in enumerate(groups, start=1)
+        )
+    )
+    logger.info(
+        f"Starting benchmark plan: stage={stage}, groups="
+        f"{[(g['ov'], g['devices'], g['models']) for g in groups]}"
+    )
+
+    def _cleanup_plan(job: jobs.Job) -> None:
+        # A finished plan leaves only its manifest, for plan_manifest to read.
+        for path, _ in rendered:
+            path.unlink(missing_ok=True)
+        script_path.unlink(missing_ok=True)
+        try:
+            Path(job.log_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    try:
+        return jobs.manager.start(
+            kind="plan",
+            argv=["bash", str(script_path)],
+            cwd=str(env.SRC_ROOT),
+            env=env.build_subprocess_env(extra_env),
+            log_path=log_path,
+            header=header,
+            meta={"stage": stage, "plan": True, "manifest": str(manifest_path),
+                  "models": [_pipeline_entry(entry) for entry in entries],
+                  "devices": devices, "ov": ov, "run_name": run_name,
+                  "groups": [
+                      {"ov": group["ov"], "devices": group["devices"],
+                       "models": group["models"]}
+                      for group in groups
+                  ]},
+            on_finish=_cleanup_plan,
+        )
+    except Exception:
+        for path, _ in rendered:
+            path.unlink(missing_ok=True)
+        script_path.unlink(missing_ok=True)
+        raise
+
+
+def plan_manifest(job: Optional[jobs.Job]) -> dict:
+    """The commands a plan job produced, parsed from its manifest.
+
+    Returns ``{"ready": bool, "commands": [...]}``: ``ready`` is True once the job
+    has left RUNNING (so the browser knows the list is complete), and each command
+    is one manifest record (case_key, model, quant, task, device, model_dir,
+    command). An absent manifest -- the job has not written it yet, or produced no
+    cases -- reads as an empty list rather than an error.
+    """
+    if job is None:
+        raise InvalidRunRequest("unknown job")
+    manifest = (job.meta or {}).get("manifest")
+    if not manifest:
+        raise InvalidRunRequest("that job is not a plan")
+    ready = job.status != jobs.STATUS_RUNNING
+    path = Path(manifest)
+    if not path.exists():
+        return {"ready": ready, "commands": []}
+    commands: List[dict] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            commands.append(json.loads(line))
+        except json.JSONDecodeError:
+            # A half-written final line while the job is still flushing; the next
+            # poll re-reads the whole file, so skipping it here loses nothing.
+            continue
+    return {"ready": ready, "commands": commands}
 
 
 def _release_quiet_mode(job: jobs.Job) -> None:

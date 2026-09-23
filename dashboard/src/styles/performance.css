@@ -992,3 +992,127 @@
     grid-template-columns: 1fr;
   }
 }
+
+:root[data-theme='light'] .perf-root {
+  background:
+    radial-gradient(circle at 10% 10%, var(--color-accent-grid), transparent 45%),
+    linear-gradient(180deg, var(--color-canvas), var(--color-bg));
+  color: var(--color-text);
+}
+
+:root[data-theme='light'] .perf-root::before {
+  background:
+    repeating-linear-gradient(90deg, var(--color-accent-grid) 0, var(--color-accent-grid) 1px, transparent 1px, transparent 48px),
+    repeating-linear-gradient(0deg, var(--color-accent-grid) 0, var(--color-accent-grid) 1px, transparent 1px, transparent 48px);
+  opacity: 0.35;
+}
+
+:root[data-theme='light'] .perf-root::after {
+  background: linear-gradient(180deg, var(--color-panel-bg), transparent 30%, var(--color-bg));
+  opacity: 0.45;
+}
+
+:root[data-theme='light'] .perf-header--sticky {
+  background: var(--color-overlay);
+  border-bottom-color: var(--color-accent-grid);
+}
+
+:root[data-theme='light'] .perf-section-title {
+  border-bottom-color: var(--color-accent-grid);
+}
+
+:root[data-theme='light'] .perf-card,
+:root[data-theme='light'] .perf-env-item,
+:root[data-theme='light'] .perf-env-driver-item,
+:root[data-theme='light'] .perf-env-chip {
+  background: var(--color-panel-bg) !important;
+  border-color: var(--color-border) !important;
+  box-shadow: 0 8px 22px var(--color-shadow) !important;
+}
+
+:root[data-theme='light'] .perf-card::before,
+:root[data-theme='light'] .perf-card::after {
+  border-color: var(--color-accent);
+}
+
+:root[data-theme='light'] .perf-section-eyebrow,
+:root[data-theme='light'] .perf-env-item-value,
+:root[data-theme='light'] .perf-env-driver-value,
+:root[data-theme='light'] .perf-env-chip-value,
+:root[data-theme='light'] .perf-insight-value,
+:root[data-theme='light'] .perf-root .ant-typography {
+  color: var(--color-text) !important;
+  text-shadow: none;
+}
+
+:root[data-theme='light'] .perf-section-subtitle,
+:root[data-theme='light'] .perf-env-item-label,
+:root[data-theme='light'] .perf-env-driver-label,
+:root[data-theme='light'] .perf-env-driver-title,
+:root[data-theme='light'] .perf-env-chip-key,
+:root[data-theme='light'] .perf-root .ant-typography-secondary {
+  color: var(--color-text-muted) !important;
+}
+
+:root[data-theme='light'] .perf-toggle-btn {
+  color: var(--color-text) !important;
+  border-color: var(--color-border-strong) !important;
+}
+
+:root[data-theme='light'] .perf-toggle-btn:hover {
+  color: var(--color-accent) !important;
+  background: var(--color-accent-soft) !important;
+  border-color: var(--color-accent) !important;
+}
+
+:root[data-theme='light'] .perf-pressure-pointer-card {
+  background: var(--color-gauge-surface);
+  border-color: var(--color-gauge-border);
+  box-shadow: none;
+}
+
+:root[data-theme='light'] .perf-pressure-pointer-title {
+  color: var(--color-text) !important;
+}
+
+:root[data-theme='light'] .perf-pressure-pointer-subtitle,
+:root[data-theme='light'] .perf-pressure-pointer-description {
+  color: var(--color-text-muted) !important;
+}
+
+:root[data-theme='light'] .perf-core-item,
+:root[data-theme='light'] .perf-gpu-block,
+:root[data-theme='light'] .perf-engine-item {
+  background: var(--color-surface-subtle);
+  border-color: var(--color-border);
+}
+
+:root[data-theme='light'] .perf-core-item:hover {
+  background: var(--color-panel-bg);
+  border-color: var(--color-border-strong);
+}
+
+:root[data-theme='light'] .perf-core-bar-track,
+:root[data-theme='light'] .perf-engine-current-bar-track {
+  background: var(--color-border);
+}
+
+:root[data-theme='light'] .perf-core-legend-item,
+:root[data-theme='light'] .perf-core-trend-title,
+:root[data-theme='light'] .perf-chart-legend-label,
+:root[data-theme='light'] .perf-series-legend-item,
+:root[data-theme='light'] .perf-spark-axis,
+:root[data-theme='light'] .perf-spark-point-label {
+  color: var(--color-text-muted) !important;
+  fill: var(--color-text-muted);
+}
+
+:root[data-theme='light'] .perf-chart-legend-item:hover,
+:root[data-theme='light'] .perf-metrics-chip:hover {
+  background: var(--color-accent-soft);
+}
+
+:root[data-theme='light'] .perf-metrics-chip {
+  background: var(--color-panel-bg);
+  border-color: var(--color-border);
+}

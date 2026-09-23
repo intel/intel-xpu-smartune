@@ -162,9 +162,9 @@ const STICKY_TOOLBAR_STYLE: React.CSSProperties = {
   // fallback covers the initial paint before the variable is set.
   top: 'var(--app-sticky-top, 128px)',
   zIndex: 25,
-  background: 'rgba(11, 15, 20, 0.9)',
+  background: 'var(--color-overlay)',
   backdropFilter: 'blur(8px)',
-  borderBottom: `1px solid ${COLORS.border}`,
+  borderBottom: '1px solid var(--color-border)',
   padding: '8px 0',
   marginBottom: 16,
 }
@@ -938,7 +938,7 @@ function LegendToggleItem({
   onClick: () => void
   dasharray?: string
 }) {
-  const lineColor = hidden ? 'rgba(120,176,255,0.25)' : color
+  const lineColor = hidden ? COLORS.borderStrong : color
   return (
     <span
       onClick={onClick}
@@ -946,16 +946,20 @@ function LegendToggleItem({
         display: 'inline-flex',
         alignItems: 'center',
         gap: 5,
+        padding: '2px 4px',
+        border: `1px solid ${hidden ? 'transparent' : `${color}66`}`,
+        borderRadius: 3,
+        background: hidden ? 'transparent' : `${color}14`,
         cursor: 'pointer',
         marginRight: 12,
-        opacity: hidden ? 0.55 : 1,
+        opacity: hidden ? 0.72 : 1,
         userSelect: 'none',
       }}
     >
       <svg width={24} height={6} style={{ verticalAlign: 'middle' }}>
         <line x1={0} y1={3} x2={24} y2={3} stroke={lineColor} strokeWidth={2.5} strokeDasharray={dasharray} />
       </svg>
-      <span style={{ color: hidden ? 'rgba(174,191,223,0.5)' : COLORS.textMuted, fontSize: 11, textDecoration: hidden ? 'line-through' : 'none' }}>{value}</span>
+      <span style={{ color: hidden ? COLORS.textTertiary : COLORS.text, fontSize: 11, textDecoration: hidden ? 'line-through' : 'none' }}>{value}</span>
     </span>
   )
 }
@@ -1447,6 +1451,7 @@ function GpuHistoryCard({
 
 function CpuPerCoreHistoryCard({ info, timeWindow }: { info: CpuPerCoreInfo; timeWindow: TimeDomain }) {
   const { points, coreCount, pCoreIndices, eCoreIndices, lpeCoreIndices } = info
+  const averageColor = COLORS.chartContrast
 
   // Check which cores actually have temperature data in at least one point
   const coresWithTemp = useMemo(() => {
@@ -1460,18 +1465,18 @@ function CpuPerCoreHistoryCard({ info, timeWindow }: { info: CpuPerCoreInfo; tim
     return has
   }, [points, coreCount])
 
-  // P-Core chart: Util % solid, Freq MHz dashed; per-core use palette, Avg uses white
+  // P-Core chart: Util % solid, Freq MHz dashed; average uses the theme contrast color.
   const pCoreSeries: SeriesConfig[] = useMemo(() => {
     if (!pCoreIndices.length) return []
     return [
-      { key: 'pAvgUtil', name: 'P Avg Util', color: '#ffffff', unit: '%' },
+      { key: 'pAvgUtil', name: 'P Avg Util', color: averageColor, unit: '%' },
       ...pCoreIndices.map((logIdx, i) => ({
         key: `u_${logIdx}`,
         name: `P${i} Util`,
         color: P_CORE_COLORS[i % P_CORE_COLORS.length],
         unit: '%',
       })),
-      { key: 'pAvgFreq', name: 'P Avg Freq', color: '#ffffff', unit: 'MHz', dasharray: '6 3', defaultOn: false },
+      { key: 'pAvgFreq', name: 'P Avg Freq', color: averageColor, unit: 'MHz', dasharray: '6 3', defaultOn: false },
       ...pCoreIndices.map((logIdx, i) => ({
         key: `f_${logIdx}`,
         name: `P${i} Freq`,
@@ -1481,20 +1486,20 @@ function CpuPerCoreHistoryCard({ info, timeWindow }: { info: CpuPerCoreInfo; tim
         defaultOn: false,
       })),
     ]
-  }, [pCoreIndices])
+  }, [pCoreIndices, averageColor])
 
   // E-Core chart: same dual-style approach (solid util, dashed freq)
   const eCoreSeries: SeriesConfig[] = useMemo(() => {
     if (!eCoreIndices.length) return []
     return [
-      { key: 'eAvgUtil', name: 'E Avg Util', color: '#ffffff', unit: '%' },
+      { key: 'eAvgUtil', name: 'E Avg Util', color: averageColor, unit: '%' },
       ...eCoreIndices.map((logIdx, i) => ({
         key: `u_${logIdx}`,
         name: `E${i} Util`,
         color: E_CORE_COLORS[i % E_CORE_COLORS.length],
         unit: '%',
       })),
-      { key: 'eAvgFreq', name: 'E Avg Freq', color: '#ffffff', unit: 'MHz', dasharray: '6 3', defaultOn: false },
+      { key: 'eAvgFreq', name: 'E Avg Freq', color: averageColor, unit: 'MHz', dasharray: '6 3', defaultOn: false },
       ...eCoreIndices.map((logIdx, i) => ({
         key: `f_${logIdx}`,
         name: `E${i} Freq`,
@@ -1504,20 +1509,20 @@ function CpuPerCoreHistoryCard({ info, timeWindow }: { info: CpuPerCoreInfo; tim
         defaultOn: false,
       })),
     ]
-  }, [eCoreIndices])
+  }, [eCoreIndices, averageColor])
 
   // LPE-Core chart: same dual-style approach
   const lpeCoreSeries: SeriesConfig[] = useMemo(() => {
     if (!lpeCoreIndices.length) return []
     return [
-      { key: 'lpeAvgUtil', name: 'LPE Avg Util', color: '#ffffff', unit: '%' },
+      { key: 'lpeAvgUtil', name: 'LPE Avg Util', color: averageColor, unit: '%' },
       ...lpeCoreIndices.map((logIdx, i) => ({
         key: `u_${logIdx}`,
         name: `LPE${i} Util`,
         color: LPE_CORE_COLORS[i % LPE_CORE_COLORS.length],
         unit: '%',
       })),
-      { key: 'lpeAvgFreq', name: 'LPE Avg Freq', color: '#ffffff', unit: 'MHz', dasharray: '6 3', defaultOn: false },
+      { key: 'lpeAvgFreq', name: 'LPE Avg Freq', color: averageColor, unit: 'MHz', dasharray: '6 3', defaultOn: false },
       ...lpeCoreIndices.map((logIdx, i) => ({
         key: `f_${logIdx}`,
         name: `LPE${i} Freq`,
@@ -1527,7 +1532,7 @@ function CpuPerCoreHistoryCard({ info, timeWindow }: { info: CpuPerCoreInfo; tim
         defaultOn: false,
       })),
     ]
-  }, [lpeCoreIndices])
+  }, [lpeCoreIndices, averageColor])
 
   // Temperature chart: Package + per-core temps (P/E/LPE labeled), skip cores with no data
   const tempSeries: SeriesConfig[] = useMemo(() => {

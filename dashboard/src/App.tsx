@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect } from 'react'
-import { Tabs, Layout, Typography, Space, Alert, Badge, Button, Dropdown, Empty, Tag, notification } from 'antd'
+import { Tabs, Layout, Typography, Space, Alert, Badge, Button, Dropdown, Empty, Tag, notification, Tooltip } from 'antd'
 import {
   DashboardOutlined,
   AlertOutlined,
@@ -12,6 +12,8 @@ import {
   LogoutOutlined,
   SettingOutlined,
   ExperimentOutlined,
+  MoonOutlined,
+  SunOutlined,
 } from '@ant-design/icons'
 import SettingsModal from './components/SettingsModal'
 import SystemOverview from './components/SystemOverview'
@@ -24,6 +26,7 @@ import Diagnostics from './components/Diagnostics'
 import About from './components/About'
 import LoginGate from './components/LoginGate'
 import { COLORS } from './styles/theme'
+import type { ColorMode } from './styles/theme'
 import { api, getToken, clearToken, setUnauthorizedHandler, consumeUrlToken, login } from './api/client'
 import { GlobalConfigNoticesProvider, useGlobalConfigNotices } from './hooks/useGlobalConfigNotices'
 import { useUiLease } from './hooks/useUiLease'
@@ -70,7 +73,12 @@ function GlobalConfigNoticeBar() {
   )
 }
 
-export default function App() {
+interface AppProps {
+  colorMode: ColorMode
+  onColorModeChange: (mode: ColorMode) => void
+}
+
+export default function App({ colorMode, onColorModeChange }: AppProps) {
   const [activeTab, setActiveTab] = useState('1')
   const [historyRangeIntent, setHistoryRangeIntent] = useState<HistoryRangeIntent | null>(null)
   // 1 = balancer + monitor, 0 = monitor only. Default to enabled so older
@@ -487,6 +495,16 @@ export default function App() {
             </Typography.Title>
           </div>
           <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Tooltip title={colorMode === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}>
+              <Button
+                type="text"
+                size="small"
+                icon={colorMode === 'light' ? <MoonOutlined /> : <SunOutlined />}
+                aria-label={colorMode === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}
+                onClick={() => onColorModeChange(colorMode === 'light' ? 'dark' : 'light')}
+                style={{ color: COLORS.textMuted }}
+              />
+            </Tooltip>
             {diagnosticsEnabled ? (
               <Dropdown
                 trigger={['click']}
@@ -527,6 +545,7 @@ export default function App() {
         <Content style={{ padding: '0 16px 16px', background: COLORS.bg }}>
           <GlobalConfigNoticeBar />
           <Tabs
+            className="app-navigation-tabs"
             activeKey={activeTab}
             onChange={setActiveTab}
             items={tabs}
@@ -535,8 +554,8 @@ export default function App() {
             tabBarStyle={{
               marginBottom: 0,
               paddingTop: 8,
-              background: COLORS.bg,
-              borderBottom: `1px solid ${COLORS.border}`,
+              background: colorMode === 'light' ? COLORS.tabAccent : COLORS.bg,
+              borderBottom: `1px solid ${colorMode === 'light' ? COLORS.tabAccent : COLORS.border}`,
               position: 'sticky',
               top: 64,
               zIndex: 99,

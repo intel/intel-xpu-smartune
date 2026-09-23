@@ -1440,7 +1440,7 @@ function PressurePointerGauge({
   const pct = hasValue ? Math.max(0, Math.min(valuePct, 100)) : 0
   const normalized = pct / 100
   const color = getPressureColor(normalized)
-  const pointerColor = COLORS.text
+  const pointerColor = COLORS.gaugeNeedle
   const label = levelLabel ?? (hasValue ? getPressureLabel(normalized) : '0%')
   const needleAngleDeg = 180 - (pct * 180) / 100
   const needleAngleRad = (needleAngleDeg * Math.PI) / 180
@@ -1466,7 +1466,7 @@ function PressurePointerGauge({
           >
             <PolarAngleAxis type="number" domain={[0, 100]} tick={false} />
             <RadialBar
-              background={{ fill: `${COLORS.border}aa` }}
+              background={{ fill: COLORS.gaugeTrack }}
               dataKey="value"
               cornerRadius={4}
               fill={color}

@@ -214,7 +214,7 @@ const EVENT_DOMAIN_OPTIONS = [
 ] as const
 
 const EVENT_DOMAIN_CATALOG = [
-  { label: 'Compute & accelerators', description: 'CPU, GPU/XPU and NPU performance, pressure or faults.' },
+  { label: 'Compute & accelerators', description: 'CPU, GPU and NPU performance, pressure or faults.' },
   { label: 'Memory, storage & network', description: 'Memory pressure, OOM, disk I/O, network and PCIe issues.' },
   { label: 'Services & workloads', description: 'Service lifecycle and benchmark job results.' },
   { label: 'Host system', description: 'System pressure, OS, kernel, drivers, temperature, power and device faults.' },

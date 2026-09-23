@@ -1596,6 +1596,113 @@
   }
 }
 
+:root[data-theme='light'] .diagnostics-toolbar {
+  background: var(--color-overlay);
+  border-bottom-color: var(--color-border);
+}
+
+:root[data-theme='light'] .diagnostics-workspace,
+:root[data-theme='light'] .diagnostics-overview,
+:root[data-theme='light'] .diagnostics-panel,
+:root[data-theme='light'] .diagnostics-logs,
+:root[data-theme='light'] .diagnostics-event-records,
+:root[data-theme='light'] .diagnostics-report-findings {
+  background: var(--color-panel-bg) !important;
+  border-color: var(--color-border) !important;
+}
+
+:root[data-theme='light'] .diagnostics-overview-summary-strip,
+:root[data-theme='light'] .diagnostics-report-finding-panel {
+  background: var(--color-surface-subtle);
+  border-color: var(--color-border);
+}
+
+:root[data-theme='light'] .diagnostics-code-block {
+  background: var(--color-canvas);
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+:root[data-theme='light'] .diagnostics-domain-distribution-row {
+  color: var(--color-text);
+}
+
+:root[data-theme='light'] .diagnostics-domain-distribution-row:hover,
+:root[data-theme='light'] .diagnostics-domain-distribution-row:focus-visible,
+:root[data-theme='light'] .diagnostics-domain-distribution-row[aria-pressed='true'] {
+  background: var(--color-accent-soft);
+}
+
+:root[data-theme='light'] .diagnostics-domain-distribution-track,
+:root[data-theme='light'] .diagnostics-utilization-track {
+  background: var(--color-border);
+}
+
+:root[data-theme='light'] .diagnostics-overview-summary-strip {
+  background: var(--color-surface-subtle);
+  border-color: var(--color-border);
+}
+
+:root[data-theme='light'] .diagnostics-overview-inline-action,
+:root[data-theme='light'] .diagnostics-overview-inline-scope {
+  color: var(--color-text);
+}
+
+:root[data-theme='light'] .diagnostics-overview-inline-severity-item[data-empty='true'] {
+  color: var(--color-text-muted);
+  opacity: 0.72;
+}
+
+:root[data-theme='light'] .diagnostics-overview-inline-divider {
+  background: var(--color-border-strong);
+}
+
+:root[data-theme='light'] .diagnostics-overview-inline-action:hover,
+:root[data-theme='light'] .diagnostics-overview-inline-action:focus-visible,
+:root[data-theme='light'] .diagnostics-overview-inline-action[aria-pressed='true'] {
+  background: var(--color-accent-soft);
+}
+
+:root[data-theme='light'] .diagnostics-resource-lane-toggle {
+  color: var(--color-text-muted);
+}
+
+:root[data-theme='light'] .diagnostics-resource-lane-toggle[data-active='true'] {
+  background: var(--color-accent-soft);
+  border-color: var(--color-accent);
+  color: var(--color-text);
+}
+
+:root[data-theme='light'] .diagnostics-time-range-segmented .ant-segmented-item-label,
+:root[data-theme='light'] .diagnostics-alert-filter .ant-segmented-item-label {
+  color: var(--color-text-muted) !important;
+}
+
+:root[data-theme='light'] .diagnostics-time-range-segmented .ant-segmented-item-selected .ant-segmented-item-label,
+:root[data-theme='light'] .diagnostics-alert-filter .ant-segmented-item-selected .ant-segmented-item-label {
+  color: #ffffff !important;
+}
+
+:root[data-theme='light'] .diagnostics-overview-section,
+:root[data-theme='light'] .diagnostics-filter-chip,
+:root[data-theme='light'] .diagnostics-event-tooltip {
+  background: var(--color-panel-bg);
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+:root[data-theme='light'] .diagnostics-filter-chip:hover,
+:root[data-theme='light'] .diagnostics-filter-chip:focus-visible,
+:root[data-theme='light'] .diagnostics-filter-chip[aria-pressed='true'],
+:root[data-theme='light'] .diagnostics-filter-chip--static:hover {
+  background: var(--color-accent-soft);
+  border-color: var(--color-accent);
+}
+
+:root[data-theme='light'] .diagnostics-domain-ranking strong {
+  color: var(--color-text);
+}
+
 .diagnostics-report-donut,
 .diagnostics-report-domain-chart {
   height: 130px;

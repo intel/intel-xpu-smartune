@@ -1,7 +1,9 @@
 import React, { useState, useCallback, useEffect } from 'react'
-import { Tabs, Layout, Typography, Space, Alert, Badge, Button, Dropdown, Empty, Tag, notification, Tooltip } from 'antd'
+import { Tabs, Layout, Typography, Space, Alert, Badge, Button, Dropdown, Empty, Tag, notification, Tooltip, Menu, Avatar } from 'antd'
+import type { MenuProps } from 'antd'
 import {
   DashboardOutlined,
+  HomeOutlined,
   AlertOutlined,
   BellOutlined,
   AppstoreOutlined,
@@ -14,6 +16,13 @@ import {
   ExperimentOutlined,
   MoonOutlined,
   SunOutlined,
+  MenuFoldOutlined,
+  MenuUnfoldOutlined,
+  MonitorOutlined,
+  SlidersOutlined,
+  FundOutlined,
+  UserOutlined,
+  DownOutlined,
 } from '@ant-design/icons'
 import SettingsModal from './components/SettingsModal'
 import SystemOverview from './components/SystemOverview'
@@ -33,9 +42,20 @@ import { useUiLease } from './hooks/useUiLease'
 import { useBenchEvent, useBenchStream } from './hooks/useBenchEvents'
 import type { DiagAlert } from './api/types'
 
-const { Header, Content } = Layout
+const { Header, Content, Sider } = Layout
 
-const BENCHMARK_TAB = '7'
+const BENCHMARK_TAB = 'models'
+
+function HealthDiagnosticsIcon() {
+  return (
+    <span className="health-diagnostics-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M20.5 8.7c0 5.7-8.5 11.1-8.5 11.1S3.5 14.4 3.5 8.7A4.6 4.6 0 0 1 12 6.2a4.6 4.6 0 0 1 8.5 2.5Z" />
+        <path d="M5.5 12h3l1.4-2.4 2.1 5 1.8-3h4" />
+      </svg>
+    </span>
+  )
+}
 
 type HistoryRangeIntent = {
   from: number
@@ -79,7 +99,10 @@ interface AppProps {
 }
 
 export default function App({ colorMode, onColorModeChange }: AppProps) {
-  const [activeTab, setActiveTab] = useState('1')
+  const [activeTab, setActiveTab] = useState('overview')
+  const [workloadView, setWorkloadView] = useState('resources')
+  const [settingsSection, setSettingsSection] = useState<string | null>(null)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [historyRangeIntent, setHistoryRangeIntent] = useState<HistoryRangeIntent | null>(null)
   // 1 = balancer + monitor, 0 = monitor only. Default to enabled so older
   // servers without the /smartune/capabilities endpoint keep full behaviour.
@@ -94,7 +117,6 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   // Gate the whole app behind a valid access token. A stored token is assumed
   // valid until the server rejects a request with 401 (handled below).
   const [authed, setAuthed] = useState(() => !!getToken())
-  const [settingsOpen, setSettingsOpen] = useState(false)
   const [activeAlertCount, setActiveAlertCount] = useState(0)
   const [activeAlerts, setActiveAlerts] = useState<DiagAlert[]>([])
   const [diagnosticsOpenAlertsSignal, setDiagnosticsOpenAlertsSignal] = useState(0)
@@ -273,15 +295,12 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
     </div>
   )
 
-  // Publish the combined height of the sticky header + sticky tab bar as a CSS
-  // variable so per-page sticky toolbars can pin themselves *below* the tab bar
-  // instead of colliding with it (both would otherwise stick at top:64 and the
-  // toolbar, having a lower z-index, would hide behind the tabs).
+  // Publish the sticky application header height so page-level toolbars can
+  // stay below it in the content workspace.
   useEffect(() => {
     const measure = () => {
       const header = document.querySelector('.ant-layout-header') as HTMLElement | null
-      const nav = document.querySelector('.ant-tabs-nav') as HTMLElement | null
-      const offset = (header?.offsetHeight ?? 64) + (nav?.offsetHeight ?? 0)
+      const offset = header?.offsetHeight ?? 64
       document.documentElement.style.setProperty('--app-sticky-top', `${offset}px`)
     }
     measure()
@@ -291,59 +310,57 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
 
   const tabs = [
     {
-      key: '1',
-      label: (
-        <Space>
-          <DashboardOutlined />
-          System Overview
-        </Space>
-      ),
-      children: <SystemOverview active={activeTab === '1'} />,
+      key: 'overview',
+      label: 'Home',
+      children: <SystemOverview active={activeTab === 'overview'} />,
     },
     {
-      key: '2',
-      label: (
-        <Space>
-          <AppstoreOutlined />
-          App Resources
-        </Space>
-      ),
+      key: 'workloads',
+      label: 'Applications',
       children: (
-        <AppResources
-          active={activeTab === '2'}
-          balancerEnabled={balancerEnabled}
-          onRegister={
-            balancerEnabled
-              ? (name) => {
-                  setRegisterKeyword(name)
-                  setActiveTab('5')
-                }
-              : undefined
-          }
-        />
-      ),
-    },
-    {
-      key: '3',
-      label: (
-        <Space>
-          <NodeIndexOutlined />
-          Processes
-        </Space>
-      ),
-      children: (
-        <Processes
-          active={activeTab === '3'}
-          balancerEnabled={balancerEnabled}
-          onRegister={
-            balancerEnabled
-              ? (name) => {
-                  setRegisterKeyword(name)
-                  setActiveTab('5')
-                }
-              : undefined
-          }
-        />
+        <div className="workload-page">
+          <div className="workspace-page-heading">
+            <div>
+              <Typography.Title level={3}>Applications</Typography.Title>
+              <Typography.Text type="secondary">Review application resource use and manage active processes.</Typography.Text>
+            </div>
+          </div>
+          <Tabs
+            className="workload-tabs"
+            activeKey={workloadView}
+            onChange={setWorkloadView}
+            items={[
+              {
+                key: 'resources',
+                label: 'Resource consumers',
+                children: (
+                  <AppResources
+                    active={activeTab === 'workloads' && workloadView === 'resources'}
+                    balancerEnabled={balancerEnabled}
+                    onRegister={balancerEnabled ? (name) => {
+                      setRegisterKeyword(name)
+                      setActiveTab('optimizer')
+                    } : undefined}
+                  />
+                ),
+              },
+              {
+                key: 'processes',
+                label: 'Processes',
+                children: (
+                  <Processes
+                    active={activeTab === 'workloads' && workloadView === 'processes'}
+                    balancerEnabled={balancerEnabled}
+                    onRegister={balancerEnabled ? (name) => {
+                      setRegisterKeyword(name)
+                      setActiveTab('optimizer')
+                    } : undefined}
+                  />
+                ),
+              },
+            ]}
+          />
+        </div>
       ),
     },
     ...(diagnosticsEnabled
@@ -362,7 +379,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
                 openAlertsSignal={diagnosticsOpenAlertsSignal}
                 onOpenHistory={(range) => {
                   setHistoryRangeIntent(range)
-                  setActiveTab('4')
+                  setActiveTab('history')
                 }}
               />
             ),
@@ -370,7 +387,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
         ]
       : []),
     {
-      key: '4',
+      key: 'history',
       label: (
         <Space>
           <LineChartOutlined />
@@ -379,7 +396,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
       ),
       children: (
         <HistoryDashboard
-          active={activeTab === '4'}
+          active={activeTab === 'history'}
           historyRangeIntent={historyRangeIntent}
           onHistoryRangeIntentConsumed={() => setHistoryRangeIntent(null)}
         />
@@ -390,7 +407,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
     ...(balancerEnabled
       ? [
           {
-            key: '5',
+            key: 'optimizer',
             label: (
               <Space>
                 <ControlOutlined />
@@ -399,7 +416,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
             ),
             children: (
               <Balance
-                active={activeTab === '5'}
+                active={activeTab === 'optimizer'}
                 balancerEnabled={balancerEnabled}
                 registerKeyword={registerKeyword}
                 onRegisterConsumed={() => setRegisterKeyword(null)}
@@ -429,23 +446,56 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
             // balancer to block a run), so the prop is left off.
             children: (
               <Benchmark
-                onOpenBalance={balancerEnabled ? () => setActiveTab('5') : undefined}
+                onOpenBalance={balancerEnabled ? () => setActiveTab('optimizer') : undefined}
               />
             ),
           },
         ]
       : []),
     {
-      key: '6',
+      key: 'about',
       label: (
         <Space>
           <InfoCircleOutlined />
           About
         </Space>
       ),
-      children: <About active={activeTab === '6'} />,
+      children: <About active={activeTab === 'about'} />,
+    },
+    {
+      key: 'settings',
+      label: 'Settings',
+      children: (
+        <SettingsModal
+          active={activeTab === 'settings'}
+          balancerEnabled={balancerEnabled}
+          onActiveTabChange={setSettingsSection}
+        />
+      ),
     },
   ]
+
+  const navigationItems: MenuProps['items'] = [
+    { key: 'overview', icon: <HomeOutlined />, label: 'Home' },
+    { key: 'workloads', icon: <AppstoreOutlined />, label: 'Applications' },
+    { key: 'history', icon: <LineChartOutlined />, label: 'History' },
+    ...(balancerEnabled ? [{ key: 'optimizer', icon: <SlidersOutlined />, label: 'Control center' }] : []),
+    ...(benchmarkEnabled ? [{ key: BENCHMARK_TAB, icon: <ExperimentOutlined />, label: 'Models' }] : []),
+    ...(diagnosticsEnabled ? [{ key: 'diagnostics', icon: <HealthDiagnosticsIcon />, label: 'System diagnostics' }] : []),
+    { key: 'settings', icon: <SettingOutlined />, label: 'Settings' },
+    { key: 'about', icon: <InfoCircleOutlined />, label: 'About' },
+  ]
+
+  const pageTitles: Record<string, string> = {
+    overview: 'Home',
+    workloads: 'Applications',
+    diagnostics: 'System diagnostics',
+    history: 'History',
+    optimizer: 'Control center',
+    [BENCHMARK_TAB]: 'Models',
+    about: 'About',
+    settings: 'Settings',
+  }
 
   // Validating a URL-hash bootstrap token — hold off rendering the gate.
   if (booting) {
@@ -459,25 +509,29 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   return (
     <GlobalConfigNoticesProvider>
       {notifyHolder}
-      <Layout style={{ minHeight: '100vh', background: COLORS.bg }}>
-        <Header
+      <Layout className="app-shell" style={{ minHeight: '100vh', background: COLORS.bg }}>
+        <Sider
+          className="app-sidebar"
+          width={264}
+          collapsedWidth={64}
+          collapsible
+          collapsed={sidebarCollapsed}
+          trigger={null}
+          onCollapse={setSidebarCollapsed}
+          theme={colorMode}
           style={{
-            background: COLORS.headerBg,
-            borderBottom: `1px solid ${COLORS.border}`,
-            padding: '0 24px',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 16,
-            position: 'sticky',
+            background: COLORS.panelBg,
+            borderRight: `1px solid ${COLORS.border}`,
             top: 0,
-            zIndex: 100,
+            height: '100vh',
+            overflow: 'auto',
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div className="app-sidebar__brand">
             <div
               style={{
-                width: 32,
-                height: 32,
+                width: 28,
+                height: 28,
                 background: `linear-gradient(135deg, ${COLORS.accent} 0%, #3a6fd8 100%)`,
                 borderRadius: 6,
                 display: 'flex',
@@ -485,7 +539,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
                 justifyContent: 'center',
               }}
             >
-              <DashboardOutlined style={{ color: '#fff', fontSize: 16 }} />
+              <DashboardOutlined style={{ color: '#fff', fontSize: 14 }} />
             </div>
             <Typography.Title
               level={4}
@@ -494,7 +548,48 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
               Intel XPU SmarTune
             </Typography.Title>
           </div>
-          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Menu
+            mode="inline"
+            selectedKeys={[activeTab]}
+            items={navigationItems}
+            onClick={({ key }) => {
+              setActiveTab(key)
+            }}
+          />
+        </Sider>
+        <Layout className="app-main" style={{ background: COLORS.bg }}>
+          <Header
+            className="app-header"
+            style={{
+              background: COLORS.headerBg,
+              borderBottom: `1px solid ${COLORS.border}`,
+              position: 'sticky',
+              top: 0,
+              zIndex: 100,
+            }}
+          >
+            <div className="app-header__breadcrumb">
+              <Tooltip title={sidebarCollapsed ? 'Expand navigation' : 'Collapse navigation'}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={sidebarCollapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+                  aria-label={sidebarCollapsed ? 'Expand navigation' : 'Collapse navigation'}
+                  onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+                />
+              </Tooltip>
+              <DashboardOutlined />
+              <Typography.Text>Intel XPU SmarTune</Typography.Text>
+              <span>/</span>
+              <Typography.Text strong>{pageTitles[activeTab] ?? 'Home'}</Typography.Text>
+              {activeTab === 'settings' && settingsSection ? (
+                <>
+                  <span>/</span>
+                  <Typography.Text strong>{settingsSection}</Typography.Text>
+                </>
+              ) : null}
+            </div>
+            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
             <Tooltip title={colorMode === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}>
               <Button
                 type="text"
@@ -511,62 +606,52 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
                 dropdownRender={() => alertCenter}
                 overlayStyle={{ paddingTop: 6 }}
               >
-                <Button type="text" size="small" style={{ color: COLORS.textMuted }}>
-                  <Space size={6}>
-                    <Badge count={activeAlertCount} size="small" offset={[2, -1]}>
-                      <BellOutlined style={{ color: COLORS.textMuted }} />
-                    </Badge>
-                    Alerts
-                  </Space>
+                <Button
+                  type="text"
+                  size="small"
+                  aria-label="Open alerts"
+                  style={{ color: COLORS.textMuted }}
+                >
+                  <Badge count={activeAlertCount} size="small" offset={[2, -1]}>
+                    <BellOutlined style={{ color: COLORS.textMuted }} />
+                  </Badge>
                 </Button>
               </Dropdown>
             ) : null}
-            <Button
-              type="text"
-              size="small"
-              icon={<SettingOutlined />}
-              onClick={() => setSettingsOpen(true)}
-              style={{ color: COLORS.textMuted }}
+            <Dropdown
+              trigger={['click']}
+              menu={{
+                items: [
+                  {
+                    key: 'sign-out',
+                    icon: <LogoutOutlined />,
+                    label: 'Sign out',
+                    onClick: handleLogout,
+                  },
+                ],
+              }}
             >
-              Settings
-            </Button>
-            <Button
-              type="text"
-              size="small"
-              icon={<LogoutOutlined />}
-              onClick={handleLogout}
-              style={{ color: COLORS.textMuted }}
-            >
-              Sign out
-            </Button>
-          </div>
-        </Header>
+              <Button type="text" size="small" className="app-account-button" aria-label="Open account menu">
+                <Avatar size="small" icon={<UserOutlined />} />
+                <DownOutlined />
+              </Button>
+            </Dropdown>
+            </div>
+          </Header>
 
-        <Content style={{ padding: '0 16px 16px', background: COLORS.bg }}>
-          <GlobalConfigNoticeBar />
-          <Tabs
-            className="app-navigation-tabs"
-            activeKey={activeTab}
-            onChange={setActiveTab}
-            items={tabs}
-            size="large"
-            style={{ color: COLORS.text }}
-            tabBarStyle={{
-              marginBottom: 0,
-              paddingTop: 8,
-              background: colorMode === 'light' ? COLORS.tabAccent : COLORS.bg,
-              borderBottom: `1px solid ${colorMode === 'light' ? COLORS.tabAccent : COLORS.border}`,
-              position: 'sticky',
-              top: 64,
-              zIndex: 99,
-            }}
-          />
-        </Content>
-        <SettingsModal
-          visible={settingsOpen}
-          onClose={() => setSettingsOpen(false)}
-          balancerEnabled={balancerEnabled}
-        />
+          <Content className="app-workspace" style={{ background: COLORS.bg }}>
+            <GlobalConfigNoticeBar />
+            <div className="app-content-area">
+              <Tabs
+                className="app-content-tabs"
+                activeKey={activeTab}
+                onChange={setActiveTab}
+                items={tabs}
+                renderTabBar={() => <div />}
+              />
+            </div>
+          </Content>
+        </Layout>
       </Layout>
     </GlobalConfigNoticesProvider>
   )

@@ -108,11 +108,11 @@ interface DiagnosticRulesConfig {
 }
 
 interface Props {
-  visible: boolean
-  onClose: () => void
+  active: boolean
   // In monitor-only deployments (started with `-m`) the balancer is not running,
   // so control settings tabs are hidden — only Monitor applies.
   balancerEnabled: boolean
+  onActiveTabChange?: (title: string) => void
 }
 
 const SECTION_LABELS: Record<string, string> = {
@@ -2011,7 +2011,7 @@ function UnsavedDot() {
   )
 }
 
-export default function SettingsModal({ visible, onClose, balancerEnabled }: Props) {
+export default function SettingsModal({ active: _active, balancerEnabled, onActiveTabChange }: Props) {
   const tabs = SETTINGS_TABS.filter((tab) => balancerEnabled || !tab.balancerOnly)
   const firstTabKey = tabs[0].key
   // Cards register here while mounted. Panes stay mounted once visited, so this
@@ -2021,6 +2021,11 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
   const [saving, setSaving] = useState(false)
   const [activeTab, setActiveTab] = useState(firstTabKey)
   const [dirtyTabs, setDirtyTabs] = useState<string[]>([])
+
+  useEffect(() => {
+    const title = tabs.find((tab) => tab.key === activeTab)?.title
+    if (title) onActiveTabChange?.(title)
+  }, [activeTab, onActiveTabChange, tabs])
 
   const refreshDirty = useCallback(() => {
     const next = [...new Set(
@@ -2045,18 +2050,9 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
     notifyDirty: refreshDirty,
   }), [refreshDirty])
 
-  // Reopening starts from the first tab with no stale markers: the panes were
-  // destroyed on close (destroyOnClose), so their handles are gone too.
-  useEffect(() => {
-    if (!visible) return
-    setActiveTab(firstTabKey)
-    setDirtyTabs([])
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible])
-
   const dirtyHandles = () => [...handles.current.values()].filter(({ handle }) => handle.isDirty?.() ?? true)
 
-  const runSave = async (pending: Array<{ tabKey: string; handle: SaveHandle }>, closeOnSuccess: boolean) => {
+  const runSave = async (pending: Array<{ tabKey: string; handle: SaveHandle }>) => {
     setSaving(true)
     try {
       // Validate everything first: a half-written save (one card written, the
@@ -2072,7 +2068,6 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
       // dialog. Either way the dialog stays open so the user can act on it.
       if (outcomes.every((outcome) => outcome === 'ok')) {
         message.success('Settings saved')
-        if (closeOnSuccess) onClose()
       }
     } finally {
       setSaving(false)
@@ -2089,39 +2084,19 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
       message.info('No unsaved changes on this page')
       return
     }
-    void runSave(pending, false)
+    void runSave(pending)
   }
 
   const saveAll = () => {
     const pending = dirtyHandles()
     if (pending.length === 0) {
-      onClose()
+      message.info('No unsaved changes')
       return
     }
-    void runSave(pending, true)
+    void runSave(pending)
   }
 
   const titleFor = (key: string) => tabs.find((tab) => tab.key === key)?.title ?? key
-
-  const requestClose = () => {
-    if (dirtyTabs.length === 0) {
-      onClose()
-      return
-    }
-    Modal.confirm({
-      title: 'Discard unsaved changes?',
-      content: (
-        <p>
-          Unsaved changes on: <b>{dirtyTabs.map(titleFor).join(', ')}</b>. Closing now throws
-          them away — use <b>Save all</b> to write every page first.
-        </p>
-      ),
-      okText: 'Discard and close',
-      okButtonProps: { danger: true },
-      cancelText: 'Keep editing',
-      onOk: onClose,
-    })
-  }
 
   // Only the second group onwards gets a gap above it; the first sits right under the header.
   const firstGroupKey = tabs.find((tab) => tab.group)?.key
@@ -2152,25 +2127,12 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
   ])
 
   return (
-    <Modal
-      title={
+    <div className="settings-page">
+      <div className="settings-page__header">
         <Space>
           <SettingOutlined style={{ color: COLORS.accent }} />
           <span>Settings</span>
         </Space>
-      }
-      open={visible}
-      onCancel={requestClose}
-      destroyOnClose
-      // Two save buttons rather than one, because a per-section dialog makes the
-      // two intents different: commit every page that was touched and leave (the
-      // wider action, so it leads), or commit the page in view and carry on.
-      // Primary is given to whichever is currently actionable rather than fixed to
-      // one of them, so the blue button always marks a save that would do something.
-      // The tooltips sit on a span because a disabled antd button swallows mouse
-      // events, and Space keeps the gaps that the footer's default button-sibling
-      // margin would otherwise lose.
-      footer={
         <Space>
           <Tooltip
             title={dirtyTabs.length === 0
@@ -2202,15 +2164,8 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
               </Button>
             </span>
           </Tooltip>
-          <Button onClick={requestClose} disabled={saving}>
-            Close
-          </Button>
         </Space>
-      }
-      width={1140}
-      // The default header margin leaves the title almost touching the first tab label.
-      styles={{ header: { marginBottom: 20 }, body: { maxHeight: '72vh', overflowY: 'auto' } }}
-    >
+      </div>
       <SettingsSaveContext.Provider value={registry}>
         {/* No destroyOnHidden: a visited pane stays mounted, so switching tabs keeps
             both the edits and the save handle of the page left behind. Panes are still
@@ -2223,9 +2178,10 @@ export default function SettingsModal({ visible, onClose, balancerEnabled }: Pro
             setActiveTab(key)
             refreshDirty()
           }}
+          className="settings-page__tabs"
           style={{ minHeight: 440 }}
         />
       </SettingsSaveContext.Provider>
-    </Modal>
+    </div>
   )
 }

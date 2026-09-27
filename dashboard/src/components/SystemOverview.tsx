@@ -2483,7 +2483,7 @@ function GpuDeviceCard({
   )
 }
 
-export default function SystemOverview({ active }: Props) {
+function SystemOverview({ active }: Props) {
   // Poll at the fast cadence only when this tab is selected AND the page is
   // actually visible; a backgrounded tab or minimized window drops to the
   // slower inactive cadence (browsers can't detect occlusion by another window,
@@ -3265,11 +3265,6 @@ export default function SystemOverview({ active }: Props) {
       <div className="perf-ambient perf-ambient--teal" />
 
       <div className="perf-header perf-header--sticky">
-        <div>
-          <Title level={3} style={{ color: COLORS.text, margin: 0 }}>
-            Performance
-          </Title>
-        </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <Space size={6}>
             <span style={REFRESH_INDICATOR_STYLE}>
@@ -3946,3 +3941,5 @@ export default function SystemOverview({ active }: Props) {
     </div>
   )
 }
+
+export default React.memo(SystemOverview)

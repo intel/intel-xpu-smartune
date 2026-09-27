@@ -76,6 +76,282 @@ body {
   color: var(--color-text);
 }
 
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  height: 64px;
+  padding: 0 24px;
+  line-height: normal;
+}
+
+.app-header__breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+
+.app-main {
+  min-width: 0;
+}
+
+.app-workspace {
+  min-height: calc(100vh - 64px);
+  padding: 0 24px 24px;
+}
+
+.app-sidebar {
+  align-self: flex-start;
+  padding: 0 12px 20px;
+  position: sticky !important;
+  z-index: 101;
+}
+
+.app-sidebar__brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 64px;
+  margin: 0 -12px 16px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.app-sidebar__brand .ant-typography {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text) !important;
+  font-size: 16px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-sidebar.ant-layout-sider-collapsed .app-sidebar__brand {
+  justify-content: center;
+  padding: 0;
+}
+
+.app-sidebar.ant-layout-sider-collapsed .app-sidebar__brand .ant-typography {
+  display: none;
+}
+
+.app-header__breadcrumb .ant-btn {
+  color: var(--color-text-muted);
+}
+
+.app-account-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-text) !important;
+}
+
+.app-account-button .ant-avatar {
+  background: var(--color-accent-soft);
+  color: var(--color-tab-accent);
+}
+
+.app-account-button .anticon:last-child {
+  color: var(--color-text-muted);
+  font-size: 10px;
+}
+
+.app-sidebar .ant-menu {
+  border-inline-end: 0;
+  background: transparent;
+  color: var(--color-text-muted);
+}
+
+.app-sidebar .ant-menu-item-group-title {
+  padding: 14px 12px 6px;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.app-sidebar .ant-menu-item {
+  width: 100%;
+  height: 40px;
+  margin: 2px 0;
+  border-radius: 4px;
+  line-height: 40px;
+}
+
+.health-diagnostics-icon {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  margin-inline-end: 10px;
+  vertical-align: -0.125em;
+}
+
+.health-diagnostics-icon svg {
+  width: 100%;
+  height: 100%;
+  stroke-width: 1.8;
+}
+
+.app-sidebar.ant-layout-sider-collapsed .health-diagnostics-icon {
+  margin-inline-end: 0;
+}
+
+
+.app-sidebar .ant-menu-item:hover {
+  background: var(--color-row-alt);
+  color: var(--color-tab-accent);
+}
+
+.app-sidebar .ant-menu-item-selected {
+  background: var(--color-accent-soft);
+  color: var(--color-tab-accent);
+  font-weight: 600;
+}
+
+.app-content-area {
+  min-width: 0;
+  padding-top: 20px;
+}
+
+.app-content-tabs > .ant-tabs-nav {
+  display: none;
+}
+
+.workspace-page-heading {
+  margin-bottom: 16px;
+}
+
+.workspace-page-heading .ant-typography {
+  margin: 0;
+}
+
+.workspace-page-eyebrow {
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+}
+
+.workload-tabs > .ant-tabs-nav {
+  width: fit-content;
+  margin-bottom: 16px;
+  padding: 4px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-header-bg);
+}
+
+.workload-tabs > .ant-tabs-nav::before {
+  border-bottom: 0;
+}
+
+.workload-tabs > .ant-tabs-nav .ant-tabs-nav-list {
+  gap: 2px;
+}
+
+.workload-tabs > .ant-tabs-nav .ant-tabs-tab {
+  margin: 0;
+  padding: 7px 12px;
+  border-radius: 3px;
+  color: var(--color-text-muted);
+}
+
+.workload-tabs > .ant-tabs-nav .ant-tabs-tab-active {
+  background: var(--color-accent-soft);
+}
+
+.workload-tabs > .ant-tabs-nav .ant-tabs-tab-active .ant-tabs-tab-btn {
+  color: var(--color-tab-accent);
+  font-weight: 600;
+}
+
+.workload-tabs > .ant-tabs-nav .ant-tabs-ink-bar {
+  display: none;
+}
+
+.settings-page {
+  max-width: 1240px;
+  padding: 4px 0 32px;
+}
+
+.settings-page__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 48px;
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text);
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.settings-page__tabs > .ant-tabs-content-holder {
+  min-width: 0;
+  padding: 0 0 0 24px;
+}
+
+@media (max-width: 768px) {
+  .app-header {
+    padding: 0 12px;
+  }
+
+  .app-header .ant-typography {
+    font-size: 16px;
+  }
+
+  .app-workspace {
+    padding: 0 12px 12px;
+  }
+
+  .app-shell {
+    display: block;
+  }
+
+  .app-sidebar {
+    width: 100% !important;
+    height: auto !important;
+    padding: 8px 0;
+    position: static !important;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .app-sidebar__brand {
+    display: none;
+  }
+
+  .app-sidebar .ant-menu-item-group-title {
+    display: none;
+  }
+
+  .app-sidebar .ant-menu {
+    display: flex;
+    min-width: max-content;
+  }
+
+  .app-sidebar .ant-menu-item-group,
+  .app-sidebar .ant-menu-item-group-list {
+    display: flex;
+    margin: 0;
+  }
+
+  .app-sidebar .ant-menu-item {
+    width: auto;
+    margin: 0 2px;
+    padding: 0 10px;
+    white-space: nowrap;
+  }
+
+  .app-content-area {
+    padding: 12px 0 0;
+  }
+}
+
 /* Recharts Brush dark theme */
 .recharts-brush-slide {
   fill: var(--color-accent-soft);

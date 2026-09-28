@@ -31,6 +31,7 @@ import queue
 import heapq
 from controller.network import NetworkController
 from controller.io import IOController
+from controller.swap import MEM_RISE_TRIGGER
 from monitor.disk_pressure import media_for_disk
 
 
@@ -83,6 +84,44 @@ def _emit_control_events(action: str, parts: dict, *, app_id: str, app_name: str
         action, app_id=app_id, app_name=app_name, protection_id=protection_id,
         resources=_control_resources(parts, resource_parts), facts=attributes,
     )
+
+
+_MB = 1024 * 1024
+
+# Ceiling on the EAGAIN backoff.  EAGAIN means swap is full, which is a
+# condition L0 fixes or nobody does; doubling without a cap would leave an app
+# un-reclaimable for hours after the headroom came back.
+_RECLAIM_MAX_BACKOFF = 600.0
+
+# Minimum spacing between swap-growth attempts.  Growth is cheap but not free,
+# and a volume that keeps refusing must not get an mkswap attempt every tick.
+_SWAP_GROWTH_INTERVAL = 60.0
+# ...except under critical pressure, where the same limiter was measured
+# cancelling the thing it sits next to.  The monitor loop bypasses
+# idle_check_interval on the critical rising edge so critical is served within a
+# second; on the stress run that bypassed tick then found only 50.2 s had
+# passed and returned without evaluating, and the OOM kill landed 29 s later.
+# The 60 s above is a guard against retrying a *refusal* (a full volume, an
+# unsupported filesystem) every tick -- it was never meant to decide how long a
+# machine in trouble waits for its next look at the watermarks.
+_SWAP_GROWTH_URGENT_INTERVAL = 10.0
+
+
+def _emit_reclaim_event(event_type: str, severity: str, summary: str,
+                        entry: "LimitedApp", attributes: dict) -> None:
+    """Report one L2 outcome to diagnostics.  Best-effort, never raises."""
+    try:
+        from diagnostics import emit_event
+    except Exception:  # pragma: no cover - diagnostics absent
+        return
+    try:
+        emit_event(event_type, severity=severity, category="resource.memory",
+                   summary=summary, source="balancer",
+                   app_id=entry.public_app_id, resource_type="memory",
+                   protection_id=entry.protection_id,
+                   attributes=dict(attributes, priority=entry.priority))
+    except Exception as exc:  # pragma: no cover - diagnostics is not load-bearing
+        logger.debug("Failed to emit %s: %s", event_type, exc)
 
 
 def _emit_auto_handoff_recovery(entry: "LimitedApp") -> None:
@@ -174,6 +213,15 @@ class LimitedApp:
     limited_at: float = 0.0                   # epoch seconds when the limit was applied
     protection_id: str = ""                   # stable control-event lifecycle identity
     adopted_from_auto: bool = False           # retain the auto-limit cgroup scope in Manual Control
+    # --- L2 (memory.reclaim) state.  No restore path reads these: reclaim is a
+    # one-shot move of pages to swap, and the app faults back whatever it still
+    # needs, so there is nothing to undo when the limit is lifted.
+    last_reclaim_at: float = 0.0              # epoch seconds, for the cooldown
+    reclaim_backoff: float = 0.0              # extra seconds on top of the cooldown,
+                                              # doubled on each EAGAIN (swap exhausted)
+    last_cpu_usec: Optional[int] = None       # previous cpu.stat sample, for the idle gate
+    last_cpu_sample_at: float = 0.0           # when that sample was taken
+    reclaim_inflight: bool = False            # a chunked reclaim is on the executor
 
 
 class LimitRegistry:
@@ -390,6 +438,7 @@ class _MonitorLoopState:
     critical_since: Optional[float] = None        # timestamp critical was first entered (sustained-recheck timer)
     last_sustained_recheck_time: float = 0.0      # last time a sustained-critical background recheck fired
     prev_pressure: Optional[str] = None
+    prev_pre_oom: bool = False                    # memory pre-OOM band on the previous iteration (rising-edge detection)
     prev_passive_enabled: Optional[bool] = None   # passive switch on the previous iteration (falling-edge -> lock-to-manual)
     # Disk-IO top-consumer prefetch state (separated policy only), mirroring the
     # pressure fields above but tracked independently so the two channels never
@@ -512,6 +561,44 @@ class TopConsumerPrefetcher:
         self._cache = {"apps": [], "reach_threshold": False, "fetched_at": 0.0}
         self._lock = threading.Lock()
         self._inflight = threading.Event()
+        # Cost accounting -- see _record_cost.  Guarded by _lock.
+        self._cost = {"runs": 0, "wall": 0.0, "cpu": 0.0, "sync_runs": 0,
+                      "sync_wall": 0.0, "first_at": 0.0}
+
+    def _record_cost(self, reason: str, wall: float, cpu: float,
+                     synchronous: bool = False) -> None:
+        """Log what one fetch cost, and the duty cycle so far.
+
+        Wall time and CPU time are reported separately on purpose.  A fetch is
+        ``_get_top_processes(samples=3, interval=1.0)``, so at least three of
+        its seconds are pure sleep, and sleep is not a reason to avoid running
+        it more often.  The question "can this refresh continuously?" is
+        answered by the CPU column and the duty cycle, not by ``took=``.
+
+        Logged at INFO: the ``took=10.51s`` line that explained the whole
+        critical-to-limit delay was at DEBUG, so nobody saw it.
+        """
+        now = time.time()
+        with self._lock:
+            if not self._cost["first_at"]:
+                self._cost["first_at"] = now - wall
+            self._cost["runs"] += 1
+            self._cost["wall"] += wall
+            self._cost["cpu"] += cpu
+            if synchronous:
+                self._cost["sync_runs"] += 1
+                self._cost["sync_wall"] += wall
+            cost = dict(self._cost)
+
+        elapsed = max(1e-6, now - cost["first_at"])
+        logger.info(
+            f"Top-consumer fetch cost ({reason}): wall={wall:.2f}s cpu={cpu:.3f}s "
+            f"({100.0 * cpu / max(wall, 1e-6):.1f}% busy, rest is the sampling sleep) | "
+            f"{cost['runs']} run(s) in {elapsed:.0f}s: wall={cost['wall']:.1f}s "
+            f"cpu={cost['cpu']:.2f}s, cpu duty={100.0 * cost['cpu'] / elapsed:.2f}%, "
+            f"wall duty={100.0 * cost['wall'] / elapsed:.1f}% | "
+            f"blocking={cost['sync_runs']} run(s), {cost['sync_wall']:.1f}s"
+        )
 
     def start(self, reason: str) -> None:
         """Kick off a background prefetch. No-op when one is already in
@@ -534,6 +621,9 @@ class TopConsumerPrefetcher:
         logger.debug(f"Top-consumer prefetch started ({reason})")
 
         def _worker():
+            # thread_time is this thread's own CPU, so the sampling sleeps and
+            # the other threads' work are both excluded -- which is the point.
+            cpu0 = time.thread_time()
             try:
                 apps, threshold = self._fetch()
                 with self._lock:
@@ -544,6 +634,8 @@ class TopConsumerPrefetcher:
                     f"Top-consumer prefetch completed ({reason}): apps={len(apps)}, "
                     f"reach_threshold={threshold}, took={time.time() - t0:.2f}s"
                 )
+                self._record_cost(reason, time.time() - t0,
+                                  time.thread_time() - cpu0)
             except Exception as e:
                 logger.warning(f"Top-consumer prefetch failed ({reason}): {e}")
             finally:
@@ -580,8 +672,14 @@ class TopConsumerPrefetcher:
         with self._lock:
             apps = list(self._cache["apps"])
             threshold = bool(self._cache["reach_threshold"])
-            age = time.time() - self._cache["fetched_at"]
-        if apps:
+            fetched_at = self._cache["fetched_at"]
+            age = time.time() - fetched_at
+        # Validity is "has a fetch ever completed", not "did it find anything".
+        # An idle machine legitimately has no app above the threshold, and
+        # testing the list meant that answer was indistinguishable from a cold
+        # start -- so every critical event on such a machine paid the full
+        # synchronous sampling cost, over and over, to be told [] again.
+        if fetched_at:
             if age > self.MAX_CACHE_AGE:
                 logger.info(
                     f"Critical resolve: cached top is stale (age={age:.1f}s > "
@@ -594,16 +692,32 @@ class TopConsumerPrefetcher:
 
         if self._inflight.is_set():
             logger.debug(f"Critical resolve: waiting up to {self.CRITICAL_WAIT}s for in-flight prefetch")
+            waited = time.time()
             self._inflight.wait(self.CRITICAL_WAIT)
+            waited = time.time() - waited
             with self._lock:
                 apps = list(self._cache["apps"])
                 threshold = bool(self._cache["reach_threshold"])
-            if apps:
-                logger.debug(f"Critical resolve: got cache after wait (apps={len(apps)})")
+                fetched_at = self._cache["fetched_at"]
+            # Same reasoning as above: the prefetch having finished is what
+            # matters, not whether it found anyone. Re-running it synchronously
+            # to get the same empty list back costs seconds and buys nothing.
+            if fetched_at:
+                logger.info(f"Critical resolve: got cache after waiting {waited:.2f}s "
+                            f"(apps={len(apps)})")
                 return apps, threshold
+            logger.info(f"Critical resolve: waited {waited:.2f}s and the prefetch "
+                        f"is still running; falling through to a blocking fetch")
 
-        logger.debug("Critical resolve: cache empty, falling back to synchronous fetch")
-        return self._fetch()
+        # The blocking branch: every second spent here is a second the limit is
+        # not applied.  Measured 10.51 s on the stress run, which is where the
+        # 10.3 s critical-to-limit gap came from -- so it is logged loudly.
+        logger.info("Critical resolve: cache empty, falling back to synchronous fetch")
+        t0, cpu0 = time.time(), time.thread_time()
+        result = self._fetch()
+        self._record_cost("critical_sync", time.time() - t0,
+                          time.thread_time() - cpu0, synchronous=True)
+        return result
 
 
 class MaxPriorityQueue:
@@ -749,6 +863,34 @@ class DynamicBalancer:
         )
 
         self.network_controller = NetworkController()
+
+        # L0 rate limiter.  Zero means "never attempted", so the first eligible
+        # tick after start-up can grow immediately.  The lock is needed because
+        # the critical-state listener claims the same slot from the pressure
+        # monitor's refresh thread -- see _claim_swap_growth_slot.
+        self._last_swap_growth_at = 0.0
+        self._swap_growth_lock = threading.Lock()
+        self._last_swap_release_at = 0.0
+
+        # Anything a previous run could not hand back -- files still held at
+        # shutdown, and files left on disk by a reboot (we never write fstab,
+        # so after a reboot they are no longer swapped on and nobody owns the
+        # space).  only_unused keeps this honest: at start-up we know nothing
+        # about the machine's memory history, so a file holding pages is left
+        # for the idle path to judge.
+        self._reclaim_orphaned_swap()
+
+    def _reclaim_orphaned_swap(self) -> None:
+        """Release leftover managed swapfiles at start-up.  Never raises.
+
+        Deliberately not gated on ``swap_growth.enabled``: switching growth off
+        should give back what an earlier run allocated, not strand it.  If the
+        feature was never on there are no managed files and this is a no-op.
+        """
+        try:
+            self.control_manager.release_swap(dry_run=False, only_unused=True)
+        except Exception as exc:
+            logger.warning(f"[swap] start-up release failed: {exc}")
 
     def _fetch_top_disk_consumers(self):
         """Adapter so ``TopConsumerPrefetcher`` can warm the disk-IO top list.
@@ -935,6 +1077,17 @@ class DynamicBalancer:
                 if quiet:
                     passive_enabled = False
 
+                # Feed L0/L2's worst-case window here, on every ~1s pass of the
+                # loop -- not inside the idle_check gate below.  The checks that
+                # consult the window run once a minute; a window built from
+                # their own samples would describe nothing.  Reading
+                # /proc/meminfo costs tens of microseconds.
+                #
+                # Unconditional, including when passive control is off: the same
+                # samples drive the shrink timer, and a run that grew swap and
+                # then had passive turned off still has to give the files back.
+                self.control_manager.sample_memory()
+
                 if quiet:
                     # The whole decision block is skipped, not just neutered.
                     # SystemPressureMonitor is stopped for the length of the run,
@@ -981,6 +1134,20 @@ class DynamicBalancer:
                         # auto-limit path.  When passive control is off we are not going to
                         # apply any auto-limit, so skip the multi-second sampling pipeline.
                         self._maybe_trigger_prefetch(state, pressure, disk_level, passive_enabled)
+
+                        # L0 before the policy tick: swap headroom is what makes
+                        # L2 able to do anything at all, and its own watermarks
+                        # -- not the pressure level -- decide whether it fires.
+                        if passive_enabled:
+                            self._tick_swap_headroom(state, pressure)
+                        # The other direction, and deliberately not gated on
+                        # passive control: a run that grew swap and then had
+                        # passive turned off would otherwise leave the extra
+                        # files behind for good.  It is inside the quiet-mode
+                        # branch though -- swapoff faults a file's pages back
+                        # in, which is exactly the kind of intervention a
+                        # measured benchmark run must not see.
+                        self._tick_swap_release(state)
 
                         if policy == "separated":
                             self._tick_separated_policy(state, pressure, disk_level, passive_enabled)
@@ -1036,19 +1203,79 @@ class DynamicBalancer:
             idle_check_interval=default_idle_check_interval,
         )
 
+    def _maybe_prefetch_early(self, state: "_MonitorLoopState") -> None:
+        """Warm the top-consumer cache before the pressure *level* moves.
+
+        Two independent signals, either is enough:
+
+        * **Entering the pre-OOM band.** ``is_memory_pre_oom`` is the flag the
+          pressure monitor already computes to decide its own refresh cadence
+          (70% of RAM used with the defaults). Replayed against the stress run
+          it turns true at 22:34:45, ten seconds before the level moves.
+        * **Memory climbing fast.** ``mem_rise_rate()`` reads the slope off the
+          same window the swap growth arms use. Replayed, 16%→55% crosses the
+          10-point threshold at 22:34:40 — fifteen seconds of lead, which
+          matters because a fetch under full CPU load was measured at 9.44 s.
+
+        Not the pressure *score*: its memory term is a deliberately sharp gate,
+        so it read 0.19 two seconds before it read 1.00. Nothing useful can be
+        predicted from a step function.
+
+        The band arm is edge-triggered so sitting in the band costs nothing. The
+        slope arm is not — but it can only fire while memory is genuinely
+        climbing by a tenth of RAM per window, which is self-limiting, and
+        ``start()`` debounces repeats within CACHE_TTL.
+        """
+        pre_oom = self.control_manager.is_memory_pre_oom
+        entering_band = pre_oom and not state.prev_pre_oom
+        state.prev_pre_oom = pre_oom
+
+        if entering_band:
+            logger.info("Memory entered the pre-OOM band: warming top-consumer cache")
+            self.top_prefetcher.start("entering_pre_oom")
+            return
+
+        rise = self.control_manager.swap.mem_rise_rate()
+        if rise is not None and rise >= MEM_RISE_TRIGGER:
+            logger.info(
+                f"Memory climbing fast (+{100.0 * rise:.0f} points across the window): "
+                f"warming top-consumer cache"
+            )
+            self.top_prefetcher.start("memory_climbing")
+
     def _on_critical_state_changed(self, is_critical: bool) -> None:
         """Critical-state listener — backstops the rising-edge prefetch
         when pressure jumps directly into critical from below the ``high``
-        band. Gates on ``passive_resource_control`` so the multi-second
-        top-consumer sampling is only paid when auto-limit will use it."""
+        band, and asks L0 for swap headroom on the same edge.
+
+        Runs on the pressure monitor's refresh thread, which is the earliest
+        anything in the process learns that pressure went critical: on the
+        stress run it fired at 22:34:55.250, while the monitor loop's own
+        critical-edge tick did not reach the swap check until 22:34:56.122.
+        Both gate on ``passive_resource_control`` — neither the multi-second
+        sampling nor a new swapfile is worth paying for when auto-limit is off.
+        """
         if not is_critical:
             return
         prc = self.config.passive_resource_control or {}
         if not bool(prc.get('enabled', True)):
             logger.debug("Critical-state listener fired but passive control disabled: skipping prefetch")
             return
+        if quiet_mode.is_active():
+            # Matches the tick, which reaches _tick_swap_headroom only inside
+            # the non-quiet branch.  A measured run must not have a swapfile
+            # appear underneath it.
+            logger.debug("Critical-state listener fired but quiet mode is active: skipping")
+            return
         logger.debug("Critical-state listener fired: triggering top-consumer prefetch")
         self.top_prefetcher.start("critical_listener")
+        # Out-of-band growth. Deliberately goes through the same rate-limit slot
+        # as the tick, so whichever thread gets there first wins and the other
+        # one is a no-op rather than a second fallocate.
+        if (self.control_manager.swap.enabled
+                and self._claim_swap_growth_slot(time.time(), urgent=True)):
+            logger.info("[swap] critical edge: requesting headroom out of band")
+            self._request_swap_headroom()
 
     def _on_pressure_level_changed(self, sys_level: str, disk_level: str) -> None:
         """Push the new pressure levels to the UI over SSE. Not stored in the DB.
@@ -1102,6 +1329,15 @@ class DynamicBalancer:
             )
             self.top_prefetcher.start("entering_high")
 
+        # The high edge above assumes pressure climbs through the bands. It does
+        # not always: on the stress run the level went low → critical in a
+        # single refresh and "entering_high" never fired once, so the first
+        # critical paid a 6.45 s synchronous fetch while the OOM killer ran.
+        # These two catch the climb before the level does. Both are edge-
+        # triggered here and debounced by CACHE_TTL inside start(), so a machine
+        # that simply sits above the line does not resample.
+        self._maybe_prefetch_early(state)
+
         # Sustained-critical recheck: if critical persists for SUSTAINED_CRITICAL_REFRESH_SEC,
         # the original top1 has had ample time to settle under its limit. Refresh top in
         # background to catch a new dominant app that may have taken over. Timed on wall-clock
@@ -1126,7 +1362,26 @@ class DynamicBalancer:
         # (see disk_top_prefetcher). A sustained window triggers a background recheck,
         # so a new dominant IO app is still picked up while the stress persists.
         disk_stressed = disk_level in ("high", "critical")
-        if disk_stressed and state.prev_disk_level not in ("high", "critical"):
+        # Memory wins when both channels are loaded. The disk sampler is cheap
+        # on its own (1.17 s measured, against 6.45 s for the memory one,
+        # because mode="io" skips the 3x1s candidate pass) but its cost is
+        # wall-clock contention, and the memory fetch was measured stretching
+        # from 1.17 s to 9.44 s under full CPU load. Running both concurrently
+        # slows down the one with an OOM kill at the end of it. The disk channel
+        # loses nothing durable: it already reuses its cache via is_stale(), and
+        # disk pressure has no equivalent cliff.
+        #
+        # Note this gates only the fetches, not disk_stressed itself: the
+        # episode timers below must keep tracking that the disk *is* stressed,
+        # or clearing them here would make the channel think the episode ended
+        # and drop a batch it is still holding.
+        disk_prefetch_ok = disk_stressed and pressure != "critical"
+        if disk_stressed and not disk_prefetch_ok:
+            logger.debug(
+                "Disk prefetch deferred: system pressure is critical and the "
+                "memory top-consumer fetch has priority"
+            )
+        if disk_prefetch_ok and state.prev_disk_level not in ("high", "critical"):
             logger.debug(
                 f"Disk level edge {state.prev_disk_level}→{disk_level}: "
                 f"triggering disk top-consumer prefetch"
@@ -1139,12 +1394,19 @@ class DynamicBalancer:
                 state.disk_high_since = now
                 state.disk_last_recheck_time = now
             elif now - state.disk_last_recheck_time >= TopConsumerPrefetcher.SUSTAINED_CRITICAL_REFRESH_SEC:
-                logger.debug(
-                    f"Sustained disk stress for {round(now - state.disk_high_since, 1)}s: "
-                    f"triggering background disk top-consumer recheck"
-                )
-                self.disk_top_prefetcher.start("sustained_disk_recheck")
-                state.disk_last_recheck_time = now
+                if not disk_prefetch_ok:
+                    # Same priority rule as the edge above. The timer is left
+                    # alone so the recheck happens on the next tick that is not
+                    # competing with a memory crisis, rather than being skipped
+                    # for another full SUSTAINED_CRITICAL_REFRESH_SEC.
+                    logger.debug("Sustained disk recheck deferred: memory is critical")
+                else:
+                    logger.debug(
+                        f"Sustained disk stress for {round(now - state.disk_high_since, 1)}s: "
+                        f"triggering background disk top-consumer recheck"
+                    )
+                    self.disk_top_prefetcher.start("sustained_disk_recheck")
+                    state.disk_last_recheck_time = now
         else:
             state.disk_high_since = None
             # The disk channel holds its batch unconsumed while it sits at "high"
@@ -1396,6 +1658,13 @@ class DynamicBalancer:
                         is_disk_io_stressed=handling_disk_io,
                         pressure_level=(disk_level if handling_disk_io else pressure),
                     )
+
+                if not handling_disk_io:
+                    # L2 runs after L1 in the same tick, deliberately.  L1 has
+                    # just pinned the target at its memory.high and pushed it
+                    # toward idle, which is exactly the state where reclaim is
+                    # cheap and the pages stay out.
+                    self._tick_memory_reclaim(state)
 
                 if handling_disk_io and disk_level != "critical":
                     # "high" is the armed state: identify the target but keep the prefetched
@@ -1667,6 +1936,10 @@ class DynamicBalancer:
                         pressure_level=pressure,
                     )
 
+                # Same ordering as the separated policy: L1 first, then L2 on
+                # the now-throttled set.
+                self._tick_memory_reclaim(state)
+
                 state.top_consume_apps.pop(0)
             else:
                 state.reset()
@@ -1674,6 +1947,244 @@ class DynamicBalancer:
             self._drain_pending_app_queue(state)
         else:
             self._tick_combined_restore(state, pressure)
+
+    # ------------------------------------------------------------------
+    # L2: proactive reclaim, run after the L1 (memory.high) arm
+    # ------------------------------------------------------------------
+
+    def _reclaim_candidates(self) -> "list[tuple[str, LimitedApp, int]]":
+        """Auto-limited apps L2 may pull from, with their time-order weight.
+
+        ``LimitRegistry.apps`` is an OrderedDict in the order limits were
+        applied, so the index is the app's seniority.  Weighting by ``index + 1``
+        makes the most recently limited app give up the most: when several apps
+        start at once, the newcomer yields before the one that was already
+        running and settled.
+        """
+        candidates = []
+        with self.all_limits.lock:
+            entries = list(self.all_limits.apps.items())
+        for index, (key, entry) in enumerate(entries):
+            if entry.source != "auto":
+                continue
+            if not entry.limit_parts.get('cpu_mem_limited'):
+                continue
+            if entry.priority == "critical":
+                continue
+            if entry.reclaim_inflight:
+                continue
+            candidates.append((key, entry, index + 1))
+        return candidates
+
+    def _reclaim_cooldown_ok(self, entry: "LimitedApp", now: float) -> bool:
+        """True once the cooldown, plus any EAGAIN backoff, has elapsed."""
+        cfg = self.control_manager.reclaim_config()
+        wait = float(cfg.get("cooldown_sec", 30)) + entry.reclaim_backoff
+        return (now - entry.last_reclaim_at) >= wait
+
+    def _tick_memory_reclaim(self, state: "_MonitorLoopState") -> None:
+        """One L2 round: measure the system deficit, split it, reclaim.
+
+        Three things make this safe to run behind the L1 arm:
+
+        * the goal is the *system* target, never a per-app one.  Deficit filled,
+          round over -- nothing is pushed below its own memory.high, which is
+          sometimes far under the app's working set;
+        * free memory is only the gate.  PSI sets the gain, because a box that is
+          85% full and not stalling does not need to be pulled at 5% a round;
+        * every candidate is checked for idleness first.  Measured: an active
+          target faults the pages straight back in within two seconds, so the
+          ~200 ms per chunk the caller pays buys nothing at all.
+        """
+        if not self.control_manager.reclaim_enabled:
+            return
+
+        deficit, facts = self.control_manager.system_memory_deficit()
+        if deficit <= 0:
+            logger.debug("[reclaim] system already under target (%.1f%% used)",
+                         facts.get("used_fraction", 0) * 100)
+            return
+
+        candidates = self._reclaim_candidates()
+        if not candidates:
+            logger.debug("[reclaim] deficit %d MB but no eligible auto-limited app",
+                         deficit // _MB)
+            return
+
+        # Swap is the only place anonymous pages can go.  When the shortfall is
+        # in slab or page tables instead, reclaim cannot reach it and the round
+        # would just cost blocking time for nothing.
+        if facts.get("movable_anon_bytes", 0) <= 0:
+            logger.info("[reclaim] shortfall is not in anonymous memory; standing down")
+            return
+
+        now = state.current_time
+        psi_memory = self.control_manager.memory_pressure()
+        gain = self.control_manager.reclaim_gain(psi_memory)
+
+        ready, weights = [], {}
+        for key, entry, order in candidates:
+            if not self._reclaim_cooldown_ok(entry, now):
+                continue
+            cgroup = entry.cgroups[0] if entry.cgroups else key
+            elapsed = now - entry.last_cpu_sample_at if entry.last_cpu_sample_at else 0.0
+            busy, cpu_usec = self.control_manager.cpu_busy_fraction(
+                cgroup, entry.last_cpu_usec, elapsed)
+            entry.last_cpu_usec = cpu_usec
+            entry.last_cpu_sample_at = now
+            allowed, reason = self.control_manager.should_reclaim(cgroup, busy)
+            if not allowed:
+                logger.debug("[reclaim] skip %s: %s", key, reason)
+                continue
+            current = self.control_manager.memory.read_current(cgroup) or 0
+            if current <= 0:
+                continue
+            ready.append((key, entry, cgroup))
+            weights[key] = current * order
+
+        if not ready:
+            return
+
+        # Cap the round at what the gain allows, then at the deficit: the gain
+        # keeps a single round from overshooting, the deficit keeps a series of
+        # rounds from reclaiming past the point of doing any good.
+        round_budget = min(deficit, int(sum(weights.values()) * gain))
+        if round_budget <= 0:
+            return
+        shares = _split_proportionally(round_budget, [k for k, _, _ in ready], weights)
+
+        logger.info(
+            "[reclaim] deficit %d MB, psi_mem %.3f -> gain %.1f%%, budget %d MB "
+            "across %d app(s)",
+            deficit // _MB, psi_memory, gain * 100, round_budget // _MB, len(ready))
+
+        for key, entry, cgroup in ready:
+            share = shares.get(key) or 0
+            if share <= 0:
+                continue
+            entry.reclaim_inflight = True
+            entry.last_reclaim_at = now
+            future = self.control_manager.reclaim_memory_async(cgroup, share)
+            future.add_done_callback(
+                lambda fut, e=entry, k=key, c=cgroup, n=share:
+                    self._on_reclaim_done(fut, e, k, c, n))
+
+    def _on_reclaim_done(self, future, entry: "LimitedApp", key: str,
+                         cgroup: str, requested: int) -> None:
+        """Executor callback: record the outcome and react to EAGAIN.
+
+        Runs on the worker thread, so it touches only this entry's own fields
+        and hands everything else to the (thread-safe) diagnostics seam.
+        """
+        entry.reclaim_inflight = False
+        try:
+            outcome = future.result()
+        except Exception as exc:                     # pragma: no cover - defensive
+            logger.error("[reclaim] %s raised: %s", key, exc)
+            return
+
+        cfg = self.control_manager.reclaim_config()
+        cooldown = float(cfg.get("cooldown_sec", 30))
+        attributes = {
+            "cgroup": cgroup,
+            "app_name": entry.app_name,
+            "requested_mb": requested // _MB,
+            "reclaimed_mb": outcome.reclaimed_bytes // _MB,
+            "elapsed_ms": round(outcome.elapsed_ms, 1),
+            "swappiness": outcome.swappiness,
+        }
+
+        if outcome.is_eagain:
+            # Swap is full: retrying immediately just burns another 4 ms per
+            # call.  Back off, and ask L0 for more fuel -- that, not the retry,
+            # is what can actually make the next round work.
+            entry.reclaim_backoff = min(
+                max(cooldown, entry.reclaim_backoff * 2), _RECLAIM_MAX_BACKOFF)
+            logger.warning(
+                "[reclaim] %s: no swap headroom (EAGAIN), backing off %.0fs "
+                "and requesting swap growth", key, entry.reclaim_backoff)
+            _emit_reclaim_event(
+                "RESOURCE_MEMORY_RECLAIM_EXHAUSTED", "warning",
+                f"Reclaim for {entry.app_name} found no swap headroom",
+                entry, dict(attributes, backoff_sec=entry.reclaim_backoff))
+            self._request_swap_headroom()
+            return
+
+        entry.reclaim_backoff = 0.0
+        if not outcome.ok:
+            logger.warning("[reclaim] %s failed: %s", key, outcome.reason)
+            _emit_reclaim_event(
+                "RESOURCE_MEMORY_RECLAIM_FAILED", "warning",
+                f"Reclaim for {entry.app_name} failed: {outcome.reason}",
+                entry, dict(attributes, error=outcome.reason))
+            return
+
+        logger.info("[reclaim] %s: freed %d MB in %.0f ms",
+                    key, outcome.reclaimed_bytes // _MB, outcome.elapsed_ms)
+        _emit_reclaim_event(
+            "RESOURCE_MEMORY_RECLAIM_APPLIED", "info",
+            f"Reclaimed {outcome.reclaimed_bytes // _MB} MB from {entry.app_name}",
+            entry, attributes)
+
+    def _claim_swap_growth_slot(self, now: float, urgent: bool) -> bool:
+        """Rate limiter for growth attempts, shared by the tick and the listener.
+
+        Returns True when the caller may go ahead, and stamps the slot as taken.
+        Locked because the two callers run on different threads -- the monitor
+        loop and the pressure monitor's refresh thread -- and the whole point of
+        the listener path is that it fires at the same moment the tick does.
+        Without this they would both submit on the critical edge and grow twice.
+        """
+        interval = _SWAP_GROWTH_URGENT_INTERVAL if urgent else _SWAP_GROWTH_INTERVAL
+        with self._swap_growth_lock:
+            if now - self._last_swap_growth_at < interval:
+                return False
+            self._last_swap_growth_at = now
+            return True
+
+    def _tick_swap_headroom(self, state: "_MonitorLoopState", pressure: str) -> None:
+        """L0: pre-emptive swap growth, evaluated on the normal tick cadence.
+
+        Not tied to critical pressure -- growth has its own watermarks and fires
+        well before the memory is needed, because ``fallocate`` on ext4 costs
+        milliseconds now and a crisis is exactly the wrong time to start
+        allocating.  But *how often we are allowed to look* is tied to it: under
+        critical the spacing drops to _SWAP_GROWTH_URGENT_INTERVAL, because the
+        cost of one more look is a /proc/meminfo parse and the cost of not
+        looking was measured at two OOM kills.
+        """
+        if not self.control_manager.swap.enabled:
+            return
+        if not self._claim_swap_growth_slot(state.current_time,
+                                            urgent=(pressure == "critical")):
+            return
+        self.control_manager.ensure_swap_headroom_async(dry_run=False)
+
+    def _tick_swap_release(self, state: "_MonitorLoopState") -> None:
+        """L0 in reverse: give a grown swapfile back once the pressure is gone.
+
+        Runs on the same cadence as growth and is the only path that will fault
+        a file's pages back into RAM, because it is the only one that can wait
+        for a moment when there is room.  Not gated on ``swap.enabled``: turning
+        growth off should hand back what earlier growth allocated, not strand
+        it.  One file per round -- see should_shrink for the hysteresis.
+        """
+        if state.current_time - self._last_swap_release_at < _SWAP_GROWTH_INTERVAL:
+            return
+        self._last_swap_release_at = state.current_time
+        self.control_manager.shrink_swap_if_idle_async()
+
+    def _request_swap_headroom(self) -> None:
+        """Ask L0 to add swap, if the operator enabled it.
+
+        Called from the EAGAIN path.  Growth is planned and executed on the
+        control manager's executor because the fallback allocator really writes
+        the whole file.
+        """
+        if not self.control_manager.swap.enabled:
+            logger.info("[reclaim] swap growth is disabled; L2 cannot make progress")
+            return
+        self.control_manager.ensure_swap_headroom_async(dry_run=False)
 
     def _upsert_auto_limited(self, app_id, public_id, app_name, limit_rates,
                              resource_limited, io_limited, priority, is_controlled,
@@ -4066,6 +4577,24 @@ class DynamicBalancer:
                     record.get("app_name"), record.get("key"))
         return True
 
+    def _release_swap_on_exit(self) -> None:
+        """Give back the swapfiles we added, but only the ones held at zero.
+
+        Shutdown undoes what smartune did -- same principle as restoring limits
+        and clearing network rules just above.  Swap is the one thing where
+        "undo it" can cost more than leaving it: swapoff faults every page of
+        the file back into RAM, so handing back a file that is actually holding
+        pages would be a multi-gigabyte fault storm on the way out the door, on
+        a machine nobody is left watching.  A file at zero used costs nothing,
+        so take those and leave the rest to the next run's idle path.
+
+        Never raises: a failure here must not stop the service from exiting.
+        """
+        try:
+            self.control_manager.release_swap(dry_run=False, only_unused=True)
+        except Exception as exc:
+            logger.warning(f"[swap] shutdown release failed: {exc}")
+
     def shutdown(self):
         """
         Stop the service thread, wait for it to finish, and ensure all queued tasks are processed.
@@ -4078,6 +4607,7 @@ class DynamicBalancer:
 
         self.restore_all_limited_apps_resources()
         self.network_controller.clear_network_rules_on_exit()
+        self._release_swap_on_exit()
         if hasattr(self, "monitor_thread"):
             self.monitor_thread.join(timeout=1)
         if hasattr(self, "handle_thread"):

@@ -27,6 +27,8 @@ Run:  python3 balancer/test/test_limit_lifecycle.py
 
 import os
 import sys
+import time
+import types
 import unittest
 from unittest import mock
 
@@ -45,8 +47,10 @@ from balancer.balancer import (  # noqa: E402
     DynamicBalancer,
     LimitedApp,
     LimitRegistry,
+    TopConsumerPrefetcher,
     _MonitorLoopState,
 )
+from controller.swap import MEM_RISE_TRIGGER  # noqa: E402
 
 NOW = 1_000_000.0
 
@@ -116,6 +120,17 @@ class _IoCtl:
 class _ControlManager:
     def __init__(self):
         self.adjust_calls = []
+        # L2 is off in every test here: these tests are about which app gets
+        # limited on which channel, and reclaim is a separate ladder rung with
+        # its own suite (test_reclaim_ladder).  The attribute has to exist
+        # though -- _tick_memory_reclaim reads it on every separated tick.
+        self.reclaim_enabled = False
+        self.sample_calls = 0
+        # Read on every tick by the early-prefetch check.  False plus a flat
+        # window means "nothing is brewing", which is what these tests want:
+        # they are about the disk channel, not about the memory warning path.
+        self.is_memory_pre_oom = False
+        self.swap = types.SimpleNamespace(enabled=False, mem_rise_rate=lambda: None)
 
     def adjust_resources(self, app_id, policy, **kwargs):
         self.adjust_calls.append((app_id, policy, kwargs))
@@ -123,6 +138,9 @@ class _ControlManager:
 
     def set_limited_app_dominant(self, dominant, cgroups=None):
         pass
+
+    def sample_memory(self):
+        self.sample_calls += 1
 
 
 def _candidate(app_id, pids=(111,)):
@@ -337,6 +355,238 @@ class CandidateBatchOwnershipTests(unittest.TestCase):
         self.assertFalse(is_controlled)
         self.assertEqual(target_id, 'session-6215.scope')
         self.assertEqual(candidate['public_app_id'], 'optimum-cli')
+
+
+class EarlyPrefetchTests(unittest.TestCase):
+    """Warming the memory cache before the pressure *level* moves.
+
+    On the incident run the level went low -> critical in a single refresh, so
+    the "entering_high" edge never fired once and the first critical tick paid
+    a 6.45 s synchronous fetch while the OOM killer was already running.  Two
+    signals catch that climb earlier: the pre-OOM band (70% used, true 10 s
+    before the level moved) and the memory slope (true 15 s before).
+    """
+
+    def _b(self, pre_oom=False, rise=None):
+        b = _balancer()
+        b.control_manager.is_memory_pre_oom = pre_oom
+        b.control_manager.swap = types.SimpleNamespace(
+            enabled=False, mem_rise_rate=lambda: rise)
+        return b
+
+    def _tick(self, b, state, pressure="low"):
+        b._maybe_trigger_prefetch(state, pressure=pressure, disk_level="low",
+                                  passive_enabled=True)
+        return b.top_prefetcher.started
+
+    def test_entering_the_band_warms_the_cache_while_the_level_says_low(self):
+        b = self._b(pre_oom=True)
+        started = self._tick(b, _state())
+        self.assertEqual(started, ["entering_pre_oom"])
+        # And specifically *not* via the edge that never fires in practice.
+        self.assertNotIn("entering_high", started)
+
+    def test_sitting_in_the_band_does_not_resample(self):
+        """Edge-triggered: a NAS that simply runs warm must not resample every
+        tick.  Only the crossing is news."""
+        b = self._b(pre_oom=True)
+        state = _state()
+        self._tick(b, state)
+        self._tick(b, state)
+        self.assertEqual(b.top_prefetcher.started, ["entering_pre_oom"])
+
+    def test_leaving_and_re_entering_the_band_warms_again(self):
+        b = self._b(pre_oom=True)
+        state = _state()
+        self._tick(b, state)
+        b.control_manager.is_memory_pre_oom = False
+        self._tick(b, state)
+        b.control_manager.is_memory_pre_oom = True
+        self._tick(b, state)
+        self.assertEqual(b.top_prefetcher.started,
+                         ["entering_pre_oom", "entering_pre_oom"])
+
+    def test_a_fast_climb_warms_the_cache_below_the_band(self):
+        """The backstop for the worst case: the band leaves ~10 s of lead and a
+        contended fetch was measured at 9.44 s.  16% -> 55% in five seconds is
+        39 points, well past the trigger, and that happened 15 s earlier."""
+        b = self._b(pre_oom=False, rise=0.39)
+        self.assertEqual(self._tick(b, _state()), ["memory_climbing"])
+
+    def test_the_trigger_is_the_configured_threshold(self):
+        b = self._b(pre_oom=False, rise=MEM_RISE_TRIGGER)
+        self.assertEqual(self._tick(b, _state()), ["memory_climbing"])
+        b = self._b(pre_oom=False, rise=MEM_RISE_TRIGGER - 0.01)
+        self.assertEqual(self._tick(b, _state()), [])
+
+    def test_memory_being_released_is_not_a_trigger(self):
+        b = self._b(pre_oom=False, rise=-0.30)
+        self.assertEqual(self._tick(b, _state()), [])
+
+    def test_too_little_history_is_not_a_trigger(self):
+        """mem_rise_rate() returns None on a cold start; nobody prefetches
+        because the process has only just come up."""
+        b = self._b(pre_oom=False, rise=None)
+        self.assertEqual(self._tick(b, _state()), [])
+
+    def test_the_band_wins_over_the_slope(self):
+        """Both true at once is one fetch, not two -- the band edge returns."""
+        b = self._b(pre_oom=True, rise=0.39)
+        self.assertEqual(self._tick(b, _state()), ["entering_pre_oom"])
+
+    def test_passive_control_off_suppresses_both(self):
+        """Nothing consumes the sampling when passive control is off, so paying
+        several seconds for it is pure waste."""
+        b = self._b(pre_oom=True, rise=0.39)
+        b._maybe_trigger_prefetch(_state(), pressure="low", disk_level="low",
+                                  passive_enabled=False)
+        self.assertEqual(b.top_prefetcher.started, [])
+
+
+class CriticalResolveCacheTests(unittest.TestCase):
+    """What counts as "the cache has an answer".
+
+    The bug: validity was tested as ``if apps:``, so "a fetch completed and
+    found nobody above the threshold" -- the normal state of an idle machine --
+    was indistinguishable from "no fetch has ever run".  Every critical event
+    on such a box therefore paid the full multi-second blocking fetch to be
+    told ``[]`` again, on the one code path where seconds cost the most.
+    """
+
+    def _settle(self, prefetcher, timeout=2.0):
+        deadline = time.time() + timeout
+        while prefetcher._inflight.is_set() and time.time() < deadline:
+            time.sleep(0.005)
+        self.assertFalse(prefetcher._inflight.is_set(), "prefetch never finished")
+
+    def test_a_completed_empty_fetch_is_an_answer_not_a_cold_start(self):
+        calls = []
+
+        def fetch():
+            calls.append(1)
+            return [], False
+
+        p = TopConsumerPrefetcher(fetch)
+        p.start("warm")
+        self._settle(p)
+        self.assertEqual(len(calls), 1)
+
+        apps, threshold = p.resolve_for_critical()
+        self.assertEqual(apps, [])
+        self.assertFalse(threshold)
+        self.assertEqual(len(calls), 1, "must not resample to be told [] again")
+
+    def test_a_real_cold_start_still_falls_back_to_a_blocking_fetch(self):
+        """The fallback has to survive: the first critical event after boot
+        must not proceed with no idea who is eating the machine."""
+        calls = []
+
+        def fetch():
+            calls.append(1)
+            return [_candidate('sys-app.scope')], True
+
+        apps, threshold = TopConsumerPrefetcher(fetch).resolve_for_critical()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([c['app']['id'] for c in apps], ['sys-app.scope'])
+        self.assertTrue(threshold)
+
+    def test_a_stale_empty_cache_is_returned_now_and_refreshed_behind(self):
+        """Same rule past MAX_CACHE_AGE: answer from the cache immediately,
+        resample in the background.  Blocking is never the right trade here."""
+        calls = []
+
+        def fetch():
+            calls.append(1)
+            return [], False
+
+        p = TopConsumerPrefetcher(fetch)
+        p.start("warm")
+        self._settle(p)
+        with p._lock:
+            p._cache["fetched_at"] = time.time() - p.MAX_CACHE_AGE - 1
+
+        apps, _ = p.resolve_for_critical()
+        self.assertEqual(apps, [])
+        self._settle(p)
+        self.assertEqual(len(calls), 2, "background refresh should have run")
+
+
+class DiskPrefetchPriorityTests(unittest.TestCase):
+    """Memory outranks disk when both channels are loaded.
+
+    Asymmetric costs: the memory fetch stretches from 1.17 s to 9.44 s under
+    CPU contention and has an OOM kill at the end of it, while disk pressure
+    has no equivalent cliff -- the worst case there is a few seconds of slow.
+    """
+
+    def _b(self):
+        b = _balancer()
+        b.control_manager.is_memory_pre_oom = False
+        b.control_manager.swap = types.SimpleNamespace(
+            enabled=False, mem_rise_rate=lambda: None)
+        return b
+
+    def test_the_disk_edge_is_deferred_while_memory_is_critical(self):
+        b = self._b()
+        b._maybe_trigger_prefetch(_state(prev_disk_level="low"),
+                                  pressure="critical", disk_level="high",
+                                  passive_enabled=True)
+        self.assertEqual(b.disk_top_prefetcher.started, [])
+
+    def test_the_disk_edge_fires_normally_when_memory_is_merely_high(self):
+        b = self._b()
+        b._maybe_trigger_prefetch(_state(prev_disk_level="low"),
+                                  pressure="high", disk_level="high",
+                                  passive_enabled=True)
+        self.assertEqual(b.disk_top_prefetcher.started, ["entering_disk_high"])
+
+    def test_the_episode_timer_keeps_running_while_deferred(self):
+        """The deferral gates the fetch only.  Clearing disk_high_since here
+        would tell the channel the episode ended, and it would drop a batch it
+        is still holding."""
+        b = self._b()
+        state = _state(prev_disk_level="low",
+                       top_consume_apps=[_candidate('hi-io.scope')],
+                       top_source='disk_io', top_fetched_at=NOW - 1)
+        b._maybe_trigger_prefetch(state, pressure="critical", disk_level="high",
+                                  passive_enabled=True)
+        self.assertEqual(state.disk_high_since, NOW)
+        self.assertEqual([c['app']['id'] for c in state.top_consume_apps],
+                         ['hi-io.scope'])
+
+    def test_a_deferred_sustained_recheck_retries_on_the_next_calm_tick(self):
+        """The timer is deliberately left alone when the recheck is skipped, so
+        it happens as soon as memory is out of the way rather than waiting
+        another full SUSTAINED_CRITICAL_REFRESH_SEC."""
+        b = self._b()
+        due = NOW - TopConsumerPrefetcher.SUSTAINED_CRITICAL_REFRESH_SEC - 1
+        state = _state(prev_disk_level="high", disk_high_since=due,
+                       disk_last_recheck_time=due)
+        b._maybe_trigger_prefetch(state, pressure="critical", disk_level="high",
+                                  passive_enabled=True)
+        self.assertEqual(b.disk_top_prefetcher.started, [])
+        self.assertEqual(state.disk_last_recheck_time, due, "timer must not advance")
+
+        state.current_time = NOW + 1
+        b._maybe_trigger_prefetch(state, pressure="high", disk_level="high",
+                                  passive_enabled=True)
+        self.assertEqual(b.disk_top_prefetcher.started, ["sustained_disk_recheck"])
+        self.assertEqual(state.disk_last_recheck_time, NOW + 1)
+
+    def test_a_disk_only_stress_is_untouched_by_any_of_this(self):
+        """The common case has to be byte-for-byte what it was: memory calm,
+        disk climbing, both the edge and the sustained recheck fire."""
+        b = self._b()
+        due = NOW - TopConsumerPrefetcher.SUSTAINED_CRITICAL_REFRESH_SEC - 1
+        state = _state(prev_disk_level="low")
+        b._maybe_trigger_prefetch(state, pressure="low", disk_level="critical",
+                                  passive_enabled=True)
+        state.prev_disk_level = "critical"
+        state.disk_last_recheck_time = due
+        b._maybe_trigger_prefetch(state, pressure="low", disk_level="critical",
+                                  passive_enabled=True)
+        self.assertEqual(b.disk_top_prefetcher.started,
+                         ["entering_disk_high", "sustained_disk_recheck"])
 
 
 class AutoLimitRestoreFailureTests(unittest.TestCase):
@@ -1160,6 +1410,66 @@ class PurgeControlledAppTests(unittest.TestCase):
         self.assertEqual(len(cfg.controlled_apps), 1)
         self.assertEqual(cfg.writes, [])
         service.restore_resource.assert_called_once_with('existing.scope')
+
+
+class SwapHandbackTests(unittest.TestCase):
+    """Stopping smartune undoes what smartune did -- swap included.
+
+    Swap is the one resource where "undo it" can cost more than leaving it:
+    swapoff faults every page of the file back into RAM, so only the files
+    holding nothing are taken on the way out.  Hence only_unused on both the
+    shutdown and the start-up call.
+    """
+
+    def _balancer(self):
+        b = _balancer()
+        b.control_manager.release_swap = mock.Mock(return_value=[])
+        b.restore_all_limited_apps_resources = mock.Mock()
+        b.network_controller = mock.Mock()
+        return b
+
+    def test_shutdown_hands_back_only_the_files_holding_nothing(self):
+        b = self._balancer()
+        b.shutdown()
+        b.control_manager.release_swap.assert_called_once_with(
+            dry_run=False, only_unused=True)
+
+    def test_shutdown_releases_swap_after_restoring_limits(self):
+        """Order matters: a restored app may fault its pages straight back in,
+        so the limits come off first and swap goes last."""
+        b = self._balancer()
+        order = []
+        b.restore_all_limited_apps_resources.side_effect = \
+            lambda *a, **k: order.append("limits")
+        b.control_manager.release_swap.side_effect = \
+            lambda *a, **k: order.append("swap") or []
+        b.shutdown()
+        self.assertEqual(order, ["limits", "swap"])
+
+    def test_a_failed_release_does_not_stop_the_service_exiting(self):
+        b = self._balancer()
+        b.control_manager.release_swap.side_effect = OSError("swapoff: busy")
+        b.shutdown()   # must not raise
+        self.assertFalse(b.is_running)
+
+    def test_an_already_stopped_service_releases_nothing(self):
+        b = self._balancer()
+        b.is_running = False
+        b.shutdown()
+        b.control_manager.release_swap.assert_not_called()
+
+    def test_startup_reclaims_what_a_reboot_left_behind(self):
+        """We never write /etc/fstab, so after a reboot the files are still on
+        disk but nothing swapped them on -- gigabytes nobody owns."""
+        b = self._balancer()
+        b._reclaim_orphaned_swap()
+        b.control_manager.release_swap.assert_called_once_with(
+            dry_run=False, only_unused=True)
+
+    def test_a_failed_startup_reclaim_does_not_stop_the_service_starting(self):
+        b = self._balancer()
+        b.control_manager.release_swap.side_effect = OSError("no such dir")
+        b._reclaim_orphaned_swap()   # must not raise
 
 
 if __name__ == "__main__":

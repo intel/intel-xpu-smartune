@@ -593,6 +593,10 @@ class SystemPressureMonitor:
         # Next refresh interval, recomputed each cycle by _update_pressure_level: normal
         # (_CACHE_TTL) when RAM is ample, _FAST_PRESSURE_UPDATE when memory is in the pre-OOM band.
         self._next_interval = self._CACHE_TTL
+        # Same band, exposed via is_memory_pre_oom for callers that want the
+        # warning rather than the faster polling.  False until the first
+        # refresh, which is the safe default: nobody prefetches on a cold start.
+        self._in_fast_zone = False
         self._is_limited_app_dominant = False
         # Cgroup paths (relative to the cgroup mount) of the auto-limited apps that are
         # currently among the top consumers, used to discount their self-inflicted PSI.
@@ -759,6 +763,12 @@ class SystemPressureMonitor:
             busy = getattr(self.config, 'memory_busy_threshold', 90)
             in_fast_zone = mem_usage >= (busy - _FAST_ZONE_MEM_MARGIN)
             self._next_interval = min(_FAST_PRESSURE_UPDATE, self._CACHE_TTL) if in_fast_zone else self._CACHE_TTL
+            # Published as well as acted on: this is the earliest signal the
+            # monitor has that memory is heading somewhere bad, and it is
+            # earlier than the level. On the stress run it turned true 10 s
+            # before the level moved, because the level never passed through
+            # "high" at all -- it went low -> critical in one refresh.
+            self._in_fast_zone = in_fast_zone
             return level, score, disk_io.get("is_stressed", False), disk_io
         except Exception as e:
             logger.error("Failed to update pressure level: %s", str(e))
@@ -772,6 +782,22 @@ class SystemPressureMonitor:
         get_current_pressure_level() when you only need the level and must not spam the log.
         """
         return self._current_level
+
+    @property
+    def is_memory_pre_oom(self) -> bool:
+        """True while memory sits in the pre-OOM band, ahead of the level moving.
+
+        The band is ``memory_busy_threshold - _FAST_ZONE_MEM_MARGIN`` (70% used
+        with the defaults) and is recomputed on every refresh. Cheap to poll --
+        it is a cached bool, no reads -- and deliberately not hysteretic: the
+        one consumer (top-consumer prefetch warming) is edge-triggered by its
+        own caller and debounced by CACHE_TTL.
+
+        Why this and not the score: the score's memory term is a sharp gate by
+        design, so it reads 0.19 two seconds before it reads 1.00. This flag
+        tracks raw usage, which climbs smoothly and therefore warns early.
+        """
+        return self._in_fast_zone
 
     def get_current_pressure_level(self) -> tuple:
         """Return the current pressure level as (level, score, is_disk_io_stressed)."""

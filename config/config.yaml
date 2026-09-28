@@ -192,6 +192,77 @@ limit_policy: # Default resource limit ratios for apps at different priority lev
       medium: 0.2
       low: 0.1
       undefined: 0.1
+    reclaim:
+      # L2: memory.reclaim, applied *after* MemoryHigh (L1) to push a cgroup
+      # below its soft limit. MemoryHigh only pins a target at the limit and
+      # makes the target pay in its allocation path; reclaim moves pages out and
+      # the cost lands on smartune instead. Off until the L0 swap headroom work
+      # lands -- with swap full, reclaim returns EAGAIN and does nothing.
+      enabled: true
+      target_mem_pct: 80  # The one and only goal: get used_eff (MemTotal minus
+                          # MemAvailable) below this share of MemTotal. Deliberately
+                          # NOT "push each app under its own MemoryHigh" -- that cap
+                          # is sometimes tiny, and forcing a target below it either
+                          # cannot be done or over-reclaims. Deficit filled, stop.
+      psi_full_scale: 0.10  # Memory PSI (some, 0..1) at which the per-round gain is
+                            # maxed out. Free memory says how much is gone; PSI says
+                            # how much it hurts. Free memory is the gate, PSI the gain.
+      gain_min: 0.01  # Per round, reclaim between 1% and 5% of the candidate's
+      gain_max: 0.05  # current usage. Small rounds converge without overshooting,
+                      # and every round costs the caller real blocking time.
+      swappiness: 180  # 0..200. Without an explicit value the kernel reclaims
+                       # page cache ONLY and never touches anonymous memory,
+                       # which is the memory actually under pressure.
+      chunk_mb: 200  # ~1 ms per MB, blocking the caller, so reclaim is chunked
+                     # onto a worker thread and never runs on the balancer tick
+      idle_cpu_threshold: 0.05  # Skip busy targets: they fault the pages straight
+                                # back in, so the block buys nothing
+      max_file_cache_fraction: 0.5  # Skip cache-heavy apps. swappiness tunes the
+                                    # scan ratio, it cannot protect page cache
+      cooldown_sec: 30
+    swap_growth:
+      # L0: swap headroom, the fuel L2 runs on. With swap full, memory.reclaim
+      # returns EAGAIN in ~4 ms having done nothing, so L2 silently stops
+      # working. Growth is pre-emptive: allocating the file takes milliseconds
+      # on ext4 and writes no data, so there is no reason to wait for the
+      # crunch -- by then it is too late.
+      #
+      # Every threshold is a ratio of MemTotal or of the disk. A value tuned
+      # against one machine is a bug: the same config has to hold on a 4 GB box
+      # and on a 128 GB one.
+      enabled: true
+      grow_mem_watermark: 0.80  # Both must be crossed. 80% memory on its own is
+      grow_swap_watermark: 0.50  # normal with a healthy page cache; it only
+                                 # matters when swap is also running out
+      grow_swap_critical: 0.10  # ...except here, where swap alone is enough.
+                                # Requiring both is unsatisfiable exactly when it
+                                # matters: every anon page swap accepts is a page
+                                # that leaves used_eff, so the fuller swap gets,
+                                # the healthier memory reads. Measured: swap hit
+                                # 0% free three times while growth was refused
+                                # for "memory below watermark".
+      pressure_window_sec: 30  # Judge on the worst reading in this window, not on
+                               # the instant. A bursty allocator swung
+                               # MemAvailable 43% -> 1% -> 47% in twenty seconds;
+                               # a minute-cadence check sampling that is a coin
+                               # flip, and only the troughs kill anything.
+      step_ratio: 0.25  # one growth step = MemTotal * this
+      max_swap_ratio: 2.0  # total swap never exceeds MemTotal * this
+      disk_reserve_pct: 10  # keep the larger of this share of the disk...
+      disk_reserve_min_gb: 20  # ...and this floor. A fixed 20 GB is sane on a
+                               # 500 GB disk and far too little on a 4 TB NAS
+      zswap: false  # Compressed pool in RAM: no disk writes, catches warm pages
+                    # in microseconds. Net gain is pool*(ratio-1), not 1:1 --
+                    # the pool itself occupies RAM
+      zswap_compressor: zstd  # kernel default lzo is ~2:1, zstd ~3:1
+      zswap_pool_percent: 20
+      path: "/var/lib/smartune/swap"  # Not /mnt: that is by convention a
+                                      # temporary mount point and a later mount
+                                      # can shadow it, stranding an active swapfile
+      allow_fs: [ext4, xfs]  # fallocate is instant here. btrfs needs nodatacow
+                             # or swapon refuses the file; a zfs swapfile can
+                             # deadlock the pool under exactly the memory
+                             # pressure we would be reacting to
   disk_io:  #
     enabled: true  # Whether to enable disk IO limits; passive limits are not applied uniformly by default — use the API to configure per-app active limits
     rate:

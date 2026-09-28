@@ -46,6 +46,13 @@ class ControllerBase(ABC):
         try:
             with open(os.path.join(self.get_full_path(cgroup), param), 'r') as f:
                 return f.read().strip()
-        except (FileNotFoundError, PermissionError) as e:
+        except FileNotFoundError as e:
+            # A cgroup that vanished between the decision and the read is the
+            # normal end of a short-lived app, not a fault: the callers poll
+            # these files every tick, so logging it at ERROR buries the real
+            # errors under one line per dead scope per tick.
+            logger.debug(f"Parameter {param} is gone: {e}")
+            return None
+        except PermissionError as e:
             logger.error(f"Failed to get parameter {param}: {e}")
             return None

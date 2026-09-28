@@ -35,6 +35,113 @@ class Controller:
             logger.warning("Failed to resolve user slice UID: %s", exc)
         return ""
 
+    def find_cgroup_dir(self, cgroup_id: str) -> Optional[str]:
+        """Absolute cgroup v2 directory for *cgroup_id*, or None.
+
+        The unit name alone does not determine the path -- a scope can sit under
+        system.slice, user.slice/user-N.slice/user@N.service/app.slice, or a
+        vendor slice -- so the tree is searched rather than guessed.
+        """
+        if not cgroup_id or not re.fullmatch(r"[A-Za-z0-9._@:-]+", cgroup_id):
+            logger.warning(f"Rejecting invalid cgroup id for lookup: {cgroup_id!r}")
+            return None
+        for root, directories, _ in os.walk(self.cgroup_mount):
+            if cgroup_id in directories:
+                return os.path.join(root, cgroup_id)
+        return None
+
+    def read_applied_limits(self, cgroup_id: str) -> Optional[dict]:
+        """The CPU and memory caps actually in force, read from cgroupfs.
+
+        This is the only honest source.  ``systemctl show`` reports systemd's
+        idea of the unit's properties, which stays stale when anything writes
+        the cgroup files directly -- the drift is then invisible precisely
+        because the property still reads back the value systemd last set.
+        """
+        path = self.find_cgroup_dir(cgroup_id)
+        if not path:
+            return None
+        applied = {"path": path}
+        try:
+            with open(os.path.join(path, "cpu.max"), encoding="utf-8") as handle:
+                parts = handle.read().split()
+            applied["cpu_quota_usec"] = None if parts[0] == "max" else int(parts[0])
+            applied["cpu_period_usec"] = int(parts[1]) if len(parts) > 1 else 100000
+            with open(os.path.join(path, "memory.high"), encoding="utf-8") as handle:
+                raw = handle.read().strip()
+            applied["memory_high_bytes"] = None if raw == "max" else int(raw)
+        except (OSError, IndexError, ValueError) as exc:
+            logger.debug(f"Cannot read applied limits for {cgroup_id}: {exc}")
+            return None
+        return applied
+
+    def verify_applied_limits(self, cgroup_id: str, cpu_quota: Optional[int],
+                              mem_high: Optional[int], is_restore: bool,
+                              attempts: int = 5, delay: float = 0.1) -> Optional[dict]:
+        """Confirm in cgroupfs that the caps we just asked for are really there.
+
+        ``systemctl set-property`` returns once systemd has accepted the
+        property, not once the kernel file has been written, so the read is
+        retried for a short window before any drift is believed.
+
+        Returns ``{"ok": bool, ...}``, or None when the cgroup could not be
+        found or read -- which is not a mismatch, only an unknown.
+        """
+        # systemd expresses CPUQuota as a percentage of one CPU's period; the
+        # caller's cpu_quota is a share of the whole machine, which is how it
+        # was scaled by self.cpus on the way in.
+        expected_cpu = None
+        if not is_restore and cpu_quota is not None:
+            expected_cpu = cpu_quota * self.cpus
+        expected_mem = None
+        if not is_restore and mem_high is not None:
+            expected_mem = int(mem_high) * 1024 * 1024
+
+        applied = None
+        for attempt in range(attempts):
+            applied = self.read_applied_limits(cgroup_id)
+            if applied is None:
+                return None
+            period = applied.get("cpu_period_usec") or 100000
+            cpu_ok = True
+            if expected_cpu is None:
+                cpu_ok = applied["cpu_quota_usec"] is None
+            elif applied["cpu_quota_usec"] is not None:
+                want = period * expected_cpu / 100.0
+                # One percent of the period absorbs systemd's own rounding
+                # without hiding a real "we asked for 40% and got 90%".
+                cpu_ok = abs(applied["cpu_quota_usec"] - want) <= period * 0.01
+            else:
+                cpu_ok = False
+
+            mem_ok = True
+            if expected_mem is None:
+                mem_ok = applied["memory_high_bytes"] is None
+            elif applied["memory_high_bytes"] is not None:
+                # The kernel rounds memory.high down to a page multiple.
+                mem_ok = abs(applied["memory_high_bytes"] - expected_mem) <= 4096
+            else:
+                mem_ok = False
+
+            if cpu_ok and mem_ok:
+                return {"ok": True, **applied}
+            if attempt < attempts - 1:
+                time.sleep(delay)
+
+        result = {"ok": False, "expected_cpu_pct": expected_cpu,
+                  "expected_memory_high_bytes": expected_mem, **(applied or {})}
+        logger.warning(
+            "Limit verification failed for %s: expected cpu=%s%% mem=%s, "
+            "cgroupfs reports cpu.max=%s memory.high=%s (%s)",
+            cgroup_id,
+            "cleared" if expected_cpu is None else expected_cpu,
+            "cleared" if expected_mem is None else f"{expected_mem // (1024 * 1024)}M",
+            applied.get("cpu_quota_usec") if applied else "?",
+            applied.get("memory_high_bytes") if applied else "?",
+            applied.get("path") if applied else "unknown path",
+        )
+        return result
+
     def inspect_cgroup_limits(self, cgroup_id: str) -> dict:
         """Read active v2 resource limits for one systemd cgroup."""
         if not cgroup_id or not re.fullmatch(r"[A-Za-z0-9._@:-]+", cgroup_id):
@@ -405,6 +512,14 @@ class Controller:
                         env=run_env
                     )
                     logger.debug(f"Executed result: {result}")
+                    # systemctl exiting 0 only means systemd accepted the
+                    # property.  Confirm against cgroupfs, never against
+                    # `systemctl show`: the property keeps reporting whatever
+                    # systemd last set even after a direct write has replaced
+                    # it in the kernel, so drift would be invisible exactly
+                    # where it matters.
+                    self.verify_applied_limits(
+                        matching_app, cpu_quota, mem_high, is_restore)
                     return True
                 except subprocess.CalledProcessError as e:
                     logger.warning(

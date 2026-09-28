@@ -44,6 +44,7 @@ import os
 import re
 import sys
 import threading
+import types
 import time
 import unittest
 from pathlib import Path
@@ -489,6 +490,12 @@ class BalancerTickTests(_GateCase):
         b.all_limits.is_limited_app_dominant = False
         b.app_priority_queue = mock.Mock()
         b.app_priority_queue.empty.return_value = True
+        # Normally set in __init__, which is bypassed above.  Without it the
+        # L0 rung raises, the loop logs and resets, and every positive control
+        # below fails for a reason that has nothing to do with quiet mode.
+        b._last_swap_growth_at = 0.0
+        b._swap_growth_lock = threading.Lock()
+        b._last_swap_release_at = 0.0
 
         for name in ("_maybe_trigger_prefetch", "_tick_separated_policy",
                      "_tick_combined_policy", "_run_network_tick",
@@ -569,6 +576,102 @@ class BalancerTickTests(_GateCase):
         b._run_monitor_resource_loop()
         self.assertIs(b._tick_separated_policy.call_args.args[3], True)
         b._run_network_tick.assert_called_once()
+
+    def test_quiet_mode_never_hands_a_swapfile_back(self):
+        # swapoff faults every page of the file into RAM. Doing that in the
+        # middle of a measured benchmark would show up in the numbers, which is
+        # the one thing quiet mode exists to prevent.
+        b = self._balancer()
+        quiet_mode.enter(OWNER)
+        b._run_monitor_resource_loop()
+        b.control_manager.shrink_swap_if_idle_async.assert_not_called()
+
+    def test_a_normal_tick_offers_swap_back(self):
+        # Positive control for the above.
+        b = self._balancer()
+        b._run_monitor_resource_loop()
+        b.control_manager.shrink_swap_if_idle_async.assert_called_once()
+
+    def test_the_window_is_sampled_even_in_quiet_mode(self):
+        # Reading /proc/meminfo changes nothing and costs tens of microseconds,
+        # and the shrink timer needs an unbroken series: a gap during a long
+        # benchmark would otherwise read as "memory was relaxed the whole time".
+        b = self._balancer()
+        quiet_mode.enter(OWNER)
+        b._run_monitor_resource_loop()
+        b.control_manager.sample_memory.assert_called()
+
+    def test_swap_release_is_rate_limited(self):
+        # The loop wakes every ~1s; swapoff must not be offered that often.
+        b = self._balancer()
+        b._last_swap_release_at = 1e18   # far in the future: "just ran"
+        b._run_monitor_resource_loop()
+        b.control_manager.shrink_swap_if_idle_async.assert_not_called()
+
+
+class CriticalListenerTests(_GateCase):
+    """The out-of-band path: swap growth asked for on the critical edge.
+
+    This listener runs on the pressure monitor's refresh thread, which is the
+    earliest anything in the process learns pressure went critical -- 22:34:55.250
+    on the incident run, against 22:34:56.122 for the monitor loop's own
+    critical-edge tick.  It has to obey the same two gates as the tick, because
+    a swapfile appearing underneath a measured benchmark is exactly what quiet
+    mode exists to prevent.
+    """
+
+    def _balancer(self, passive=True, swap_enabled=True):
+        b = DynamicBalancer.__new__(DynamicBalancer)
+        b.config = mock.Mock()
+        b.config.passive_resource_control = {"enabled": passive}
+        b.control_manager = mock.Mock()
+        b.control_manager.swap.enabled = swap_enabled
+        b.top_prefetcher = mock.Mock()
+        b._last_swap_growth_at = 0.0
+        b._swap_growth_lock = threading.Lock()
+        return b
+
+    def test_the_critical_edge_asks_for_headroom_immediately(self):
+        b = self._balancer()
+        b._on_critical_state_changed(True)
+        b.top_prefetcher.start.assert_called_once_with("critical_listener")
+        b.control_manager.ensure_swap_headroom_async.assert_called_once_with(dry_run=False)
+
+    def test_leaving_critical_does_nothing(self):
+        b = self._balancer()
+        b._on_critical_state_changed(False)
+        b.top_prefetcher.start.assert_not_called()
+        b.control_manager.ensure_swap_headroom_async.assert_not_called()
+
+    def test_quiet_mode_suppresses_the_whole_listener(self):
+        b = self._balancer()
+        quiet_mode.enter(OWNER)
+        b._on_critical_state_changed(True)
+        b.top_prefetcher.start.assert_not_called()
+        b.control_manager.ensure_swap_headroom_async.assert_not_called()
+
+    def test_passive_control_off_suppresses_the_whole_listener(self):
+        b = self._balancer(passive=False)
+        b._on_critical_state_changed(True)
+        b.top_prefetcher.start.assert_not_called()
+        b.control_manager.ensure_swap_headroom_async.assert_not_called()
+
+    def test_swap_growth_off_still_warms_the_cache(self):
+        """The two halves are independent: knowing who is eating the machine is
+        useful whether or not the operator lets us add swap."""
+        b = self._balancer(swap_enabled=False)
+        b._on_critical_state_changed(True)
+        b.top_prefetcher.start.assert_called_once_with("critical_listener")
+        b.control_manager.ensure_swap_headroom_async.assert_not_called()
+
+    def test_the_listener_and_the_tick_do_not_both_fallocate(self):
+        """Both fire on the same edge from different threads.  They share one
+        rate-limit slot, so the loser is a no-op rather than a second file."""
+        b = self._balancer()
+        b._on_critical_state_changed(True)
+        b._tick_swap_headroom(
+            types.SimpleNamespace(current_time=time.time()), "critical")
+        b.control_manager.ensure_swap_headroom_async.assert_called_once()
 
 
 class RunLifecycleTests(_GateCase):

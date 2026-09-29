@@ -27,6 +27,7 @@ Run:  python3 balancer/test/test_limit_lifecycle.py
 
 import os
 import sys
+import threading
 import time
 import types
 import unittest
@@ -726,6 +727,148 @@ class GoneTargetTests(unittest.TestCase):
 
 class AutoToManualScopeTests(unittest.TestCase):
     """Taking control must retain exactly the cgroups Auto Control limited."""
+
+    def test_manual_limit_reclaims_successful_cgroup_to_its_memory_high(self):
+        b = _balancer()
+        usage = {
+            'cgroup_paths': ['/user.slice/user-1000.slice/app-test.scope'],
+            'pids': [111],
+            'cpu_percent': 100,
+            'mem_current': 1000,
+            'mem_swap_current': 0,
+            'per_cgroup_mem': {'app-test.scope': 1000},
+            'per_cgroup_cpu_delta': {'app-test.scope': 100},
+            'io_read_mb': 0,
+            'io_write_mb': 0,
+            'io_read_iops': 0,
+            'io_write_iops': 0,
+        }
+        b.control_manager.adjust_resources = mock.Mock(return_value=True)
+        b.control_manager.reclaim_memory_to_target = mock.Mock(
+            return_value=types.SimpleNamespace(
+                reclaimed_bytes=100 * 1024 * 1024, elapsed_ms=100,
+                ok=True, reason="target reached",
+            )
+        )
+        b.get_limited_rates = mock.Mock(return_value={
+            'cpu_rate': 0.3,
+            'mem_rate': 0.5,
+            'disk_io_rate': {},
+        })
+
+        with mock.patch.object(balancer_mod.app_utils, 'get_app_resource_usage', return_value=usage), \
+                mock.patch.object(balancer_mod.app_utils, 'get_cgroup_path_by_pid',
+                                  return_value=usage['cgroup_paths'][0]), \
+                mock.patch.object(b, '_is_io_limit_reached', return_value=False), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils.callback_manager,
+                                  'send_callback_notification'), \
+                mock.patch.object(balancer_mod, '_emit_control_events'):
+            result = b.set_resource_limit('test-app', 'test app', 'low')
+
+        self.assertTrue(result)
+        (cgroup, target), kwargs = b.control_manager.reclaim_memory_to_target.call_args
+        self.assertEqual((cgroup, target), ('app-test.scope', 500 * 1024 * 1024))
+        # The growth gate must be the balancer's own rate limiter, or a manual
+        # limit can allocate a swapfile a periodic L0 check just allocated.
+        b._last_swap_growth_at = 0.0
+        b._swap_growth_lock = threading.Lock()
+        self.assertTrue(kwargs['growth_gate']())
+        self.assertFalse(kwargs['growth_gate']())
+        entry = b.all_limits.apps['app-test.scope']
+        self.assertEqual(entry.source, 'manual')
+
+    def test_manual_limit_reclaims_with_the_operation_lock_released(self):
+        """A reclaim blocking for seconds must not stall the pressure loop."""
+        b = _balancer()
+        usage = {
+            'cgroup_paths': ['/user.slice/user-1000.slice/app-test.scope'],
+            'pids': [111],
+            'cpu_percent': 100,
+            'mem_current': 1000,
+            'mem_swap_current': 0,
+            'per_cgroup_mem': {'app-test.scope': 1000},
+            'per_cgroup_cpu_delta': {'app-test.scope': 100},
+            'io_read_mb': 0,
+            'io_write_mb': 0,
+            'io_read_iops': 0,
+            'io_write_iops': 0,
+        }
+        b.control_manager.adjust_resources = mock.Mock(return_value=True)
+        held_during_reclaim = []
+
+        def lock_is_held():
+            # acquire(blocking=False) on this thread would succeed on an RLock we
+            # already own, so a second thread has to do the asking -- and the same
+            # thread must release it, or RLock raises on the foreign release.
+            probe = []
+
+            def attempt():
+                acquired = b.all_limits.operation_lock.acquire(blocking=False)
+                probe.append(acquired)
+                if acquired:
+                    b.all_limits.operation_lock.release()
+
+            thread = threading.Thread(target=attempt)
+            thread.start()
+            thread.join()
+            return not (probe and probe[0])
+
+        def observe(cgroup, target, growth_gate=None):
+            held_during_reclaim.append(lock_is_held())
+            return types.SimpleNamespace(
+                reclaimed_bytes=0, elapsed_ms=0, ok=True, reason="noop")
+
+        b.control_manager.reclaim_memory_to_target = mock.Mock(side_effect=observe)
+        b.get_limited_rates = mock.Mock(return_value={
+            'cpu_rate': 0.3, 'mem_rate': 0.5, 'disk_io_rate': {},
+        })
+
+        with mock.patch.object(balancer_mod.app_utils, 'get_app_resource_usage', return_value=usage), \
+                mock.patch.object(balancer_mod.app_utils, 'get_cgroup_path_by_pid',
+                                  return_value=usage['cgroup_paths'][0]), \
+                mock.patch.object(b, '_is_io_limit_reached', return_value=False), \
+                mock.patch.object(b, '_claim_swap_growth_slot', return_value=False), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils.callback_manager,
+                                  'send_callback_notification'), \
+                mock.patch.object(balancer_mod, '_emit_control_events'):
+            b.set_resource_limit('test-app', 'test app', 'low')
+
+        self.assertEqual(held_during_reclaim, [False])
+
+    def test_manual_limit_skips_reclaim_when_no_memory_cap_was_applied(self):
+        b = _balancer()
+        usage = {
+            'cgroup_paths': ['/user.slice/user-1000.slice/app-test.scope'],
+            'pids': [111],
+            'cpu_percent': 100,
+            'mem_current': 1000,
+            'mem_swap_current': 0,
+            'per_cgroup_mem': {'app-test.scope': 1000},
+            'per_cgroup_cpu_delta': {'app-test.scope': 100},
+            'io_read_mb': 0,
+            'io_write_mb': 0,
+            'io_read_iops': 0,
+            'io_write_iops': 0,
+        }
+        b.control_manager.adjust_resources = mock.Mock(return_value=True)
+        b.control_manager.reclaim_memory_to_target = mock.Mock()
+        b.get_limited_rates = mock.Mock(return_value={
+            'cpu_rate': 0.3, 'mem_rate': None, 'disk_io_rate': {},
+        })
+
+        with mock.patch.object(balancer_mod.app_utils, 'get_app_resource_usage', return_value=usage), \
+                mock.patch.object(balancer_mod.app_utils, 'get_cgroup_path_by_pid',
+                                  return_value=usage['cgroup_paths'][0]), \
+                mock.patch.object(b, '_is_io_limit_reached', return_value=False), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils.callback_manager,
+                                  'send_callback_notification'), \
+                mock.patch.object(balancer_mod, '_emit_control_events'):
+            self.assertTrue(b.set_resource_limit('test-app', 'test app', 'low'))
+
+        b.control_manager.reclaim_memory_to_target.assert_not_called()
 
     def test_manual_limit_rejects_an_auto_limited_target_cgroup(self):
         b = _balancer()

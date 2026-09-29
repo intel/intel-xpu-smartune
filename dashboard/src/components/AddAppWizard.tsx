@@ -10,6 +10,7 @@ import {
   Space,
   Tag,
   Alert,
+  Checkbox,
 } from 'antd'
 import type { ColumnsType, TableRowSelection } from 'antd/es/table/interface'
 import { COLORS } from '../styles/theme'
@@ -42,6 +43,9 @@ const STEP_CONFIRM = 1
 const STEP_DONE = 2
 
 const SEARCH_DEBOUNCE_MS = 300
+// Rows per page in the discovery table, and therefore the point past which
+// "current page" and "all results" stop meaning the same thing.
+const CANDIDATE_PAGE_SIZE = 8
 
 export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props) {
   const [step, setStep] = useState(STEP_PICK)
@@ -57,6 +61,9 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
   )
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState<string | null>(null)
+  // Pagination is controlled only so the two header checkboxes can tell which
+  // rows are "the current page"; antd would otherwise keep that to itself.
+  const [candidatePage, setCandidatePage] = useState(1)
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const searchSeq = useRef(0) // protects against out-of-order debounced responses
 
@@ -96,6 +103,7 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
     setSelected({})
     setSearching(false)
     setSearchError(null)
+    setCandidatePage(1)
     setAppId('')
     setPriority('low')
     setRemark('')
@@ -148,6 +156,8 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
       return
     }
     const mySeq = ++searchSeq.current
+    // A new result set makes the old page number meaningless.
+    setCandidatePage(1)
     setSearching(true)
     setSearchError(null)
     try {
@@ -342,18 +352,44 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
     })
   }, [])
 
-  // Per-row toggles (onSelect/onSelectAll) rather than onChange: the basket
-  // spans multiple searches, so we must add/remove individual rows instead of
-  // replacing the whole selection with only the currently-visible keys.
+  // Per-row toggles (onSelect) rather than onChange: the basket spans multiple
+  // searches, so we must add/remove individual rows instead of replacing the
+  // whole selection with only the currently-visible keys.  hideSelectAll
+  // because the default header checkbox silently means "this page only" --
+  // the two checkboxes in the table title say which scope they cover.
   const rowSelection: TableRowSelection<DiscoverCandidate> = {
     selectedRowKeys: selectedPids,
+    hideSelectAll: true,
     onSelect: (record, checked) =>
       checked ? addToBasket([record]) : removeFromBasket([record.pid]),
-    onSelectAll: (checked, _rows, changeRows) =>
-      checked
-        ? addToBasket(changeRows)
-        : removeFromBasket(changeRows.map((r) => r.pid)),
   }
+
+  // The rows antd is currently showing, derived rather than read back from the
+  // table so the "current page" checkbox can act on exactly them.
+  const pageCandidates = useMemo(
+    () => candidates.slice(
+      (candidatePage - 1) * CANDIDATE_PAGE_SIZE,
+      candidatePage * CANDIDATE_PAGE_SIZE,
+    ),
+    [candidates, candidatePage],
+  )
+
+  const selectionScopes = useMemo(() => {
+    const scope = (rows: DiscoverCandidate[]) => {
+      const picked = rows.filter((row) => selected[row.pid]).length
+      return {
+        rows,
+        checked: rows.length > 0 && picked === rows.length,
+        indeterminate: picked > 0 && picked < rows.length,
+      }
+    }
+    return { page: scope(pageCandidates), all: scope(candidates) }
+  }, [candidates, pageCandidates, selected])
+
+  const toggleScope = useCallback((rows: DiscoverCandidate[], checked: boolean) => {
+    if (checked) addToBasket(rows)
+    else removeFromBasket(rows.map((row) => row.pid))
+  }, [addToBasket, removeFromBasket])
 
   // ---------- footer buttons (one set per step) ----------
   const footer = useMemo(() => {
@@ -476,8 +512,36 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
             dataSource={candidates}
             columns={candidateColumns}
             rowSelection={rowSelection}
-            pagination={{ pageSize: 8, hideOnSinglePage: true }}
+            pagination={{
+              pageSize: CANDIDATE_PAGE_SIZE,
+              hideOnSinglePage: true,
+              current: candidatePage,
+              onChange: setCandidatePage,
+            }}
             locale={{ emptyText: emptyHint }}
+            // Both scopes live here, above the rows they act on.  The second
+            // one only appears once the results outgrow a single page, where
+            // it would otherwise duplicate the first.
+            title={candidates.length > 0 ? () => (
+              <Space size={24}>
+                {candidates.length > CANDIDATE_PAGE_SIZE && (
+                  <Checkbox
+                    checked={selectionScopes.page.checked}
+                    indeterminate={selectionScopes.page.indeterminate}
+                    onChange={(e) => toggleScope(pageCandidates, e.target.checked)}
+                  >
+                    Current page ({pageCandidates.length})
+                  </Checkbox>
+                )}
+                <Checkbox
+                  checked={selectionScopes.all.checked}
+                  indeterminate={selectionScopes.all.indeterminate}
+                  onChange={(e) => toggleScope(candidates, e.target.checked)}
+                >
+                  All {candidates.length} matching results
+                </Checkbox>
+              </Space>
+            ) : undefined}
           />
 
         </div>

@@ -47,6 +47,7 @@ import {
   YAxis,
 } from 'recharts'
 import { api, getLatestServerTime } from '../api/client'
+import { MEMORY_RECOVERY_HINT } from '../utils/messages'
 import { indexMetrics, formatWithUnit, metricLabel } from '../utils/benchMetrics'
 import type {
   DiagBenchCase,
@@ -1386,6 +1387,7 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
             if (snapshot.source === 'auto') await api.autoLimitRestore({ app_id: appId })
             else await api.resourceRestore({ app_id: appId })
             message.success(`Resources resumed for ${appId}`)
+            message.info({ content: `${appId}: ${MEMORY_RECOVERY_HINT}`, duration: 8 })
             // Advance the live window so the RECOVERED event just emitted by the
             // restore is inside it; otherwise the overview updates but the event
             // records (time-bounded) miss the new row. See the clear path above.

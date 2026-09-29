@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from utils.logger import get_logger
 logger = get_logger(__name__)
@@ -45,6 +45,13 @@ RECLAIM_DEFAULTS = {
     "max_file_cache_fraction": 0.5,
     "cooldown_sec": 30,
 }
+
+# Pre-reclaim L0 check skip factor.  The check can only answer "no growth
+# needed" when free swap already exceeds what is about to be pushed out, and
+# paying for it means blocking on the single-worker L0 executor -- possibly
+# behind a periodic growth that is mid-fallocate.  The margin is there because
+# the cgroup is not the only thing swapping while we work.
+PRE_RECLAIM_SWAP_MARGIN = 1.5
 
 
 class ControlManager:
@@ -298,6 +305,125 @@ class ControlManager:
         """
         return self._executor.submit(
             self.reclaim_memory, cgroup, nbytes, swappiness, chunk_bytes
+        )
+
+    def _swap_covers(self, nbytes: int) -> bool:
+        """True when free swap already has room for *nbytes*, with margin.
+
+        Reading /proc/meminfo costs tens of microseconds; the L0 check this
+        guards can block on the executor for as long as a fallocate takes.
+        """
+        snapshot = self.swap.read_meminfo()
+        if snapshot.swap_total <= 0:
+            return False
+        return snapshot.swap_free >= nbytes * PRE_RECLAIM_SWAP_MARGIN
+
+    def _grow_swap_for_manual_reclaim(
+            self, gate: Optional[Callable[[], bool]], why: str) -> Optional[bool]:
+        """Ask L0 for headroom on behalf of a manual reclaim.
+
+        ``True`` grown, ``False`` wanted but unavailable, ``None`` not needed or
+        not attempted.  *gate* is the caller's growth rate limiter: the balancer
+        passes the same slot claim its periodic checks use, so a manual limit
+        cannot allocate a step a tick just allocated.  ``None`` disables rate
+        limiting, which is what the unit tests want.
+        """
+        if gate is not None and not gate():
+            logger.debug(
+                f"[manual-reclaim] {why}: swap growth rate-limited, check skipped")
+            return None
+        try:
+            # The one-worker executor used by automatic L0 checks, so a manual
+            # request cannot race a periodic growth plan/file creation.
+            plan, growth = self.ensure_swap_headroom_async(dry_run=False).result()
+        except Exception as exc:
+            logger.warning(f"[manual-reclaim] {why} swap check failed: {exc}")
+            return False
+        if not plan.should_grow:
+            logger.debug(f"[manual-reclaim] {why}: L0 sees no need to grow ({plan.reason})")
+            return None
+        if growth is None or not growth.ok:
+            logger.warning(
+                f"[manual-reclaim] {why}: swap growth unavailable ({plan.reason})")
+            return False
+        return True
+
+    def reclaim_memory_to_target(
+            self, cgroup: str, target_bytes: int,
+            growth_gate: Optional[Callable[[], bool]] = None) -> ReclaimOutcome:
+        """Best-effort reclaim until *cgroup* reaches a user-requested target.
+
+        This is the explicit manual-limit path, so it intentionally does not
+        apply L2's automatic idle/cache/system-deficit gates. Check enabled L0
+        watermarks before reclaim; if reclaim still runs out of headroom, check
+        again and retry only after a managed swapfile was successfully added.
+
+        *growth_gate* rate-limits those L0 checks -- see
+        :meth:`_grow_swap_for_manual_reclaim`.  A gate claimed by the pre-check
+        therefore refuses the post-EAGAIN one, which is the intended reading: a
+        second growth step seconds after the first is exactly what the limiter
+        exists to prevent, and if the reclaim EAGAIN'd *after* headroom was
+        added, more headroom is not what it is short of.
+        """
+        current = self.memory.read_current(cgroup)
+        if current is None:
+            return ReclaimOutcome(
+                ok=False, reason="memory.current unreadable; cannot size manual reclaim"
+            )
+
+        requested = max(0, current - max(0, int(target_bytes)))
+        if requested == 0:
+            return ReclaimOutcome(ok=True, reason="already at or below memory target")
+
+        grown = None
+        if self.swap.enabled and not self._swap_covers(requested):
+            grown = self._grow_swap_for_manual_reclaim(growth_gate, "pre-reclaim")
+
+        outcome = self.reclaim_memory(cgroup, requested)
+        logger.debug(
+            "[manual-reclaim] %s requested=%d MB reclaimed=%d MB "
+            "elapsed=%.0f ms ok=%s reason=%s",
+            cgroup, requested // (1024 * 1024),
+            outcome.reclaimed_bytes // (1024 * 1024), outcome.elapsed_ms,
+            outcome.ok, outcome.reason,
+        )
+        if not outcome.is_eagain or not self.swap.enabled:
+            return outcome
+        if grown is False:
+            # The pre-check already wanted headroom and could not get it; the
+            # retry would meet the same full swap.
+            return outcome
+
+        # No outer log line here: every branch of the helper already says which
+        # of "rate-limited", "not needed" or "failed" stopped the retry.
+        if not self._grow_swap_for_manual_reclaim(growth_gate, "post-EAGAIN"):
+            return outcome
+
+        current = self.memory.read_current(cgroup)
+        if current is None:
+            return outcome
+        remaining = max(0, current - int(target_bytes))
+        if remaining == 0:
+            return ReclaimOutcome(
+                ok=True, requested_bytes=requested,
+                reclaimed_bytes=outcome.reclaimed_bytes,
+                elapsed_ms=outcome.elapsed_ms, swappiness=outcome.swappiness,
+                reason="target reached before swap headroom was exhausted",
+            )
+
+        retry = self.reclaim_memory(cgroup, remaining)
+        logger.info(
+            "[manual-reclaim] %s retry requested=%d MB reclaimed=%d MB "
+            "elapsed=%.0f ms ok=%s reason=%s",
+            cgroup, remaining // (1024 * 1024),
+            retry.reclaimed_bytes // (1024 * 1024), retry.elapsed_ms,
+            retry.ok, retry.reason,
+        )
+        return ReclaimOutcome(
+            ok=retry.ok, errno=retry.errno, requested_bytes=requested,
+            reclaimed_bytes=outcome.reclaimed_bytes + retry.reclaimed_bytes,
+            elapsed_ms=outcome.elapsed_ms + retry.elapsed_ms,
+            swappiness=retry.swappiness, reason=retry.reason,
         )
 
     # ------------------------------------------------------------------

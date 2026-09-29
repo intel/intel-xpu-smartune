@@ -3759,7 +3759,6 @@ class DynamicBalancer:
         logger.debug(f"Priority '{priority}' limit rates: {result}")
         return result
 
-    @_serialized_limit_operation
     def set_resource_limit(
             self,
             app_id: str,
@@ -3770,9 +3769,67 @@ class DynamicBalancer:
     ) -> bool:
         """Set resource limits for an application (balanced policy).
 
+        Two phases, and the split is the point: installing the limit needs
+        ``operation_lock`` (ownership checks and cgroup writes must not
+        interleave with the pressure loop's own appliers), while pushing the
+        app down to its new memory.high must *not* hold it -- a single reclaim
+        can block for seconds, and the auto-limit path takes the same lock.
+        """
+        reclaim_plan: "list[tuple[str, int]]" = []
+        result = self._install_resource_limit(
+            app_id, app_name, priority=priority, limit_overrides=limit_overrides,
+            target_cgroups=target_cgroups, reclaim_plan=reclaim_plan,
+        )
+        self._reclaim_to_manual_targets(reclaim_plan)
+        return result
+
+    def _reclaim_to_manual_targets(self, plan: "list[tuple[str, int]]") -> None:
+        """Push each freshly-limited cgroup down to its own memory.high.
+
+        Best-effort by design: memory.high is already installed, so a reclaim
+        that fails (full swap, cgroup gone) must not turn a working limit into
+        a failed one.  Runs with no lock held -- see :meth:`set_resource_limit`.
+        """
+        for cgroup_id, target_mb in plan:
+            try:
+                outcome = self.control_manager.reclaim_memory_to_target(
+                    cgroup_id, int(target_mb) * _MB,
+                    growth_gate=lambda: self._claim_swap_growth_slot(
+                        time.time(), urgent=True),
+                )
+                logger.info(
+                    "[manual-reclaim] %s target=%d MB reclaimed=%d MB "
+                    "elapsed=%.0f ms ok=%s reason=%s",
+                    cgroup_id, int(target_mb),
+                    outcome.reclaimed_bytes // _MB,
+                    outcome.elapsed_ms, outcome.ok, outcome.reason,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[manual-reclaim] {cgroup_id} failed after limit applied: {exc}"
+                )
+
+    @_serialized_limit_operation
+    def _install_resource_limit(
+            self,
+            app_id: str,
+            app_name: str,
+            priority: str = None,
+            limit_overrides: Optional[Dict[str, Any]] = None,
+            target_cgroups: Optional[list[str]] = None,
+            reclaim_plan: "Optional[list[tuple[str, int]]]" = None,
+    ) -> bool:
+        """Install the manual limit and record it in the registry.
+
         ``target_cgroups`` optionally restricts the limit to a subset of the
         app's currently-running instances (by cgroup basename).  When omitted
         or empty, every cgroup the app currently occupies is limited.
+
+        ``reclaim_plan`` is an *output* parameter: the ``(cgroup, target_mb)``
+        pairs the caller should reclaim once this method's lock is released.
+        It is filled rather than returned so that the method keeps a single
+        return contract (``True`` / ``False`` / ``{"skipped": reason}``) across
+        all of its early exits.
         """
         priority = priority or "undefined"
         if isinstance(limit_overrides, dict):
@@ -3916,6 +3973,8 @@ class DynamicBalancer:
 
         per_cg_mem = usage.get('per_cgroup_mem', {})
         per_cg_cpu_delta = usage.get('per_cgroup_cpu_delta', {})
+        limited_cgroups = []
+        mem_high_by_cgroup = {effective_app_id: mem_high}
 
         if baseline:
             baseline_pcg_mem = baseline.get("per_cgroup_mem", {})
@@ -3935,6 +3994,7 @@ class DynamicBalancer:
             if extra_effective_ids:
                 all_ids = [effective_app_id] + extra_effective_ids
                 mem_dist = _split_proportionally(mem_high, all_ids, per_cg_mem)
+                mem_high_by_cgroup = mem_dist
                 cpu_dist = _split_proportionally(cpu_quota, all_ids, per_cg_cpu_delta)
                 primary_ok = self.control_manager.adjust_resources(
                     effective_app_id, "critical",
@@ -3943,6 +4003,7 @@ class DynamicBalancer:
                 )
                 if primary_ok:
                     resource_limited = True
+                    limited_cgroups.append(effective_app_id)
                     self.control_manager.set_limited_app_dominant(True)
                     logger.info(f"Successfully set CPU/Memory limits for {app_name} ({effective_app_id})")
                 else:
@@ -3953,6 +4014,8 @@ class DynamicBalancer:
                         cpu_quota=cpu_dist.get(extra_id, cpu_quota),
                         mem_high=mem_dist.get(extra_id, mem_high),
                     )
+                    if ok:
+                        limited_cgroups.append(extra_id)
                     logger.info(
                         f"{'Successfully set' if ok else 'Failed to set'} "
                         f"CPU/Memory limits for extra cgroup {extra_id}"
@@ -3964,6 +4027,7 @@ class DynamicBalancer:
                         mem_high=mem_high
                 ):
                     resource_limited = True
+                    limited_cgroups.append(effective_app_id)
                     self.control_manager.set_limited_app_dominant(True)
                     logger.info(f"Successfully set CPU/Memory limits for {app_name} ({effective_app_id})")
                 else:
@@ -4058,7 +4122,18 @@ class DynamicBalancer:
                                 "limit_overrides": limit_overrides},
                     control_mode="manual",
                 )
-                return True
+
+        if resource_limited or io_limited:
+            # Hand the reclaim targets to the caller instead of reclaiming here:
+            # this runs under operation_lock, which the pressure loop's appliers
+            # also take, and a reclaim can block for seconds.
+            if mem_high is not None and reclaim_plan is not None:
+                reclaim_plan.extend(
+                    (cgroup_id, mem_high_by_cgroup[cgroup_id])
+                    for cgroup_id in limited_cgroups
+                    if mem_high_by_cgroup.get(cgroup_id) is not None
+                )
+            return True
 
         failed_at = time.time()
         _emit_control_events(

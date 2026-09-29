@@ -453,14 +453,21 @@ export const api = {
   // successful evaluation, not an error, so post() resolves and the caller can
   // distinguish "applied" vs "skipped" via the response shape.
   resourceLimit: async (payload: ResourceLimitPayload) => {
-    const res = await client.post<ApiResponse<{ skipped?: boolean }>>('/app/resource_limit', payload)
+    const res = await client.post<ApiResponse<{ skipped?: boolean }>>(
+      '/app/resource_limit', payload, { timeout: 120_000 },
+    )
     if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
     return { skipped: res.data.data?.skipped === true, message: res.data.retmsg }
   },
   getResourceLimitProfile: (payload: Pick<ResourceLimitPayload, 'app_id' | 'app_name' | 'priority'>) =>
     post<ResourceLimitProfileData>('/app/resource_limit_profile', payload),
-  resourceRestore: (payload: Pick<AppIdPayload, 'app_id'>) =>
-    post<void>('/app/resource_restore', payload),
+  resourceRestore: async (payload: Pick<AppIdPayload, 'app_id'>) => {
+    const res = await client.post<ApiResponse<void>>(
+      '/app/resource_restore', payload, { timeout: 60_000 },
+    )
+    if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
+    return res.data.data
+  },
   getLimitSnapshot: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<LimitSnapshotData>('/app/limit_snapshot', payload),
   getInterruptedLimitStatus: (payload: { cgroups: string[] }) =>

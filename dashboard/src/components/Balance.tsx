@@ -43,6 +43,7 @@ import {
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
+import { MEMORY_RECOVERY_HINT } from '../utils/messages'
 import { api } from '../api/client'
 import type {
   AppInfo,
@@ -1261,6 +1262,8 @@ export default function Balance({
       }
 
       if (shouldApplyResourceLimit) {
+        // No toast here: the dialog stays open with an in-place Alert saying the
+        // same thing, and it lasts exactly as long as the request does.
         const res = await api.resourceLimit({
           app_id: limitDialog.app.app_id,
           app_name: limitDialog.app.app_name,
@@ -1313,6 +1316,10 @@ export default function Balance({
     withLoading(`restore-${app.app_id}`, async () => {
       await api.resourceRestore({ app_id: app.app_id })
       messageApi.success(`Resources restored for ${app.app_name}`)
+      messageApi.info({
+        content: `${app.app_name}: ${MEMORY_RECOVERY_HINT}`,
+        duration: 8,
+      })
     })()
 
   const handleKeepAlive = (app: AppInfo) =>
@@ -1340,6 +1347,10 @@ export default function Balance({
       // must start counting from zero, not from the limit the user just lifted.
       delete limitedSinceRef.current[row.effective_app_id ?? row.app_id]
       messageApi.success(`Resources restored for ${row.app_name || row.app_id}`)
+      messageApi.info({
+        content: `${row.app_name || row.app_id}: ${MEMORY_RECOVERY_HINT}`,
+        duration: 8,
+      })
       messageApi.warning({ content: AUTO_LIMIT_EXCLUSION_HINT, duration: 8 })
       await Promise.allSettled([refreshAutoLimited(), refreshControlled()])
     })()
@@ -2682,6 +2693,7 @@ export default function Balance({
         )}
         open={limitDialog.open}
         onCancel={() => {
+          if (limitDialog.submitting) return
           setLimitDialog({ app: null, open: false, loadingProfile: false, submitting: false })
           setResourceSectionExpanded(false)
           setNetworkSectionExpanded(false)
@@ -2690,11 +2702,24 @@ export default function Balance({
         okText="Apply Changes"
         confirmLoading={limitDialog.submitting}
         maskClosable={false}
+        // The request installs cgroup limits and then reclaims memory, so it
+        // cannot be cancelled. onCancel already refuses while it is in flight;
+        // these two stop Cancel and the X from *looking* available meanwhile.
+        cancelButtonProps={{ disabled: limitDialog.submitting }}
+        closable={!limitDialog.submitting}
         width={760}
         destroyOnClose
       >
         <div style={{ opacity: limitDialog.loadingProfile ? 0.6 : 1, pointerEvents: limitDialog.loadingProfile ? 'none' : 'auto' }}>
           <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            {limitDialog.submitting && (
+              <Alert
+                type="info"
+                showIcon
+                message="Applying resource limits"
+                description="Waiting for systemd to update the app's cgroup. This can take several seconds; keep this dialog open."
+              />
+            )}
             <Text type="secondary" style={{ fontSize: 12 }}>
               The limit is applied to all instances of this app running right now (matched by name).
               Use the process checkboxes in the expanded app row to choose specific scopes.

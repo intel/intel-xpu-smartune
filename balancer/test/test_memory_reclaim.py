@@ -561,6 +561,203 @@ class ChunkingTests(unittest.TestCase):
         self.assertIn("gone", out.reason)
 
 
+def _fake_swap(enabled=True, swap_total=0, swap_free=0):
+    """Stand-in for SwapController: only what the manual reclaim path reads.
+
+    ``swap_free`` defaults to a full swap so the pre-reclaim L0 check is not
+    short-circuited -- that is the interesting case for most of these tests.
+    """
+    return types.SimpleNamespace(
+        enabled=enabled,
+        read_meminfo=lambda: types.SimpleNamespace(
+            swap_total=swap_total, swap_free=swap_free),
+    )
+
+
+class ManualTargetReclaimTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.cg = FakeCgroup(self.root)
+        self.cg.set_state(anon_mb=400, file_mb=100)
+        self.controller = make_controller(str(self.root))
+        self.manager = make_manager(self.controller, {"chunk_mb": 200})
+        self.manager.swap = _fake_swap(enabled=False)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_reclaims_the_gap_between_current_and_manual_target(self):
+        mb = 1024 * 1024
+        expected = 500 * mb - 300 * mb
+        with mock.patch.object(self.manager, "reclaim_memory", return_value=ReclaimOutcome(
+                ok=True, requested_bytes=expected, reclaimed_bytes=expected)) as reclaim:
+            outcome = self.manager.reclaim_memory_to_target(self.cg.name, 300 * mb)
+        reclaim.assert_called_once_with(self.cg.name, expected)
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.requested_bytes, expected)
+
+    def test_eagain_grows_enabled_swap_then_retries_only_remaining_bytes(self):
+        mb = 1024 * 1024
+        initial = ReclaimOutcome(
+            ok=False, errno=errno.EAGAIN, requested_bytes=200 * mb,
+            reclaimed_bytes=50 * mb,
+        )
+        retry = ReclaimOutcome(ok=True, requested_bytes=150 * mb, reclaimed_bytes=150 * mb)
+        self.manager.swap = _fake_swap(swap_total=1000 * mb, swap_free=0)
+        calls = []
+
+        def reclaim(cgroup, nbytes):
+            calls.append((cgroup, nbytes))
+            if len(calls) == 1:
+                self.cg.write("memory.current", str(450 * mb))
+                return initial
+            return retry
+
+        self.manager.reclaim_memory = mock.Mock(side_effect=reclaim)
+        no_growth = (
+            types.SimpleNamespace(should_grow=False, reason="swap still roomy"), None,
+        )
+        growth_result = (
+            types.SimpleNamespace(should_grow=True, reason="swap critically low"),
+            types.SimpleNamespace(ok=True),
+        )
+        growth_checks = iter((no_growth, growth_result))
+        self.manager.ensure_swap_headroom_async = mock.Mock(side_effect=lambda **kwargs:
+            types.SimpleNamespace(result=lambda: next(growth_checks)))
+
+        outcome = self.manager.reclaim_memory_to_target(self.cg.name, 300 * mb)
+
+        self.assertEqual(self.manager.ensure_swap_headroom_async.call_count, 2)
+        self.assertEqual(self.manager.ensure_swap_headroom_async.call_args_list, [
+            mock.call(dry_run=False), mock.call(dry_run=False),
+        ])
+        self.assertEqual(calls, [
+            (self.cg.name, 200 * mb),
+            (self.cg.name, 150 * mb),
+        ])
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.reclaimed_bytes, 200 * mb)
+
+    def test_full_swap_is_checked_and_grown_before_manual_reclaim(self):
+        mb = 1024 * 1024
+        calls = []
+        plan = types.SimpleNamespace(should_grow=True, reason="swap critically low")
+        action = types.SimpleNamespace(ok=True)
+        future = types.SimpleNamespace(result=lambda: (plan, action))
+        self.manager.swap = _fake_swap(swap_total=1000 * mb, swap_free=0)
+        self.manager.ensure_swap_headroom_async = mock.Mock(
+            side_effect=lambda **kwargs: (calls.append("grow"), future)[1]
+        )
+
+        def reclaim(cgroup, nbytes):
+            calls.append("reclaim")
+            return ReclaimOutcome(ok=True, requested_bytes=nbytes,
+                                  reclaimed_bytes=nbytes)
+
+        self.manager.reclaim_memory = mock.Mock(side_effect=reclaim)
+        outcome = self.manager.reclaim_memory_to_target(self.cg.name, 300 * mb)
+
+        self.assertEqual(calls, ["grow", "reclaim"])
+        self.assertTrue(outcome.ok)
+
+    def test_eagain_does_not_retry_when_swap_growth_is_disabled(self):
+        outcome = ReclaimOutcome(ok=False, errno=errno.EAGAIN, requested_bytes=200)
+        self.manager.swap = _fake_swap(enabled=False)
+        self.manager.reclaim_memory = mock.Mock(return_value=outcome)
+        self.manager.ensure_swap_headroom_async = mock.Mock()
+
+        result = self.manager.reclaim_memory_to_target(self.cg.name, 300 * 1024 * 1024)
+
+        self.manager.reclaim_memory.assert_called_once()
+        self.manager.ensure_swap_headroom_async.assert_not_called()
+        self.assertTrue(result.is_eagain)
+
+    def test_unreadable_current_after_growth_preserves_eagain(self):
+        mb = 1024 * 1024
+        outcome = ReclaimOutcome(ok=False, errno=errno.EAGAIN, requested_bytes=200 * mb)
+        self.manager.swap = _fake_swap(swap_total=1000 * mb, swap_free=0)
+        self.manager.reclaim_memory = mock.Mock(return_value=outcome)
+        growth_result = (
+            types.SimpleNamespace(should_grow=True, reason="swap critically low"),
+            types.SimpleNamespace(ok=True),
+        )
+        self.manager.ensure_swap_headroom_async = mock.Mock(return_value=
+            types.SimpleNamespace(result=lambda: growth_result))
+
+        with mock.patch.object(self.controller, "read_current", side_effect=[
+                500 * mb, None]):
+            result = self.manager.reclaim_memory_to_target(self.cg.name, 300 * mb)
+
+        self.assertTrue(result.is_eagain)
+        self.manager.reclaim_memory.assert_called_once()
+
+    def test_roomy_swap_skips_the_pre_reclaim_l0_check(self):
+        """The L0 check blocks on a one-worker executor; skip it when it cannot help.
+
+        Free swap already covers the 200 MB about to be pushed out with margin,
+        so the check could only answer "no growth needed".
+        """
+        mb = 1024 * 1024
+        self.manager.swap = _fake_swap(swap_total=1000 * mb, swap_free=900 * mb)
+        self.manager.ensure_swap_headroom_async = mock.Mock()
+        self.manager.reclaim_memory = mock.Mock(return_value=ReclaimOutcome(
+            ok=True, requested_bytes=200 * mb, reclaimed_bytes=200 * mb))
+
+        outcome = self.manager.reclaim_memory_to_target(self.cg.name, 300 * mb)
+
+        self.manager.ensure_swap_headroom_async.assert_not_called()
+        self.manager.reclaim_memory.assert_called_once_with(self.cg.name, 200 * mb)
+        self.assertTrue(outcome.ok)
+
+    def test_swap_free_below_the_margin_still_checks_l0(self):
+        """Just enough free swap is not enough: the app is not the only swapper."""
+        mb = 1024 * 1024
+        self.manager.swap = _fake_swap(swap_total=1000 * mb, swap_free=210 * mb)
+        self.manager.ensure_swap_headroom_async = mock.Mock(return_value=
+            types.SimpleNamespace(result=lambda: (
+                types.SimpleNamespace(should_grow=False, reason="roomy"), None)))
+        self.manager.reclaim_memory = mock.Mock(return_value=ReclaimOutcome(
+            ok=True, requested_bytes=200 * mb, reclaimed_bytes=200 * mb))
+
+        self.manager.reclaim_memory_to_target(self.cg.name, 300 * mb)
+
+        self.manager.ensure_swap_headroom_async.assert_called_once_with(dry_run=False)
+
+    def test_rate_limited_growth_gate_blocks_both_l0_checks(self):
+        """A refused gate means a tick just grew swap; do not grow again, do not retry."""
+        mb = 1024 * 1024
+        self.manager.swap = _fake_swap(swap_total=1000 * mb, swap_free=0)
+        self.manager.ensure_swap_headroom_async = mock.Mock()
+        self.manager.reclaim_memory = mock.Mock(return_value=ReclaimOutcome(
+            ok=False, errno=errno.EAGAIN, requested_bytes=200 * mb))
+        gate = mock.Mock(return_value=False)
+
+        result = self.manager.reclaim_memory_to_target(
+            self.cg.name, 300 * mb, growth_gate=gate)
+
+        self.manager.ensure_swap_headroom_async.assert_not_called()
+        self.manager.reclaim_memory.assert_called_once()
+        self.assertEqual(gate.call_count, 2)
+        self.assertTrue(result.is_eagain)
+
+    def test_open_growth_gate_lets_the_l0_check_through(self):
+        mb = 1024 * 1024
+        self.manager.swap = _fake_swap(swap_total=1000 * mb, swap_free=0)
+        self.manager.ensure_swap_headroom_async = mock.Mock(return_value=
+            types.SimpleNamespace(result=lambda: (
+                types.SimpleNamespace(should_grow=True, reason="swap critically low"),
+                types.SimpleNamespace(ok=True))))
+        self.manager.reclaim_memory = mock.Mock(return_value=ReclaimOutcome(
+            ok=True, requested_bytes=200 * mb, reclaimed_bytes=200 * mb))
+
+        outcome = self.manager.reclaim_memory_to_target(
+            self.cg.name, 300 * mb, growth_gate=mock.Mock(return_value=True))
+
+        self.manager.ensure_swap_headroom_async.assert_called_once_with(dry_run=False)
+        self.assertTrue(outcome.ok)
+
+
 class OutcomeTests(unittest.TestCase):
     def test_eagain_and_unsupported_are_disjoint(self):
         self.assertTrue(ReclaimOutcome(ok=False, errno=errno.EAGAIN).is_eagain)

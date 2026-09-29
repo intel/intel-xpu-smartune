@@ -2529,7 +2529,6 @@ export default function SystemOverview({ active }: Props) {
   const showNpuSection = monitoredSections.has('npu')
   const showPressureSection = monitoredSections.has('pressure')
   const showNetworkSection = monitoredSections.has('network')
-  const showNetworkPressureCard = showPressureSection || showNetworkSection
   // With no monitored sections (config `monitored_sections: []`) there is
   // nothing to display, and a bare /dynamic_info request would otherwise be
   // read by the backend as "collect everything".  Skip polling entirely; the
@@ -3343,7 +3342,7 @@ export default function SystemOverview({ active }: Props) {
         />
       )}
 
-      {(showPressureSection || showNetworkSection) && (
+      {showPressureSection && (
       <Card className="perf-card perf-rise" bodyStyle={{ padding: 18, marginBottom: 18 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
           <Space size={8}>
@@ -3351,59 +3350,54 @@ export default function SystemOverview({ active }: Props) {
             <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>Pressure Overview</Text>
           </Space>
         </div>
+        {/* The three gauges share one source section, so they appear and disappear together. */}
         <Row gutter={[16, 12]}>
-          {showPressureSection && (
-            <>
-              {/* Disk IO Pressure: gauge shows PSI-gated severity; subtitle lists which/how many disks are busy */}
-              <Col xs={24} md={showNetworkPressureCard ? 8 : 12}>
-                <PressurePointerGauge
-                  title="Disk IO Pressure"
-                  valuePct={diskPressurePct}
-                  levelLabel={diskBusyLevelLabel}
-                  subtitle={[
-                    diskBusyCount > 0 ? `Busy: ${diskBusyNames.join(', ')}` : null,
-                    diskTotalCount > 0 ? `${diskBusyCount}/${diskTotalCount} disks busy` : null,
-                  ].filter(Boolean).join(' | ')}
-                  description="IO pressure severity; subtitle shows which disks are busy"
-                />
-              </Col>
+          {/* Disk IO Pressure: gauge shows PSI-gated severity; subtitle lists which/how many disks are busy */}
+          <Col xs={24} md={8}>
+            <PressurePointerGauge
+              title="Disk IO Pressure"
+              valuePct={diskPressurePct}
+              levelLabel={diskBusyLevelLabel}
+              subtitle={[
+                diskBusyCount > 0 ? `Busy: ${diskBusyNames.join(', ')}` : null,
+                diskTotalCount > 0 ? `${diskBusyCount}/${diskTotalCount} disks busy` : null,
+              ].filter(Boolean).join(' | ')}
+              description="IO pressure severity; subtitle shows which disks are busy"
+            />
+          </Col>
 
-              {/* System Pressure (middle): weighted composite score from SystemPressureMonitor */}
-              <Col xs={24} md={showNetworkPressureCard ? 8 : 12}>
-                <PressurePointerGauge
-                  title="System Pressure"
-                  valuePct={systemPressurePct}
-                  // Use the backend level as the single source of truth for the label; deriving
-                  // it from the score here can disagree with the backend (it applies hysteresis
-                  // and latches critical off the raw score), which read as "high" while the
-                  // system was already acting on "critical".
-                  levelLabel={pressureLevel ? pressureLevel.toUpperCase() : undefined}
-                  subtitle={pressureLevel
-                    ? `Level: ${pressureLevel.toUpperCase()} | Score: ${isNumber(pressureScore) ? (pressureScore / 100).toFixed(2) : 'N/A'}`
-                    : undefined}
-                  description="Weighted composite score (PSI × resource usage)"
-                />
-              </Col>
-            </>
-          )}
+          {/* System Pressure (middle): weighted composite score from SystemPressureMonitor */}
+          <Col xs={24} md={8}>
+            <PressurePointerGauge
+              title="System Pressure"
+              valuePct={systemPressurePct}
+              // Use the backend level as the single source of truth for the label; deriving
+              // it from the score here can disagree with the backend (it applies hysteresis
+              // and latches critical off the raw score), which read as "high" while the
+              // system was already acting on "critical".
+              levelLabel={pressureLevel ? pressureLevel.toUpperCase() : undefined}
+              subtitle={pressureLevel
+                ? `Level: ${pressureLevel.toUpperCase()} | Score: ${isNumber(pressureScore) ? (pressureScore / 100).toFixed(2) : 'N/A'}`
+                : undefined}
+              description="Weighted composite score (PSI × resource usage)"
+            />
+          </Col>
 
           {/* Network pressure: worst fused NIC/direction, with busy-NIC breadth below. */}
-          {showNetworkPressureCard && (
-            <Col xs={24} md={showPressureSection ? 8 : 12}>
-              <PressurePointerGauge
-                title="Network Pressure"
-                valuePct={networkPressurePct}
-                levelLabel={networkPressureLevelLabel}
-                subtitle={[
-                  networkPressureLevelLabel === 'CRITICAL' && networkWorstReason
-                    ? `${networkWorstNic || ''}${networkWorstDirection ? ` (${networkWorstDirection})` : ''}: ${networkWorstReason}`
-                    : (networkBusyCount > 0 && networkWorstNic ? `Busy: ${networkWorstNic}${networkWorstDirection ? ` (${networkWorstDirection})` : ''}` : null),
-                  networkTotalCount > 0 ? `${networkBusyCount}/${networkTotalCount} NICs busy` : null,
-                ].filter(Boolean).join(' | ')}
-                description="Worst fused RX/TX pressure; subtitle shows the reason when critical, else affected NICs"
-              />
-            </Col>
-          )}
+          <Col xs={24} md={8}>
+            <PressurePointerGauge
+              title="Network Pressure"
+              valuePct={networkPressurePct}
+              levelLabel={networkPressureLevelLabel}
+              subtitle={[
+                networkPressureLevelLabel === 'CRITICAL' && networkWorstReason
+                  ? `${networkWorstNic || ''}${networkWorstDirection ? ` (${networkWorstDirection})` : ''}: ${networkWorstReason}`
+                  : (networkBusyCount > 0 && networkWorstNic ? `Busy: ${networkWorstNic}${networkWorstDirection ? ` (${networkWorstDirection})` : ''}` : null),
+                networkTotalCount > 0 ? `${networkBusyCount}/${networkTotalCount} NICs busy` : null,
+              ].filter(Boolean).join(' | ')}
+              description="Worst fused RX/TX pressure; subtitle shows the reason when critical, else affected NICs"
+            />
+          </Col>
         </Row>
       </Card>
       )}

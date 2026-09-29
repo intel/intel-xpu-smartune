@@ -420,14 +420,16 @@ function MonitoredSectionsCard() {
   const [allSections, setAllSections] = useState<string[]>([])
   const [selected, setSelected] = useState<string[]>([])
   const [updatedAt, setUpdatedAt] = useState<number | undefined>(undefined)
-  // No Form here to ask, so track edits by hand (see SaveHandle.isDirty).
-  const [dirty, setDirty] = useState(false)
+  // No Form here to ask, so track edits by hand (see SaveHandle.isDirty). A ref
+  // rather than state: notifyDirty() re-reads isDirty() synchronously, before the
+  // re-render that a setState would need, so state would always be one edit stale.
+  const dirty = useRef(false)
 
   const applyData = useCallback((data: MonitoredSectionsData) => {
     setAllSections(data.all_sections ?? [])
     setSelected(data.sections ?? [])
     setUpdatedAt(data.updated_at)
-    setDirty(false)
+    dirty.current = false
     notifyDirty()
   }, [notifyDirty])
 
@@ -492,7 +494,7 @@ function MonitoredSectionsCard() {
     }
   }
 
-  useRegisterSave('monitored_sections', { isDirty: () => dirty, save: handleSave })
+  useRegisterSave('monitored_sections', { isDirty: () => dirty.current, save: handleSave })
 
   return (
     <Card size="small" title="System Overview" style={{ marginBottom: 16 }}>
@@ -518,7 +520,7 @@ function MonitoredSectionsCard() {
           value={selected}
           onChange={(vals) => {
             setSelected(vals as string[])
-            setDirty(true)
+            dirty.current = true
             notifyDirty()
           }}
           style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 24px' }}

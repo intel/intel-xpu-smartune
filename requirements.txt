@@ -3,4 +3,4 @@ peewee==4.1.0
 psutil==7.1.0
 PyYAML==6.0.3
 Requests==2.34.2
-urllib3==2.7.0
+urllib3==2.8.0

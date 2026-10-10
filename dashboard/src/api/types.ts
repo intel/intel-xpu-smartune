@@ -785,6 +785,8 @@ export interface StaticInfoData {
     ddr_speeds: string[]
     total_gb: number | null
     swap_total_gb?: number | null
+    // Theoretical peak DRAM bandwidth in GB/s (from DMI); null without root/DMI.
+    max_bandwidth_gb_s?: number | null
     devices?: {
       total_slots: number | null
       populated: number
@@ -920,6 +922,15 @@ export interface DynamicInfoData {
     swap_total_gb: number | null
     swap_used_gb: number | null
     swap_usage_percent: number | null
+    // Live system memory bandwidth (uncore IMC counters). All null when the PMU
+    // is unavailable or on the first sample (needs a delta). usage_percent is the
+    // live total as a fraction of the DMI ceiling (static max_bandwidth_gb_s).
+    bandwidth?: {
+      total_gb_s: number | null
+      read_gb_s: number | null
+      write_gb_s: number | null
+      usage_percent: number | null
+    } | null
   }
   pressure: PressureData
   network: {

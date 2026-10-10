@@ -371,6 +371,9 @@ export default function About({ active }: Props) {
             { label: 'Swap', value: typeof staticInfo.memory.swap_total_gb === 'number' && staticInfo.memory.swap_total_gb > 0
               ? `${staticInfo.memory.swap_total_gb.toFixed(1)} GB`
               : 'Not configured' },
+            { label: 'Peak bandwidth', value: typeof staticInfo.memory.max_bandwidth_gb_s === 'number'
+              ? `${staticInfo.memory.max_bandwidth_gb_s.toFixed(1)} GB/s`
+              : 'N/A' },
           ]
         })(),
       },

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from monitor.metrics import cpu as cpu_metrics
-from monitor.metrics import gpu_perf, membw, npu as npu_metrics
+from monitor.metrics import gpu_perf, memory as mem_metrics, npu as npu_metrics
 from utils import quiet_mode
 from utils.logger import get_logger
 logger = get_logger(__name__)
@@ -93,7 +93,7 @@ class RunSampler:
         self._fh = None
         self._writer: Optional[csv.DictWriter] = None
         self._gpu = None
-        self._membw: Optional[membw.Sampler] = None
+        self._membw: Optional[mem_metrics.Sampler] = None
         self._membw_max_gb_s: Optional[float] = None
         self._cpu: Optional[cpu_metrics.CpuUsageSampler] = None
 
@@ -122,7 +122,7 @@ class RunSampler:
         gpu = gpu_perf.create_independent_sampler()
         self._gpu = gpu if gpu.start() else None
 
-        bandwidth = membw.Sampler()
+        bandwidth = mem_metrics.Sampler()
         if bandwidth.start():
             self._membw = bandwidth
             self._membw_max_gb_s = bandwidth.max_bandwidth_gb_s
@@ -259,7 +259,7 @@ class RunSampler:
     def _sample_memory(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         try:
-            mem = cpu_metrics.get_memory_dynamic()
+            mem = mem_metrics.get_memory_dynamic()
             total = mem.get("total_gb")
             available = mem.get("available_gb")
             out["memory_used_gb"] = (
@@ -272,7 +272,8 @@ class RunSampler:
             out.update({"memory_used_gb": None, "memory_available_gb": None,
                         "memory_used_pct": None})
 
-        gb_s = self._membw.sample() if self._membw is not None else None
+        bw = self._membw.sample() if self._membw is not None else None
+        gb_s = bw.total_gb_s if bw is not None else None
         out["memory_bandwidth_gb_s"] = _round(gb_s)
         out["memory_bandwidth_pct"] = (
             _round(100.0 * gb_s / self._membw_max_gb_s)

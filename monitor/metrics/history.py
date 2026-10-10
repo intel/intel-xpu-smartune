@@ -332,8 +332,15 @@ def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
 
     if "memory" in data:
         memory = data.get("memory") or {}
+        bandwidth = memory.get("bandwidth") or {}
         payload["memory"] = {
             "usage_percent": to_float(memory.get("usage_percent")),
+            "bandwidth": {
+                "total_gb_s": to_float(bandwidth.get("total_gb_s")),
+                "read_gb_s": to_float(bandwidth.get("read_gb_s")),
+                "write_gb_s": to_float(bandwidth.get("write_gb_s")),
+                "usage_percent": to_float(bandwidth.get("usage_percent")),
+            },
         }
 
     if "pressure" in data:

@@ -26,7 +26,6 @@ from monitor.metrics.utils import safe_read, run_cmd
 from monitor.metrics.cpu import (
     get_cpu_freq_summary,
     get_cpu_dynamic,
-    get_memory_dynamic,
     get_cpu_temperatures,
     detect_core_groups,
 )
@@ -44,6 +43,7 @@ from monitor.metrics.gpu_info import (
     get_gpu_pci_addresses,
     card_to_gpu_label,
 )
+from monitor.metrics.memory import get_memory_dynamic, get_memory_static
 from monitor.metrics.npu import (
     get_npu_names,
     get_npu_fw_version,
@@ -99,104 +99,6 @@ def _parse_bios_version() -> Optional[str]:
         if "Version:" in line:
             return line.split("Version:", 1)[1].strip()
     return None
-
-
-def _get_dmidecode_memory_output() -> Optional[str]:
-    """Cache-friendly single call to dmidecode -t memory."""
-    return run_cmd(["dmidecode", "-t", "memory"])
-
-
-def _parse_ddr_speeds(output: Optional[str] = None) -> List[str]:
-    if output is None:
-        output = _get_dmidecode_memory_output()
-    if not output:
-        return []
-    speeds: List[str] = []
-    for line in output.splitlines():
-        line = line.strip()
-        if line.lower().startswith("speed:"):
-            value = line.split(":", 1)[1].strip()
-            if value and value not in speeds:
-                speeds.append(value)
-    return speeds
-
-
-def _parse_memory_devices(output: Optional[str] = None) -> Dict[str, Any]:
-    """Parse per-slot memory device info from dmidecode -t memory.
-
-    Returns dict with:
-      total_slots  - total number of memory slots/banks
-      populated    - number of slots with a module installed
-      devices      - list of populated device dicts
-    """
-    if output is None:
-        output = _get_dmidecode_memory_output()
-    if not output:
-        return {"total_slots": None, "populated": 0, "devices": []}
-
-    devices: List[Dict[str, Any]] = []
-    total_slots = 0
-
-    # Split into sections by "Memory Device" header
-    sections = re.split(r"(?=^Memory Device\s*$)", output, flags=re.MULTILINE)
-
-    for section in sections:
-        if not section.strip().startswith("Memory Device"):
-            continue
-        total_slots += 1
-
-        # Parse key-value pairs
-        kv: Dict[str, str] = {}
-        for line in section.splitlines():
-            line = line.strip()
-            if ":" in line:
-                key, _, val = line.partition(":")
-                kv[key.strip()] = val.strip()
-
-        size_raw = kv.get("Size", "")
-        if not size_raw or "No Module Installed" in size_raw:
-            continue
-
-        # Parse size to GB
-        size_gb: Optional[float] = None
-        size_match = re.match(r"(\d+)\s*(GB|MB|TB)", size_raw, re.IGNORECASE)
-        if size_match:
-            val = int(size_match.group(1))
-            unit = size_match.group(2).upper()
-            if unit == "GB":
-                size_gb = float(val)
-            elif unit == "MB":
-                size_gb = round(val / 1024, 2)
-            elif unit == "TB":
-                size_gb = float(val * 1024)
-
-        device = {
-            "locator": kv.get("Locator") or None,
-            "bank_locator": kv.get("Bank Locator") or None,
-            "size_gb": size_gb,
-            "type": kv.get("Type") or None,
-            "speed": kv.get("Speed") or None,
-            "configured_speed": kv.get("Configured Memory Speed") or None,
-            "form_factor": kv.get("Form Factor") or None,
-            "manufacturer": kv.get("Manufacturer") or None,
-            "part_number": (kv.get("Part Number") or "").strip() or None,
-        }
-        devices.append(device)
-
-    # Extract channel count from Bank Locator values (e.g. "Channel 0 Slot 0")
-    channels: set = set()
-    for dev in devices:
-        bl = dev.get("bank_locator") or ""
-        ch_match = re.search(r"Channel\s+(\d+)", bl, re.IGNORECASE)
-        if ch_match:
-            channels.add(int(ch_match.group(1)))
-
-    return {
-        "total_slots": total_slots,
-        "populated": len(devices),
-        "channels": len(channels) if channels else None,
-        "devices": devices,
-    }
 
 
 def _parse_cpu_model() -> Optional[str]:
@@ -546,8 +448,6 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
         now = time.time()
 
         cpu_freqs = get_cpu_freq_summary()
-        mem = psutil.virtual_memory()
-        dmi_mem_output = _get_dmidecode_memory_output()
         cards = get_gpu_cards()
         network_static = _get_network_static_info()
         disk_static = _get_disk_static_info()
@@ -583,12 +483,7 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
                 },
                 "freq_mhz": cpu_freqs,
             },
-            "memory": {
-                "ddr_speeds": _parse_ddr_speeds(dmi_mem_output),
-                "total_gb": round(mem.total / (1024 ** 3), 2),
-                "swap_total_gb": round(psutil.swap_memory().total / (1024 ** 3), 2),
-                "devices": _parse_memory_devices(dmi_mem_output),
-            },
+            "memory": get_memory_static(),
             "network": network_static,
             "disk": disk_static,
             "gpu": {

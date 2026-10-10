@@ -326,7 +326,7 @@ class CpuUsageSampler:
     each consume the interval the other was about to measure, and both end up
     reporting slivers of time rather than the period they think they asked for.
 
-    Same shape as membw.Sampler and gpu_perf.IndependentGpuSampler: the module
+    Same shape as memory.Sampler and gpu_perf.IndependentGpuSampler: the module
     keeps one shared instance for the dashboard, and any second consumer that
     samples on its own clock constructs one of its own. Unlike those two there is
     nothing to release, so there is no ``close()``.
@@ -497,19 +497,6 @@ def get_cpu_dynamic() -> Dict[str, Any]:
         "e_core_indices": e_cores,
         "lpe_core_indices": lpe_cores,
         "core_type_source": core_class["source"],
-    }
-
-
-def get_memory_dynamic() -> Dict[str, Any]:
-    mem = psutil.virtual_memory()
-    swap = psutil.swap_memory()
-    return {
-        "usage_percent": round(mem.percent, 2),
-        "total_gb": round(mem.total / (1024 ** 3), 2),
-        "available_gb": round(mem.available / (1024 ** 3), 2),
-        "swap_total_gb": round(swap.total / (1024 ** 3), 2),
-        "swap_used_gb": round(swap.used / (1024 ** 3), 2),
-        "swap_usage_percent": round(swap.percent, 2),
     }
 
 

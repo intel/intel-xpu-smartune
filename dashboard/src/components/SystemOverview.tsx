@@ -2987,6 +2987,9 @@ function SystemOverview({ active }: Props) {
         : (staticMemory.ddr_speeds?.length ? staticMemory.ddr_speeds.join('/') : null)
       if (speedStr) parts.push(speedStr)
       else if (!memTypes.length) parts.push('DDR N/A')
+      // Theoretical peak DRAM bandwidth, after capacity/type/speed.
+      const peak = staticMemory.max_bandwidth_gb_s
+      if (isNumber(peak)) parts.push(`${peak.toFixed(0)} GB/s`)
       return parts.join(' | ')
     }
     return (dynamicTotalGb != null && isNumber(dynamicTotalGb))
@@ -3469,6 +3472,17 @@ function SystemOverview({ active }: Props) {
                   ? `${formatMetric(mem?.swap_used_gb, 'GB', 1)} / ${swapTotal.toFixed(1)} GB (${formatPercent(mem?.swap_usage_percent)})`
                   : 'N/A'
               })(), source: 'dynamic' },
+              // Bandwidth (throughput) is orthogonal to usage% (capacity): how
+              // hard the memory controller works vs how full RAM is.
+              { label: 'BW Total', value: (() => {
+                const bw = dynamicInfo?.memory?.bandwidth
+                if (!isNumber(bw?.total_gb_s)) return 'N/A'
+                // Peak lives in the card subtitle; here show live value + its %.
+                const pct = isNumber(bw?.usage_percent) ? ` (${bw.usage_percent.toFixed(0)}%)` : ''
+                return `${bw.total_gb_s.toFixed(1)} GB/s${pct}`
+              })(), source: 'dynamic' },
+              { label: 'BW Read', value: formatMetric(dynamicInfo?.memory?.bandwidth?.read_gb_s, 'GB/s', 1), source: 'dynamic' },
+              { label: 'BW Write', value: formatMetric(dynamicInfo?.memory?.bandwidth?.write_gb_s, 'GB/s', 1), source: 'dynamic' },
             ]}
             sparkMode={sparkMode}
             trendWindow={trendWindow}

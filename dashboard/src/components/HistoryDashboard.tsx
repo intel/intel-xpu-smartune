@@ -42,11 +42,22 @@ interface CpuMemTrendPoint {
   pCoreUtilization: number | null
   eCoreUtilization: number | null
   lpeCoreUtilization: number | null
-  memoryUtilization: number | null
   pCoreFreqMhz: number | null
   eCoreFreqMhz: number | null
   lpeCoreFreqMhz: number | null
   cpuTemperatureC: number | null
+}
+
+interface MemoryTrendPoint {
+  timestamp: string
+  ts: number
+  // Left axis: capacity utilization (%). Right axis: the three IMC bandwidth
+  // reads (GB/s). Bandwidth is null when the PMU is unavailable or on the
+  // first sample (it is a counter delta).
+  memoryUtilization: number | null
+  bandwidthTotal: number | null
+  bandwidthRead: number | null
+  bandwidthWrite: number | null
 }
 
 interface DiskTrendPoint {
@@ -416,7 +427,8 @@ const DEFAULT_MONITORED_DYNAMIC_SECTION_SET = new Set<string>(DEFAULT_MONITORED_
 
 const RAW_SECTION_OPTIONS = [
   { label: 'System Pressure', value: 'pressure' },
-  { label: 'CPU & Memory', value: 'cpuMem' },
+  { label: 'CPU', value: 'cpu' },
+  { label: 'System Memory', value: 'memory' },
   { label: 'CPU Per-Core', value: 'cpuPerCore' },
   { label: 'Disk I/O', value: 'disk' },
   { label: 'Network I/O', value: 'network' },
@@ -424,12 +436,12 @@ const RAW_SECTION_OPTIONS = [
   { label: 'GPU', value: 'gpu' },
 ]
 // A chart is shown when ANY of its required sections is monitored (`.some`),
-// not all of them.  This matters for the combined "CPU & Memory" chart: with
-// only cpu (or only memory) monitored it still appears, showing whichever
-// series has data.  Single-requirement entries are unaffected.
+// not all of them.  Single-requirement entries (the common case) simply appear
+// whenever that one section is monitored.
 const SECTION_REQUIREMENTS: Record<string, string[]> = {
   pressure: ['pressure'],
-  cpuMem: ['cpu', 'memory'],
+  cpu: ['cpu'],
+  memory: ['memory'],
   cpuPerCore: ['cpu'],
   disk: ['disk'],
   network: ['network'],
@@ -596,11 +608,26 @@ function buildCpuMemTrendPoints(items: HistorySnapshotItem[]): CpuMemTrendPoint[
       pCoreUtilization: toNumber(dynamic?.cpu?.p_core_usage),
       eCoreUtilization: toNumber(dynamic?.cpu?.e_core_usage),
       lpeCoreUtilization: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.lpe_core_usage as number | null),
-      memoryUtilization: toNumber(dynamic?.memory?.usage_percent),
       pCoreFreqMhz: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.p_core_freq_mhz as number | null),
       eCoreFreqMhz: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.e_core_freq_mhz as number | null),
       lpeCoreFreqMhz: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.lpe_core_freq_mhz as number | null),
       cpuTemperatureC: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.temperature_c as number | null),
+    }
+  })
+}
+
+function buildMemoryTrendPoints(items: HistorySnapshotItem[]): MemoryTrendPoint[] {
+  return [...items].reverse().map((item) => {
+    const dynamic = toDynamicData(item)
+    const { ts, label } = buildTimestamp(item)
+    const bandwidth = dynamic?.memory?.bandwidth
+    return {
+      timestamp: label,
+      ts,
+      memoryUtilization: toNumber(dynamic?.memory?.usage_percent),
+      bandwidthTotal: toNumber(bandwidth?.total_gb_s),
+      bandwidthRead: toNumber(bandwidth?.read_gb_s),
+      bandwidthWrite: toNumber(bandwidth?.write_gb_s),
     }
   })
 }
@@ -1883,7 +1910,11 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
   }, [dynamicItems])
   const cpuMemTrendPoints = useMemo(() => {
     const raw = buildCpuMemTrendPoints(dynamicItems)
-    return downsampleWithGaps(raw, MAX_CHART_POINTS, (p) => Math.abs(p.cpuUtilization ?? 0) + Math.abs(p.memoryUtilization ?? 0) + Math.abs(p.pCoreFreqMhz ?? 0) + Math.abs(p.cpuTemperatureC ?? 0))
+    return downsampleWithGaps(raw, MAX_CHART_POINTS, (p) => Math.abs(p.cpuUtilization ?? 0) + Math.abs(p.pCoreFreqMhz ?? 0) + Math.abs(p.cpuTemperatureC ?? 0))
+  }, [dynamicItems])
+  const memoryTrendPoints = useMemo(() => {
+    const raw = buildMemoryTrendPoints(dynamicItems)
+    return downsampleWithGaps(raw, MAX_CHART_POINTS, (p) => Math.abs(p.memoryUtilization ?? 0) + Math.abs(p.bandwidthTotal ?? 0))
   }, [dynamicItems])
   const cpuPerCoreInfo = useMemo<CpuPerCoreInfo>(() => {
     const raw = buildCpuPerCoreTrendPoints(dynamicItems)
@@ -2175,6 +2206,9 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
         { header: 'mem_util_pct', key: 'util', width: 14 },
         { header: 'mem_total_gb', key: 'total', width: 14 },
         { header: 'mem_available_gb', key: 'avail', width: 16 },
+        { header: 'mem_bw_total_gbs', key: 'bwTotal', width: 16 },
+        { header: 'mem_bw_read_gbs', key: 'bwRead', width: 16 },
+        { header: 'mem_bw_write_gbs', key: 'bwWrite', width: 16 },
         { header: 'swap_util_pct', key: 'swap', width: 14 },
         { header: 'swap_total_gb', key: 'swap_total', width: 14 },
       ],
@@ -2182,6 +2216,9 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
         util: d?.memory?.usage_percent ?? null,
         total: d?.memory?.total_gb ?? null,
         avail: d?.memory?.available_gb ?? null,
+        bwTotal: d?.memory?.bandwidth?.total_gb_s ?? null,
+        bwRead: d?.memory?.bandwidth?.read_gb_s ?? null,
+        bwWrite: d?.memory?.bandwidth?.write_gb_s ?? null,
         swap: d?.memory?.swap_usage_percent ?? null,
         swap_total: d?.memory?.swap_total_gb ?? null,
       }),
@@ -2629,10 +2666,10 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
         )}
       </Card>}
 
-      {/* CPU & Memory — all metrics in one configurable chart */}
-      {visibleSections.includes('cpuMem') && !loading && cpuMemTrendPoints.length > 0 && (
+      {/* CPU — all CPU metrics in one configurable chart */}
+      {visibleSections.includes('cpu') && !loading && cpuMemTrendPoints.length > 0 && (
         <ConfigurableChart
-          title="CPU & Memory"
+          title="CPU"
           storageKey="history-cpu-series"
           data={cpuMemTrendPoints}
           timeWindow={timeWindow}
@@ -2647,7 +2684,6 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
             ...(cpuPerCoreInfo.lpeCoreIndices.length
               ? [{ key: 'lpeCoreUtilization', name: 'LPE-Core Util', color: '#b19cd9', unit: '%' }]
               : []),
-            { key: 'memoryUtilization', name: 'Memory', color: '#4ade80', unit: '%' },
             { key: 'pCoreFreqMhz', name: 'P-Core Freq', color: '#ff9f1c', unit: 'MHz', defaultOn: false },
             ...(cpuPerCoreInfo.eCoreIndices.length
               ? [{ key: 'eCoreFreqMhz', name: 'E-Core Freq', color: '#7ae582', unit: 'MHz', dasharray: '6 3', defaultOn: false }]
@@ -2656,6 +2692,24 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
               ? [{ key: 'lpeCoreFreqMhz', name: 'LPE-Core Freq', color: '#c7a8ff', unit: 'MHz', dasharray: '6 3', defaultOn: false }]
               : []),
             { key: 'cpuTemperatureC', name: 'CPU Temp', color: '#fbbf24', unit: '°C', dasharray: '4 2', defaultOn: false },
+          ]}
+        />
+      )}
+
+      {/* System Memory — capacity utilization (left %) + IMC bandwidth (right GB/s) */}
+      {visibleSections.includes('memory') && !loading && memoryTrendPoints.length > 0 && (
+        <ConfigurableChart
+          title="System Memory"
+          storageKey="history-memory-series"
+          data={memoryTrendPoints}
+          timeWindow={timeWindow}
+          height={280}
+          showBrush
+          allSeries={[
+            { key: 'memoryUtilization', name: 'Utilization', color: '#4ade80', unit: '%' },
+            { key: 'bandwidthTotal', name: 'BW Total', color: COLORS.accent, unit: 'GB/s' },
+            { key: 'bandwidthRead', name: 'BW Read', color: '#22d3ee', unit: 'GB/s' },
+            { key: 'bandwidthWrite', name: 'BW Write', color: METRIC_COLORS.write, unit: 'GB/s' },
           ]}
         />
       )}

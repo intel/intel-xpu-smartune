@@ -2056,7 +2056,11 @@ def update_passive_control():
 # static routes (weights_top, passive_control, monitored_sections, retention)
 # keep their dedicated handlers and take priority over this dynamic route.
 # ---------------------------------------------------------------------------
-_LIMIT_POLICY_MODES = ("combined", "separated")
+# The key stays as an extension point, but "separated" is the only mode the
+# balancer implements: the CPU/memory and disk-IO channels are judged, applied
+# and recovered independently.  Kept validated rather than dropped so a future
+# mode needs one entry here and nothing else.
+_LIMIT_POLICY_MODES = ("separated",)
 _LIMIT_PRIORITIES = ("high", "medium", "low", "undefined")
 _DISK_RATE_FIELDS = ("write", "read", "write_iops", "read_iops")
 _DISK_FLOOR_FIELDS = ("mb_s", "iops")
@@ -2344,7 +2348,7 @@ def _get_limit_policy_config():
     }
 
     return {
-        "policy": lp.get("policy", "combined"),
+        "policy": lp.get("policy", "separated"),
         "cpu": _res("cpu"),
         "memory": _res("memory"),
         "disk_io": disk,

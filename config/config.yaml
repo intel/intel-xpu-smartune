@@ -177,7 +177,9 @@ app_priority:
   medium: 50
   low: 20
 limit_policy: # Default resource limit ratios for apps at different priority levels
-  policy: "separated"  # combined: cpu/mem/disk IO limited under the same condition; separated: cpu/mem and disk IO evaluated independently
+  # "separated" is the only mode implemented now: cpu/mem and disk IO are judged, applied and
+  # recovered independently. The key is kept as an extension point for a future mode.
+  policy: "separated"
   cpu:
     enabled: true
     rate: # No limit for critical apps, so no ratio is configured for them

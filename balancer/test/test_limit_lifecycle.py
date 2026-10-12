@@ -127,6 +127,13 @@ class _ControlManager:
         # though -- _tick_memory_reclaim reads it on every separated tick.
         self.reclaim_enabled = False
         self.sample_calls = 0
+        # cgroupfs fallback for the auto memory cap. None means "could not read",
+        # which is the honest default here: these tests hand the cap the RSS it
+        # should use through the top-consumer sample instead.
+        self.memory = types.SimpleNamespace(
+            read_current=lambda cgroup: None,
+            read_swap_current=lambda cgroup: None,
+        )
         # Read on every tick by the early-prefetch check.  False plus a flat
         # window means "nothing is brewing", which is what these tests want:
         # they are about the disk channel, not about the memory warning path.
@@ -336,6 +343,45 @@ class CandidateBatchOwnershipTests(unittest.TestCase):
         apply_mock.assert_called_once()
         self.assertFalse(apply_mock.call_args.kwargs['is_disk_io_stressed'])
         self.assertEqual(b.disk_top_prefetcher.resolved, 0)
+
+    def test_disk_critical_does_not_get_to_apply_while_the_system_is_critical(self):
+        """Both channels critical at once: only the system channel acts. Writing an
+        io.max here would cap the very app the system channel is about to make a
+        reclaim target, which is the conflict _clear_io_cap_before_sys_limit exists
+        to undo -- cheaper never to create it. The disk stays critical, so the next
+        tick after memory calms down throttles it then."""
+        b = _balancer()
+        state = _state()
+
+        with mock.patch.object(b, '_apply_resource_limits') as apply_mock, \
+                mock.patch.object(b, '_target_still_present', return_value=True), \
+                mock.patch.object(b, '_handle_disk_io_stressed') as disk_pick, \
+                mock.patch.object(b, '_handle_critical_pressure',
+                                  return_value=(True, False, 'sys-app.scope', {'cpu_rate': 0.3})):
+            b._tick_separated_policy(state, 'critical', 'critical', True)
+
+        apply_mock.assert_called_once()
+        self.assertFalse(apply_mock.call_args.kwargs['is_disk_io_stressed'])
+        # The disk arm is not merely out-voted on the apply -- it never runs, so it
+        # neither samples nor spends a candidate batch on this tick.
+        disk_pick.assert_not_called()
+        self.assertEqual(b.disk_top_prefetcher.resolved, 0)
+
+    def test_disk_critical_applies_once_the_system_is_no_longer_critical(self):
+        """The other half of the hand-off: yielding is deferral, not forgiveness."""
+        b = _balancer()
+        state = _state()
+
+        with mock.patch.object(b, '_apply_resource_limits') as apply_mock, \
+                mock.patch.object(b, '_target_still_present', return_value=True), \
+                mock.patch.object(b, '_handle_disk_io_stressed',
+                                  return_value=(True, False, 'hi-io.scope',
+                                                {'disk_io_rate': {'read': 20}},
+                                                _candidate('hi-io.scope'), 0)):
+            b._tick_separated_policy(state, 'high', 'critical', True)
+
+        apply_mock.assert_called_once()
+        self.assertTrue(apply_mock.call_args.kwargs['is_disk_io_stressed'])
 
     def test_unmanaged_system_candidate_uses_sampled_cgroup_for_restoration(self):
         """A bare process name must not be retained as the cgroup restore target."""
@@ -870,6 +916,130 @@ class AutoToManualScopeTests(unittest.TestCase):
 
         b.control_manager.reclaim_memory_to_target.assert_not_called()
 
+    def _io_and_mem_usage(self):
+        return {
+            'cgroup_paths': ['/user.slice/user-1000.slice/app-test.scope'],
+            'pids': [111],
+            'cpu_percent': 100,
+            'mem_current': 1000,
+            'mem_swap_current': 0,
+            'per_cgroup_mem': {'app-test.scope': 1000},
+            'per_cgroup_cpu_delta': {'app-test.scope': 100},
+            'io_read_mb': 0, 'io_write_mb': 0,
+            'io_read_iops': 0, 'io_write_iops': 0,
+        }
+
+    def _run_manual_limit_with_io(self, b, order, mem_rate=0.5):
+        """One manual limit asking for a memory cap and a disk-IO cap at once."""
+        usage = self._io_and_mem_usage()
+        b.control_manager.adjust_resources = mock.Mock(return_value=True)
+        b.control_manager.reclaim_memory_to_target = mock.Mock(
+            side_effect=lambda *a, **k: order.append('reclaim') or types.SimpleNamespace(
+                reclaimed_bytes=0, elapsed_ms=0, ok=True, reason="noop"))
+        b.io_ctl.set_disk_io_throttle = mock.Mock(
+            side_effect=lambda *a, **k: order.append('io.max') or True)
+        b.get_limited_rates = mock.Mock(return_value={
+            'cpu_rate': 0.3, 'mem_rate': mem_rate,
+            'disk_io_rate': {'read': 10, 'write': 10,
+                             'read_iops': 2000, 'write_iops': 2000},
+        })
+        with mock.patch.object(balancer_mod.app_utils, 'get_app_resource_usage', return_value=usage), \
+                mock.patch.object(balancer_mod.app_utils, 'get_cgroup_path_by_pid',
+                                  return_value=usage['cgroup_paths'][0]), \
+                mock.patch.object(b, '_is_io_limit_reached', return_value=True), \
+                mock.patch.object(b, '_claim_swap_growth_slot', return_value=False), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils.callback_manager,
+                                  'send_callback_notification'), \
+                mock.patch.object(balancer_mod, '_emit_control_events'):
+            return b.set_resource_limit('test-app', 'test app', 'low')
+
+    def test_the_io_cap_goes_on_after_the_reclaim_not_before(self):
+        """Reclaim writes the app's anon pages to swap, and swap bios carry the
+        owning memcg's blkcg -- so an io.max installed first throttles the very
+        reclaim the memory cap asked for.  Measured: a 5.3 GB reclaim took 7.6 s
+        unthrottled and would need ~9 minutes behind a 10 MB/s cap."""
+        b = _balancer()
+        order = []
+        self.assertTrue(self._run_manual_limit_with_io(b, order))
+        self.assertEqual(order[0], 'reclaim')
+        self.assertIn('io.max', order)
+        self.assertLess(order.index('reclaim'), order.index('io.max'))
+
+    def test_a_deferred_io_cap_is_recorded_once_it_actually_lands(self):
+        """The entry is created before the cap exists, so io_limited starts
+        False and only becomes True after the deferred write succeeds -- a limit
+        the registry claims must always have a restore to pair with."""
+        b = _balancer()
+        self._run_manual_limit_with_io(b, [])
+        self.assertTrue(b.all_limits.apps['app-test.scope'].limit_parts['io_limited'])
+
+    def test_a_failed_deferred_io_cap_is_not_claimed_as_applied(self):
+        b = _balancer()
+        usage = self._io_and_mem_usage()
+        b.control_manager.adjust_resources = mock.Mock(return_value=True)
+        b.control_manager.reclaim_memory_to_target = mock.Mock(
+            return_value=types.SimpleNamespace(
+                reclaimed_bytes=0, elapsed_ms=0, ok=True, reason="noop"))
+        b.io_ctl.set_disk_io_throttle = mock.Mock(return_value=False)
+        b.get_limited_rates = mock.Mock(return_value={
+            'cpu_rate': 0.3, 'mem_rate': 0.5,
+            'disk_io_rate': {'read': 10, 'write': 10,
+                             'read_iops': 2000, 'write_iops': 2000},
+        })
+        with mock.patch.object(balancer_mod.app_utils, 'get_app_resource_usage', return_value=usage), \
+                mock.patch.object(balancer_mod.app_utils, 'get_cgroup_path_by_pid',
+                                  return_value=usage['cgroup_paths'][0]), \
+                mock.patch.object(b, '_is_io_limit_reached', return_value=True), \
+                mock.patch.object(b, '_claim_swap_growth_slot', return_value=False), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils.callback_manager,
+                                  'send_callback_notification'), \
+                mock.patch.object(balancer_mod, '_emit_control_events'):
+            b.set_resource_limit('test-app', 'test app', 'low')
+        self.assertFalse(b.all_limits.apps['app-test.scope'].limit_parts['io_limited'])
+
+    def test_a_deferred_io_cap_is_dropped_if_the_app_was_restored_meanwhile(self):
+        """The reclaim runs with no lock held, so a UI restore can land in the
+        middle.  Writing io.max then would leave a cap with no registry entry to
+        ever take it off again."""
+        b = _balancer()
+        usage = self._io_and_mem_usage()
+        b.control_manager.adjust_resources = mock.Mock(return_value=True)
+
+        def restore_during_reclaim(*a, **k):
+            b.all_limits.apps.pop('app-test.scope', None)
+            return types.SimpleNamespace(
+                reclaimed_bytes=0, elapsed_ms=0, ok=True, reason="noop")
+
+        b.control_manager.reclaim_memory_to_target = mock.Mock(
+            side_effect=restore_during_reclaim)
+        b.io_ctl.set_disk_io_throttle = mock.Mock(return_value=True)
+        b.get_limited_rates = mock.Mock(return_value={
+            'cpu_rate': 0.3, 'mem_rate': 0.5,
+            'disk_io_rate': {'read': 10, 'write': 10,
+                             'read_iops': 2000, 'write_iops': 2000},
+        })
+        with mock.patch.object(balancer_mod.app_utils, 'get_app_resource_usage', return_value=usage), \
+                mock.patch.object(balancer_mod.app_utils, 'get_cgroup_path_by_pid',
+                                  return_value=usage['cgroup_paths'][0]), \
+                mock.patch.object(b, '_is_io_limit_reached', return_value=True), \
+                mock.patch.object(b, '_claim_swap_growth_slot', return_value=False), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils.callback_manager,
+                                  'send_callback_notification'), \
+                mock.patch.object(balancer_mod, '_emit_control_events'):
+            b.set_resource_limit('test-app', 'test app', 'low')
+        b.io_ctl.set_disk_io_throttle.assert_not_called()
+
+    def test_an_io_only_manual_limit_is_applied_immediately(self):
+        """Nothing to reclaim means nothing to protect, so deferring would only
+        delay the user's cap."""
+        b = _balancer()
+        order = []
+        self.assertTrue(self._run_manual_limit_with_io(b, order, mem_rate=None))
+        self.assertEqual(order, ['io.max'])
+
     def test_manual_limit_rejects_an_auto_limited_target_cgroup(self):
         b = _balancer()
         b.all_limits.apps['session-8740.scope'] = _limited('session-8740.scope', cpu_mem=True)
@@ -1277,43 +1447,6 @@ class SeparatedRestoreChannelTests(unittest.TestCase):
         self.assertEqual(lifecycle['active_resources'], [])
         self.assertEqual(lifecycle['status'], 'recovered')
 
-    def test_combined_auto_limit_recovers_cpu_memory_after_sustained_recap(self):
-        """Combined policy caps CPU+memory+IO together and records no cpu/memory
-        split. A sustained-critical re-cap must not turn that missing split into a
-        {cpu:False, memory:False} value that drops CPU/MEMORY from the RECOVERED
-        ledger and leaves them stuck 'active' after the user restores the app."""
-        b = _balancer()
-        with mock.patch.object(control_events, 'emit_event') as emit, \
-                mock.patch.object(control_events, 'read_boot_id', return_value='boot-1'):
-            for _ in range(2):  # second tick exercises the merge branch
-                b._upsert_auto_limited(
-                    'app.scope', 'app-1', 'demo',
-                    {'cpu_rate': 0.3, 'mem_rate': 0.1, 'disk_io_rate': {}},
-                    resource_limited=True, io_limited=True, priority='low',
-                    is_controlled=False, limit_reason='system_pressure',
-                    pressure_level='critical', cgroups=['app.scope'])
-            entry = b.all_limits.apps.pop('app.scope')  # caller pops before restore
-            with mock.patch.object(b, '_cgroup_exists', return_value=True):
-                self.assertTrue(b._restore_entry(entry, notify=False))
-
-        events = [
-            {
-                'event_id': str(index),
-                'ts_utc': f'2026-01-01T00:00:0{index}+00:00',
-                'event_type': call.args[0],
-                'protection_id': call.kwargs['protection_id'],
-                'resource_type': call.kwargs['resource_type'],
-                'app_id': call.kwargs['app_id'],
-                'source': call.kwargs['source'],
-            }
-            for index, call in enumerate(emit.call_args_list, start=1)
-        ]
-
-        lifecycle = control_lifecycle.summarize(events)[0]
-        self.assertEqual(lifecycle['recovered_resources'], ['cpu', 'disk_io', 'memory'])
-        self.assertEqual(lifecycle['active_resources'], [])
-        self.assertEqual(lifecycle['status'], 'recovered')
-
     def test_disk_pressure_apply_records_only_disk_io(self):
         """Disk-pressure limiting caps only IO. The priority limit_rates still carry
         cpu_rate/mem_rate and a caller may hand a resource_parts that reflects the
@@ -1424,61 +1557,177 @@ class SeparatedRestoreChannelTests(unittest.TestCase):
         self.assertFalse(b._restore_channel('sys', 'full', 'test'))
         self.assertIn('io-only.scope', b.all_limits.apps)
 
-
-class CombinedPolicyTests(unittest.TestCase):
-    """Combined policy has a single channel and restores both caps together."""
-
     def test_failed_full_restore_emits_terminal_failure_events(self):
+        """A full restore that the kernel refuses leaves the cap on, so the
+        lifecycle is not recovered -- it is terminally FAILED. The event names
+        only the channel that was being lifted, even though the app is capped on
+        both: the other channel's cap was never touched by this call."""
         b = _balancer()
         entry = _limited('app.scope', cpu_mem=True, io=True)
         entry.protection_id = 'protect-1'
         b.all_limits.apps['app.scope'] = entry
         b.control_manager.adjust_resources = mock.Mock(return_value=False)
-        state = _state(
-            pressure_start_time=NOW - _MonitorLoopState.STABLE_PERIOD,
-            current_pressure='low',
-        )
 
         with mock.patch.object(balancer_mod, '_emit_control_events') as emit, \
                 mock.patch.object(b, '_notify_auto_limit_changed'):
-            b._tick_combined_restore(state, 'low')
+            self.assertFalse(b._restore_channel('sys', 'full', 'test'))
 
         emit.assert_called_once()
         action, parts = emit.call_args.args
-        assert action == 'FAILED'
-        assert parts == {'cpu_mem_limited': True, 'io_limited': True}
-        assert emit.call_args.kwargs['protection_id'] == 'protect-1'
-        assert emit.call_args.kwargs['attributes']['restore_type'] == 'full'
-        assert emit.call_args.kwargs['attributes']['cgroups'] == ['app.scope']
+        self.assertEqual(action, 'FAILED')
+        self.assertEqual(parts, {'cpu_mem_limited': True, 'io_limited': False})
+        self.assertEqual(emit.call_args.kwargs['protection_id'], 'protect-1')
+        self.assertEqual(emit.call_args.kwargs['attributes']['cgroups'], ['app.scope'])
+        # Still registered, so the next calm tick retries it.
+        self.assertIn('app.scope', b.all_limits.apps)
 
-    def test_stale_batch_is_resampled(self):
+
+def _sys_target(app_id='app.scope', rss=None, extras=()):
+    """A sys-channel top-consumer sample shaped the way _apply_resource_limits reads it."""
+    return {
+        'app': {'id': app_id, 'name': 'demo'},
+        'process': {'name': 'demo', 'pid': 111},
+        'pids': [111],
+        'public_app_id': 'app-1',
+        'extra_cgroups': list(extras),
+        'per_cgroup_mem_rss': dict(rss or {}),
+        'per_cgroup_cpu': {},
+        'resolved_priority': 'low',
+    }
+
+
+class SysLimitIoYieldTests(unittest.TestCase):
+    """A CPU/memory cap and an io.max cap on the same app defeat each other: the
+    app becomes a reclaim target whose swap writes go down the throttled path.
+    The disk channel yields, through the normal restore so the books stay square."""
+
+    def _apply(self, b, target=None, rates=None):
+        with mock.patch.object(balancer_mod, '_emit_control_events'), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils, 'callback_manager'), \
+                mock.patch.object(b, '_warn_on_shared_cgroups'):
+            b._apply_resource_limits(
+                target or _sys_target(), 'app.scope',
+                rates or {'cpu_rate': 0.3, 'mem_rate': 0.3},
+                False, is_disk_io_stressed=False, pressure_level='critical')
+
+    def test_sys_cap_lifts_an_existing_io_cap_first(self):
         b = _balancer()
-        state = _state(top_consume_apps=[_candidate('old.scope')],
-                       top_source='sys', reach_threshold=True,
-                       top_fetched_at=NOW - _MonitorLoopState.TOP_BATCH_TTL - 1)
+        entry = _limited('app.scope', io=True)
+        b.all_limits.apps['app.scope'] = entry
 
-        with mock.patch.object(b, '_update_dominant_flag_from_top'), \
-                mock.patch.object(b, '_apply_combined_critical_limits') as apply_mock, \
-                mock.patch.object(b, '_target_still_present', return_value=True), \
-                mock.patch.object(b, '_handle_critical_pressure',
-                                  side_effect=lambda apps, reached: (
-                                      True, False, apps[0]['app']['id'], {'cpu_rate': 0.3})):
-            b._tick_combined_policy(state, "critical", True)
+        self._apply(b)
 
-        self.assertEqual(b.top_prefetcher.resolved, 1)
-        self.assertEqual(apply_mock.call_args.args[1], 'sys-app.scope')
+        self.assertEqual([c for c, _ in b.io_ctl.restore_calls], ['app.scope'])
+        # Restored through the registry, not by a bare write: the flag is cleared,
+        # so the disk timer will not try to restore a cap that is already gone.
+        self.assertFalse(b.all_limits.apps['app.scope'].limit_parts['io_limited'])
+        self.assertTrue(b.all_limits.apps['app.scope'].limit_parts['cpu_mem_limited'])
 
-    def test_dead_target_is_not_limited(self):
+    def test_an_app_with_no_io_cap_is_left_alone(self):
         b = _balancer()
-        state = _state()
-        with mock.patch.object(b, '_update_dominant_flag_from_top'), \
-                mock.patch.object(b, '_apply_combined_critical_limits') as apply_mock, \
-                mock.patch.object(b, '_pid_gone_or_dying', return_value=True), \
-                mock.patch.object(b, '_cgroup_exists', return_value=False), \
-                mock.patch.object(b, '_handle_critical_pressure',
-                                  return_value=(True, False, 'sys-app.scope', {'cpu_rate': 0.3})):
-            b._tick_combined_policy(state, "critical", True)
-        apply_mock.assert_not_called()
+        b.all_limits.apps['app.scope'] = _limited('app.scope', cpu_mem=True)
+
+        self._apply(b)
+
+        self.assertEqual(b.io_ctl.restore_calls, [])
+
+    def test_a_manual_io_cap_is_never_lifted(self):
+        """A manual limit is the user's decision. The auto path skips the app
+        entirely rather than quietly handing back a cap it did not apply."""
+        b = _balancer()
+        entry = _limited('app.scope', io=True)
+        entry.source = 'manual'
+        b.all_limits.apps['app.scope'] = entry
+
+        self._apply(b)
+
+        self.assertEqual(b.io_ctl.restore_calls, [])
+        self.assertTrue(b.all_limits.apps['app.scope'].limit_parts['io_limited'])
+
+
+class AutoMemoryCapTests(unittest.TestCase):
+    """The auto memory cap has to be a cap on the app, not on the machine."""
+
+    # _balancer() reports a 32000 MB machine.
+    TOTAL_MB = 32000
+
+    def _mem_high(self, b, target, rate=0.3):
+        with mock.patch.object(balancer_mod, '_emit_control_events'), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils, 'callback_manager'), \
+                mock.patch.object(b, '_warn_on_shared_cgroups'):
+            b._apply_resource_limits(
+                target, 'app.scope', {'cpu_rate': 0.3, 'mem_rate': rate},
+                False, is_disk_io_stressed=False, pressure_level='critical')
+        primary = [kwargs for cg, _, kwargs in b.control_manager.adjust_calls
+                   if cg == 'app.scope']
+        return primary[0]['mem_high']
+
+    def test_a_small_app_is_capped_against_its_own_usage(self):
+        """2000 MB app, 30% rate: the system share is 9600 MB, which is five times
+        what the app holds -- writing that is not a limit, it is a no-op that still
+        costs a registry entry and a restore."""
+        b = _balancer()
+        mem_high = self._mem_high(
+            b, _sys_target(rss={'app.scope': 2000 * 1024 ** 2}))
+        self.assertEqual(mem_high, 600)
+
+    def test_a_working_set_larger_than_ram_is_held_to_the_system_share(self):
+        """Working set counts swapped pages, so it can exceed MemTotal -- and then
+        its share exceeds the machine's. memory.high is measured against RAM, so
+        the system share is still the ceiling."""
+        b = _balancer()
+        b.control_manager.memory = types.SimpleNamespace(
+            read_current=lambda cgroup: 29000 * 1024 ** 2,
+            read_swap_current=lambda cgroup: 8000 * 1024 ** 2,
+        )
+        # 37000 MB * 0.3 = 11100 MB, more than 30% of a 32000 MB machine.
+        self.assertEqual(self._mem_high(b, _sys_target()),
+                         int(self.TOTAL_MB * 0.3))
+
+    def test_usage_is_summed_across_every_cgroup_of_the_app(self):
+        """mem_high is the app's total; _split_proportionally divides it afterwards.
+        Sizing it off one cgroup would under-count a multi-scope app."""
+        b = _balancer()
+        target = _sys_target(
+            rss={'app.scope': 2000 * 1024 ** 2, 'extra.scope': 2000 * 1024 ** 2},
+            extras=('extra.scope',))
+        with mock.patch.object(balancer_mod, '_emit_control_events'), \
+                mock.patch.object(balancer_mod.app_utils, 'update_app_status'), \
+                mock.patch.object(balancer_mod.app_utils, 'callback_manager'), \
+                mock.patch.object(b, '_warn_on_shared_cgroups'):
+            b._apply_resource_limits(
+                target, 'app.scope', {'cpu_rate': 0.3, 'mem_rate': 0.3},
+                False, is_disk_io_stressed=False, pressure_level='critical')
+        caps = {cg: kwargs['mem_high'] for cg, _, kwargs in b.control_manager.adjust_calls}
+        self.assertEqual(sum(caps.values()), 1200)
+
+    def test_swapped_pages_still_count_as_the_working_set(self):
+        """Reclaim moves anon pages out of RSS into swap. If the cap were sized on
+        RSS alone, every successful reclaim would shrink the next cap -- a ratchet
+        that ends with the app pinned at nothing."""
+        b = _balancer()
+        b.control_manager.memory = types.SimpleNamespace(
+            read_current=lambda cgroup: 500 * 1024 ** 2,
+            read_swap_current=lambda cgroup: 1500 * 1024 ** 2,
+        )
+        # No sampled RSS, so the cgroupfs fallback answers: 500 MB resident plus
+        # 1500 MB swapped is the same 2000 MB working set as the test above.
+        self.assertEqual(self._mem_high(b, _sys_target()), 600)
+
+    def test_an_unreadable_app_falls_back_to_the_system_share(self):
+        """A failed read is not 'the app uses nothing'. Writing 0 MB would put the
+        app in permanent reclaim instead of limiting it."""
+        b = _balancer()
+        self.assertEqual(self._mem_high(b, _sys_target()),
+                         int(self.TOTAL_MB * 0.3))
+
+    def test_a_tiny_app_is_never_capped_at_zero(self):
+        b = _balancer()
+        mem_high = self._mem_high(
+            b, _sys_target(rss={'app.scope': 2 * 1024 ** 2}), rate=0.3)
+        self.assertEqual(mem_high, 1)
 
 
 class EffectiveLimitDetailsTests(unittest.TestCase):

@@ -57,6 +57,10 @@ def _balancer(disk_io_cfg=None, disks=None):
     b = DynamicBalancer.__new__(DynamicBalancer)  # no __init__: no BPF, no cgroups
     b.config = _Cfg(disk_io_cfg)
     b.io_ctl = _IoCtl(disks or {"nvme0n1": "259:0"})
+    # Never inside the post-reclaim quiet window: that gate stands the whole arm
+    # down (see _RECLAIM_DISK_QUIET_SEC), which is its own test's subject, not a
+    # precondition for the candidate-selection tests here.
+    b._reclaim_quiet_until = 0.0
     return b
 
 

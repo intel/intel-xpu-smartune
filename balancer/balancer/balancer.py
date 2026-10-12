@@ -58,9 +58,9 @@ def _control_resources(parts: dict, resource_parts: dict) -> list:
         cpu = bool(resource_parts.get("cpu"))
         memory = bool(resource_parts.get("memory"))
         # cpu_mem_limited means the channel is capped. When the split names
-        # neither -- combined policy never records it, and a merge can leave
-        # {cpu:False, memory:False} -- attribute to both rather than drop the
-        # resource, so RECOVERED stays symmetric with APPLIED.
+        # neither -- a merge can leave {cpu:False, memory:False} -- attribute to
+        # both rather than drop the resource, so RECOVERED stays symmetric with
+        # APPLIED.
         if not (cpu or memory):
             cpu = memory = True
         if cpu:
@@ -105,6 +105,24 @@ _SWAP_GROWTH_INTERVAL = 60.0
 # unsupported filesystem) every tick -- it was never meant to decide how long a
 # machine in trouble waits for its next look at the watermarks.
 _SWAP_GROWTH_URGENT_INTERVAL = 10.0
+
+# How long after our own reclaim the disk-IO arm stays quiet.
+#
+# Reclaim pushes anon pages to swap, and swap bios are real device traffic: a
+# measured 5.3 GB reclaim drove nvme0n1 to 717 MB/s write, aqu 197, and the disk
+# channel to critical within seconds.  Acting on that is wrong twice over -- the
+# pressure is ours, not the candidate's, and it is gone as soon as the reclaim
+# ends -- and the arm cannot tell, because `/proc/<pid>/io` only sees
+# process-context IO so kernel writeback never shows up against the app that
+# caused it.  (`self_disc` does not cover this either: it discounts a *limited
+# app's* own stall on its own io.max, measured from that cgroup's io.pressure,
+# while reclaim stalls land on the daemon's cgroup.)
+#
+# The window has to outlast the signal, not the write: the disk score is an
+# EWMA (alpha 0.3) over the pressure monitor's refresh, so our contribution
+# lingers for several samples after the last byte.  20 s sheds most of it while
+# still letting a genuinely heavy writer be throttled on the next tick but one.
+_RECLAIM_DISK_QUIET_SEC = 20.0
 
 
 def _emit_reclaim_event(event_type: str, severity: str, summary: str,
@@ -188,9 +206,7 @@ class LimitedApp:
             identity an auto-limit exclusion is keyed by (see
             LimitRegistry.add_exclusion).
       * limit_reason  — which pressure channel triggered the limit:
-            "system_pressure" or "disk_pressure".  The combined policy folds
-            CPU/memory and disk IO into the single system-pressure signal, so
-            everything it limits is reported as "system_pressure".
+            "system_pressure" or "disk_pressure".
       * pressure_level — the level of that channel when the limit landed.
     """
     public_app_id: str
@@ -297,16 +313,6 @@ class LimitRegistry:
             if skip_partially_restored and app.partial_parts.get(channel):
                 continue
             return key, app
-        return None
-
-    def pop_last_auto(self) -> "Optional[tuple[str, LimitedApp]]":
-        """Pop and return the most-recently-inserted auto-limited entry.
-
-        Preserves LIFO-tail ordering for combined-policy restoration.
-        """
-        for key in reversed(self.apps):
-            if self.apps[key].source == "auto":
-                return key, self.apps.pop(key)
         return None
 
     def by_public_id(self, public_app_id: str, source: Optional[str] = None) -> "Optional[tuple[str, LimitedApp]]":
@@ -872,6 +878,13 @@ class DynamicBalancer:
         self._swap_growth_lock = threading.Lock()
         self._last_swap_release_at = 0.0
 
+        # Wall-clock until which the disk-IO arm ignores disk pressure because
+        # our own reclaim produced it -- see _RECLAIM_DISK_QUIET_SEC.  A plain
+        # float: written from the reclaim executor's callback and the REST
+        # thread, read from the monitor loop, and a torn read is impossible for
+        # a float store in CPython while a lock here would sit on the hot path.
+        self._reclaim_quiet_until = 0.0
+
         # Anything a previous run could not hand back -- files still held at
         # shutdown, and files left on disk by a reboot (we never write fstab,
         # so after a reboot they are no longer swapped on and nobody owns the
@@ -1023,18 +1036,26 @@ class DynamicBalancer:
         """Main pressure-driven decision loop.
 
         Each iteration:
-          1. Samples peak pressure (and disk-IO stress, in separated policy).
+          1. Samples peak pressure and disk-IO stress.
           2. Warms the top-consumer cache on rising edges / sustained
              critical, gated by ``passive_resource_control``.
-          3. Dispatches to the policy-specific tick method.
+          3. Runs the policy tick.
           4. Runs the network tick.
 
-        Decision logic lives in ``_tick_separated_policy`` /
-        ``_tick_combined_policy``; this method only orchestrates.
+        Decision logic lives in ``_tick_separated_policy``; this method only
+        orchestrates.
         """
         logger.info("Monitor resource service started")
         state = self._make_monitor_loop_state()
-        policy = self.config.limit_policy['policy']
+        # ``limit_policy.policy`` is kept as an extension point, but "separated"
+        # is the only mode there is: the CPU/memory and disk-IO channels have
+        # their own thresholds, their own candidate lists and their own recovery
+        # timers. Anything else in the config is a leftover, not a choice.
+        policy = self.config.limit_policy.get('policy', 'separated')
+        if policy != 'separated':
+            logger.warning(
+                "limit_policy.policy=%r is no longer supported; running as 'separated'",
+                policy)
 
         self.control_manager.register_critical_state_listener(self._on_critical_state_changed)
         self.control_manager.register_level_change_listener(self._on_pressure_level_changed)
@@ -1123,11 +1144,7 @@ class DynamicBalancer:
                         # Use consume_peak_pressure_level() instead of get_current_pressure_level()
                         # so that transient "critical" spikes that occurred while the
                         # idle_check_interval gate was closed are never silently dropped.
-                        disk_level = "low"
-                        if policy == "separated":
-                            pressure, _, disk_level = self.control_manager.consume_peak_pressure_level()
-                        else:  # policy == "combined"
-                            pressure, *_ = self.control_manager.consume_peak_pressure_level()
+                        pressure, _, disk_level = self.control_manager.consume_peak_pressure_level()
 
                         state.last_check_time = state.current_time
                         # Top-consumer prefetch / recheck only exist to warm the cache for the
@@ -1149,10 +1166,7 @@ class DynamicBalancer:
                         # measured benchmark run must not see.
                         self._tick_swap_release(state)
 
-                        if policy == "separated":
-                            self._tick_separated_policy(state, pressure, disk_level, passive_enabled)
-                        elif policy == "combined":
-                            self._tick_combined_policy(state, pressure, passive_enabled)
+                        self._tick_separated_policy(state, pressure, disk_level, passive_enabled)
                         state.prev_pressure = pressure
                         state.prev_disk_level = disk_level
 
@@ -1816,6 +1830,23 @@ class DynamicBalancer:
             return False
 
         app_id, entry = found
+        return self._restore_channel_for(app_id, entry, channel, restore_type, why)
+
+    def _restore_channel_for(self, app_id: str, entry: "LimitedApp", channel: str,
+                             restore_type: str, why: str) -> bool:
+        """Restore one channel of one *named* entry.
+
+        The body of ``_restore_channel`` after it has picked a target.  Split out
+        so a caller that already knows which app it wants — the sys-critical path
+        clearing an io cap off the app it is about to reclaim from — goes through
+        the same accounting as the timers do: the ``limit_parts`` flag, the
+        ``limit_disks`` list, the RECOVERED/FAILED events and the UI notification
+        all happen here and nowhere else.  A cap lifted outside this method would
+        leave the registry claiming a limit the kernel no longer has.
+
+        :returns: True when a full restore actually completed.
+        """
+        part = self._CHANNEL_PART[channel]
         app_name = entry.app_name
         # Only this channel's flag is set, so restore_resources leaves the other
         # channel's cap in place even when the app is limited on both.
@@ -1886,87 +1917,60 @@ class DynamicBalancer:
         logger.info(f"Fully restored app {app_id}, removed from limited apps")
         return True
 
-    def _tick_combined_policy(
-        self,
-        state: "_MonitorLoopState",
-        pressure: str,
-        passive_enabled: bool,
-    ) -> None:
-        """One iteration of the combined-policy state machine.
+    def _clear_io_cap_before_sys_limit(self, app_id: str, app_name: str) -> None:
+        """Lift an auto disk-IO cap off an app that is about to be capped on CPU/memory.
 
-        Combined policy treats CPU/memory and disk-IO as a single pressure
-        signal, so there's no parallel disk-IO branch and no double-stable
-        timer: one channel ("sys") fills the candidate batch and one limit
-        covers CPU/Mem + IO together. Three mutually-exclusive cases:
-          * critical pressure         — apply or refresh limits (CPU/Mem + IO together)
-          * pending app launches      — drain queue when pressure isn't critical
-          * medium/low pressure       — staged restore on a single timer
+        The two caps are individually sound and jointly self-defeating: an app
+        under ``memory.high`` is a reclaim target, and reclaim writes its anon
+        pages to swap over the same block device ``io.max`` is throttling.  The
+        app then either reclaims at the throttled rate or stalls outright, and
+        the system deficit the CPU/memory cap was meant to relieve stays.
+
+        Only the disk channel yields, and only for auto limits — a manual io cap
+        is the user's decision and is never touched here.  Yielding is not
+        forgetting: the disk channel is judged on its own thresholds every tick,
+        so if the disk is still saturated once memory is off the critical list it
+        gets capped again.
         """
-        if passive_enabled and pressure == "critical":
-            state.pressure_start_time = None
-            state.restore_pending = False
-            # Only one channel here, so a held batch can only be stale by age --
-            # a multi-entry batch left over from an earlier critical episode
-            # would otherwise be consumed one entry per tick, long after the
-            # apps it named stopped being the heavy ones.
-            stale_reason = state.stale_top_batch_reason("sys", state.current_time)
-            if stale_reason:
-                logger.info(
-                    "Discarding %d held top-consumer candidate(s): %s",
-                    len(state.top_consume_apps), stale_reason,
-                )
-                state.drop_top_batch()
-            if not state.top_consume_apps:
-                apps, reach_threshold = self.top_prefetcher.resolve_for_critical()
-                state.keep_top_batch(self._drop_excluded_candidates(apps),
-                                     reach_threshold, "sys", state.current_time)
-            self._refilter_held_batch(state)
+        found = self.all_limits.by_any_id(app_id, source="auto")
+        if not found:
+            return
+        key, entry = found
+        if not entry.limit_parts.get('io_limited'):
+            return
 
-            if state.top_consume_apps:
-                self._update_dominant_flag_from_top(state)
-                should_adjust, is_controlled, app_id, limit_rates = self._handle_critical_pressure(
-                    state.top_consume_apps, state.reach_threshold)
-
-                target_app = state.top_consume_apps[0]
-                if (not self.all_limits.is_limited_app_dominant and state.reach_threshold
-                        and should_adjust and app_id
-                        and self._target_still_present(target_app, app_id)):
-                    self._apply_combined_critical_limits(
-                        target_app, app_id, limit_rates, is_controlled,
-                        pressure_level=pressure,
-                    )
-
-                # Same ordering as the separated policy: L1 first, then L2 on
-                # the now-throttled set.
-                self._tick_memory_reclaim(state)
-
-                state.top_consume_apps.pop(0)
-            else:
-                state.reset()
-        elif not self.app_priority_queue.empty() and pressure != "critical":
-            self._drain_pending_app_queue(state)
-        else:
-            self._tick_combined_restore(state, pressure)
+        logger.info(
+            "[io-yield] %s (%s) is about to be capped on CPU/memory while it carries "
+            "an auto io.max; restoring its disk-IO channel first so reclaim can write "
+            "to swap", app_name, key)
+        self._restore_channel_for(
+            key, entry, "disk_io", "full",
+            "System pressure is critical; the disk cap yields to memory reclaim")
 
     # ------------------------------------------------------------------
     # L2: proactive reclaim, run after the L1 (memory.high) arm
     # ------------------------------------------------------------------
 
     def _reclaim_candidates(self) -> "list[tuple[str, LimitedApp, int]]":
-        """Auto-limited apps L2 may pull from, with their time-order weight.
+        """Limited apps L2 may pull from, with their time-order weight.
 
         ``LimitRegistry.apps`` is an OrderedDict in the order limits were
         applied, so the index is the app's seniority.  Weighting by ``index + 1``
         makes the most recently limited app give up the most: when several apps
         start at once, the newcomer yields before the one that was already
         running and settled.
+
+        ``source`` is deliberately not filtered.  A manually-limited app has a
+        ``memory.high`` the user chose and is, by the fact that the user chose to
+        limit it, usually one of the big holders; excluding it left L2 unable to
+        reach the very apps most worth reclaiming from.  Reclaim does not change
+        anyone's cap -- it asks the kernel to honour the cap already in place --
+        so this takes nothing away from the user's decision.
         """
         candidates = []
         with self.all_limits.lock:
             entries = list(self.all_limits.apps.items())
         for index, (key, entry) in enumerate(entries):
-            if entry.source != "auto":
-                continue
             if not entry.limit_parts.get('cpu_mem_limited'):
                 continue
             if entry.priority == "critical":
@@ -2026,6 +2030,15 @@ class DynamicBalancer:
         for key, entry, order in candidates:
             if not self._reclaim_cooldown_ok(entry, now):
                 continue
+            # Reclaim writes anon pages to swap over the block device this app's
+            # io.max is throttling, so reclaiming here buys stalls, not memory.
+            # L2 does not lift the cap itself -- the disk channel's accounting is
+            # not L2's to touch.  ``_clear_io_cap_before_sys_limit`` clears it on
+            # the next sys-critical cap, and the disk timer clears it when the
+            # disk calms down; either way this app comes back as a candidate.
+            if entry.limit_parts.get('io_limited'):
+                logger.debug("[reclaim] skip %s: still under an io.max cap", key)
+                continue
             cgroup = entry.cgroups[0] if entry.cgroups else key
             elapsed = now - entry.last_cpu_sample_at if entry.last_cpu_sample_at else 0.0
             busy, cpu_usec = self.control_manager.cpu_busy_fraction(
@@ -2064,6 +2077,7 @@ class DynamicBalancer:
                 continue
             entry.reclaim_inflight = True
             entry.last_reclaim_at = now
+            self._mark_reclaim_noise()
             future = self.control_manager.reclaim_memory_async(cgroup, share)
             future.add_done_callback(
                 lambda fut, e=entry, k=key, c=cgroup, n=share:
@@ -2077,6 +2091,9 @@ class DynamicBalancer:
         and hands everything else to the (thread-safe) diagnostics seam.
         """
         entry.reclaim_inflight = False
+        # Re-arm from the *end* of the reclaim: a long one would otherwise have
+        # its window expire while it was still writing to swap.
+        self._mark_reclaim_noise()
         try:
             outcome = future.result()
         except Exception as exc:                     # pragma: no cover - defensive
@@ -2125,6 +2142,18 @@ class DynamicBalancer:
             "RESOURCE_MEMORY_RECLAIM_APPLIED", "info",
             f"Reclaimed {outcome.reclaimed_bytes // _MB} MB from {entry.app_name}",
             entry, attributes)
+
+    def _mark_reclaim_noise(self) -> None:
+        """Declare the disk traffic from now on ours, for a short window.
+
+        Called on both edges of every reclaim (ours and the manual path's) so a
+        reclaim that runs longer than the window keeps extending it.
+        """
+        self._reclaim_quiet_until = time.time() + _RECLAIM_DISK_QUIET_SEC
+
+    def _in_reclaim_quiet_window(self) -> bool:
+        """True while disk pressure is attributable to our own reclaim."""
+        return time.time() < self._reclaim_quiet_until
 
     def _claim_swap_growth_slot(self, now: float, urgent: bool) -> bool:
         """Rate limiter for growth attempts, shared by the tick and the listener.
@@ -2291,325 +2320,6 @@ class DynamicBalancer:
                             "cgroups": cgroups, "pids": pids},
             )
 
-    @_serialized_limit_operation
-    def _apply_combined_critical_limits(
-        self,
-        target: dict,
-        app_id: str,
-        limit_rates: dict,
-        is_controlled: bool,
-        pressure_level: str = "",
-    ) -> None:
-        """Apply combined-policy CPU/Memory + disk-IO limits to the
-        dominant top consumer.
-
-        Both channels are capped off the single system-pressure signal, so the recorded
-        reason is "system_pressure" even for the io.max part -- there is no separate disk
-        level under this policy to attribute it to.
-        """
-        app_name = (
-            (target.get('app') or {}).get('name')
-            or target.get('process', {}).get('name')
-            or app_id
-        )
-        total_mem = self.resource_monitor.get_total_memory()
-        logger.info(f"Adjusting resources for app: {app_id}")
-        extra_cgroup_ids = target.get('extra_cgroups', [])
-        manual_cgroups = [
-            cgroup_id for cgroup_id in [app_id] + list(extra_cgroup_ids)
-            if self.all_limits.by_any_id(cgroup_id, source="manual") is not None
-        ]
-        if manual_cgroups:
-            logger.info(
-                "Skipped auto limit for %s: cgroup(s) already manual-limited: %s",
-                app_name, ", ".join(manual_cgroups),
-            )
-            return
-        per_cg_mem_rss = target.get('per_cgroup_mem_rss', {})
-        per_cg_cpu = target.get('per_cgroup_cpu', {})
-
-        resource_limited = False
-        io_limited = False
-
-        cpu_rate = int(100 * limit_rates["cpu_rate"]) if limit_rates.get("cpu_rate") else None
-        mem_rate = int(total_mem * limit_rates["mem_rate"]) if limit_rates.get(
-            "mem_rate") else None
-
-        if (cpu_rate is not None or mem_rate is not None) and self.is_running:
-            if extra_cgroup_ids:
-                all_ids = [app_id] + extra_cgroup_ids
-                mem_dist = _split_proportionally(mem_rate, all_ids, per_cg_mem_rss)
-                cpu_dist = _split_proportionally(cpu_rate, all_ids, per_cg_cpu)
-                auto_limit = self.control_manager.adjust_resources(
-                    app_id, "critical",
-                    cpu_quota=cpu_dist.get(app_id, cpu_rate),
-                    mem_high=mem_dist.get(app_id, mem_rate),
-                )
-                if auto_limit:
-                    resource_limited = True
-                    logger.info(f"Successfully limited CPU/Memory for {app_name} ({app_id})")
-                else:
-                    logger.warning(f"Failed to limit CPU/Memory for {app_name} ({app_id})")
-                for extra_id in extra_cgroup_ids:
-                    ok = self.control_manager.adjust_resources(
-                        extra_id, "critical",
-                        cpu_quota=cpu_dist.get(extra_id, cpu_rate),
-                        mem_high=mem_dist.get(extra_id, mem_rate),
-                    )
-                    logger.info(
-                        f"{'Successfully limited' if ok else 'Failed to limit'} "
-                        f"CPU/Memory for extra cgroup {extra_id}"
-                    )
-            else:
-                auto_limit = self.control_manager.adjust_resources(
-                    app_id,
-                    "critical",
-                    cpu_quota=cpu_rate,
-                    mem_high=mem_rate,
-                )
-                if auto_limit:
-                    resource_limited = True
-                    logger.info(f"Successfully limited CPU/Memory for {app_name}")
-                else:
-                    logger.warning(f"Failed to limit CPU/Memory for {app_name}")
-
-        io_limits = limit_rates.get("disk_io_rate", {})
-        if io_limits and self.is_running:
-            limits = self._scaled_io_limits(io_limits)
-            io_limited = self.io_ctl.set_disk_io_throttle(
-                app_id,
-                limits=limits
-            )
-            if not io_limited:
-                logger.error(f"Failed to set write IO limit for {app_name}")
-            for extra_id in extra_cgroup_ids:
-                self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
-
-        if resource_limited or io_limited:
-            # app_id addresses cgroups (it may have been rewritten to the resolved primary
-            # cgroup); the DB row and the UI know the app by its public id. Writing the
-            # cgroup name into public_app_id makes every later status update miss its row.
-            public_id = target.get('public_app_id') or app_id
-            existing = self.all_limits.apps.get(app_id)
-            if existing is None or existing.source != "auto":
-                self._warn_on_shared_cgroups(
-                    app_name,
-                    target.get('resolved_cgroup_paths') or [],
-                    target.get('pids') or [],
-                )
-            self._upsert_auto_limited(
-                app_id, public_id, app_name, limit_rates,
-                resource_limited=resource_limited,
-                io_limited=io_limited,
-                priority=target.get('resolved_priority'),
-                is_controlled=is_controlled,
-                limit_reason="system_pressure",
-                pressure_level=pressure_level,
-                cgroups=[app_id] + list(extra_cgroup_ids),
-                pids=target.get('pids'),
-                representative_pid=(target.get('process') or {}).get('pid'),
-                # Combined policy caps CPU and memory together, so both track
-                # resource_limited; recording it keeps the registry entry (and the
-                # RECOVERED ledger) from having to guess the split later.
-                resource_parts={'cpu': resource_limited, 'memory': resource_limited},
-            )
-
-            if is_controlled:
-                app_utils.update_app_status(public_id, "limited")
-
-            app_utils.callback_manager.send_callback_notification({
-                'app_id': public_id,
-                'app_name': app_name,
-                'status': "limited",
-                'purpose': "app"
-            }, False)
-        else:
-            logger.warning(f"No resource limits successfully applied for {app_name}")
-
-    def _tick_combined_restore(self, state: "_MonitorLoopState", pressure: str) -> None:
-        """Staged restore arm of the combined-policy tick.
-
-        Single ``STABLE_PERIOD`` timer drives both partial (at medium) and
-        full (at low) restore on the head of ``auto_limited_apps``.
-        """
-        if not (self.all_limits.first_auto() is not None and not state.restore_pending):
-            return
-        if pressure not in ("medium", "low"):
-            state.reset()
-            return
-
-        if (state.pressure_start_time is None) or (state.current_pressure != pressure):
-            state.pressure_start_time = state.current_time
-            state.current_pressure = pressure
-            logger.info(
-                f"Pressure level changed to {pressure}. "
-                f"Will restore resources after {state.STABLE_PERIOD} sec if it remains stable."
-            )
-            return
-
-        if state.current_time - state.pressure_start_time < state.STABLE_PERIOD:
-            return
-
-        state.restore_pending = True
-
-        if pressure == "medium":
-            app_id, entry = self.all_limits.first_auto()
-            app_name, limit_rates, limit_parts = entry.app_name, entry.limit_rates, entry.limit_parts
-            if entry.state != "partially_restored":
-                total_mem = self.resource_monitor.get_total_memory()
-                logger.info(
-                    f"Pressure remained at 'medium' for {state.STABLE_PERIOD} sec. "
-                    f"Partially restoring app {app_id} (twice the rate of limited resources)."
-                )
-                extra_ids = entry.cgroups[1:]
-                restore_success = True
-
-                if limit_parts.get('cpu_mem_limited', False):
-                    cpu_restore = int(100 * limit_rates[
-                        "cpu_rate"] * 2) if "cpu_rate" in limit_rates else None
-                    mem_restore = int(total_mem * limit_rates[
-                        "mem_rate"] * 2) if "mem_rate" in limit_rates else None
-
-                    if (cpu_restore is not None or mem_restore is not None) and self.is_running:
-                        cpu_mem_restored = self.control_manager.adjust_resources(
-                            app_id,
-                            "medium",
-                            cpu_quota=cpu_restore,
-                            mem_high=mem_restore,
-                            is_restore=False,
-                        )
-                        if not cpu_mem_restored:
-                            logger.error(
-                                f"Failed to partially restore CPU/Memory for {app_name}")
-                            restore_success = False
-                        for extra_id in extra_ids:
-                            self.control_manager.adjust_resources(
-                                extra_id, "medium",
-                                cpu_quota=cpu_restore,
-                                mem_high=mem_restore,
-                                is_restore=False,
-                            )
-
-                if (limit_parts.get('io_limited', False) and "disk_io_rate" in limit_rates) and self.is_running:
-                    io_restored = True
-                    io_limits = limit_rates["disk_io_rate"]
-
-                    # Same disks the cap was written to, never "all": a relaxed cap is
-                    # still a cap, so an unfiltered replay throttles disks the limit
-                    # never touched. Empty means it was applied to all.
-                    disks = entry.limit_disks or None
-                    # Re-scaled by media, like the original cap. Doubling the raw rate row
-                    # instead would hand a USB disk many times the cap it was given, since
-                    # its coefficient is the smallest -- "2x" has to mean 2x of what was
-                    # actually written.
-                    relaxed = {k: io_limits[k] * 2
-                               for k in ('read', 'write', 'read_iops', 'write_iops')}
-                    limits = self._scaled_io_limits(relaxed, disks)
-                    logger.info(
-                        f"[disk-io] partial restore for {app_name!r} (app_id={app_id!r}): "
-                        f"relaxing io.max to 2x rd={io_limits['read']*2}MB/s wr={io_limits['write']*2}MB/s "
-                        f"on disks={entry.limit_disks or 'ALL'} (extra_cgroups={extra_ids})"
-                    )
-                    io_limited = self.io_ctl.set_disk_io_throttle(
-                        app_id,
-                        limits=limits,
-                        disk_filter=disks,
-                    )
-
-                    if not io_limited:
-                        logger.error(
-                            f"Failed to partially restore disk IO for {app_name}")
-                        io_restored = False
-                    for extra_id in extra_ids:
-                        self.io_ctl.set_disk_io_throttle(
-                            extra_id, limits=limits, disk_filter=disks)
-
-                    if not io_restored:
-                        restore_success = False
-
-                if restore_success:
-                    # Combined policy relaxes both channels in one step, so both
-                    # are marked; there is no per-channel timer to advance here.
-                    entry.state = "partially_restored"
-                    entry.partial_parts.update({'sys': True, 'disk_io': True})
-                    self._notify_auto_limit_changed(
-                        entry.public_app_id or app_id, app_name, "partially_restored")
-                else:
-                    logger.warning(f"Partial restore failed for {app_name}")
-
-                self.all_limits.apps.move_to_end(app_id)
-        else:  # pressure == "low"
-            app_id, entry = self.all_limits.pop_last_auto()
-            app_name, limit_parts = entry.app_name, entry.limit_parts
-            logger.info(
-                f"Pressure remained at 'low' for {state.STABLE_PERIOD} sec. "
-                f"Fully restoring app {app_id} (100% resources)."
-            )
-
-            restore_success = True
-            extra_ids = entry.cgroups[1:]
-
-            if limit_parts.get('cpu_mem_limited', False) and self.is_running:
-                if not self.control_manager.adjust_resources(app_id, "low"):
-                    logger.error(f"Failed to fully restore CPU/Memory for {app_name}")
-                    restore_success = False
-                for extra_id in extra_ids:
-                    self.control_manager.adjust_resources(extra_id, "low")
-
-            if limit_parts.get('io_limited', False) and self.is_running:
-                io_restored = True
-
-                disks = entry.limit_disks or None
-                logger.info(
-                    f"[disk-io] full restore for {app_name!r} (app_id={app_id!r}): "
-                    f"removing io.max cap on disks={entry.limit_disks or 'ALL'} "
-                    f"(extra_cgroups={extra_ids})"
-                )
-                if not self.io_ctl.restore_disk_io_throttle(app_id, disk_filter=disks):
-                    logger.error(f"Failed to remove IO limits for {app_name}")
-                    io_restored = False
-                for extra_id in extra_ids:
-                    self.io_ctl.restore_disk_io_throttle(extra_id, disk_filter=disks)
-
-                if not io_restored:
-                    restore_success = False
-
-            if restore_success:
-                # Status/callbacks are keyed by the public app id, which for a
-                # resolved multi-cgroup app is not the cgroup key used above.
-                public_id = entry.public_app_id or app_id
-                app_utils.update_app_status(public_id, "running")
-                app_utils.callback_manager.send_callback_notification({
-                    'app_id': public_id,
-                    'app_name': app_name,
-                    'status': "running",
-                    'purpose': "app"
-                }, False)
-            else:
-                logger.error(f"Failed to fully restore resources for {app_name}")
-                _emit_control_events(
-                    "FAILED", limit_parts,
-                    app_id=entry.public_app_id or app_id,
-                    app_name=app_name,
-                    protection_id=entry.protection_id,
-                    attributes={
-                        "app_name": app_name,
-                        "priority": entry.priority,
-                        "limit_parts": dict(entry.limit_parts),
-                        "resource_parts": dict(entry.resource_parts),
-                        "cgroups": list(entry.cgroups),
-                        "pids": list(entry.pids),
-                        "restore_type": "full",
-                    },
-                )
-                # pop_last_auto() already removed the entry, so the row is gone either
-                # way -- tell the UI or it lingers until the next unrelated event.
-                self._notify_auto_limit_changed(
-                    entry.public_app_id or app_id, app_name, "restore_failed")
-
-        state.restore_pending = False
-        state.reset()  # reset timer and current pressure state
-
     def _run_network_tick(self, state: "_MonitorLoopState") -> None:
         """Network sampling + handling. Runs every iteration (regardless
         of ``idle_check_interval``) so traffic pressure stays current.
@@ -2684,6 +2394,76 @@ class DynamicBalancer:
             logger.warning(f"[disk-io] could not read stressed disks: {e}")
             return []
 
+    def _app_working_set_mb(self, cgroup_ids: "list[str]",
+                            per_cg_mem_rss: dict) -> int:
+        """This app's working set in MB, across every cgroup it spans.
+
+        Prefers the RSS the top-consumer sample already carries (bytes, keyed by
+        cgroup) so the common path costs nothing.  When the sample has no row for
+        a cgroup -- an app resolved to more cgroups than were sampled, or a sample
+        that predates the app's growth -- that cgroup is read from cgroupfs
+        instead.  ``memory.current`` plus ``memory.swap.current``, matching the
+        manual path's definition (balancer.py ``set_resource_limit``): pages this
+        app pushed to swap are still its working set, and counting only RSS would
+        shrink the cap every time reclaim succeeded.
+
+        :returns: MB, or 0 when nothing could be read.
+        """
+        total_bytes = 0
+        for cgroup in cgroup_ids:
+            sampled = per_cg_mem_rss.get(cgroup)
+            if sampled:
+                total_bytes += int(sampled)
+                continue
+            try:
+                current = self.control_manager.memory.read_current(cgroup) or 0
+                swapped = self.control_manager.memory.read_swap_current(cgroup) or 0
+            except Exception as exc:
+                logger.debug("[auto-limit] could not read memory of %s: %s", cgroup, exc)
+                continue
+            total_bytes += current + swapped
+        return total_bytes // _MB
+
+    def _auto_mem_high_mb(self, app_id: str, extra_cgroup_ids: "list[str]",
+                          per_cg_mem_rss: dict, total_mem_mb: int,
+                          rate: "Optional[float]", app_name: str) -> "Optional[int]":
+        """The ``memory.high`` an auto limit should write, in MB.
+
+        The system share (``total_mem * rate``) is a ceiling on how much of the
+        machine one app may hold, not a limit on the app: a process using 2% of
+        RAM "capped" at 30% of RAM is not capped at all, and the whole
+        many-small-apps case is exactly that shape.  Sizing against the app's own
+        working set instead means ``rate < 1`` always buys a real reduction,
+        which is what makes the entry worth registering and what gives L2
+        something to reclaim against.
+
+        The system share is kept as a ceiling because the working set counts
+        swapped pages and can therefore exceed MemTotal, while ``memory.high`` is
+        measured against RAM alone.
+
+        A working set of 0 means the read failed, not that the app is empty --
+        fall back to the system share rather than writing a cap of 0 MB.
+        """
+        if not rate:
+            return None
+        system_share = int(total_mem_mb * rate)
+        working_set = self._app_working_set_mb([app_id] + list(extra_cgroup_ids),
+                                               per_cg_mem_rss)
+        if working_set <= 0:
+            logger.info(
+                "[auto-limit] %s: no memory reading; falling back to the system "
+                "share %d MB", app_name, system_share)
+            return system_share
+        # Floor of 1 MB for the same reason as the manual path: a cap of 0 would
+        # put the app in permanent reclaim rather than limit it.
+        usage_share = max(1, int(working_set * rate))
+        mem_high = min(system_share, usage_share)
+        logger.info(
+            "[auto-limit] %s: working set %d MB * %.2f = %d MB vs system share "
+            "%d MB -> memory.high %d MB",
+            app_name, working_set, rate, usage_share, system_share, mem_high)
+        return mem_high
+
     @_serialized_limit_operation
     def _apply_resource_limits(self, target_app, app_id, limit_rates, is_controlled,
                                is_disk_io_stressed=False, pressure_level=""):
@@ -2719,8 +2499,20 @@ class DynamicBalancer:
         limited_disks: list = []
 
         if not is_disk_io_stressed:
+            # Memory pressure won this tick, and the CPU/memory cap about to land
+            # here makes this app a reclaim target: L2 will ask the kernel to push
+            # its anon pages out to swap.  That write goes down the very path an
+            # io.max would be throttling, so an app carrying both caps reclaims at
+            # the throttled rate -- or not at all.  Lift the disk cap first, through
+            # the normal restore so the registry, the RECOVERED event and the UI all
+            # agree; the disk channel gets re-capped by its own timer if the disk is
+            # still hot once memory is off the critical list.
+            self._clear_io_cap_before_sys_limit(app_id, app_name)
+
             cpu_rate = int(100 * limit_rates["cpu_rate"]) if limit_rates.get("cpu_rate") else None
-            mem_rate = int(total_mem * limit_rates["mem_rate"]) if limit_rates.get("mem_rate") else None
+            mem_rate = self._auto_mem_high_mb(
+                app_id, extra_cgroup_ids, per_cg_mem_rss, total_mem,
+                limit_rates.get("mem_rate"), app_name)
 
             if (cpu_rate is not None or mem_rate is not None) and self.is_running:
                 if extra_cgroup_ids:
@@ -2871,11 +2663,10 @@ class DynamicBalancer:
                 disks = (entry.limit_disks or None) if entry is not None else None
                 if restore_type == "partial" and "disk_io_rate" in limit_rates:
                     io_limits = limit_rates["disk_io_rate"]
-                    # Re-scaled by media, exactly like the original cap (and like the
-                    # combined-policy partial restore): doubling the raw rate row instead
-                    # would hand a slow disk several times the cap it was actually given,
-                    # since its coefficient is the smallest -- "2x" has to mean 2x of what
-                    # was written.
+                    # Re-scaled by media, exactly like the original cap: doubling the
+                    # raw rate row instead would hand a slow disk several times the cap
+                    # it was actually given, since its coefficient is the smallest --
+                    # "2x" has to mean 2x of what was written.
                     relaxed = {k: io_limits[k] * 2
                                for k in ('read', 'write', 'read_iops', 'write_iops')}
                     limits = self._scaled_io_limits(relaxed, disks)
@@ -2940,7 +2731,20 @@ class DynamicBalancer:
             every candidate is Critical, already limited, or below threshold -- returns
             ``(False, False, None, None, None, None)`` even under critical pressure: there
             is simply no useful throttle left to apply.
+
+        The same nothing-to-do answer is returned outright while our own reclaim
+        is still echoing through the disk signal (:data:`_RECLAIM_DISK_QUIET_SEC`).
         """
+        if self._in_reclaim_quiet_window():
+            # Not a skip of one candidate but of the whole arm: the pressure
+            # belongs to our reclaim, so *every* candidate here would be capped
+            # for traffic it did not generate.
+            logger.info(
+                "[disk-io] stand down: disk pressure is our own reclaim's swap "
+                "writeback (quiet window ends in %.0f s)",
+                self._reclaim_quiet_until - time.time())
+            return False, False, None, None, None, None
+
         for idx, app_info in enumerate(top_consumers or []):
             app_id = app_info['app'].get('id') if app_info.get('app') else None
             if not app_id:
@@ -3769,19 +3573,79 @@ class DynamicBalancer:
     ) -> bool:
         """Set resource limits for an application (balanced policy).
 
-        Two phases, and the split is the point: installing the limit needs
+        Three phases, and the ordering is the point.  Installing the limit needs
         ``operation_lock`` (ownership checks and cgroup writes must not
         interleave with the pressure loop's own appliers), while pushing the
         app down to its new memory.high must *not* hold it -- a single reclaim
         can block for seconds, and the auto-limit path takes the same lock.
+
+        The disk-IO cap goes on *last*, after the reclaim, whenever the same
+        request asks for both.  Reclaim writes the app's anon pages to swap, and
+        swap bios carry the owning memcg's blkcg, so an ``io.max`` installed
+        first throttles the very reclaim the memory cap was asking for: a
+        measured 5.3 GB reclaim that took 7.6 s unthrottled would need ~9
+        minutes behind a 10 MB/s cap.  This is the manual-path counterpart of
+        :meth:`_clear_io_cap_before_sys_limit` -- but it defers rather than
+        lifts, because here the io cap is the user's own request and must end up
+        applied, not dropped.
         """
         reclaim_plan: "list[tuple[str, int]]" = []
+        io_plan: "list[dict]" = []
         result = self._install_resource_limit(
             app_id, app_name, priority=priority, limit_overrides=limit_overrides,
-            target_cgroups=target_cgroups, reclaim_plan=reclaim_plan,
+            target_cgroups=target_cgroups, reclaim_plan=reclaim_plan, io_plan=io_plan,
         )
         self._reclaim_to_manual_targets(reclaim_plan)
+        for deferred in io_plan:
+            self._apply_deferred_io_cap(deferred)
         return result
+
+    @_serialized_limit_operation
+    def _apply_deferred_io_cap(self, deferred: dict) -> None:
+        """Install the io cap held back by :meth:`set_resource_limit`.
+
+        Takes ``operation_lock`` again because it writes cgroup files and
+        mutates the registry entry, both of which the pressure loop also
+        touches.  The entry was recorded with ``io_limited=False``, so this is
+        the write that makes the accounting true; if it fails the entry keeps
+        saying False, which is correct -- there is then no io cap to restore.
+        """
+        key = deferred["key"]
+        with self.all_limits.lock:
+            entry = self.all_limits.apps.get(key)
+        if entry is None:
+            # Restored or reaped while the reclaim ran.  Applying the cap now
+            # would leave an io.max with no registry entry to restore it.
+            logger.info(
+                "[io-defer] %s went away during reclaim; dropping its deferred io cap",
+                key)
+            return
+
+        limits = deferred["limits"]
+        app_name = deferred["app_name"]
+        ok = self.io_ctl.set_disk_io_throttle(key, limits=limits)
+        for extra_id in deferred["extra_ids"]:
+            self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
+        logger.info(
+            "[io-defer] %s disk IO cap applied after reclaim: ok=%s", app_name, ok)
+
+        with self.all_limits.lock:
+            entry = self.all_limits.apps.get(key)
+            if entry is None:
+                return
+            entry.limit_parts['io_limited'] = bool(ok)
+            protection_id = entry.protection_id
+        _emit_control_events(
+            "APPLIED" if ok else "FAILED", {'io_limited': True},
+            app_id=deferred["app_id"], app_name=app_name,
+            protection_id=protection_id,
+            attributes={"app_name": app_name, "priority": deferred["priority"],
+                        "limit_rates": deferred["limit_rates"],
+                        "limit_overrides": deferred["limit_overrides"],
+                        "parts": {'io_limited': bool(ok)},
+                        "cgroups": [key] + list(deferred["extra_ids"])},
+            control_mode="manual",
+        )
 
     def _reclaim_to_manual_targets(self, plan: "list[tuple[str, int]]") -> None:
         """Push each freshly-limited cgroup down to its own memory.high.
@@ -3791,6 +3655,7 @@ class DynamicBalancer:
         a failed one.  Runs with no lock held -- see :meth:`set_resource_limit`.
         """
         for cgroup_id, target_mb in plan:
+            self._mark_reclaim_noise()
             try:
                 outcome = self.control_manager.reclaim_memory_to_target(
                     cgroup_id, int(target_mb) * _MB,
@@ -3808,6 +3673,10 @@ class DynamicBalancer:
                 logger.warning(
                     f"[manual-reclaim] {cgroup_id} failed after limit applied: {exc}"
                 )
+            finally:
+                # Re-arm from the end too: this call is synchronous and can run
+                # for seconds, which would eat into the window it opened.
+                self._mark_reclaim_noise()
 
     @_serialized_limit_operation
     def _install_resource_limit(
@@ -3818,6 +3687,7 @@ class DynamicBalancer:
             limit_overrides: Optional[Dict[str, Any]] = None,
             target_cgroups: Optional[list[str]] = None,
             reclaim_plan: "Optional[list[tuple[str, int]]]" = None,
+            io_plan: "Optional[list[dict]]" = None,
     ) -> bool:
         """Install the manual limit and record it in the registry.
 
@@ -3825,11 +3695,13 @@ class DynamicBalancer:
         app's currently-running instances (by cgroup basename).  When omitted
         or empty, every cgroup the app currently occupies is limited.
 
-        ``reclaim_plan`` is an *output* parameter: the ``(cgroup, target_mb)``
-        pairs the caller should reclaim once this method's lock is released.
-        It is filled rather than returned so that the method keeps a single
-        return contract (``True`` / ``False`` / ``{"skipped": reason}``) across
-        all of its early exits.
+        ``reclaim_plan`` and ``io_plan`` are *output* parameters: the
+        ``(cgroup, target_mb)`` pairs the caller should reclaim once this
+        method's lock is released, and the disk-IO cap the caller should install
+        once that reclaim is done (see :meth:`set_resource_limit` for why the
+        order matters).  They are filled rather than returned so that the method
+        keeps a single return contract (``True`` / ``False`` /
+        ``{"skipped": reason}``) across all of its early exits.
         """
         priority = priority or "undefined"
         if isinstance(limit_overrides, dict):
@@ -4033,6 +3905,16 @@ class DynamicBalancer:
                 else:
                     logger.error(f"Failed to set CPU/Memory limits for {app_name} ({effective_app_id})")
 
+        # Hold the io cap back when this same request also lands a memory cap
+        # that something will have to be reclaimed down to: the reclaim writes
+        # to swap over the device the io cap throttles.  Only when the cpu/mem
+        # write actually succeeded -- otherwise there is no reclaim to protect
+        # and deferring would just delay the user's io cap for nothing.
+        defer_io = bool(
+            should_apply_io_limit and io_limits and self.is_running
+            and io_plan is not None and resource_limited
+            and mem_high is not None and limited_cgroups
+        )
         if should_apply_io_limit and io_limits and self.is_running:
             limits = {
                 "default": {
@@ -4042,13 +3924,25 @@ class DynamicBalancer:
                     "riops": io_limits['read_iops']
                 }
             }
-            io_limited = self.io_ctl.set_disk_io_throttle(effective_app_id, limits=limits)
-            if io_limited:
-                logger.info(f"Successfully set disk IO limits for {app_name} ({effective_app_id})")
+            if defer_io:
+                io_plan.append({
+                    "key": effective_app_id, "extra_ids": list(extra_effective_ids),
+                    "limits": limits, "app_id": app_id, "app_name": app_name,
+                    "priority": priority, "limit_rates": limit_rates,
+                    "limit_overrides": limit_overrides,
+                })
+                logger.info(
+                    "[io-defer] %s (%s): holding the disk IO cap until the reclaim to "
+                    "memory.high=%s MB finishes, so swap writeback is not throttled by it",
+                    app_name, effective_app_id, mem_high)
             else:
-                logger.error(f"Failed to set disk IO limit for {app_name} ({effective_app_id})")
-            for extra_id in extra_effective_ids:
-                self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
+                io_limited = self.io_ctl.set_disk_io_throttle(effective_app_id, limits=limits)
+                if io_limited:
+                    logger.info(f"Successfully set disk IO limits for {app_name} ({effective_app_id})")
+                else:
+                    logger.error(f"Failed to set disk IO limit for {app_name} ({effective_app_id})")
+                for extra_id in extra_effective_ids:
+                    self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
         with self.all_limits.lock:
             if resource_limited or io_limited:
@@ -4113,7 +4007,10 @@ class DynamicBalancer:
                 )
                 _emit_control_events(
                     "FAILED",
-                    {part: attempted and not {'cpu_mem_limited': resource_limited, 'io_limited': io_limited}.get(part)
+                    # A deferred io cap has not been attempted yet, so it cannot
+                    # have failed -- _apply_deferred_io_cap emits its own verdict.
+                    {part: attempted and not (part == 'io_limited' and defer_io)
+                     and not {'cpu_mem_limited': resource_limited, 'io_limited': io_limited}.get(part)
                      for part, attempted in attempted_parts.items()},
                     app_id=app_id, app_name=app_name,
                     protection_id=self.all_limits.apps[effective_app_id].protection_id,

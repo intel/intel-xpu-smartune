@@ -46,7 +46,11 @@ class Config:
     shell_tools: list = None
     cooldown_time: float = 15
     cpu_busy_threshold: float = 90
-    memory_busy_threshold: float = 90
+    # Must track config.yaml: this default only applies when the key is missing,
+    # so a mismatch means a config without the key behaves unlike every config
+    # with it -- and memory_busy_threshold is the centre of the mem_scarcity
+    # sigmoid, so the two values classify different machines as critical.
+    memory_busy_threshold: float = 80
     # Steepness of the sigmoid (logistic) memory scarcity gate in pressure.py
     # (larger = sharper transition around the memory "busy" point). See
     # PressureAnalyzer._mem_scarcity_gate.
@@ -612,7 +616,7 @@ class Config:
         ``updates`` mirrors the config shape, e.g.::
 
             {
-              "policy": "combined",
+              "policy": "separated",
               "cpu":     {"enabled": True, "rate": {"high": 0.7, ...}},
               "memory":  {"enabled": True, "rate": {"high": 0.3, ...}},
               "disk_io": {"enabled": True,

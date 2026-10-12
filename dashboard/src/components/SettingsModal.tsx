@@ -12,7 +12,6 @@ import {
   Form,
   Input,
   InputNumber,
-  Radio,
   Switch,
   Select,
   Row,
@@ -1254,8 +1253,8 @@ function DiskFloorMatrix({ disabled }: { disabled?: boolean }) {
 // Smartune Control holds System Control and Disk I/O Control as two nested cards, but they
 // share ONE form and one save: both live in the same `limit_policy` config section, so two
 // independent saves would race on its optimistic-concurrency token and the second would
-// always conflict. The master "auto control" switch and the policy mode sit on the outer
-// card because they gate and shape both channels, not just CPU/memory.
+// always conflict. The master "auto control" switch sits on the outer card because it
+// gates both channels, not just CPU/memory.
 function AutoControlPanel() {
   const [form] = Form.useForm()
   const { publishNotice } = useGlobalConfigNotices()
@@ -1299,7 +1298,6 @@ function AutoControlPanel() {
       form.resetFields()
       form.setFieldsValue({
         enabled: pc.enabled,
-        policy: lp.policy,
         cpu: toPercentageRates(lp.cpu),
         memory: toPercentageRates(lp.memory),
         disk_io: lp.disk_io,
@@ -1340,8 +1338,9 @@ function AutoControlPanel() {
         api.updatePassiveControl(Boolean(values.enabled), enabledTs),
         api.updateConfig<LimitPolicyData>(
           'limit_policy',
+          // `policy` is deliberately not sent: "separated" is the only mode, so the
+          // backend default owns it.  The key stays server-side as an extension point.
           {
-            policy: policyValues.policy,
             cpu: toRatioRates(policyValues.cpu),
             memory: toRatioRates(policyValues.memory),
             disk_io: policyValues.disk_io,
@@ -1410,10 +1409,10 @@ function AutoControlPanel() {
 
   return (
     <Spin spinning={loading}>
-      {/* One Form spanning the whole block: the master switch, the policy mode and both
-          per-channel sections are one config section server-side, so they are saved and
-          reset together. The switch and the policy mode sit on the outer card because
-          they govern both channels, not just CPU/memory. */}
+      {/* One Form spanning the whole block: the master switch and both per-channel
+          sections are one config section server-side, so they are saved and reset
+          together. The switch sits on the outer card because it governs both channels,
+          not just CPU/memory. */}
       <Form form={form} layout="vertical" onFieldsChange={markDirty}>
         <Card size="small" title="Smartune Control" style={{ marginBottom: 16 }}>
           <Form.Item
@@ -1443,24 +1442,6 @@ function AutoControlPanel() {
             <>
               <Text type="secondary">
                 The policy below only applies while auto control is enabled.
-              </Text>
-
-              <Divider orientation="left" orientationMargin={0} plain style={{ margin: '12px 0 8px' }}>
-                <SectionLabel
-                  text="Policy mode"
-                  tip="How the disk-IO channel relates to the CPU/memory one. Separated: disk I/O is judged on its own thresholds and its own top-consumer list, so a saturated disk is throttled even while CPU and memory are calm, and each channel recovers on its own timer. Combined: there is only the system pressure score (disk I/O enters it as the I/O weight), so caps are applied only when that score is critical, and CPU/memory + disk caps are applied and lifted together."
-                />
-              </Divider>
-              <Form.Item name="policy" rules={[{ required: true }]} style={{ marginBottom: 4 }}>
-                <Radio.Group disabled={!autoEnabled}>
-                  <Radio.Button value="combined">Combined</Radio.Button>
-                  <Radio.Button value="separated">Separated</Radio.Button>
-                </Radio.Group>
-              </Form.Item>
-              <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 12 }}>
-                Separated is recommended when disk I/O matters on its own: under Combined, disk
-                pressure only contributes the I/O weight to the system score, so a disk-only
-                storm rarely reaches critical and may never be throttled.
               </Text>
 
               <Card size="small" type="inner" title="System Control" style={{ marginBottom: 12 }}>

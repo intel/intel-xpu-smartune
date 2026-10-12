@@ -31,6 +31,15 @@ from utils.self_ident import is_own_process
 
 _GPU_DRM_DRIVERS = frozenset({'i915', 'xe'})
 _GPU_SAMPLE_INTERVAL = 0.3  # seconds between the two fdinfo snapshots for GPU utilisation
+# Candidates handed to the balancer per prefetch. Cost is dominated by
+# `samples * interval` inside _get_top_processes and is flat in n; only the
+# candidate pool grows (9 -> 15). The balancer consumes one per tick.
+_TOP_CONSUMER_BATCH = 5
+# Minimum resources a candidate set must hold to be worth limiting. The smallest
+# limit we ever apply leaves an app 30% of its share, more for already-controlled
+# apps, so 25% here avoids false negatives.
+_THRESHOLD_CPU_PCT = 25  # per-core CPU%
+_THRESHOLD_MEM_FRACTION = 0.25  # fraction of MemTotal
 _BARE_INTERPRETER_RE = re.compile(
     r'^(?:bash|sh|dash|zsh|fish|tcsh|python(?:\d+(?:\.\d+)*)?|node(?:js)?)$')
 
@@ -1156,23 +1165,52 @@ class ResourceMonitor:
 
         return None
 
-    def get_top_resource_consumers(self):
-        """Return the single highest resource-consuming process and its application metadata."""
-        results = []
-        reach_threshold = True
-        processes = self._get_top_processes(n=1)
-        logger.debug(f"Top processes: {processes}")
+    def _candidates_reach_threshold(self, processes):
+        """Whether the candidate set holds enough CPU or memory to be worth limiting.
 
-        # Return empty list if top process doesn't meet minimum resource thresholds.
-        # `mem_rss` is in GB (see _get_top_processes), so compare against total memory in GB.
-        # Since the minimum thresholds is 30% for uncontrolled apps, larger for controlled apps,
-        # we use 25% here to avoid false negatives.
-        mem_total_gb = psutil.virtual_memory().total / (1024 ** 3)
-        if processes and (processes[0]['cpu_avg'] < 25  # if CPU usage < 25% per core
-                  and processes[0]['mem_rss'] < mem_total_gb * 0.25):  # 25% of total memory (GB)
-            logger.debug(f"Top process - {next(iter(processes[0]['names']), 'unknown')} corresponding "
-                     f"app does not meet minimum resource thresholds")
-            reach_threshold = False
+        The leader is tested on its own first, so a single dominant app behaves
+        exactly as it always has. Only when no one app clears the bar is the set
+        judged together: many small apps can starve the box without any of them
+        looking big individually, and limiting them one per tick is the only thing
+        that moves the needle there. The aggregate test is self-gating -- when the
+        shortfall sits in page cache or the kernel rather than in these apps, the
+        sum stays small and the ladder stands down.
+
+        `mem_rss` is in GB (see _get_top_processes), so it compares against total
+        memory in GB.
+        """
+        if not processes:
+            return True
+
+        mem_bar_gb = psutil.virtual_memory().total / (1024 ** 3) * _THRESHOLD_MEM_FRACTION
+        leader = processes[0]
+        if leader['cpu_avg'] >= _THRESHOLD_CPU_PCT or leader['mem_rss'] >= mem_bar_gb:
+            return True
+
+        cpu_sum = sum(p['cpu_avg'] for p in processes)
+        mem_sum = sum(p['mem_rss'] for p in processes)
+        leader_name = next(iter(leader['names']), 'unknown')
+        if cpu_sum >= _THRESHOLD_CPU_PCT or mem_sum >= mem_bar_gb:
+            logger.debug(f"No single top consumer reaches the thresholds, but {len(processes)} "
+                         f"candidates together do (cpu {cpu_sum:.1f}%, mem {mem_sum:.2f} GB "
+                         f"vs {mem_bar_gb:.2f} GB) - arming on the candidate set")
+            return True
+
+        logger.debug(f"Top process - {leader_name} corresponding app does not meet minimum "
+                     f"resource thresholds, nor do its {len(processes)} candidates together "
+                     f"(cpu {cpu_sum:.1f}%, mem {mem_sum:.2f} GB vs {mem_bar_gb:.2f} GB)")
+        return False
+
+    def get_top_resource_consumers(self, n=_TOP_CONSUMER_BATCH):
+        """Return the top ``n`` resource-consuming cgroups and their application metadata.
+
+        The second return value says whether the candidate set is worth limiting;
+        the balancer skips the whole limiting path when it is False.
+        """
+        results = []
+        processes = self._get_top_processes(n=n)
+        logger.debug(f"Top processes: {processes}")
+        reach_threshold = self._candidates_reach_threshold(processes)
 
         for process in processes:
             process_name = process.get('dominant_name') or next(iter(process['names']), "unknown")

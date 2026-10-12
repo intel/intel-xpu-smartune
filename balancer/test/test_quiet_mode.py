@@ -498,7 +498,7 @@ class BalancerTickTests(_GateCase):
         b._last_swap_release_at = 0.0
 
         for name in ("_maybe_trigger_prefetch", "_tick_separated_policy",
-                     "_tick_combined_policy", "_run_network_tick",
+                     "_run_network_tick",
                      "_reap_closed_apps", "lock_all_auto_to_manual",
                      "_drain_pending_app_queue"):
             setattr(b, name, mock.Mock())
@@ -518,7 +518,6 @@ class BalancerTickTests(_GateCase):
         # forced off, not with a stale pressure level, not even the read.
         b._maybe_trigger_prefetch.assert_not_called()
         b._tick_separated_policy.assert_not_called()
-        b._tick_combined_policy.assert_not_called()
         # Network sampling reads every interface; the handling side can install
         # tc classes on the run's own traffic. Both have to go.
         b._run_network_tick.assert_not_called()

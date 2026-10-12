@@ -57,22 +57,41 @@ class Controller:
         idea of the unit's properties, which stays stale when anything writes
         the cgroup files directly -- the drift is then invisible precisely
         because the property still reads back the value systemd last set.
+
+        The two channels are read independently, and each reports whether its
+        file exists at all.  ``cpu.max`` is absent whenever no unit under the
+        parent slice carries a ``CPUQuota=``: systemd adds ``+cpu`` to the
+        ancestors' ``cgroup.subtree_control`` on demand and drops it again on
+        restore, so an ENOENT right after ``CPUQuota=`` is the normal cleared
+        state, not a failure.  Sharing one ``try`` used to let that expected
+        ENOENT discard a perfectly good ``memory.high`` reading as well, which
+        left every restore silently unverified.
         """
         path = self.find_cgroup_dir(cgroup_id)
         if not path:
             return None
-        applied = {"path": path}
+        applied = {"path": path, "cpu_present": False, "memory_present": False,
+                   "cpu_quota_usec": None, "cpu_period_usec": 100000,
+                   "memory_high_bytes": None}
         try:
             with open(os.path.join(path, "cpu.max"), encoding="utf-8") as handle:
                 parts = handle.read().split()
             applied["cpu_quota_usec"] = None if parts[0] == "max" else int(parts[0])
             applied["cpu_period_usec"] = int(parts[1]) if len(parts) > 1 else 100000
+            applied["cpu_present"] = True
+        except FileNotFoundError:
+            pass  # cpu controller not delegated here; see the docstring.
+        except (OSError, IndexError, ValueError) as exc:
+            logger.debug(f"Cannot read cpu.max for {cgroup_id}: {exc}")
+        try:
             with open(os.path.join(path, "memory.high"), encoding="utf-8") as handle:
                 raw = handle.read().strip()
             applied["memory_high_bytes"] = None if raw == "max" else int(raw)
-        except (OSError, IndexError, ValueError) as exc:
-            logger.debug(f"Cannot read applied limits for {cgroup_id}: {exc}")
-            return None
+            applied["memory_present"] = True
+        except FileNotFoundError:
+            pass  # memory controller not delegated here.
+        except (OSError, ValueError) as exc:
+            logger.debug(f"Cannot read memory.high for {cgroup_id}: {exc}")
         return applied
 
     def verify_applied_limits(self, cgroup_id: str, cpu_quota: Optional[int],
@@ -84,8 +103,11 @@ class Controller:
         property, not once the kernel file has been written, so the read is
         retried for a short window before any drift is believed.
 
-        Returns ``{"ok": bool, ...}``, or None when the cgroup could not be
-        found or read -- which is not a mismatch, only an unknown.
+        Returns ``{"ok": bool, ...}``, or None when the cgroup directory itself
+        could not be found -- which is not a mismatch, only an unknown.  A
+        channel whose interface file is absent counts as *cleared*: that is
+        exactly the state a restore is supposed to produce, so restores verify
+        like any other write instead of being waved through as unknown.
         """
         # systemd expresses CPUQuota as a percentage of one CPU's period; the
         # caller's cpu_quota is a share of the whole machine, which is how it
@@ -103,10 +125,14 @@ class Controller:
             if applied is None:
                 return None
             period = applied.get("cpu_period_usec") or 100000
-            cpu_ok = True
+            # An absent interface file means the controller is not delegated
+            # here, which for our purposes is the same as "no cap in force".
+            cpu_capped = applied["cpu_present"] and applied["cpu_quota_usec"] is not None
+            mem_capped = applied["memory_present"] and applied["memory_high_bytes"] is not None
+
             if expected_cpu is None:
-                cpu_ok = applied["cpu_quota_usec"] is None
-            elif applied["cpu_quota_usec"] is not None:
+                cpu_ok = not cpu_capped
+            elif cpu_capped:
                 want = period * expected_cpu / 100.0
                 # One percent of the period absorbs systemd's own rounding
                 # without hiding a real "we asked for 40% and got 90%".
@@ -114,10 +140,9 @@ class Controller:
             else:
                 cpu_ok = False
 
-            mem_ok = True
             if expected_mem is None:
-                mem_ok = applied["memory_high_bytes"] is None
-            elif applied["memory_high_bytes"] is not None:
+                mem_ok = not mem_capped
+            elif mem_capped:
                 # The kernel rounds memory.high down to a page multiple.
                 mem_ok = abs(applied["memory_high_bytes"] - expected_mem) <= 4096
             else:
@@ -130,14 +155,25 @@ class Controller:
 
         result = {"ok": False, "expected_cpu_pct": expected_cpu,
                   "expected_memory_high_bytes": expected_mem, **(applied or {})}
+
+        def _seen(present_key: str, value_key: str) -> str:
+            if not applied:
+                return "?"
+            if not applied.get(present_key):
+                # Say which it is: a missing file indicts the delegation chain
+                # (cgroup.subtree_control), a literal "max" indicts the write.
+                return "absent (controller not delegated)"
+            value = applied.get(value_key)
+            return "max" if value is None else str(value)
+
         logger.warning(
             "Limit verification failed for %s: expected cpu=%s%% mem=%s, "
             "cgroupfs reports cpu.max=%s memory.high=%s (%s)",
             cgroup_id,
             "cleared" if expected_cpu is None else expected_cpu,
             "cleared" if expected_mem is None else f"{expected_mem // (1024 * 1024)}M",
-            applied.get("cpu_quota_usec") if applied else "?",
-            applied.get("memory_high_bytes") if applied else "?",
+            _seen("cpu_present", "cpu_quota_usec"),
+            _seen("memory_present", "memory_high_bytes"),
             applied.get("path") if applied else "unknown path",
         )
         return result

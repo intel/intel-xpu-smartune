@@ -106,6 +106,28 @@ class VerificationTest(unittest.TestCase):
     def test_a_missing_cgroup_reads_as_unknown(self):
         self.assertIsNone(self.controller.read_applied_limits("ghost.scope"))
 
+    def test_an_absent_cpu_max_does_not_void_the_memory_reading(self):
+        """``cpu.max`` is gone whenever no unit under the parent slice carries a
+        ``CPUQuota=`` -- systemd adds ``+cpu`` to the ancestors' subtree_control
+        on demand and drops it again on restore.  Sharing one ``try`` let that
+        expected ENOENT discard a perfectly good ``memory.high`` as well."""
+        path = self.make_cgroup(memory_high=150 * 1024 * 1024)
+        (path / "cpu.max").unlink()
+        applied = self.controller.read_applied_limits(UNIT)
+        self.assertIsNotNone(applied)
+        self.assertFalse(applied["cpu_present"])
+        self.assertTrue(applied["memory_present"])
+        self.assertEqual(applied["memory_high_bytes"], 150 * 1024 * 1024)
+
+    def test_an_absent_memory_high_does_not_void_the_cpu_reading(self):
+        path = self.make_cgroup(cpu_max=f"{320000} {PERIOD}")
+        (path / "memory.high").unlink()
+        applied = self.controller.read_applied_limits(UNIT)
+        self.assertIsNotNone(applied)
+        self.assertTrue(applied["cpu_present"])
+        self.assertFalse(applied["memory_present"])
+        self.assertEqual(applied["cpu_quota_usec"], 320000)
+
     # -- verifying ---------------------------------------------------------
 
     def verify(self, cpu=None, mem=None, is_restore=False):
@@ -151,6 +173,26 @@ class VerificationTest(unittest.TestCase):
     def test_restore_verifies_when_both_are_actually_cleared(self):
         self.make_cgroup()
         self.assertTrue(self.verify(is_restore=True)["ok"])
+
+    def test_restore_verifies_when_the_interface_files_are_gone(self):
+        """The real post-restore shape on a user scope: ``CPUQuota=`` makes
+        systemd drop ``+cpu`` from the ancestors, so ``cpu.max`` disappears
+        rather than reading "max".  That is the cleared state we asked for, and
+        treating it as unknown left every restore silently unverified."""
+        path = self.make_cgroup()
+        (path / "cpu.max").unlink()
+        result = self.verify(is_restore=True)
+        self.assertIsNotNone(result)
+        self.assertTrue(result["ok"])
+
+    def test_a_limit_we_asked_for_on_an_undelegated_controller_is_caught(self):
+        """The other direction: we asked for a cap and the file is not even
+        there, so the cap cannot be in force.  An absent file must not be read
+        as 'fine' just because it is also the restore shape."""
+        path = self.make_cgroup()
+        (path / "cpu.max").unlink()
+        result = self.verify(cpu=40)
+        self.assertFalse(result["ok"])
 
     def test_an_unfindable_cgroup_is_unknown_not_a_mismatch(self):
         """The app may have exited between the write and the check.  Reporting

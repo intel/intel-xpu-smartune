@@ -232,6 +232,13 @@ class FakeControlManager:
             elapsed_ms=nbytes / _MB))
         return future
 
+    def reclaim_memory_to_target(self, cgroup, target_bytes, growth_gate=None):
+        """The manual path's synchronous form (:meth:`_reclaim_to_manual_targets`)."""
+        self.requests.append((cgroup, target_bytes))
+        return self._outcome or ReclaimOutcome(
+            ok=True, requested_bytes=target_bytes, reclaimed_bytes=target_bytes,
+            elapsed_ms=1.0)
+
     def ensure_swap_headroom_async(self, dry_run=True):
         self.swap_growth_calls += 1
         return Future()
@@ -255,6 +262,7 @@ def balancer_with(manager, entries) -> DynamicBalancer:
     instance._last_swap_growth_at = 0.0
     instance._swap_growth_lock = threading.Lock()
     instance._last_swap_release_at = 0.0
+    instance._reclaim_quiet_until = 0.0
     return instance
 
 
@@ -271,7 +279,11 @@ def state_at(now=1000.0):
 
 
 class CandidateTests(unittest.TestCase):
-    def test_only_auto_limited_cpu_mem_apps_are_eligible(self):
+    def test_only_cpu_mem_limited_apps_are_eligible(self):
+        """The cap is what L2 reclaims against, so an app without one has nothing
+        for this rung to aim at. Source is not a filter: a manual limit is still a
+        memory.high, and the apps a user bothers to limit by hand are exactly the
+        big holders L2 most needs to reach."""
         manager = FakeControlManager(deficit=4 * GB)
         balancer = balancer_with(manager, [
             limited("auto-sys", "a.scope"),
@@ -279,7 +291,17 @@ class CandidateTests(unittest.TestCase):
             limited("io-only", "c.scope", cpu_mem=False),
         ])
         keys = [k for k, _, _ in balancer._reclaim_candidates()]
-        self.assertEqual(keys, ["auto-sys"])
+        self.assertEqual(keys, ["auto-sys", "manual"])
+
+    def test_an_io_capped_app_is_not_reclaimed_from(self):
+        """Reclaim pushes anon pages to swap over the block device io.max is
+        throttling. Reclaiming from a throttled app buys stalls, not memory."""
+        manager = FakeControlManager(deficit=4 * GB)
+        key, entry = limited("throttled", "a.scope")
+        entry.limit_parts['io_limited'] = True
+        balancer = balancer_with(manager, [(key, entry), limited("free", "b.scope")])
+        balancer._tick_memory_reclaim(state_at())
+        self.assertEqual([c for c, _ in manager.requests], ["b.scope"])
 
     def test_critical_priority_apps_are_never_touched(self):
         manager = FakeControlManager(deficit=4 * GB)
@@ -308,6 +330,66 @@ class CandidateTests(unittest.TestCase):
         ])
         orders = {k: o for k, _, o in balancer._reclaim_candidates()}
         self.assertEqual(orders, {"first": 1, "second": 2, "third": 3})
+
+
+class ReclaimQuietWindowTests(unittest.TestCase):
+    """The disk arm must not act on disk pressure our own reclaim produced.
+
+    Reclaim writes anon pages to swap, which is real device traffic -- a
+    measured 5.3 GB reclaim put nvme0n1 at 717 MB/s and drove the disk channel
+    to critical.  Nothing downstream can attribute it: ``/proc/<pid>/io`` only
+    counts process-context IO, so kernel writeback never appears against the app
+    that caused it, and the arm would cap whichever innocent app happens to be
+    top of the list for traffic it did not generate and that disappears on its
+    own within seconds.
+    """
+
+    def _balancer(self):
+        return balancer_with(FakeControlManager(deficit=0), [])
+
+    def test_the_whole_arm_stands_down_during_the_window(self):
+        balancer = self._balancer()
+        balancer._mark_reclaim_noise()
+        should_adjust, _, app_id, rates, target, idx = \
+            balancer._handle_disk_io_stressed([{"app": {"id": "hog"}}])
+        self.assertFalse(should_adjust)
+        self.assertIsNone(app_id)
+        self.assertIsNone(idx)
+
+    def test_the_window_expires(self):
+        balancer = self._balancer()
+        balancer._mark_reclaim_noise()
+        self.assertTrue(balancer._in_reclaim_quiet_window())
+        balancer._reclaim_quiet_until = 0.0
+        self.assertFalse(balancer._in_reclaim_quiet_window())
+
+    def test_submitting_a_reclaim_round_opens_the_window(self):
+        manager = FakeControlManager(deficit=4 * GB)
+        balancer = balancer_with(manager, [limited("app", "a.scope")])
+        self.assertFalse(balancer._in_reclaim_quiet_window())
+        balancer._tick_memory_reclaim(state_at())
+        self.assertTrue(manager.requests)
+        self.assertTrue(balancer._in_reclaim_quiet_window())
+
+    def test_a_manual_reclaim_opens_the_window_too(self):
+        """The manual path reclaims synchronously in the REST thread, outside
+        the L2 round, so it has to arm the window itself."""
+        manager = FakeControlManager(deficit=0)
+        balancer = balancer_with(manager, [])
+        balancer._claim_swap_growth_slot = lambda *a, **k: False
+        balancer._reclaim_to_manual_targets([("a.scope", 512)])
+        self.assertEqual([c for c, _ in manager.requests], ["a.scope"])
+        self.assertTrue(balancer._in_reclaim_quiet_window())
+
+    def test_the_window_opens_even_when_the_manual_reclaim_throws(self):
+        """A reclaim that raised still wrote to swap up to the point it failed,
+        so the window is armed in a ``finally``, not on the success path."""
+        manager = FakeControlManager(deficit=0)
+        manager.reclaim_memory_to_target = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("cgroup gone"))
+        balancer = balancer_with(manager, [])
+        balancer._reclaim_to_manual_targets([("a.scope", 512)])
+        self.assertTrue(balancer._in_reclaim_quiet_window())
 
 
 class RoundTests(unittest.TestCase):

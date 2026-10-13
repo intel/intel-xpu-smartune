@@ -46,12 +46,12 @@ const DARK_COLORS = {
   yellow: '#fade2a',
   orange: '#f2495c',
   red: '#c4162a',
-  accent: '#5794f2',
-  tabAccent: '#5794f2',
+  accent: '#1677ff',
+  tabAccent: '#0068b5',
   text: '#d9d9d9',
-  textMuted: '#8e9ab3',
-  textTertiary: '#8e9ab3',
-  textPlaceholder: '#8e9ab3',
+  textMuted: '#b0bdd0',
+  textTertiary: '#9eacc0',
+  textPlaceholder: '#95a3b8',
   headerBg: '#141720',
   rowAlt: '#1e2235',
   canvas: '#0b0f14',
@@ -136,6 +136,41 @@ export function setColorMode(mode: ColorMode): void {
   for (const [name, value] of Object.entries(colors)) {
     document.documentElement.style.setProperty(`--color-${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`, value)
   }
+}
+
+export function getGpuChartColors() {
+  const dark = COLORS.bg === COLOR_MODES.dark.bg
+  return dark
+    ? {
+        utilization: '#5794f2',
+        vcs: '#73bf69',
+        vecs: '#22d3ee',
+        ccs: '#a78bfa',
+        rcs: '#f1f5f9',
+        bcs: '#fade2a',
+        memory: '#34d399',
+        gt0: '#94a3b8',
+        gt1: '#4ade80',
+        gt0Rc6: '#60a5fa',
+        gt1Rc6: '#2dd4bf',
+        gpuPower: '#38bdf8',
+        packagePower: '#f59e0b',
+      }
+    : {
+        utilization: '#1677ff',
+        vcs: '#3f8600',
+        vecs: '#087f8c',
+        ccs: '#6d28d9',
+        rcs: '#334155',
+        bcs: '#ad6800',
+        memory: '#059669',
+        gt0: '#64748b',
+        gt1: '#16a34a',
+        gt0Rc6: '#2563eb',
+        gt1Rc6: '#0f766e',
+        gpuPower: '#0284c7',
+        packagePower: '#b45309',
+      }
 }
 
 export function getPressureColor(value: number): string {

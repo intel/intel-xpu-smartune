@@ -46,9 +46,9 @@ const { Header, Content, Sider } = Layout
 
 const BENCHMARK_TAB = 'models'
 
-function HealthDiagnosticsIcon() {
+function HealthDiagnosticsIcon({ className }: { className?: string }) {
   return (
-    <span className="health-diagnostics-icon" aria-hidden="true">
+    <span className={[className, 'health-diagnostics-icon'].filter(Boolean).join(' ')} aria-hidden="true">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
         <path d="M20.5 8.7c0 5.7-8.5 11.1-8.5 11.1S3.5 14.4 3.5 8.7A4.6 4.6 0 0 1 12 6.2a4.6 4.6 0 0 1 8.5 2.5Z" />
         <path d="M5.5 12h3l1.4-2.4 2.1 5 1.8-3h4" />
@@ -102,6 +102,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   const [activeTab, setActiveTab] = useState('overview')
   const [workloadView, setWorkloadView] = useState('resources')
   const [settingsSection, setSettingsSection] = useState<string | null>(null)
+  const [settingsTabIntent, setSettingsTabIntent] = useState<{ key: string; requestId: number } | null>(null)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [historyRangeIntent, setHistoryRangeIntent] = useState<HistoryRangeIntent | null>(null)
   // 1 = balancer + monitor, 0 = monitor only. Default to enabled so older
@@ -120,6 +121,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   const [activeAlertCount, setActiveAlertCount] = useState(0)
   const [activeAlerts, setActiveAlerts] = useState<DiagAlert[]>([])
   const [diagnosticsOpenAlertsSignal, setDiagnosticsOpenAlertsSignal] = useState(0)
+  const [diagnosticsRangeIntent, setDiagnosticsRangeIntent] = useState<{ window: '1h'; requestId: number } | null>(null)
   // While a bootstrap token from the URL hash (desktop launcher) is being
   // validated, hold rendering so the login gate does not flash before we know
   // whether the auto-login succeeds. Only blocks when such a token is present.
@@ -312,7 +314,29 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
     {
       key: 'overview',
       label: 'Home',
-      children: <SystemOverview active={activeTab === 'overview'} />,
+      children: (
+        <SystemOverview
+          active={activeTab === 'overview'}
+          colorMode={colorMode}
+          onNavigate={setActiveTab}
+          onOpenDiagnostics={(window) => {
+            setDiagnosticsRangeIntent((current) => ({
+              window,
+              requestId: (current?.requestId ?? 0) + 1,
+            }))
+            setActiveTab('diagnostics')
+          }}
+          onOpenSettings={(section) => {
+            setSettingsTabIntent((current) => ({
+              key: section,
+              requestId: (current?.requestId ?? 0) + 1,
+            }))
+            setActiveTab('settings')
+          }}
+          diagnosticsEnabled={diagnosticsEnabled}
+          balancerEnabled={balancerEnabled}
+        />
+      ),
     },
     {
       key: 'workloads',
@@ -377,6 +401,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
               <Diagnostics
                 active={activeTab === 'diagnostics'}
                 openAlertsSignal={diagnosticsOpenAlertsSignal}
+                rangeIntent={diagnosticsRangeIntent}
                 onOpenHistory={(range) => {
                   setHistoryRangeIntent(range)
                   setActiveTab('history')
@@ -470,6 +495,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
           active={activeTab === 'settings'}
           balancerEnabled={balancerEnabled}
           onActiveTabChange={setSettingsSection}
+          tabIntent={settingsTabIntent}
         />
       ),
     },
@@ -609,7 +635,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
                 <Button
                   type="text"
                   size="small"
-                  aria-label="Open alerts"
+                  aria-label={`Open alerts, ${activeAlertCount} need attention`}
                   style={{ color: COLORS.textMuted }}
                 >
                   <Badge count={activeAlertCount} size="small" offset={[2, -1]}>

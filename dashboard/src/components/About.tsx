@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import { Alert, Button, Card, Col, Descriptions, Row, Space, Spin, Typography, Timeline } from 'antd'
+import { Alert, Button, Card, Col, Descriptions, Modal, Row, Space, Spin, Typography, Timeline } from 'antd'
 import { InfoCircleOutlined, ReloadOutlined, RobotOutlined } from '@ant-design/icons'
 import { api } from '../api/client'
 import type { PackageInfo, StaticInfoData } from '../api/types'
 import { COLORS } from '../styles/theme'
+import '../styles/about.css'
 
 const { Text, Title, Paragraph } = Typography
 
@@ -233,10 +234,21 @@ function SectionCard({
   )
 }
 
+function hardwareSectionOrder(title: string): number {
+  if (title === 'CPU') return 0
+  if (title.includes('GPU')) return 1
+  if (title === 'NPU') return 2
+  if (title === 'Memory') return 3
+  if (title === 'Disk' || title.startsWith('Disk:')) return 4
+  if (title === 'Network' || title.startsWith('NIC:')) return 5
+  return 6
+}
+
 export default function About({ active }: Props) {
   const [staticInfo, setStaticInfo] = useState<StaticInfoData | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [featuresOpen, setFeaturesOpen] = useState(false)
 
   const fetchStatic = useCallback(async (forceRefresh: boolean) => {
     if (!active) return
@@ -264,6 +276,13 @@ export default function About({ active }: Props) {
       {
         title: 'Software & Drivers',
         items: [
+          { label: 'Host name', value: formatPlain(staticInfo.host?.hostname) },
+          {
+            label: 'Boot time',
+            value: staticInfo.host?.boot_time
+              ? new Date(staticInfo.host.boot_time * 1000).toLocaleString()
+              : 'N/A',
+          },
           { label: 'OS version', value: formatPlain(staticInfo.os.version) },
           { label: 'BIOS version', value: formatPlain(staticInfo.bios.version) },
           { label: 'Kernel version', value: formatPlain(staticInfo.driver.kernel_version) },
@@ -323,7 +342,7 @@ export default function About({ active }: Props) {
       return { title: gpu.label, items }
     })
 
-    return [
+    const sections = [
       {
         title: 'CPU',
         items: [
@@ -422,13 +441,14 @@ export default function About({ active }: Props) {
       },
       ...gpuCards,
     ]
+    return sections.sort((left, right) => hardwareSectionOrder(left.title) - hardwareSectionOrder(right.title))
   }, [staticInfo])
 
   return (
     <div style={{ padding: '16px 0' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <Space size={8}>
-          <InfoCircleOutlined style={{ color: COLORS.accent }} />
+          <InfoCircleOutlined style={{ color: COLORS.tabAccent }} />
           <Title level={4} style={{ color: COLORS.text, margin: 0 }}>
             About
           </Title>
@@ -439,14 +459,19 @@ export default function About({ active }: Props) {
           )}
         </Space>
 
-        <Button
-          size="small"
-          icon={<ReloadOutlined />}
-          onClick={() => fetchStatic(true)}
-          loading={loading}
-        >
-          Refresh
-        </Button>
+        <Space size={8}>
+          <Button size="small" icon={<RobotOutlined />} onClick={() => setFeaturesOpen(true)}>
+            Features
+          </Button>
+          <Button
+            size="small"
+            icon={<ReloadOutlined />}
+            onClick={() => fetchStatic(true)}
+            loading={loading}
+          >
+            Refresh
+          </Button>
+        </Space>
       </div>
 
       {error && (
@@ -465,21 +490,14 @@ export default function About({ active }: Props) {
         </Card>
       ) : (
         <>
-          <Text style={{ color: COLORS.textMuted, fontSize: 12, display: 'block', marginBottom: 8 }}>
-            Features
-          </Text>
-          <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-            <Col span={24}>
-              <Card
-                className="perf-card perf-rise"
-                bodyStyle={{ padding: 16 }}
-              >
-                <Space align="center" style={{ marginBottom: 12 }}>
-                  <RobotOutlined style={{ color: COLORS.accent, fontSize: 16 }} />
-                  <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
-                    SmarTune 功能说明
-                  </Text>
-                </Space>
+          <Modal
+            className="about-features-modal"
+            title="SmarTune Features"
+            open={featuresOpen}
+            onCancel={() => setFeaturesOpen(false)}
+            footer={null}
+            width={760}
+          >
                 <Timeline
                   style={{ marginTop: 8 }}
                   items={[
@@ -595,9 +613,7 @@ export default function About({ active }: Props) {
                     },
                   ]}
                 />
-              </Card>
-            </Col>
-          </Row>
+          </Modal>
 
           <Text style={{ color: COLORS.textMuted, fontSize: 12, display: 'block', marginBottom: 8 }}>
             Software Configuration

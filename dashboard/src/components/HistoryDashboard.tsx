@@ -15,7 +15,7 @@ import {
 import dayjs, { type Dayjs } from 'dayjs'
 import { api } from '../api/client'
 import type { BenchQuietModeState, DynamicInfoData, HistoryData, HistoryRetentionData, HistorySnapshotItem, GpuUsageDevice, StaticInfoData } from '../api/types'
-import { COLORS } from '../styles/theme'
+import { COLORS, getGpuChartColors } from '../styles/theme'
 import { useMonitoredSections } from '../hooks/useMonitoredSections'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 
@@ -410,14 +410,6 @@ type EngineKey = 'vcs' | 'vecs' | 'ccs' | 'rcs' | 'bcs'
 // Fixed per-metric colors for disk and network charts
 const METRIC_COLORS = { util: '#56c8d8', read: '#73bf69', write: '#e07b54', rx: '#73bf69', tx: '#e07b54' }
 
-const ENGINE_CURVE_META: Array<{ key: EngineKey; name: string; color: string }> = [
-  { key: 'vcs', name: 'VCS %', color: '#f9c74f' },
-  { key: 'vecs', name: 'VECS %', color: '#ff9f1c' },
-  { key: 'ccs', name: 'CCS %', color: '#5aa9ff' },
-  { key: 'rcs', name: 'RCS %', color: '#4cc9f0' },
-  { key: 'bcs', name: 'BCS %', color: '#ff6b9d' },
-]
-
 const P_CORE_COLORS = ['#ff7f00', '#ffd700', '#a65628', '#d4a017', '#ffa500', '#b8860b', '#cd853f', '#daa520']
 const E_CORE_COLORS = ['#377eb8', '#4daf4a', '#17becf', '#1e90ff', '#00ced1', '#7cfc00', '#20b2aa', '#2e8b57', '#4682b4', '#32cd32', '#00ffff', '#008b8b', '#6495ed', '#7fffd4', '#00fa9a', '#87ceeb']
 const LPE_CORE_COLORS = ['#984ea3', '#f781bf', '#ba55d3', '#e879f9', '#9370db', '#ff69b4', '#c71585', '#dda0dd']
@@ -428,12 +420,12 @@ const DEFAULT_MONITORED_DYNAMIC_SECTION_SET = new Set<string>(DEFAULT_MONITORED_
 const RAW_SECTION_OPTIONS = [
   { label: 'System Pressure', value: 'pressure' },
   { label: 'CPU', value: 'cpu' },
-  { label: 'System Memory', value: 'memory' },
   { label: 'CPU Per-Core', value: 'cpuPerCore' },
+  { label: 'GPU', value: 'gpu' },
+  { label: 'NPU', value: 'npu' },
+  { label: 'System Memory', value: 'memory' },
   { label: 'Disk I/O', value: 'disk' },
   { label: 'Network I/O', value: 'network' },
-  { label: 'NPU', value: 'npu' },
-  { label: 'GPU', value: 'gpu' },
 ]
 // A chart is shown when ANY of its required sections is monitored (`.some`),
 // not all of them.  Single-requirement entries (the common case) simply appear
@@ -1036,6 +1028,7 @@ function ConfigurableChart<T extends { timestamp: string; ts: number }>({
   height = 280,
   showBrush = false,
   hoverPanel = false,
+  order,
 }: {
   title: string
   storageKey: string
@@ -1045,6 +1038,7 @@ function ConfigurableChart<T extends { timestamp: string; ts: number }>({
   height?: number
   showBrush?: boolean
   hoverPanel?: boolean
+  order?: number
 }) {
   const defaults = useMemo(() => allSeries.filter((s) => s.defaultOn !== false).map((s) => s.key), [allSeries])
   const [active, toggle] = usePersistedSet(storageKey, defaults)
@@ -1131,7 +1125,7 @@ function ConfigurableChart<T extends { timestamp: string; ts: number }>({
 
   return (
     <Card
-      style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16 }}
+      style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16, order }}
       bodyStyle={{ padding: 16 }}
     >
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
@@ -1325,23 +1319,28 @@ function GpuHistoryCard({
   )
 
   const memLabel = series.isIntegrated ? 'Sys Mem %' : 'VRAM %'
+  const gpuColors = getGpuChartColors()
 
   const engineLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string; strokeWidth?: number }> = [
-    { key: 'utilization', name: 'GPU Util %', color: '#ff6b6b', yAxisId: 'util', strokeWidth: 2 },
-    ...ENGINE_CURVE_META.map((e) => ({ key: e.key, name: e.name, color: e.color, yAxisId: 'util' })),
-    { key: 'memUsage', name: memLabel, color: '#4ade80', dasharray: '5 3', yAxisId: 'util' },
-    { key: 'gt0Act', name: 'GT0 Act MHz', color: '#cbd5e1', yAxisId: 'freq' },
-    { key: 'gt0Req', name: 'GT0 Req MHz', color: '#cbd5e1', dasharray: '6 4', yAxisId: 'freq' },
-    { key: 'gt1Act', name: 'GT1 Act MHz', color: '#34d399', yAxisId: 'freq' },
-    { key: 'gt1Req', name: 'GT1 Req MHz', color: '#34d399', dasharray: '4 4', yAxisId: 'freq' },
-    { key: 'gt0Rc6', name: 'GT0 RC6 %', color: '#2dd4bf', dasharray: '3 2', yAxisId: 'util' },
-    { key: 'gt1Rc6', name: 'GT1 RC6 %', color: '#a3e635', dasharray: '3 2', yAxisId: 'util' },
+    { key: 'utilization', name: 'GPU Util %', color: gpuColors.utilization, yAxisId: 'util', strokeWidth: 2 },
+    { key: 'vcs', name: 'VCS %', color: gpuColors.vcs, yAxisId: 'util' },
+    { key: 'vecs', name: 'VECS %', color: gpuColors.vecs, yAxisId: 'util' },
+    { key: 'ccs', name: 'CCS %', color: gpuColors.ccs, yAxisId: 'util' },
+    { key: 'rcs', name: 'RCS %', color: gpuColors.rcs, yAxisId: 'util' },
+    { key: 'bcs', name: 'BCS %', color: gpuColors.bcs, yAxisId: 'util' },
+    { key: 'memUsage', name: memLabel, color: gpuColors.memory, dasharray: '5 3', yAxisId: 'util' },
+    { key: 'gt0Act', name: 'GT0 Act MHz', color: gpuColors.gt0, yAxisId: 'freq' },
+    { key: 'gt0Req', name: 'GT0 Req MHz', color: gpuColors.gt0, dasharray: '6 4', yAxisId: 'freq' },
+    { key: 'gt1Act', name: 'GT1 Act MHz', color: gpuColors.gt1, yAxisId: 'freq' },
+    { key: 'gt1Req', name: 'GT1 Req MHz', color: gpuColors.gt1, dasharray: '4 4', yAxisId: 'freq' },
+    { key: 'gt0Rc6', name: 'GT0 RC6 %', color: gpuColors.gt0Rc6, dasharray: '3 2', yAxisId: 'util' },
+    { key: 'gt1Rc6', name: 'GT1 RC6 %', color: gpuColors.gt1Rc6, dasharray: '3 2', yAxisId: 'util' },
   ]
 
   const pkgPowerLabel = series.isIntegrated ? 'Pkg Power W' : 'Card Power W'
   const powerLines: Array<{ key: string; name: string; color: string; dasharray?: string }> = [
-    { key: 'gpuPower', name: 'GPU Power W', color: '#4cc9f0' },
-    { key: 'pkgPower', name: pkgPowerLabel, color: '#ff9f1c', dasharray: '5 3' },
+    { key: 'gpuPower', name: 'GPU Power W', color: gpuColors.gpuPower },
+    { key: 'pkgPower', name: pkgPowerLabel, color: gpuColors.packagePower, dasharray: '5 3' },
   ]
 
   return (
@@ -2366,7 +2365,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
   }, [dynamicItems, rangePreset, customRange, exportBasename, triggerDownload, messageApi])
 
   return (
-    <div style={{ padding: '16px 0' }}>
+    <div style={{ padding: '16px 0', display: 'flex', flexDirection: 'column' }}>
       {messageContextHolder}
       {error && (
         <Alert
@@ -2583,7 +2582,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
 
       {/* System Pressure */}
       {visibleSections.includes('pressure') && <Card
-        style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6 }}
+        style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16, order: 1 }}
         bodyStyle={{ padding: 16 }}
       >
         <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 6 }}>
@@ -2592,7 +2591,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
         {pressureTrendPoints.length > 0 && (() => {
           const lines: Array<{ key: string; name: string; color: string; dasharray?: string }> = [
             { key: 'systemPressure', name: 'System Pressure %', color: COLORS.accent },
-            { key: 'diskPressure', name: 'Disk Pressure %', color: COLORS.red, dasharray: '5 3' },
+            { key: 'diskPressure', name: 'Disk I/O Pressure %', color: COLORS.red, dasharray: '5 3' },
             { key: 'networkPressure', name: 'Network Pressure %', color: COLORS.green, dasharray: '5 3' },
           ]
           return (
@@ -2693,6 +2692,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
               : []),
             { key: 'cpuTemperatureC', name: 'CPU Temp', color: '#fbbf24', unit: '°C', dasharray: '4 2', defaultOn: false },
           ]}
+          order={2}
         />
       )}
 
@@ -2711,12 +2711,15 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
             { key: 'bandwidthRead', name: 'BW Read', color: '#22d3ee', unit: 'GB/s' },
             { key: 'bandwidthWrite', name: 'BW Write', color: METRIC_COLORS.write, unit: 'GB/s' },
           ]}
+          order={6}
         />
       )}
 
       {/* CPU Per-Core — utilization, frequency, temperature */}
       {visibleSections.includes('cpuPerCore') && !loading && cpuPerCoreInfo.coreCount > 0 && (
-        <CpuPerCoreHistoryCard info={cpuPerCoreInfo} timeWindow={timeWindow} />
+        <div style={{ order: 3 }}>
+          <CpuPerCoreHistoryCard info={cpuPerCoreInfo} timeWindow={timeWindow} />
+        </div>
       )}
 
       {/* Disk — Utilization & Bandwidth per device */}
@@ -2730,7 +2733,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
         return (
         <Card
           key={`disk-${diskName}`}
-          style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16 }}
+          style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16, order: 7 }}
           bodyStyle={{ padding: 16 }}
         >
           {(() => {
@@ -2837,7 +2840,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
         return (
         <Card
           key={`net-${nicName}`}
-          style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16 }}
+          style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16, order: 8 }}
           bodyStyle={{ padding: 16 }}
         >
           {(() => {
@@ -2930,7 +2933,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
 
       {/* NPU — split into unit-grouped charts so axes aren't mixed */}
       {visibleSections.includes('npu') && !loading && hasNpuData && (
-        <>
+        <div style={{ order: 5 }}>
           <ConfigurableChart
             title="NPU — Utilization & Frequency"
             storageKey="history-npu-util-freq"
@@ -2974,12 +2977,12 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
                   { key: 'npuMemoryMb', name: 'Memory Used', color: '#56c8d8', unit: 'MB' },
                 ]}
           />
-        </>
+        </div>
       )}
 
       {/* GPU History — shares the single global "Loading history..." indicator
           above; no separate loading placeholder (matches the other sections). */}
-      {visibleSections.includes('gpu') && !loading && <div style={{ marginTop: 16 }}>
+      {visibleSections.includes('gpu') && !loading && <div style={{ marginTop: 16, order: 4 }}>
         {gpuTrendSeries.length === 0 ? (
           <Card
             style={{

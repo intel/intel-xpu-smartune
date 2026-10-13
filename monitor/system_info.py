@@ -462,6 +462,10 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
 
         data = {
             "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "host": {
+                "hostname": socket.gethostname(),
+                "boot_time": int(psutil.boot_time()),
+            },
             "bios": {"version": _parse_bios_version()},
             "os": {"version": _parse_os_version()},
             "driver": {

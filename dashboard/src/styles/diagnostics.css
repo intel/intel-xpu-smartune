@@ -1,4 +1,5 @@
 .diagnostics-page {
+  --diagnostics-text-muted: var(--color-text-muted);
   margin-top: 12px;
   border-color: var(--diagnostics-border, #2d3149) !important;
 }

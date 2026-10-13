@@ -748,6 +748,10 @@ export interface PackageInfo {
 
 export interface StaticInfoData {
   collected_at: string
+  host?: {
+    hostname: string | null
+    boot_time: number | null
+  }
   bios: {
     version: string | null
   }
@@ -913,6 +917,7 @@ export interface DynamicInfoData {
     lpe_core_indices: number[]
     core_type_source: string
     temperature_c: number | null
+    pkg_power_w: number | null
     per_core_temperature_c?: Array<number | null>
   }
   memory: {

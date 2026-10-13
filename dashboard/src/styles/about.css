@@ -1,0 +1,33 @@
+.about-features-modal .ant-modal-title {
+  color: var(--color-text);
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.about-features-modal .ant-modal-body {
+  max-height: 72vh;
+  overflow-y: auto;
+  padding-right: 8px;
+}
+
+.about-features-modal .ant-timeline-item {
+  padding-bottom: 16px;
+}
+
+.about-features-modal .ant-timeline-item-content > div > span.ant-typography {
+  color: var(--color-text) !important;
+  font-size: 14px;
+  font-weight: 600 !important;
+}
+
+.about-features-modal p.ant-typography {
+  color: var(--color-text) !important;
+  font-size: 13px !important;
+  line-height: 1.65;
+}
+
+@media (max-width: 768px) {
+  .about-features-modal .ant-modal-body {
+    max-height: 76vh;
+  }
+}

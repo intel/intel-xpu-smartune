@@ -10,6 +10,11 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    from monitor.metrics.rapl import RaplPackagePowerSampler
+except ModuleNotFoundError:
+    from metrics.rapl import RaplPackagePowerSampler
+
 VERBOSE = False
 
 def vprint(*args, **kwargs):
@@ -726,6 +731,7 @@ class IGpuPower:
         self.rapl_counters = {}
         self.rapl_num = 0
         self.msr = None
+        self.package_power = RaplPackagePowerSampler()
 
         # Try RAPL perf_event first
         self._try_rapl_perf()
@@ -812,6 +818,10 @@ class IGpuPower:
                 pkg_delta = (cur_sample["msr_pkg"] - prev_sample["msr_pkg"]) & 0xFFFFFFFF
                 power["gpu_w"] = round((gpu_delta * self.msr.scale) / dt_s, 2)
                 power["pkg_w"] = round((pkg_delta * self.msr.scale) / dt_s, 2)
+
+        package_power_w = self.package_power.read_power_w()
+        if package_power_w is not None:
+            power["pkg_w"] = package_power_w
 
         return power
 

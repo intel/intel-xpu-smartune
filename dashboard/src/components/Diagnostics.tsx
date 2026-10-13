@@ -49,6 +49,7 @@ import {
 import { api, getLatestServerTime } from '../api/client'
 import { MEMORY_RECOVERY_HINT } from '../utils/messages'
 import { indexMetrics, formatWithUnit, metricLabel } from '../utils/benchMetrics'
+import { createLiveDiagnosticWindow, groupDiagnosticEvents } from '../utils/diagnosticEvents'
 import type {
   DiagBenchCase,
   DiagBoot,
@@ -147,6 +148,7 @@ const { Text } = Typography
 interface Props {
   active: boolean
   openAlertsSignal?: number
+  rangeIntent?: { window: '1h'; requestId: number } | null
   onOpenHistory: (range: { from: number; to: number }) => void
 }
 
@@ -162,12 +164,6 @@ const WINDOW_SECONDS: Record<Exclude<WindowKey, 'custom' | 'entire'>, number> = 
   '24h': 24 * 60 * 60,
 }
 
-// A live window's upper bound tracks "now", but "now" is only known to ±1-2s via the
-// server-clock skew estimate (whole-second Date header, refreshed on drift). Querying
-// [from, now] therefore drops an event stamped in the last second or two -- e.g. the
-// RECOVERED emitted by Resume. Pad the *query* upper bound (not the displayed range)
-// a few minutes ahead so a just-emitted event and skew jitter always fall inside.
-const LIVE_WINDOW_LEAD_SECONDS = 5 * 60
 const INVESTIGATION_EVENT_WINDOW_SECONDS = 5 * 60
 
 const REFRESH_MILLISECONDS: Record<Exclude<RefreshInterval, 'off'>, number> = {
@@ -471,27 +467,7 @@ function displayEventKey(item: DisplayEvent): string {
 }
 
 function displayEvents(events: DiagEvent[]): DisplayEvent[] {
-  const grouped = new Map<string, DisplayEvent>()
-  const ungrouped: DisplayEvent[] = []
-  for (const event of events) {
-    const action = protectionAction(event)
-    if (!action) {
-      ungrouped.push({ event, resources: event.resource_type ? [event.resource_type] : [] })
-      continue
-    }
-    // Merge only the resources of ONE action, not every action of a protection:
-    // CPU+Memory capped together (same second) stay one row, but a disk-IO limit
-    // applied minutes later — or a later recovery — is its own row. The ledger
-    // emits a separate event per resource, so batch by second-precision timestamp.
-    const key = `${event.protection_id}:${action}:${event.ts_utc.slice(0, 19)}`
-    const existing = grouped.get(key)
-    if (existing) {
-      if (event.resource_type && !existing.resources.includes(event.resource_type)) existing.resources.push(event.resource_type)
-    } else {
-      grouped.set(key, { event, resources: event.resource_type ? [event.resource_type] : [] })
-    }
-  }
-  return [...ungrouped, ...grouped.values()].sort((left, right) => right.event.ts_utc.localeCompare(left.event.ts_utc))
+  return groupDiagnosticEvents(events)
 }
 
 function displayEventSummary(item: DisplayEvent): string {
@@ -977,6 +953,20 @@ function resourceUtilizationColor(label: string): string {
   return '#b18be8'
 }
 
+function resourceDisplayOrder(label: string): number {
+  if (label === 'CPU') return 0
+  if (label === 'iGPU' || label === 'dGPU' || label.startsWith('GPU')) return 1
+  if (label === 'NPU') return 2
+  if (label === 'Memory') return 3
+  if (label === 'Disk') return 4
+  if (label === 'Network') return 5
+  return 6
+}
+
+function sortResourceLabels(labels: string[]): string[] {
+  return labels.sort((left, right) => resourceDisplayOrder(left) - resourceDisplayOrder(right))
+}
+
 // The scope kinds /diag/context accepts, used to drive the investigation drawer.
 type ContextTarget = { kind: 'job' | 'app'; value: string; label?: string }
 
@@ -992,7 +982,7 @@ function contextTargetForEvent(event: DiagEvent): ContextTarget | null {
   return null
 }
 
-export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }: Props) {
+export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onOpenHistory }: Props) {
   const [events, setEvents] = useState<DiagEvent[]>([])
   const [controlLifecycles, setControlLifecycles] = useState<DiagControlLifecycle[]>([])
   const [records, setRecords] = useState<DiagLogRecord[]>([])
@@ -1121,6 +1111,15 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
     setEventPage(1)
   }
 
+  useEffect(() => {
+    if (!active || !rangeIntent) return
+    setWindowKey(rangeIntent.window)
+    setCustomRange(null)
+    setBootCustomRange(null)
+    setRangeEndEpoch(Math.floor(Date.now() / 1000))
+    resetEventViewForTimeRange()
+  }, [active, rangeIntent?.requestId, rangeIntent?.window])
+
   const selectedBoot = useMemo(
     () => boots.find((b) => b.boot_id === selectedBootId) ?? null,
     [boots, selectedBootId],
@@ -1129,9 +1128,9 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
   const timeRange = useMemo(() => {
     const now = rangeEndEpoch + (clockSkewSec ?? 0)
     // `to` is the semantic end shown to the user; `queryTo` is what the fetches use.
-    // They differ only for live windows, whose upper bound tracks "now" and so needs
-    // the lead (see LIVE_WINDOW_LEAD_SECONDS); fixed/historical ends query as-is.
-    const live = (from: number, to: number) => ({ from, to, queryTo: to + LIVE_WINDOW_LEAD_SECONDS })
+    // They differ only for live windows, whose upper bound tracks "now" and uses
+    // the shared query lead; fixed and historical ends query as-is.
+    const live = createLiveDiagnosticWindow
     const fixed = (from: number, to: number) => ({ from, to, queryTo: to })
     if (bootScopeEnabled && selectedBoot?.first_ts) {
       const bootFrom = selectedBoot.first_ts
@@ -1184,7 +1183,7 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
       if (token === eventsRefreshSeq.current) setEventsLoading(false)
       updateClockSkew()
     }
-  }, [jobId, appId, timeRange, updateClockSkew])
+  }, [jobId, appId, timeRange.from, timeRange.queryTo, updateClockSkew])
 
   const loadControlLifecycles = useCallback(async () => {
     const token = ++controlLifecyclesRefreshSeq.current
@@ -1498,8 +1497,7 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
     for (const point of rangeResourceTrend) {
       Object.keys(point.values).forEach((label) => available.add(label))
     }
-    return ['CPU', 'Memory', ...Array.from(available).filter((label) => label === 'iGPU' || label === 'dGPU' || label.startsWith('GPU')), 'NPU', 'Disk', 'Network']
-      .filter((label, index, labels) => available.has(label) && labels.indexOf(label) === index)
+    return sortResourceLabels(Array.from(available))
   }, [rangeResourceTrend])
 
   const activeResourceTrendSeries = useMemo(
@@ -1755,10 +1753,12 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
     () => monitorPressurePoints(contextData?.metrics?.monitor?.series ?? []),
     [contextData],
   )
-  const averageResourceUtilization = useMemo(() => rangeResourceUtilization.map((resource) => ({
-    ...resource,
-    color: resourceUtilizationColor(resource.label),
-  })), [rangeResourceUtilization])
+  const averageResourceUtilization = useMemo(() => [...rangeResourceUtilization]
+    .sort((left, right) => resourceDisplayOrder(left.label) - resourceDisplayOrder(right.label))
+    .map((resource) => ({
+      ...resource,
+      color: resourceUtilizationColor(resource.label),
+    })), [rangeResourceUtilization])
   const contextAlerts = contextData?.alerts ?? []
   const rangeAlerts = useMemo(() => alerts.filter((alert) => {
     const timestamp = dayjs(alert.last_fired_at).unix()
@@ -1770,11 +1770,13 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
   )
   const currentlySilenced = useCallback((alert: DiagAlert) =>
     !!alert.silenced_until && dayjs(alert.silenced_until).isAfter(dayjs()), [])
+  const needsAttentionAlerts = useMemo(
+    () => currentAlerts.filter((alert) => !alert.acknowledged_at && !currentlySilenced(alert)),
+    [currentAlerts, currentlySilenced],
+  )
   const displayedAlerts = useMemo(() => {
     if (alertFilter === 'range') return rangeAlerts
-    if (alertFilter === 'needs_attention') {
-      return currentAlerts.filter((alert) => !alert.acknowledged_at && !currentlySilenced(alert))
-    }
+    if (alertFilter === 'needs_attention') return needsAttentionAlerts
     if (alertFilter === 'acknowledged') {
       return currentAlerts.filter((alert) => !!alert.acknowledged_at && !currentlySilenced(alert))
     }
@@ -1782,7 +1784,7 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
     if (alertFilter === 'resolved') return rangeAlerts.filter((alert) => alert.status === 'resolved')
     const resolvedInRange = rangeAlerts.filter((alert) => alert.status === 'resolved')
     return [...currentAlerts, ...resolvedInRange]
-  }, [alertFilter, currentAlerts, currentlySilenced, rangeAlerts])
+  }, [alertFilter, currentAlerts, currentlySilenced, needsAttentionAlerts, rangeAlerts])
   const alertFilterLabel = {
     range: 'Selected time range',
     all: 'Current + resolved',
@@ -1888,17 +1890,18 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
   const reportAvailableResourceTrendLabels = useMemo(() => {
     const available = new Set<string>()
     for (const point of reportResourceTrend) Object.keys(point.values).forEach((label) => available.add(label))
-    return ['CPU', 'Memory', ...Array.from(available).filter((label) => label === 'iGPU' || label === 'dGPU' || label.startsWith('GPU')), 'NPU', 'Disk', 'Network']
-      .filter((label, index, labels) => available.has(label) && labels.indexOf(label) === index)
+    return sortResourceLabels(Array.from(available))
   }, [reportResourceTrend])
   const reportResourceTrendSeries = useMemo(
     () => reportAvailableResourceTrendLabels.filter((label) => reportResourceTrendLabels.has(label)),
     [reportAvailableResourceTrendLabels, reportResourceTrendLabels],
   )
-  const reportAverageResourceUtilization = useMemo(() => reportResourceUtilization.map((resource) => ({
-    ...resource,
-    color: resourceUtilizationColor(resource.label),
-  })), [reportResourceUtilization])
+  const reportAverageResourceUtilization = useMemo(() => [...reportResourceUtilization]
+    .sort((left, right) => resourceDisplayOrder(left.label) - resourceDisplayOrder(right.label))
+    .map((resource) => ({
+      ...resource,
+      color: resourceUtilizationColor(resource.label),
+    })), [reportResourceUtilization])
   const reportEventActivityTick = useCallback((ts: number) => {
     const duration = reportQueryRange.to - reportQueryRange.from
     return dayjs.unix(ts).format(duration <= 24 * 60 * 60 ? 'HH:mm' : 'MM-DD HH:mm')
@@ -2150,11 +2153,10 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
     if (jobId) setLogsOpen(true)
   }, [jobId])
 
-  // A boot-scoped investigation needs host logs as well as diagnostic events.
+  // Load boot metadata up front, but keep the expensive host-log query opt-in.
   useEffect(() => {
     if (!bootScopeEnabled) return
     if (!boots.length && !bootsLoading) loadBoots()
-    setLogsOpen(true)
   }, [bootScopeEnabled, boots.length, bootsLoading, loadBoots])
 
   useEffect(() => {
@@ -2251,17 +2253,6 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
                   void loadLogs()
                 }}
               />
-              <Tooltip title={`Current alerts${currentAlerts.length ? ` (${currentAlerts.length})` : ''}. Open it to view active alerts, resolved history, and alert policy.`}>
-                <Button
-                  aria-label='Alert history'
-                  icon={<BellOutlined />}
-                  onClick={() => {
-                    setAlertFilter('all')
-                    setAlertsOpen(true)
-                  }}
-                  loading={alertsLoading}
-                />
-              </Tooltip>
               <Tooltip title={`Advices${rangeFindings.length ? ` (${rangeFindings.length})` : ''}. Advice is generated by deterministic rules from metrics and supported built-in event types; custom-rule events do not independently create advice.`}>
                 <Button aria-label='Advices' icon={<BulbOutlined />} onClick={() => setInsightsOpen(true)} />
               </Tooltip>
@@ -2399,7 +2390,7 @@ export default function Diagnostics({ active, openAlertsSignal, onOpenHistory }:
                   setAlertFilter('range')
                   setAlertsOpen(true)
                 }}>
-                  <BellOutlined /> <strong>{alertsLoading ? '-' : rangeAlerts.length}</strong> alerts
+                  <BellOutlined /> <strong>{alertsLoading ? '-' : rangeAlerts.length}</strong> alerts in range
                 </button>
               </Tooltip>
 

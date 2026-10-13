@@ -112,17 +112,20 @@ interface Props {
   // so control settings tabs are hidden — only Monitor applies.
   balancerEnabled: boolean
   onActiveTabChange?: (title: string) => void
+  tabIntent?: { key: string; requestId: number } | null
 }
 
 const SECTION_LABELS: Record<string, string> = {
   cpu: 'CPU',
-  memory: 'Memory',
-  pressure: 'Pressure',
-  network: 'Network',
-  disk: 'Disk I/O',
   gpu: 'GPU',
   npu: 'NPU',
+  memory: 'Memory',
+  disk: 'Disk I/O',
+  network: 'Network',
+  pressure: 'Pressure',
 }
+
+const SECTION_ORDER = ['cpu', 'gpu', 'npu', 'memory', 'disk', 'network', 'pressure']
 
 const PRIORITIES: Array<{ key: LimitPriority; label: string }> = [
   { key: 'high', label: 'High' },
@@ -524,7 +527,11 @@ function MonitoredSectionsCard() {
           }}
           style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 24px' }}
         >
-          {allSections.map((s) => (
+          {[...allSections].sort((left, right) => {
+            const leftIndex = SECTION_ORDER.indexOf(left)
+            const rightIndex = SECTION_ORDER.indexOf(right)
+            return (leftIndex < 0 ? SECTION_ORDER.length : leftIndex) - (rightIndex < 0 ? SECTION_ORDER.length : rightIndex)
+          }).map((s) => (
             <Checkbox key={s} value={s} disabled={saving}>
               {SECTION_LABELS[s] ?? s}
             </Checkbox>
@@ -1992,7 +1999,7 @@ function UnsavedDot() {
   )
 }
 
-export default function SettingsModal({ active: _active, balancerEnabled, onActiveTabChange }: Props) {
+export default function SettingsModal({ active: _active, balancerEnabled, onActiveTabChange, tabIntent }: Props) {
   const tabs = SETTINGS_TABS.filter((tab) => balancerEnabled || !tab.balancerOnly)
   const firstTabKey = tabs[0].key
   // Cards register here while mounted. Panes stay mounted once visited, so this
@@ -2002,6 +2009,12 @@ export default function SettingsModal({ active: _active, balancerEnabled, onActi
   const [saving, setSaving] = useState(false)
   const [activeTab, setActiveTab] = useState(firstTabKey)
   const [dirtyTabs, setDirtyTabs] = useState<string[]>([])
+
+  useEffect(() => {
+    if (tabIntent?.key && tabs.some((tab) => tab.key === tabIntent.key)) {
+      setActiveTab(tabIntent.key)
+    }
+  }, [tabIntent?.key, tabIntent?.requestId])
 
   useEffect(() => {
     const title = tabs.find((tab) => tab.key === activeTab)?.title

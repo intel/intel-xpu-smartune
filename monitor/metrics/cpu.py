@@ -11,11 +11,13 @@ from typing import Any, Dict, List, Optional, Set
 import psutil
 
 from monitor.metrics.utils import safe_read, run_cmd
+from monitor.metrics.rapl import RaplPackagePowerSampler
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
 _CORE_CLASS_CACHE: Dict[str, Any] = {"cpu_count": None, "result": None}
 _CORE_TOPOLOGY: Optional[List[Optional[int]]] = None
+_PACKAGE_POWER_SAMPLER = RaplPackagePowerSampler()
 
 
 def _expand_cpu_ranges(spec: Optional[str]) -> Set[int]:
@@ -497,6 +499,7 @@ def get_cpu_dynamic() -> Dict[str, Any]:
         "e_core_indices": e_cores,
         "lpe_core_indices": lpe_cores,
         "core_type_source": core_class["source"],
+        "pkg_power_w": _PACKAGE_POWER_SAMPLER.read_power_w(),
     }
 
 

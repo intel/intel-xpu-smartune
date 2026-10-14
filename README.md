@@ -155,8 +155,11 @@ Each component of the Edge Infrastructure external is licensed under [Apache 2.0
 
 ### 1. Resource Control
 Dynamically restricts CPU, memory, and disk I/O resource usage for the most resource-intensive applications via cgroups v2 when system resources are strained. Switches power modes according to pressure levels and gradually restores resource quotas as pressure eases.
-- cgroups v2 resource control: CPU quota, memory.high, I/O weight (io.weight), and per-disk read/write throughput and IOPS throttling (io.max: rbps/wbps/riops/wiops) per app
+- cgroups v2 resource control: CPU quota (`CPUQuota`), memory soft limit (`memory.high`), and per-disk read/write throughput and IOPS throttling (`io.max`: rbps/wbps/riops/wiops) per app
+- Three-layer memory handling: swap headroom growth (L0), `memory.high` soft limit (L1), and proactive `memory.reclaim` on idle limited apps (L2)
 - CPU frequency governor switching (powersave/performance) based on pressure level
+- Automatic control pauses itself for the duration of a measured benchmark run (quiet mode), without touching any configuration switch
+- 📖 Deep dive: [Balancer Guide](docs/balancer_guide.md) — every scenario the balancer acts on under Auto and Manual control, what each one adjusts, and a lookup table of all tunable parameters
 
 ### 2. Pressure Monitoring
 Real-time collection of CPU and I/O stall data from Linux PSI (Pressure Stall Information) plus memory scarcity from a free-RAM sigmoid, combined into a composite score and classified into four pressure levels (low/medium/high/critical). Disk I/O runs as a **second, independent channel** with its own score and levels, so a saturated disk authorizes an `io.max` cap without inflating the system score. Intercepts execve system calls via eBPF to detect controlled app launches and exits in real-time.
@@ -218,11 +221,19 @@ Supports manual operations on controlled apps, including priority adjustment, ca
 - REST API and Web UI for manual app management (priority, limits, restore, delete)
 - React dashboard with 6-tab UI: Performance, App Resources, Process Resources, Balancer, History, About
 - Support for manual resource limit adjustment and restoration
+- Safe handoff of a pressure-driven limit to the operator: ownership flips from auto to manual with the kernel caps left in place, so no release window opens under sustained pressure
+- 📖 See the [Balancer Guide](docs/balancer_guide.md) for what each manual action does and how it interacts with automatic control
 
 
 ## API Documentation
 
-For a complete reference of all backend REST API endpoints, see the [Backend API Guide](docs/API_ENDPOINTS.md).
+| Surface | Prefixes | Reference |
+|---------|----------|-----------|
+| Core — auth, capabilities, app management, system monitor | `/auth`, `/smartune`, `/app`, `/monitor` | [Backend API Guide](docs/API_ENDPOINTS.md) |
+| Benchmark (optional feature) | `/bench` | [Benchmark API Guide](benchmark/API_benchmark.md) |
+| Diagnostics (optional feature) | `/diag` | [Diagnostics API Guide](diagnostics/API_diagnostics.md) |
+
+The optional features are mounted only when present in the deployment — query `GET /smartune/capabilities` to find out which are available on a given server.
 
 ## Directory Structure:
 
@@ -238,7 +249,7 @@ intel-xpu-smartune/
 ├── my_database.db              # Peewee SQLite DB (generated at runtime)
 ├── key/                        # Generated TLS certificate/key (b_server.crt / .key)
 ├── logs/                       # Runtime logs
-├── docs/                       # Docs: API_ENDPOINTS.md, pressure_algorithm.md, disk_io_throttle_results.md (+ images/)
+├── docs/                       # Docs: API_ENDPOINTS.md, balancer_guide.md, pressure_algorithm.md, disk_io_throttle_results.md (+ images/)
 ├── config/                     # config.yaml (thresholds, weights, app list) and config loader
 ├── utils/                      # Shared utilities: logger, app_utils, http_utils
 ├── db/                         # Peewee ORM database model for controlled app records

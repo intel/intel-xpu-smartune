@@ -2142,8 +2142,9 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
   }, [active, logsOpen, loadLogs])
 
   const openContextHistory = useCallback(() => {
-    if (!contextData?.window.from || !contextData.window.to) return
-    onOpenHistory({ from: contextData.window.from, to: contextData.window.to })
+    const contextWindow = contextData?.window
+    if (!contextWindow?.from || !contextWindow.to) return
+    onOpenHistory({ from: contextWindow.from, to: contextWindow.to })
     setContextTarget(null)
   }, [contextData, onOpenHistory])
 
@@ -3526,7 +3527,7 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
         width={760}
         extra={contextTarget ? (
           <Space size={8}>
-            <Button icon={<LineChartOutlined />} size='small' disabled={!contextData?.window.from || !contextData.window.to} onClick={openContextHistory}>
+            <Button icon={<LineChartOutlined />} size='small' disabled={!contextData?.window?.from || !contextData?.window?.to} onClick={openContextHistory}>
               Open in History
             </Button>
             <Button type='primary' size='small' onClick={() => applyContextToMainView(contextTarget)}>

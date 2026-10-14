@@ -68,6 +68,24 @@ BASE_REQS="${MULTI_ENV}/uv_base_requirements.txt"
 GENAI_REQS="${DIR_GENAI}/tools/llm_bench/requirements.txt"
 OV_REQS="${SCRIPT_DIR}/requirements/openvino.requirements.txt"   # project OV pins folded into base
 
+# Packages the generator scripts import directly (gen_wrapper.py ->
+# model_precision_check.py parse the IR model.xml with defusedxml) but that
+# neither the download requirements nor the OpenVINO/genai pools pull in on their
+# own. gen_wrapper runs in the base venv for a build-only pass and in the active
+# OV column for a benchmark pass, so BOTH have to carry them.
+#
+# Installed as a top-up rather than folded into the venv's existence check: an OV
+# column takes hours to build, and missing a single pure-python wheel is not a
+# reason to tear one down and start over.
+GENERATOR_DEPS=(defusedxml)
+ensure_generator_deps() {
+    local py="$1"
+    "${py}" -c "import defusedxml" >/dev/null 2>&1 && return 0
+    ensure_uv   # the venv-is-already-built path never needed uv until now
+    echo ">> installing generator deps (${GENERATOR_DEPS[*]}) into ${py}"
+    "${UV_BIN}" pip install --python "${py}" "${GENERATOR_DEPS[@]}"
+}
+
 ensure_uv() {
     if [[ -x "${UV_BIN}" ]]; then return; fi
     if command -v uv >/dev/null 2>&1; then UV_BIN="$(command -v uv)"; return; fi
@@ -187,6 +205,7 @@ bootstrap() {
             "${UV_BIN}" pip install --python "${BASE_VENV}/bin/python" huggingface_hub modelscope jinja2 || return 1
         fi
     fi
+    ensure_generator_deps "${BASE_VENV}/bin/python" || return 1
     # The service (env.py / global_vars.sh) reads $PYENV_VENV_DIR for the `hf`
     # CLI; keep it pointing at the base venv. A benchmark relinks $PYENV_VENV_DIR
     # to its OV column inside its own process only (run_template.sh), never here.
@@ -239,6 +258,9 @@ ensure_ov() {
     if [[ -x "${venv}/bin/python" ]] && \
        "${venv}/bin/python" -c "import openvino,transformers" >/dev/null 2>&1; then
         echo ">> OV ${ov}: already built, skipping."
+        # Columns built before a generator dep was introduced still need it:
+        # run_template.sh activates this venv and then runs gen_wrapper in it.
+        ensure_generator_deps "${venv}/bin/python" || return 1
         return 0
     fi
     echo ">> OV ${ov}: not built yet, building column on demand ..."

@@ -2063,6 +2063,8 @@ export default function SettingsModal({ active: _active, balancerEnabled, onActi
       if (outcomes.every((outcome) => outcome === 'ok')) {
         message.success('Settings saved')
       }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Failed to save settings')
     } finally {
       setSaving(false)
       refreshDirty()

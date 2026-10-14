@@ -15,3 +15,6 @@ pillow
 torchvision
 datasets
 modelscope>=1.22.0
+# gen_wrapper.py / model_precision_check.py parse the IR model.xml; a benchmark
+# pass runs them inside the activated OV column, so the parser lives here too.
+defusedxml>=0.7.1

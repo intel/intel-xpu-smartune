@@ -546,7 +546,7 @@ class DiskIOMonitor:
             # aqu = avg queue depth = Δ(weighted io ms) / Δt (Little's law). Uses the
             # true time_in_queue field; falls back to 0 when diskstats is unavailable.
             weighted_delta_ms = max(0.0, curr_weighted.get(disk, 0) - prev_weighted.get(disk, 0))
-            aqu = weighted_delta_ms / (time_elapsed * 1000.0) if time_elapsed > 0 else 0.0
+            aqu = weighted_delta_ms / (time_elapsed * 1000.0)
 
             merged_result[disk] = {
                 'utilization': round(utilization, 2),

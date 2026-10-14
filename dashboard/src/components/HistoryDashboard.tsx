@@ -726,10 +726,17 @@ function buildDiskTrendPoints(items: HistorySnapshotItem[]): { points: DiskTrend
     } else if (disk?.disk_io) {
       for (const [name, diskData] of Object.entries(disk.disk_io)) {
         diskNameSet.add(name)
-        point[`${name}:util`] = normalizePercent(diskData?.utilization)
-        point[`${name}:capUsedPct`] = normalizePercent(diskData?.usage_percent)
-        point[`${name}:read`] = toNumber(diskData?.read_kb_per_sec != null ? diskData.read_kb_per_sec / 1024 : null)
-        point[`${name}:write`] = toNumber(diskData?.write_kb_per_sec != null ? diskData.write_kb_per_sec / 1024 : null)
+        if (diskData == null || typeof diskData !== 'object') {
+          point[`${name}:util`] = null
+          point[`${name}:capUsedPct`] = null
+          point[`${name}:read`] = null
+          point[`${name}:write`] = null
+          continue
+        }
+        point[`${name}:util`] = normalizePercent(diskData.utilization)
+        point[`${name}:capUsedPct`] = normalizePercent(diskData.usage_percent)
+        point[`${name}:read`] = toNumber(diskData.read_kb_per_sec != null ? diskData.read_kb_per_sec / 1024 : null)
+        point[`${name}:write`] = toNumber(diskData.write_kb_per_sec != null ? diskData.write_kb_per_sec / 1024 : null)
       }
     }
     return point

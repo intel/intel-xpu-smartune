@@ -158,7 +158,8 @@ def analyze_model(source: str, model_dir: Path) -> dict:
     model_name = model_dir.name
     config_path = model_dir / "config.json"
     config = safe_read_json(config_path) if config_path.exists() else None
-    has_model_type = bool(config and config.get("model_type"))
+    model_type = config.get("model_type") if isinstance(config, dict) else None
+    has_model_type = bool(model_type)
     direct_artifacts = find_direct_artifacts(model_dir)
     primary_artifact = pick_largest(direct_artifacts)
     inferred_task = infer_task(model_name, model_dir)
@@ -173,7 +174,7 @@ def analyze_model(source: str, model_dir: Path) -> dict:
             f"Found direct export artifact {primary_artifact.relative_to(model_dir)}; OVC can try this file directly."
         )
     if has_model_type:
-        reasons.append(f"config.json provides model_type={config['model_type']}; this matches optimum/AutoConfig expectations.")
+        reasons.append(f"config.json provides model_type={model_type}; this matches optimum/AutoConfig expectations.")
     elif (model_dir / "modules.json").exists():
         reasons.append("Found modules.json; package looks like a sentence-transformers style model that optimum may load.")
     else:

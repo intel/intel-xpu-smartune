@@ -21,4 +21,6 @@ RUN npm install --global npm@10
 
 WORKDIR /workspace
 
+USER 65534:65534
+
 ENTRYPOINT ["/workspace/packaging/deb/build_deb.sh"]

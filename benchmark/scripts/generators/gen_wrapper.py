@@ -28,11 +28,11 @@ import json
 import os
 import shlex
 import sys
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
-from jinja2 import Environment, FileSystemLoader
+from defusedxml import ElementTree as ET
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.global_vars import (
@@ -793,7 +793,10 @@ def generate_batch_wrappers(routes: List[Dict], stage: str, strategy: str,
         print(f"Error: unsupported stage/strategy combination '{stage}/{strategy}'", file=sys.stderr)
         return []
 
-    template_env = Environment(loader=FileSystemLoader(str(get_templates_root())))
+    template_env = Environment(
+        loader=FileSystemLoader(str(get_templates_root())),
+        autoescape=select_autoescape(enabled_extensions=('html', 'htm', 'xml')),
+    )
     scripts_dir = get_scripts_dir() / stage / strategy
     scripts_dir.mkdir(parents=True, exist_ok=True)
 

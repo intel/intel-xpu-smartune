@@ -418,13 +418,6 @@ const AUTO_LIMIT_EXCLUSION_HINT =
   'Restored apps stay excluded from auto-limiting until you clear them under ' +
   'Balancer → Application Control Center → Excluded (also cleared on Smartune restart).'
 
-// Shown on the manual buttons while the pressure engine owns a row's cgroup. Tells the
-// operator how to take over safely instead of racing the auto-limit writer.
-const AUTO_LOCK_TOOLTIP =
-  'System pressure is high and automatic circuit-breaking has taken over. To control this ' +
-  'app by hand, click "Take Control" on this row to move it to manual control (its limit is ' +
-  'kept in place), or turn off the global passive-control switch at the top right.'
-
 function deriveDisplayProcessName(row: ProcessStatusRow): string {
   const rawName = (row.process_name || '').trim()
   const cmdline = (row.cmdline || '').trim()
@@ -1605,8 +1598,7 @@ export default function Balance({
           )
         }
 
-        const isAuto = record.control_status === 'AUTO_LIMITED'
-        if (isAuto) {
+        if (record.control_status === 'AUTO_LIMITED') {
           return (
             <Space size={4} wrap={false}>
               {detailsButton}
@@ -1709,12 +1701,11 @@ export default function Balance({
               </Button>
             </Tooltip>
 
-            <Tooltip title={isAuto ? AUTO_LOCK_TOOLTIP : 'Delete completely (purges config + DB; needs the wizard to re-add)'}>
+            <Tooltip title="Delete completely (purges config + DB; needs the wizard to re-add)">
               <Button
                 size="small"
                 danger
-                icon={isAuto ? <LockOutlined /> : <DeleteFilled />}
-                disabled={isAuto}
+                icon={<DeleteFilled />}
                 loading={actionLoading[`delete-${record.app_id}`]}
                 onClick={() => {
                   Modal.confirm({

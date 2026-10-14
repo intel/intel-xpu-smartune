@@ -13,9 +13,13 @@ The system control and monitoring module is designed to balance multiple AI apps
 Its core mechanisms are as follows:
 ```
 1. Control: When system resources are strained, dynamically restrict the top resource-consuming apps'
-    CPU quota, memory.high, I/O weight (io.weight), and per-disk read/write throughput and IOPS
+    CPU quota (CPUQuota), memory soft limit (memory.high), and per-disk read/write throughput and IOPS
     limits (io.max: rbps/wbps/riops/wiops) via cgroups v2, while switching the CPU frequency governor
     (powersave/performance) according to pressure level. Resources are gradually restored once pressure drops.
+    Note: io.weight is deliberately left untouched -- writing it can detach the io controller and race
+    with the io.max writes, so only io.max is used for disk-IO control.
+    Memory is handled in three layers: swap headroom growth (L0), memory.high (L1), and proactive
+    memory.reclaim on idle limited apps (L2).
 2. Monitor: Collect CPU, memory, and I/O Pressure Stall Information (PSI) in real time, compute a
     composite pressure score, and map it to four levels (low/medium/high/critical). Intercept controlled
     app launches and exits via eBPF (execve hook). Independently detect disk I/O stress and identify
@@ -32,6 +36,9 @@ Key Words:
     Balancer, Controlled Apps, Monitoring, Priority-Queue-based App Management, Top Resource-Consuming App Processes,
     System Pressure Calculation, CPU/Memory/Disk and Network IO Usage Status...
 ```
+
+For every scenario the balancer acts on under Auto and Manual control, what each one adjusts, and a
+lookup table of all tunable parameters, see the [Balancer Guide](../docs/balancer_guide.md).
 
 # Network Control & Monitor Design
 The network control and monitoring module is designed as an independent component,

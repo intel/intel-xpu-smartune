@@ -2,6 +2,22 @@
 
 This document provides a comprehensive reference for the Intel XPU SmartTune backend API endpoints.
 
+## API Surfaces
+
+Every API the product serves, and where it is documented:
+
+| Feature | Prefix | Reference | Mounted when |
+|---------|--------|-----------|--------------|
+| Authentication & service | `/auth/*`, `/smartune/*` | Below, [Part 1](#part-1-authentication--application-management) | Always |
+| Application management | `/app/*` | Below, [Part 1](#part-1-authentication--application-management) | Balancer is present (`capabilities: 1`) |
+| System monitor & config | `/monitor/*` | Below, [Part 2](#part-2-system-monitor) | Always |
+| Benchmark | `/bench/*` | [benchmark/API_benchmark.md](../benchmark/API_benchmark.md) | `benchmark: 1` |
+| Diagnostics | `/diag/*` | [diagnostics/API_diagnostics.md](../diagnostics/API_diagnostics.md) | `diagnostics: 1` |
+
+Query `GET /smartune/capabilities` to find out which optional features a given server has.
+The base information, authentication and the `RetCode` table below apply to every endpoint,
+wherever its details are documented.
+
 ## Base Information
 
 | Item | Value |
@@ -53,24 +69,36 @@ All endpoints return a standardized JSON structure:
 | Category | Endpoint | Method | Description | Key Features |
 |----------|----------|--------|-------------|--------------|
 | Auth | `/auth/login` | POST | User authentication | SHA256 token validation |
+| Service | `/smartune/capabilities` | GET | What this server serves | Balancer / benchmark / diagnostics flags |
+| Service | `/smartune/ui/heartbeat` | POST | Renew an open-UI lease | Posted every few seconds per tab |
+| Service | `/smartune/ui/release` | POST | Release an open-UI lease | Best-effort on tab close |
 | App | `/app/get_apps` | GET, POST | List all apps | Optional DB sync |
 | App | `/app/set_priority` | POST | Set app priority | OOM score auto-adjustment |
+| App | `/app/set_network_priority` | POST | Set network priority | Drives the tc/HTB class |
 | App | `/app/get_priority_data` | POST | Get priority info | Query by app_id or name |
 | App | `/app/set_to_control` | POST | Enable app control | Register with BPF monitor |
 | App | `/app/discover_search` | POST | Wizard: search processes | Keyword-based /proc scan |
 | App | `/app/discover_extract` | POST | Wizard: extract fields | Derive bpf_name/id from PIDs |
 | App | `/app/new_controlled_app` | POST | Wizard: register new app | Config + DB + BPF in one step |
+| App | `/app/merge_controlled_app_processes` | POST | Add process identities | Add-only merge into an existing app |
+| App | `/app/set_controlled_app_processes` | POST | Replace process identities | Add *and* remove; limited names protected |
 | App | `/app/purge_controlled_app` | POST | Hard-delete app | Removes config + DB + BPF |
 | App | `/app/get_controlled_app` | POST | List controlled apps | Full metadata, status |
 | App | `/app/check_running_apps` | POST | Scan running processes | Detect pre-existing apps |
 | App | `/app/get_pending_app` | POST | List pending apps | Sorted by priority DESC |
 | App | `/app/set_oom_score` | POST | Set OOM score | Protect from OOM killer |
 | App | `/app/cancel_relaunch` | POST | Cancel app relaunch | By app_id |
+| App | `/app/kill_process` | POST | Terminate a process | SIGTERM, or SIGKILL with `force` |
+| App | `/app/suspend_process` | POST | Freeze/resume a process | SIGSTOP, or SIGCONT with `resume` |
 | App | `/app/resource_limit` | POST | Set resource limit | cgroup-based, overridable |
 | App | `/app/resource_limit_profile` | POST | Get limit profile | Defaults + bounds for UI |
 | App | `/app/resource_restore` | POST | Restore resources | Remove limits by app_id |
+| App | `/app/limit_snapshot` | POST | Live limit snapshot | Ownership + effective caps + pids |
+| App | `/app/interrupted_limit_status` | POST | Probe kernel caps by cgroup | Recovers an interrupted lifecycle |
 | App | `/app/auto_limited_apps` | POST | List pressure-driven limits | Rows + live pressure levels |
 | App | `/app/auto_limit_restore` | POST | Release one auto limit | Also excludes the app |
+| App | `/app/lock_to_manual` | POST | Hand an auto limit to the user | No cgroup release; ownership flip only |
+| App | `/app/adopt_auto_limit` | POST | "Take Control" of an auto limit | Registers the app, then adopts the limit |
 | App | `/app/auto_limit_exclusions` | POST | List excluded apps | Runtime only, cleared on restart |
 | App | `/app/auto_limit_exclusion_remove` | POST | Undo an exclusion | By key or app_id |
 | App | `/app/events` | GET | SSE event stream | Real-time status push |
@@ -82,6 +110,7 @@ All endpoints return a standardized JSON structure:
 | Monitor | `/monitor/app_resource_stats` | GET | App CPU/memory usage | Background-cached, top-N |
 | Monitor | `/monitor/app_disk_io_stats` | GET | App disk I/O usage | Throughput + IOPS |
 | Monitor | `/monitor/processes` | GET | All processes | Like `top`, sorted by CPU |
+| Monitor | `/monitor/process_detail` | GET | One process, in detail | Read-only; backs the Properties dialog |
 | Monitor | `/monitor/static_info` | GET | System hardware info | BIOS/OS/CPU/GPU/NPU |
 | Monitor | `/monitor/static_info/<section>` | GET | Single static section | e.g. `/static_info/gpu`; `all` = full |
 | Monitor | `/monitor/dynamic_info` | GET | Live system metrics (CPU, memory, IO, GPU, NPU) | Full snapshot; optional `?sections=` filter |
@@ -141,6 +170,85 @@ All endpoints return a standardized JSON structure:
   }
 }
 ```
+
+---
+
+### Service
+
+#### GET /smartune/capabilities
+
+**Purpose:** Report what this server serves, so the dashboard knows which tabs to render. A monitor-only deployment ships without the balancer, and the benchmark and diagnostics features are optional.
+
+**Request:** No parameters.
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Successfully retrieved capabilities",
+  "data": {
+    "capabilities": 1,
+    "benchmark": 1,
+    "diagnostics": 1
+  }
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| capabilities | int | `1` = balancer + monitor, `0` = monitor only |
+| benchmark | int | `1` = the `/bench` API is mounted here, `0` = not available |
+| diagnostics | int | `1` = the `/diag` API is mounted here, `0` = not available |
+
+**Notes:**
+- `benchmark: 1` only means the feature is **mounted**, NOT that its Python environment is installed — the dashboard needs the tab to exist in order to offer the "install environment" action. Readiness comes from `GET /bench/env`.
+
+---
+
+#### POST /smartune/ui/heartbeat
+
+**Purpose:** Renew an open-UI lease. Each dashboard tab posts this every few seconds so the server knows a UI is still open; the lease lapses shortly after the posts stop.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | session_id | Yes | string | Non-empty identifier for this browser tab |
+
+**Request Example:**
+```json
+{
+  "session_id": "tab-7f3a1c"
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "success",
+  "data": {"ok": true}
+}
+```
+
+**Notes:**
+- A missing or empty `session_id` returns `RetCode.ARGUMENT_ERROR` with `{"ok": false}`.
+- Only acted on when the UI-lease watchdog is armed (the packaged monitor); otherwise it is recorded harmlessly.
+
+---
+
+#### POST /smartune/ui/release
+
+**Purpose:** Release an open-UI lease. Sent best-effort on `pagehide` (a keepalive fetch), so closing a tab winds the lease down promptly instead of waiting for the heartbeat to lapse.
+
+**Request:** Same `session_id` body as `/smartune/ui/heartbeat`.
+
+**Response:** `{"ok": true}`.
+
+**Notes:**
+- Same `RetCode.ARGUMENT_ERROR` on a missing `session_id`.
 
 ---
 
@@ -207,6 +315,41 @@ All endpoints return a standardized JSON structure:
   "data": {}
 }
 ```
+
+---
+
+#### POST /app/set_network_priority
+
+**Purpose:** Set the network priority of an application. This is independent of the resource priority set by `/app/set_priority` — it only decides which tc/HTB class the app's traffic is filtered into.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | app_id | Yes | string | Application identifier |
+| Body | network_priority | Yes | string | `critical` / `high` / `low` / `system` |
+
+**Request Example:**
+```json
+{
+  "app_id": "com.example.app",
+  "network_priority": "high"
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Network priority updated successfully",
+  "data": {}
+}
+```
+
+**Notes:**
+- `medium` is accepted and normalized to `low`: the network scheme has four classes, not five. Any unrecognized value also falls back to `low`.
+- Returns `RetCode.NOT_EXISTING` when the app has no database record.
+- The value is persisted to the DB; the running tc filters are rebuilt on the next network cycle.
 
 ---
 
@@ -430,6 +573,101 @@ Or query by name:
 
 ---
 
+#### POST /app/merge_controlled_app_processes
+
+**Purpose:** Add discovered process identities to an existing controlled app. Add-only: the incoming `process_names` / `bpf_name` are merged into whatever the entry already has, nothing is removed. Used when the wizard rediscovers an app that is already registered.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | id | Yes | string | Identifier of the existing `controlled_apps` entry |
+| Body | process_names | No | string[] | Process names to add |
+| Body | bpf_name | No | string[] | Executable names for the BPF execve watch |
+
+**Request Example:**
+```json
+{
+  "id": "heliconsearch.id",
+  "process_names": ["VLMService"],
+  "bpf_name": ["VLMService"]
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Process identities merged into 'heliconSearch'",
+  "data": {
+    "id": "heliconsearch.id",
+    "name": "heliconSearch",
+    "process_names": ["HeliconSearch_agent", "VLMService"],
+    "bpf_name": ["HeliconSearch_a", "VLMService"]
+  }
+}
+```
+
+**Notes:**
+- Merging is case-insensitive and preserves the original order; duplicates are dropped.
+- Writes `config.yaml`, refreshes the DB metadata and rebuilds the controlled-app map.
+- Returns `RetCode.NOT_EXISTING` when no entry carries that `id`.
+
+---
+
+#### POST /app/set_controlled_app_processes
+
+**Purpose:** Replace an existing app's process/BPF identities. Unlike `/app/merge_controlled_app_processes` (add-only), this overwrites both lists with exactly what the caller sends, so the Edit dialog can prune stale names.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | id | Yes | string | Identifier of the existing `controlled_apps` entry |
+| Body | process_names | Yes | string[] | The complete new list; at least one entry |
+| Body | bpf_name | No | string[] | The complete new list (may be empty) |
+
+**Request Example:**
+```json
+{
+  "id": "heliconsearch.id",
+  "process_names": ["HeliconSearch_agent"],
+  "bpf_name": ["HeliconSearch_a"]
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Process identities updated for 'heliconSearch'",
+  "data": {
+    "id": "heliconsearch.id",
+    "name": "heliconSearch",
+    "process_names": ["HeliconSearch_agent"],
+    "bpf_name": ["HeliconSearch_a"]
+  }
+}
+```
+
+**Response (name under an active limit):**
+```json
+{
+  "retcode": 103,
+  "retmsg": "Cannot remove process name(s) that are currently limited: VLMService. Restore the limit first, then edit.",
+  "data": {
+    "limited": ["VLMService"]
+  }
+}
+```
+
+**Notes:**
+- A program name whose instance currently owns a live limit may NOT be dropped — the cgroup throttle would end up referenced by nothing and could never be restored from the UI. The dashboard already locks those names in the Edit dialog; this is the server-side safety net for direct callers and races.
+- `process_names` must contain at least one entry, otherwise `RetCode.ARGUMENT_ERROR`.
+- Returns `RetCode.NOT_EXISTING` when no entry carries that `id`.
+
+---
+
 #### POST /app/purge_controlled_app
 
 **Purpose:** Hard-delete an application from BOTH config.yaml and the DB: this completely wipes the entry — an active manual resource limit is restored first, then config is removed, the DB row is deleted, the OOM score is restored, and the BPF cache is refreshed. If the active manual limit cannot be restored, the purge fails and leaves the application intact. Auto-limited apps must be restored or taken under manual control before deletion. Used when the user wants to re-add an app whose process_names overlap with an existing entry.
@@ -616,6 +854,75 @@ Or query by name:
 
 ---
 
+#### POST /app/kill_process
+
+**Purpose:** Terminate an arbitrary process by PID. Sends `SIGTERM` by default, `SIGKILL` when `force` is set.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | pid | Yes | int | Target process ID |
+| Body | force | No | bool | `true` sends `SIGKILL` instead of `SIGTERM` (default `false`) |
+
+**Request Example:**
+```json
+{
+  "pid": 12345,
+  "force": false
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Terminated example (pid=12345)",
+  "data": {}
+}
+```
+
+**Notes:**
+- `pid` must be an integer, otherwise `RetCode.ARGUMENT_ERROR`.
+- Two guards return `RetCode.OPERATING_ERROR` with the reason in `retmsg`: PIDs below 2 (init and friends) are refused, and so is any PID belonging to the SmartTune service itself.
+- A process that no longer exists, or that the service lacks permission to signal, also returns `RetCode.OPERATING_ERROR`.
+
+---
+
+#### POST /app/suspend_process
+
+**Purpose:** Freeze a process with `SIGSTOP`, or resume it with `SIGCONT`.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | pid | Yes | int | Target process ID |
+| Body | resume | No | bool | `true` sends `SIGCONT` instead of `SIGSTOP` (default `false`) |
+
+**Request Example:**
+```json
+{
+  "pid": 12345,
+  "resume": false
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Suspended example (pid=12345)",
+  "data": {}
+}
+```
+
+**Notes:**
+- Same PID guards and error codes as `/app/kill_process`.
+- Unrelated to the pressure-driven launch queue: an app held `pending` under critical pressure is resumed by the balancer itself, or cancelled via `/app/cancel_relaunch`.
+
+---
+
 #### POST /app/resource_limit
 
 **Purpose:** Set resource limit (cgroup-based) for a specific app.
@@ -718,6 +1025,133 @@ Or query by name:
 
 ---
 
+#### POST /app/limit_snapshot
+
+**Purpose:** Return the live limit state for one app: who owns the limit, which channels are capped, and with what values. Covers both manual and auto limits, so the dashboard can render a controlled-app row without a separate event-history subsystem.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | app_id | Yes | string | Public application identifier |
+
+**Request Example:**
+```json
+{
+  "app_id": "com.example.app"
+}
+```
+
+**Response (app is limited):**
+```json
+{
+  "retcode": 0,
+  "retmsg": "success",
+  "data": {
+    "limited": true,
+    "effective_app_id": "app-com.example.app.scope",
+    "source": "auto",
+    "control_status": "AUTO_LIMITED",
+    "pids": [12345, 12346],
+    "cgroups": ["app-com.example.app.scope"],
+    "limit_parts": {"cpu_mem_limited": true, "io_limited": false},
+    "limited_at": 1755764400.12,
+    "adopted_from_auto": false,
+    "effective": {
+      "cpu_mem": {"limited": true, "cpu_rate": 0.5, "mem_rate": 0.2},
+      "disk_io": {
+        "limited": false,
+        "disks": [],
+        "read_mb_s": null,
+        "write_mb_s": null,
+        "read_iops": null,
+        "write_iops": null
+      }
+    },
+    "auto_detail": {
+      "limit_reason": "system_pressure",
+      "pressure_level": "critical",
+      "partial_parts": {}
+    }
+  }
+}
+```
+
+**Response (app is not limited):**
+```json
+{
+  "retcode": 0,
+  "retmsg": "success",
+  "data": {
+    "limited": false,
+    "source": null,
+    "control_status": "NORMAL",
+    "pids": [],
+    "cgroups": []
+  }
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| control_status | string | `NORMAL`, `MANUAL_LIMITED` or `AUTO_LIMITED` — the coarse enum that drives tag colour and button gating |
+| source | string | `auto` or `manual`; `null` when not limited |
+| effective_app_id | string | Registry key (the primary cgroup) |
+| effective.cpu_mem | object | Whether CPU/memory is capped and at what rates |
+| effective.disk_io | object | Whether `io.max` is in place, on which disks (empty = every disk), and with what MB/s + IOPS |
+| adopted_from_auto | bool | `true` when this manual limit came from `/app/lock_to_manual` or `/app/adopt_auto_limit` |
+| auto_detail | object | Present only for auto limits: why it fired, the level at the time, and `partial_parts` for channels already half-restored. `null` for manual limits |
+
+**Notes:**
+- The limit stays multi-dimensional on purpose and is never collapsed to a single percentage: CPU and memory travel together under one part, disk I/O is its own channel.
+- An auto limit that has been partially restored still reports `AUTO_LIMITED`; the half-relaxed state rides along in `auto_detail.partial_parts` for display only.
+
+---
+
+#### POST /app/interrupted_limit_status
+
+**Purpose:** Probe the kernel directly for the cgroups of an interrupted control lifecycle. Used when the registry entry was lost (service restart) but the cgroup caps may still be in place, so the UI can tell whether there is anything left to restore.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | cgroups | No | string[] | Cgroup basenames to inspect; empty or missing returns `{available: true, resources: []}` |
+
+**Request Example:**
+```json
+{
+  "cgroups": ["app-com.example.app.scope"]
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "success",
+  "data": {
+    "available": true,
+    "resources": ["cpu", "memory"]
+  }
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| available | bool | `false` when a cgroup's control files could not be read at all — treat as "unknown", not as "no limit" |
+| resources | string[] | Union across the given cgroups of `cpu` / `memory` / `disk_io`, i.e. which controllers currently hold a non-`max` value |
+
+**Notes:**
+- Reads `cpu.max`, `memory.high` and `io.max` from cgroupfs rather than asking systemd. `systemctl show` keeps reporting whatever systemd last set even after a direct write replaced it, so drift would be invisible exactly where it matters.
+- Cgroup names are validated against `[A-Za-z0-9._@:-]+`; anything else returns `available: false`.
+
+---
+
 #### POST /app/auto_limited_apps
 
 **Purpose:** List the apps the balancer is currently limiting on its own because system or disk I/O pressure hit critical. Manual limits set from the UI are not included — they show on the controlled app's own row.
@@ -803,6 +1237,81 @@ Or query by name:
 **Notes:**
 - Returns `RetCode.OPERATING_ERROR` with `No auto-limited app found for this id` when the id matches nothing, or `Failed to restore resources for this app` when the cgroup write fails.
 - Emits an `auto_limit_restored_by_user` notify event on `/app/events`.
+
+---
+
+#### POST /app/lock_to_manual
+
+**Purpose:** Take an auto-limited app over as a manual limit without releasing its cgroup caps — the "safe handoff". The kernel throttle is left exactly where the pressure engine put it; only ownership flips from auto to manual. Afterwards the app is `MANUAL_LIMITED` and the manual Limit / Restore / Edit actions unlock.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | app_id | Yes | string | `effective_app_id` or `app_id` from `/app/auto_limited_apps` |
+
+**Request Example:**
+```json
+{
+  "app_id": "com.example.app"
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Locked to manual",
+  "data": {}
+}
+```
+
+**Notes:**
+- No cgroup write happens. Restoring and then re-applying would open a window in which the suppressed load stampedes back; this path has none.
+- Only works on an app that is already in the controlled list. An unregistered instance returns `RetCode.OPERATING_ERROR` with `Take this app under control first, then lock it to manual` — use `/app/adopt_auto_limit` for those.
+- The app is also added to the auto-limit exclusions with reason `manual_limit`, so the pressure loop never re-grabs an app the operator now owns.
+- Emits a `locked_to_manual` notify event on `/app/events`.
+- Manual limits are process-lifetime: they are lost on service restart, and so is the exclusion.
+- Turning off `passive_resource_control` applies this to every controlled auto-limited app at once. Unregistered entries are skipped and left for the staged restore to release.
+
+---
+
+#### POST /app/adopt_auto_limit
+
+**Purpose:** "Take Control" of an auto limit on an app that is not registered yet. Registers the instance under a new app identity and adopts the live limit in one step, re-tagging the existing registry entry in place — no cgroup release, no duplicate row.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | effective_app_id | Yes | string | `effective_app_id` from `/app/auto_limited_apps` (the cgroup the limit lives on) |
+| Body | app_id | Yes | string | The new controlled-app identifier to adopt it under |
+| Body | app_name | No | string | Display name for the new identity |
+| Body | priority | No | string | Priority to assign |
+
+**Request Example:**
+```json
+{
+  "effective_app_id": "app-com.example.app.scope",
+  "app_id": "com.example.app",
+  "app_name": "example",
+  "priority": "medium"
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Adopted",
+  "data": {}
+}
+```
+
+**Notes:**
+- Registering is always an explicit user action. The balancer never moves an unregistered instance into the controlled list on its own — left alone, such an app stays auto-owned until the staged restore releases it.
+- Both `effective_app_id` and `app_id` are required; either missing gives `RetCode.ARGUMENT_ERROR`.
+- The outcome is the same as `/app/lock_to_manual`: `MANUAL_LIMITED`, caps untouched, added to the auto-limit exclusions.
 
 ---
 
@@ -1051,6 +1560,50 @@ on your own hardware.
   }
 }
 ```
+
+---
+
+#### GET /monitor/process_detail
+
+**Purpose:** Return detailed read-only information for a single PID. Backs the Properties dialog on the Processes tab.
+
+**Query Parameters:**
+
+| Parameter | Required | Type | Default | Description |
+|-----------|----------|------|---------|-------------|
+| pid | Yes | int | — | Target process ID |
+
+**Request Example:**
+```
+GET /monitor/process_detail?pid=12345
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Successfully retrieved process detail",
+  "data": {
+    "pid": 12345,
+    "name": "example",
+    "exe": "/usr/bin/example",
+    "cwd": "/var/lib/example",
+    "username": "root",
+    "status": "running",
+    "ppid": 1,
+    "num_threads": 12,
+    "num_fds": 48,
+    "nice": 0,
+    "create_time": 1755764400.12,
+    "cmdline": "/usr/bin/example --mode=inference"
+  }
+}
+```
+
+**Notes:**
+- Read-only: this endpoint never signals or modifies the process. Use `/app/kill_process` or `/app/suspend_process` for that.
+- Every field is collected defensively — one the service may not read (`exe`, `cwd`, `num_fds` on a process owned by another user) comes back empty or `null` rather than failing the request.
+- A non-numeric `pid` returns `RetCode.ARGUMENT_ERROR`; a PID that does not exist returns `RetCode.NOT_EXISTING`.
 
 ---
 

@@ -19,21 +19,15 @@ from config.config import b_config
 # ---------------------------------------------------------------------------
 # memory.reclaim swappiness
 #
-# Measured on this box (kernel 7.0), a cgroup holding 304 MB anon + 300 MB page
-# cache, asked to reclaim 200 MB:
-#
-#   echo 209715200                    -> anon 304->304, file 300->100, swap 0     (19 ms)
-#   echo "209715200 swappiness=200"   -> anon 304->201, file  98->0,   swap 0->103 (208 ms)
-#
 # Without an explicit swappiness the kernel takes the cheap route and reclaims
 # *only* clean page cache -- not a single anonymous page moves.  For a NAS that
 # is worse than doing nothing: the file-serving cache is destroyed and the
 # memory pressure, which is anonymous, is untouched.  So every caller must pass
 # a swappiness, and the default here is anon-biased.
 #
-# Note the second line: swappiness=200 still drained the remaining page cache
-# before touching anon.  swappiness tunes the *scan ratio*, it is not an
-# absolute preference -- there is no "anon only" mode.  Protecting page cache is
+# Even at swappiness=200 the kernel drains the remaining page cache before
+# touching anon.  swappiness tunes the *scan ratio*, it is not an absolute
+# preference -- there is no "anon only" mode.  Protecting page cache is
 # therefore the caller's job (see file_cache_fraction()), not swappiness'.
 # ---------------------------------------------------------------------------
 DEFAULT_RECLAIM_SWAPPINESS = 180
@@ -134,15 +128,14 @@ class MemoryController(ControllerBase):
     def get_full_path(self, cgroup: str) -> str:
         """Return the cgroup v2 path for *cgroup*.
 
-        Two things are wrong with the inherited version.  It inserts the
-        controller name (``/sys/fs/cgroup/memory/...``), which is the v1 layout
-        and does not exist under v2; and it assumes the caller passes a path
-        relative to the mount, when in fact every caller here passes a bare unit
-        name.  A systemd scope is nested -- a terminal's is at
+        Overrides the inherited version, which is unusable here on two counts:
+        it inserts the controller name (``/sys/fs/cgroup/memory/...``, the v1
+        layout, absent under v2), and it expects a path relative to the mount
+        while every caller here passes a bare unit name.  A systemd scope is
+        nested -- a terminal's sits at
         ``user.slice/user-N.slice/user@N.service/app.slice/app-....slice/`` --
-        so joining the mount to the bare name yields a path that never exists.
-        That silently turned every read into None and every reclaim into a
-        no-op, reported as "cgroup gone".
+        so joining the mount to a bare name yields a path that never exists,
+        turning every read into None and every reclaim into a silent no-op.
 
         Results are cached because the idle gate reads three files per candidate
         per tick and a tree walk per read would cost more than the reclaim.
@@ -227,9 +220,9 @@ class MemoryController(ControllerBase):
     def read_cpu_usec(self, cgroup: str) -> Optional[int]:
         """``cpu.stat``'s ``usage_usec``, used for the idle gate before reclaim.
 
-        Reclaiming from an *active* target is wasted work: measured, such a
-        target climbed back from 230 MB to 402 MB within two seconds, while the
-        caller paid a 450 ms synchronous block for it.
+        Reclaiming from an *active* target is wasted work: it faults the pages
+        straight back in within seconds, and the caller paid a synchronous
+        block for them.
         """
         return self._read_flat_keyed(cgroup, "cpu.stat").get("usage_usec")
 
@@ -364,10 +357,10 @@ class MemoryController(ControllerBase):
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
                 return True
-            logger.warning(f"Failed to set ManagedOOMMemoryPressure: {result.stderr.strip()}")
+            logger.error(f"Failed to set ManagedOOMMemoryPressure on {user_service}: {result.stderr.strip()}")
             return False
         except Exception:
-            logger.error("Exception occurred while setting ManagedOOMMemoryPressure")
+            logger.error(f"Exception while setting ManagedOOMMemoryPressure on {user_service}", exc_info=True)
             return False
 
     def set_parameter(self, cgroup: str, param: str, value: str) -> bool:

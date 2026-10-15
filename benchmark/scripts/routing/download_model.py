@@ -96,8 +96,8 @@ def normalize_network_env() -> None:
     """Fill in the HF endpoint and mirror the proxy across all four spellings.
 
     The inherited environment wins: the caller (SmarTune's benchmark/service/env.py, or a
-    shell that sourced env/global_vars.sh) is what knows this site's proxy,
-    and overriding it here used to pin every download to one corporate proxy.
+    shell that sourced env/global_vars.sh) is what knows this site's proxy, so
+    overriding it here would pin every download to one hard-coded one.
     """
     os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
 

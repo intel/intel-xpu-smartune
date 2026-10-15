@@ -58,14 +58,12 @@ class Controller:
         the cgroup files directly -- the drift is then invisible precisely
         because the property still reads back the value systemd last set.
 
-        The two channels are read independently, and each reports whether its
-        file exists at all.  ``cpu.max`` is absent whenever no unit under the
-        parent slice carries a ``CPUQuota=``: systemd adds ``+cpu`` to the
-        ancestors' ``cgroup.subtree_control`` on demand and drops it again on
-        restore, so an ENOENT right after ``CPUQuota=`` is the normal cleared
-        state, not a failure.  Sharing one ``try`` used to let that expected
-        ENOENT discard a perfectly good ``memory.high`` reading as well, which
-        left every restore silently unverified.
+        The two channels are read independently -- each in its own ``try``, so
+        an expected ENOENT on one cannot discard a good reading from the other
+        and leave a restore silently unverified.  ``cpu.max`` is absent whenever
+        no unit under the parent slice carries a ``CPUQuota=``: systemd adds
+        ``+cpu`` to the ancestors' ``cgroup.subtree_control`` on demand and
+        drops it on restore, so ENOENT there is the normal cleared state.
         """
         path = self.find_cgroup_dir(cgroup_id)
         if not path:
@@ -536,7 +534,7 @@ class Controller:
             if dbus_address:
                 run_env["DBUS_SESSION_BUS_ADDRESS"] = dbus_address
 
-            logger.debug(f"Executing command: {' '.join(cmd)}")
+            logger.info(f"Executing command: {' '.join(cmd)}")
             for attempt in range(1, _MAX_RETRIES + 1):
                 try:
                     result = subprocess.run(
@@ -547,7 +545,7 @@ class Controller:
                         check=True,
                         env=run_env
                     )
-                    logger.debug(f"Executed result: {result}")
+                    logger.info(f"Executed result: {result}")
                     # systemctl exiting 0 only means systemd accepted the
                     # property.  Confirm against cgroupfs, never against
                     # `systemctl show`: the property keeps reporting whatever
@@ -573,10 +571,10 @@ class Controller:
 
     def set_cpu_quota(self, app_id: str, cpu_quota: int, is_restore: bool = False):
         if is_restore:
-            logger.info(f"Restoring CPU quota for {app_id}")
+            logger.debug(f"Restoring CPU quota for {app_id}")
             cpu_quota = None
         else:
-            logger.info(f"Setting CPU quota for {app_id} to {cpu_quota}%")
+            logger.debug(f"Setting CPU quota for {app_id} to {cpu_quota}%")
 
         return self._set_resource_quota(
             app_id,
@@ -586,10 +584,10 @@ class Controller:
 
     def set_mem_high(self, app_id: str, mem_high: Optional[str] = None, is_restore: bool = False):
         if is_restore:
-            logger.info(f"Restoring memory limit for {app_id}")
+            logger.debug(f"Restoring memory limit for {app_id}")
             mem_high = None
         else:
-            logger.info(f"Setting memory limit for {app_id} to {mem_high}")
+            logger.debug(f"Setting memory limit for {app_id} to {mem_high}")
 
         return self._set_resource_quota(
             app_id,
@@ -599,12 +597,12 @@ class Controller:
 
     def set_io_weight(self, app_id: str, io_weight: Optional[int] = None, is_restore: bool = False):
         if is_restore:
-            logger.info(f"Restoring IO weight for {app_id}")
+            logger.debug(f"Restoring IO weight for {app_id}")
             io_weight = None
         elif io_weight is not None and not (1 <= io_weight <= 10000):
             raise ValueError("IOWeight must be 1-10000")
         else:
-            logger.info(f"Setting IO weight for {app_id} to {io_weight}")
+            logger.debug(f"Setting IO weight for {app_id} to {io_weight}")
 
         return self._set_resource_quota(
             app_id,
@@ -616,10 +614,10 @@ class Controller:
                           io_weight: Optional[int] = None, is_restore: bool = False):
         """Set resource limits for an application (CPU, memory, and IO)."""
         if is_restore:
-            logger.info(f"Restoring ALL resources for {app_id}")
+            logger.debug(f"Restoring ALL resources for {app_id}")
             cpu_quota = mem_high = io_weight = None
         else:
-            logger.info(
+            logger.debug(
                 f"Setting resources for {app_id}: "
                 f"CPU={cpu_quota}%, MEM={mem_high}M, IO={io_weight}"
             )

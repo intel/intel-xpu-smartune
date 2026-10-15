@@ -67,7 +67,7 @@ class IOController:
         success = True
         for path in paths:
             if not self._check_file_exists(os.path.dirname(path)):
-                logger.info(f"Path does not exist: {os.path.dirname(path)}")
+                logger.warning(f"Cannot enable IO controller, path does not exist: {os.path.dirname(path)}")
                 success = False
                 continue
 
@@ -122,14 +122,14 @@ class IOController:
 
                 disk_map[name] = maj_min
 
-            logger.info(f"Found disks: {disk_map}")
+            logger.debug(f"Found disks: {disk_map}")
             return disk_map
 
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to get disk ID: {e.stderr.strip()}")
             return {}
         except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
+            logger.error(f"Unexpected error while enumerating disks: {e}")
             return {}
 
     def _ensure_io_enabled(self, cgroup_path: str) -> bool:
@@ -168,7 +168,7 @@ class IOController:
                     if 'io' in f.read().split():
                         continue
 
-                logger.info(f"Enabling IO controller at {control_file}")
+                logger.debug(f"Enabling IO controller at {control_file}")
                 if not self._write_cgroup_file("+io", control_file):
                     logger.warning(f"Failed to enable IO at {control_file}")
                     return False
@@ -201,11 +201,11 @@ class IOController:
                     target_path = os.path.join(base_path, file)
                     return target_path
 
-            logger.info(f"Failed to find the path for cgroup_id: {cgroup_id}")
+            logger.warning(f"Failed to find the path for cgroup_id: {cgroup_id}")
             return None
 
         except subprocess.CalledProcessError as e:
-            logger.error(f"{e.stderr.strip()}")
+            logger.error(f"Cgroup path lookup for {cgroup_id} failed: {e.stderr.strip()}")
             return None
 
     def set_disk_io_throttle(
@@ -344,7 +344,7 @@ class IOController:
         if not self._ensure_io_enabled(io_weight_path):
             return False
 
-        logger.info(f"Setting IO weight to {weight} for cgroup {cgroup_id}")
+        logger.debug(f"Setting IO weight to {weight} for cgroup {cgroup_id}")
         return self._write_cgroup_file(str(weight), io_weight_path)
 
     def get_current_io_limits(self, cgroup_id: str) -> Optional[tuple[int, int, int, int]]:

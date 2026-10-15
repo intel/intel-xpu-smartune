@@ -684,14 +684,13 @@ def collect_dynamic_info(resource_monitor=None, system_pressure_monitor=None,
         system_pressure_monitor: optional SystemPressureMonitor.
         sections: optional iterable of section names (see
             ``DYNAMIC_INFO_SECTIONS``) to restrict collection to specific
-            hardware groups.  ``None`` (default) collects the full snapshot and
-            is fully backward compatible.  Unknown names are ignored; the
-            returned sections always follow the canonical order.
+            hardware groups.  ``None`` (default) collects the full snapshot.
+            Unknown names are ignored; the returned sections always follow the
+            canonical order.
         persist: whether to write this snapshot to history.  ``None`` (default)
-            keeps the historical behaviour — only full snapshots are persisted,
-            so ad-hoc partial API pulls never pollute history.  The background
-            monitor passes ``persist=True`` to persist its configured
-            (possibly partial) monitored set.
+            persists only full snapshots, so ad-hoc partial API pulls never
+            pollute history.  The background monitor passes ``persist=True`` to
+            persist its configured (possibly partial) monitored set.
     """
     full = sections is None
     if full:

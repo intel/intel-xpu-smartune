@@ -8,11 +8,8 @@ actually did. The alternative -- ``/proc/<pid>/io`` via ``psutil.io_counters()``
 reports ``syscr``/``syscw`` in the fields psutil calls ``read_count``/``write_count``.
 Those are **system-call counts, not device requests**: one 1 MB buffered ``write()``
 becomes ~8 requests of 128 KB at the block layer, and a single ``io_submit()`` can
-carry a whole batch of async O_DIRECT IOs. Measured on cgroup v2 (reproduce with
-``balancer/test/probe_cgroup_io.py``):
-
-    dd bs=4k oflag=direct count=20000  ->  wios = 20000   syscw = 20014   (agree)
-    dd bs=1M conv=fsync  count=300     ->  wios =  2400   syscw =   309   (7.8x low)
+carry a whole batch of async O_DIRECT IOs (``balancer/test/probe_cgroup_io.py``
+demonstrates the divergence).
 
 Bytes agree between the two sources; only the operation counts diverge, and they
 diverge in the direction that matters -- a large-block or async writer looks an order

@@ -112,8 +112,8 @@ def _dynamic_info_collector_loop() -> None:
         try:
             monitored = [] if quiet_mode.is_active() else _get_monitored_sections()
             if monitored:
-                # sections=None collects the full snapshot (and keeps the exact
-                # historical full-snapshot shape); a subset collects just those.
+                # sections=None collects the full snapshot; a subset collects
+                # just those sections.
                 all_set = set(monitored) == set(DYNAMIC_INFO_SECTIONS)
                 sections_arg = None if all_set else monitored
                 need_rm = any(s in _SECTIONS_NEED_RM for s in monitored)
@@ -763,11 +763,8 @@ class SystemPressureMonitor:
             busy = getattr(self.config, 'memory_busy_threshold', 90)
             in_fast_zone = mem_usage >= (busy - _FAST_ZONE_MEM_MARGIN)
             self._next_interval = min(_FAST_PRESSURE_UPDATE, self._CACHE_TTL) if in_fast_zone else self._CACHE_TTL
-            # Published as well as acted on: this is the earliest signal the
-            # monitor has that memory is heading somewhere bad, and it is
-            # earlier than the level. On the stress run it turned true 10 s
-            # before the level moved, because the level never passed through
-            # "high" at all -- it went low -> critical in one refresh.
+            # Publish the pre-OOM signal so consumers can react before the
+            # pressure level changes.
             self._in_fast_zone = in_fast_zone
             return level, score, disk_io.get("is_stressed", False), disk_io
         except Exception as e:
@@ -793,9 +790,8 @@ class SystemPressureMonitor:
         one consumer (top-consumer prefetch warming) is edge-triggered by its
         own caller and debounced by CACHE_TTL.
 
-        Why this and not the score: the score's memory term is a sharp gate by
-        design, so it reads 0.19 two seconds before it reads 1.00. This flag
-        tracks raw usage, which climbs smoothly and therefore warns early.
+        The flag tracks raw memory usage and can become true before the pressure
+        score reaches a higher level.
         """
         return self._in_fast_zone
 

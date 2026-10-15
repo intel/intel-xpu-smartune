@@ -1,14 +1,14 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# SmartTune application logging (diagnostics plan, stage 1 / appendix A).
+# SmartTune application logging.
 #
 # One structured store for every SmartTune-produced log line, so the diagnostics
-# `smartune` source (stage 2) can read them back for querying, alerting and
-# correlation. Design contract:
+# `smartune` source can read them back for querying, alerting and correlation.
+# Design contract:
 #
 #   * production format = one JSON object per line (grep- and Agent-parseable);
-#     development format = the old human-readable text.
+#     development format = human-readable text.
 #   * every record carries ts / level / service / mode / logger / pid / thread /
 #     msg, plus app_id / job_id / event_type when relevant.
 #   * single landing: SmartTune's own rotated JSON file is the ONLY place the
@@ -60,7 +60,7 @@ _CONTEXT_FIELDS = ("app_id", "job_id", "event_type")
 
 # Context-bound correlation ids: set at a request/task boundary with
 # bind_log_context(); the formatter falls back to these when a call site did not
-# pass the field explicitly via extra=. Only the plumbing lands in stage 1.
+# pass the field explicitly via extra=.
 _ctx_vars = {name: contextvars.ContextVar("smartune_" + name, default=None)
              for name in _CONTEXT_FIELDS}
 
@@ -83,9 +83,9 @@ def bind_log_context(**fields):
 
 
 def current_log_context():
-    """Return the currently bound correlation ids as a dict (only keys with a
-    non-None value). Lets diagnostics' emit_event() inherit app_id / job_id /
-    values from the ambient bind_log_context() without threading them."""
+    """Return the currently bound correlation ids as a dict (non-None keys only),
+    so diagnostics' emit_event() can inherit them from the ambient
+    bind_log_context() without threading them through."""
     return {name: var.get() for name, var in _ctx_vars.items() if var.get() is not None}
 
 
@@ -150,7 +150,7 @@ def _record_context(record):
 
 
 class _JsonFormatter(logging.Formatter):
-    """One JSON object per line with the stage-1 field schema (appendix A.3)."""
+    """One JSON object per line, with the field schema from the module docstring."""
 
     def format(self, record):
         payload = {
@@ -173,8 +173,8 @@ class _JsonFormatter(logging.Formatter):
 
 
 class _TextFormatter(logging.Formatter):
-    """Human-readable development format; keeps the historical layout and only
-    appends the correlation ids when present so dev output stays uncluttered."""
+    """Human-readable development format; appends the correlation ids only when
+    present so dev output stays uncluttered."""
 
     def __init__(self):
         super().__init__("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -207,19 +207,18 @@ class _SmartuneLoggerAdapter(logging.LoggerAdapter):
         return msg, kwargs
 
 
-# --- log-file rotation (unchanged behaviour) ------------------------------
+# --- log-file rotation ------------------------------------------------------
 
 
 def prune_old_logs(log_dir, prefix=LOG_PREFIX, keep=LOG_RETENTION):
     """Delete all but the ``keep`` newest ``<prefix>_<timestamp>.log`` files.
 
-    Called at import so every process start trims the backlog left by earlier
-    runs. Best-effort: it never raises, so a cleanup hiccup cannot stop the
-    service from starting. The ``<prefix>_latest.log`` symlink and any
-    non-regular files are left untouched. Files are ranked by name which, given
-    the fixed ``YYYYMMDD_HHMMSS`` stamp, is chronological — so pruning does not
-    depend on mtimes that a copy or ``touch`` could perturb. ``keep < 0`` keeps
-    everything (pruning disabled); ``keep == 0`` removes all matching files.
+    Called at import so every process start trims the backlog. Best-effort: it
+    never raises, so a cleanup hiccup cannot stop the service from starting. The
+    ``<prefix>_latest.log`` symlink and non-regular files are left untouched.
+    Files are ranked by name, which the fixed ``YYYYMMDD_HHMMSS`` stamp makes
+    chronological without depending on mtimes. ``keep < 0`` disables pruning;
+    ``keep == 0`` removes all matching files.
     """
     if keep < 0:
         return
@@ -251,9 +250,9 @@ def prune_old_logs(log_dir, prefix=LOG_PREFIX, keep=LOG_RETENTION):
 
 class Logger:
     """Configures the shared base logger. Kept as a class for backward
-    compatibility with ``Logger(...).get_logger()`` callers, but the file
-    handler is now best-effort so an unwritable log directory degrades to
-    console-only instead of aborting import."""
+    compatibility with ``Logger(...).get_logger()`` callers. The file handler is
+    best-effort: an unwritable log directory degrades to console-only rather
+    than aborting import."""
 
     def __init__(self, log_file=None, log_level=None):
         self.log_file = log_file
@@ -272,13 +271,9 @@ class Logger:
                 h.close()
         self.logger.propagate = False
 
-        # The file is the diagnostics `smartune` source's store, which parses one
-        # JSON object per line -- so the FILE is ALWAYS JSON, regardless of the tty
-        # heuristic. Only the console follows _make_formatter(), so a developer on a
-        # tty still gets human-readable output. (Previously both shared one
-        # formatter: a tty-launched service wrote a text file the source could not
-        # parse, so the Diagnostics log panel came back empty.) SMARTUNE_LOG_FORMAT
-        # therefore governs the console view; the persisted store stays structured.
+        # The file is the diagnostics `smartune` source's store and must parse as
+        # one JSON object per line, so it is ALWAYS JSON regardless of the tty
+        # heuristic. SMARTUNE_LOG_FORMAT governs only the console view.
         file_formatter = _JsonFormatter()
         console_formatter = _make_formatter()
 
@@ -296,14 +291,11 @@ class Logger:
                 # console-only. systemd captures the console via StandardError.
                 pass
 
-        # The console/stderr sink is added ONLY when it will not violate the
-        # single-landing contract (module docstring): under systemd StandardError
-        # goes to journald, so a StreamHandler here would persist every record in
-        # journald in addition to the JSON file -- a second store the diagnostics
-        # source never reads. Attach it only when there is no working file sink
-        # (degraded fallback) or we are on an interactive tty (developer console).
-        # A genuine early/fatal crash still reaches journald as the interpreter's
-        # own stderr, which is the intended "process never came up" safety net.
+        # The console sink would violate the single-landing contract under
+        # systemd (StandardError -> journald, a second store nothing reads), so
+        # attach it only when there is no working file sink (degraded fallback)
+        # or we are on an interactive tty (developer console). A fatal crash
+        # still reaches journald as the interpreter's own stderr.
         if (not file_ok) or _stderr_is_interactive():
             console_handler = logging.StreamHandler()
             console_handler.setFormatter(console_formatter)
@@ -361,15 +353,12 @@ _base_logger = _init_base_logger()
 
 def _install_crash_hooks():
     """Route uncaught exceptions through the logger so a crash lands in the same
-    single JSON store as every other record -- and the diagnostics ``smartune``
-    source turns it into a LOG_EXCEPTION event/alert -- instead of only reaching
-    journald as a raw interpreter traceback.
+    JSON store as every other record and the diagnostics ``smartune`` source can
+    turn it into a LOG_EXCEPTION event/alert.
 
-    Production (no tty): the JSON log now owns the crash, so the traceback is NOT
-    echoed to stderr, keeping SmarTune's log stream out of journald. Developer
-    (tty): the previous hook is chained so the console traceback still shows.
-    Only truly early failures (before this module is imported) fall back to
-    systemd's stderr safety net."""
+    Production (no tty): the traceback is NOT echoed to stderr, keeping the log
+    stream out of journald. Developer (tty): the previous hook is chained so the
+    console traceback still shows."""
     previous_excepthook = sys.excepthook
 
     def _excepthook(exc_type, exc_value, exc_tb):
@@ -401,10 +390,10 @@ _install_crash_hooks()
 
 
 def get_logger(name=None):
-    """Return a logger for ``name`` (typically ``__name__``). The returned
-    adapter tags every record with the ``service`` derived from the module's
-    top-level package and the real module name, then writes through the shared
-    base logger's handlers. Call sites use it exactly like a stdlib logger."""
+    """Return a logger for ``name`` (typically ``__name__``). The adapter tags
+    every record with the ``service`` derived from the module's top-level
+    package plus the real module name, then writes through the shared base
+    logger's handlers. Use it exactly like a stdlib logger."""
     name = name or "smartune"
     return _SmartuneLoggerAdapter(
         _base_logger, {"service": _service_for(name), "logger_name": name})

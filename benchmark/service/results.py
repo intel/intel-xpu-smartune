@@ -86,13 +86,12 @@ _MEDIANS_DIMENSION_COLUMNS = frozenset({
 
 # metric metadata
 #
-# What a metric key means, so the dashboard does not have to guess. It used to
-# carry a hardcoded label table and no notion of direction at all, which is fine
-# for a plain table and not enough for a comparison: highlighting the best cell
-# in a row, or colouring a bar by how good it is, needs to know whether more is
-# better -- and no naming convention says whether "cpu_usage_percent" wants to be
-# high or low. So the answer is stated here, once, next to the code that reads
-# the files.
+# What a metric key means, so the dashboard does not have to guess. A label
+# alone is enough for a plain table but not for a comparison: highlighting the
+# best cell in a row, or colouring a bar by how good it is, needs to know
+# whether more is better -- and no naming convention says whether
+# "cpu_usage_percent" wants to be high or low. So the answer is stated here,
+# once, next to the code that reads the files.
 #
 # `higher_is_better` is deliberately three-valued. None means the metric has no
 # direction (frequency, input length, utilisation): showing it is useful,
@@ -484,15 +483,12 @@ def _read_derived(run_dir: Path) -> Dict[str, Dict[str, float]]:
     `dims` -- model, device, precision, mode -- so they are matched to the
     medians rows, which do carry one, on exactly that grouping.
 
-    That grouping does NOT include the run, and since runner.py started giving
-    every run its own directory (benchmark/templates/benchmark_*_common.sh take
-    RUN_NAME from BENCH_RUN_NAME), the same test measured twice is two medians
-    rows under one pivot row. The report's figure is the group's -- it was
-    computed from the medians across every repetition -- so it is attached to
-    each of them rather than dropped: a repeated test would otherwise lose its
-    whole Comparison column, which is the opposite of what repeating it was for.
-    Two repetitions therefore show the same speedup, which is correct; what
-    differs between them is what was measured, not what the sweep concluded.
+    That grouping does NOT include the run, and every run gets its own directory,
+    so the same test measured twice is two medians rows under one pivot row. The
+    report's figure is the group's -- computed from the medians across every
+    repetition -- so it is attached to each of them rather than dropped, and the
+    repetitions show the same speedup. What differs between them is what was
+    measured, not what the sweep concluded.
     """
     payload = _pivot_payload(run_dir)
     rows = payload.get("data")

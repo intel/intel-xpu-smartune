@@ -8,8 +8,8 @@
 # other half is business code calling emit_event() directly.
 #
 # System-level detectors that need journald / platform sources (kernel OOM, GPU
-# hang, thermal) are stage 3 and will register here the same way -- reusing the
-# same alert dedup/cooldown (alert_state) so nothing re-implements throttling.
+# hang, thermal) register here the same way -- reusing the same alert
+# dedup/cooldown (alert_state) so nothing re-implements throttling.
 #
 # Idempotency: a monotonic cursor (last seen ts_epoch) skips lines already turned
 # into events across runs, and emit_event's severity>=warning path already folds

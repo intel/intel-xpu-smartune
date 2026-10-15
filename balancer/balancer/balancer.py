@@ -96,27 +96,25 @@ _RECLAIM_MAX_BACKOFF = 600.0
 # Minimum spacing between swap-growth attempts.  Growth is cheap but not free,
 # and a volume that keeps refusing must not get an mkswap attempt every tick.
 _SWAP_GROWTH_INTERVAL = 60.0
-# ...except under critical pressure, where the same limiter was measured
-# cancelling the thing it sits next to.  The monitor loop bypasses
-# idle_check_interval on the critical rising edge so critical is served within a
-# second; on the stress run that bypassed tick then found only 50.2 s had
-# passed and returned without evaluating, and the OOM kill landed 29 s later.
-# The 60 s above is a guard against retrying a *refusal* (a full volume, an
-# unsupported filesystem) every tick -- it was never meant to decide how long a
-# machine in trouble waits for its next look at the watermarks.
+# ...except under critical pressure, where the 60 s spacing cancels the very
+# bypass that exists to serve critical: the monitor loop skips
+# idle_check_interval on the critical rising edge, and that bypassed tick would
+# then return without evaluating because 60 s had not elapsed.  The interval
+# above guards against retrying a *refusal* (full volume, unsupported
+# filesystem) every tick; it must not decide how long a machine in trouble
+# waits for its next look at the watermarks.
 _SWAP_GROWTH_URGENT_INTERVAL = 10.0
 
 # How long after our own reclaim the disk-IO arm stays quiet.
 #
-# Reclaim pushes anon pages to swap, and swap bios are real device traffic: a
-# measured 5.3 GB reclaim drove nvme0n1 to 717 MB/s write, aqu 197, and the disk
-# channel to critical within seconds.  Acting on that is wrong twice over -- the
-# pressure is ours, not the candidate's, and it is gone as soon as the reclaim
-# ends -- and the arm cannot tell, because `/proc/<pid>/io` only sees
-# process-context IO so kernel writeback never shows up against the app that
-# caused it.  (`self_disc` does not cover this either: it discounts a *limited
-# app's* own stall on its own io.max, measured from that cgroup's io.pressure,
-# while reclaim stalls land on the daemon's cgroup.)
+# Reclaim pushes anon pages to swap, and swap bios are real device traffic --
+# enough to drive the disk channel critical within seconds.  Acting on that is
+# wrong twice over: the pressure is ours, not the candidate's, and it is gone as
+# soon as the reclaim ends.  The arm cannot tell on its own, because
+# `/proc/<pid>/io` only sees process-context IO so kernel writeback never shows
+# up against the app that caused it.  (`self_disc` does not cover this either:
+# it discounts a *limited app's* own stall on its own io.max, while reclaim
+# stalls land on the daemon's cgroup.)
 #
 # The window has to outlast the signal, not the write: the disk score is an
 # EWMA (alpha 0.3) over the pressure monitor's refresh, so our contribution
@@ -139,7 +137,7 @@ def _emit_reclaim_event(event_type: str, severity: str, summary: str,
                    protection_id=entry.protection_id,
                    attributes=dict(attributes, priority=entry.priority))
     except Exception as exc:  # pragma: no cover - diagnostics is not load-bearing
-        logger.debug("Failed to emit %s: %s", event_type, exc)
+        logger.warning("Failed to emit %s: %s", event_type, exc)
 
 
 def _emit_auto_handoff_recovery(entry: "LimitedApp") -> None:
@@ -185,12 +183,10 @@ class LimitedApp:
       * state         — ``None`` for fully limited, ``"partially_restored"``
             once *any* channel has been partially restored (auto only).
       * partial_parts — {'sys': bool, 'disk_io': bool}: which channel has
-            already had its staged (2x) relaxation.  Under the separated
-            policy the sys (CPU/memory) and disk-IO channels recover on
-            independent timers, so a single ``state`` flag would let the
-            first channel to relax block the other one forever; ``state``
-            stays as the coarse "has been relaxed at all" signal that the
-            PSI-dominant check reads.
+            already had its staged (2x) relaxation.  The two channels recover
+            on independent timers, so one flag per channel is required --
+            ``state`` stays as the coarse "has been relaxed at all" signal
+            that the PSI-dominant check reads.
       * cgroups       — [primary, *extras]; multi-cgroup apps fan restores
             out across every entry.
       * limit_disks   — disk names the io.max cap was written to, empty for
@@ -518,37 +514,27 @@ class TopConsumerPrefetcher:
     class warms the answer asynchronously so the eventual critical-path
     lookup returns immediately.
 
-    Pure cache, no autonomous behavior:
-      * Never schedules its own work — every fetch is triggered by an
-        explicit ``start(reason)`` call from the caller.
-      * Never inspects ``passive_resource_control`` — the caller is
-        responsible for skipping ``start()`` when auto-limit is off, so
-        that the multi-second sampling never runs without a consumer.
-
-    Allowed triggers from the pressure loop (each gated by the caller):
-      1. Rising-edge into ``high``       — ``reason="entering_high"``
-      2. Sustained-critical recheck      — ``reason="sustained_critical_recheck"``
-      3. Critical-state listener entry   — ``reason="critical_listener"``
+    Pure cache, no autonomous behavior: every fetch comes from an explicit
+    ``start(reason)`` call, and it never inspects ``passive_resource_control``
+    itself -- the caller must skip ``start()`` when auto-limit is off so the
+    multi-second sampling never runs without a consumer.
 
     Two independent time constants, easy to confuse:
       * ``CACHE_TTL`` is a *debounce*: it suppresses repeat ``start()`` calls
-        fired within seconds of one another (e.g. rising-edge followed by
-        listener). It says nothing about whether the data is still valid.
+        fired within seconds of one another. It says nothing about validity.
       * ``MAX_CACHE_AGE`` is the *validity* bound used by
         ``resolve_for_critical()``. Past it the cached answer is still returned
-        (acting on slightly stale data beats stalling the critical path for a
-        multi-second resample) but a background refresh is kicked off, so the
-        next tick acts on fresh data. Without this the event-driven refresh
+        (slightly stale beats stalling the critical path on a resample) but a
+        background refresh is kicked off. Without it the event-driven refresh
         alone could hand back a minutes-old top list.
 
-    Cold-start fallback: ``resolve_for_critical()`` first returns cached
-    data; if empty, waits up to ``CRITICAL_WAIT`` for an in-flight
-    prefetch; only then falls back to a synchronous fetch (paying the
-    full sampling cost), so the first critical event after boot never
+    Cold-start fallback: ``resolve_for_critical()`` returns cached data; if
+    empty, waits up to ``CRITICAL_WAIT`` for an in-flight prefetch; only then
+    pays for a synchronous fetch. So the first critical event after boot never
     proceeds without top-consumer info.
 
-    Thread-safety: ``_lock`` guards the cache dict; ``_inflight`` is a
-    one-shot gate that prevents fetch storms when multiple triggers race.
+    Thread-safety: ``_lock`` guards the cache dict; ``_inflight`` is a one-shot
+    gate that prevents fetch storms when multiple triggers race.
     """
 
     CACHE_TTL = 5.0                       # rising-edge / listener debounce window (s)
@@ -581,8 +567,8 @@ class TopConsumerPrefetcher:
         it more often.  The question "can this refresh continuously?" is
         answered by the CPU column and the duty cycle, not by ``took=``.
 
-        Logged at INFO: the ``took=10.51s`` line that explained the whole
-        critical-to-limit delay was at DEBUG, so nobody saw it.
+        Deliberately at INFO, not DEBUG: this line is what explains a long
+        critical-to-limit delay, and it is useless if it is filtered out.
         """
         now = time.time()
         with self._lock:
@@ -716,8 +702,7 @@ class TopConsumerPrefetcher:
                         f"is still running; falling through to a blocking fetch")
 
         # The blocking branch: every second spent here is a second the limit is
-        # not applied.  Measured 10.51 s on the stress run, which is where the
-        # 10.3 s critical-to-limit gap came from -- so it is logged loudly.
+        # not applied, and the fetch takes seconds -- so it is logged loudly.
         logger.info("Critical resolve: cache empty, falling back to synchronous fetch")
         t0, cpu0 = time.time(), time.thread_time()
         result = self._fetch()
@@ -1220,19 +1205,17 @@ class DynamicBalancer:
     def _maybe_prefetch_early(self, state: "_MonitorLoopState") -> None:
         """Warm the top-consumer cache before the pressure *level* moves.
 
-        Two independent signals, either is enough:
+        Two independent signals, either is enough, and both give the fetch (which
+        takes seconds under full CPU load) a head start on the level change:
 
         * **Entering the pre-OOM band.** ``is_memory_pre_oom`` is the flag the
           pressure monitor already computes to decide its own refresh cadence
-          (70% of RAM used with the defaults). Replayed against the stress run
-          it turns true at 22:34:45, ten seconds before the level moves.
+          (70% of RAM used with the defaults).
         * **Memory climbing fast.** ``mem_rise_rate()`` reads the slope off the
-          same window the swap growth arms use. Replayed, 16%→55% crosses the
-          10-point threshold at 22:34:40 — fifteen seconds of lead, which
-          matters because a fetch under full CPU load was measured at 9.44 s.
+          same window the swap growth arms use.
 
         Not the pressure *score*: its memory term is a deliberately sharp gate,
-        so it read 0.19 two seconds before it read 1.00. Nothing useful can be
+        so it steps straight from near-zero to 1.00. Nothing useful can be
         predicted from a step function.
 
         The band arm is edge-triggered so sitting in the band costs nothing. The
@@ -1343,13 +1326,12 @@ class DynamicBalancer:
             )
             self.top_prefetcher.start("entering_high")
 
-        # The high edge above assumes pressure climbs through the bands. It does
-        # not always: on the stress run the level went low → critical in a
-        # single refresh and "entering_high" never fired once, so the first
-        # critical paid a 6.45 s synchronous fetch while the OOM killer ran.
-        # These two catch the climb before the level does. Both are edge-
-        # triggered here and debounced by CACHE_TTL inside start(), so a machine
-        # that simply sits above the line does not resample.
+        # The high edge above assumes pressure climbs through the bands, but it
+        # can jump low → critical in a single refresh, in which case
+        # "entering_high" never fires and the first critical pays for a
+        # synchronous multi-second fetch. These two catch the climb before the
+        # level does. Both are edge-triggered here and debounced by CACHE_TTL
+        # inside start(), so a machine sitting above the line does not resample.
         self._maybe_prefetch_early(state)
 
         # Sustained-critical recheck: if critical persists for SUSTAINED_CRITICAL_REFRESH_SEC,
@@ -1376,14 +1358,12 @@ class DynamicBalancer:
         # (see disk_top_prefetcher). A sustained window triggers a background recheck,
         # so a new dominant IO app is still picked up while the stress persists.
         disk_stressed = disk_level in ("high", "critical")
-        # Memory wins when both channels are loaded. The disk sampler is cheap
-        # on its own (1.17 s measured, against 6.45 s for the memory one,
-        # because mode="io" skips the 3x1s candidate pass) but its cost is
-        # wall-clock contention, and the memory fetch was measured stretching
-        # from 1.17 s to 9.44 s under full CPU load. Running both concurrently
-        # slows down the one with an OOM kill at the end of it. The disk channel
-        # loses nothing durable: it already reuses its cache via is_stale(), and
-        # disk pressure has no equivalent cliff.
+        # Memory wins when both channels are loaded. The disk sampler is cheap on
+        # its own (mode="io" skips the 3x1s candidate pass), but its real cost is
+        # wall-clock contention: run concurrently it stretches the memory fetch
+        # several-fold under load, and that is the fetch with an OOM kill at the
+        # end of it. The disk channel loses nothing durable -- it already reuses
+        # its cache via is_stale(), and has no equivalent cliff.
         #
         # Note this gates only the fetches, not disk_stressed itself: the
         # episode timers below must keep tracking that the disk *is* stressed,
@@ -1554,7 +1534,7 @@ class DynamicBalancer:
                     dominant_cgroups.append(cg)
 
         self.all_limits.is_limited_app_dominant = is_dominant
-        logger.debug(f"Balance- was the process limited before? {self.all_limits.is_limited_app_dominant}")
+        logger.info(f"Balance- was the process limited before? {self.all_limits.is_limited_app_dominant}")
         self.control_manager.set_limited_app_dominant(
             self.all_limits.is_limited_app_dominant, dominant_cgroups)
 
@@ -1744,8 +1724,8 @@ class DynamicBalancer:
             state.reset()
             return
 
-        logger.info(f"pressure_start_time: {state.pressure_start_time}, "
-                    f"current_pressure: {state.current_pressure}, pressure: {pressure}")
+        logger.debug(f"pressure_start_time: {state.pressure_start_time}, "
+                     f"current_pressure: {state.current_pressure}, pressure: {pressure}")
         if should_check_pressure:
             if (state.pressure_start_time is None) or (state.current_pressure != pressure):
                 state.pressure_start_time = state.current_time
@@ -1767,7 +1747,7 @@ class DynamicBalancer:
         io_double_stable = (should_check_io and
                      (state.current_time - state.disk_io_not_stressed_start_time >= state.STABLE_DISK_IO_PERIOD * 2))
 
-        logger.info(f"pressure_stable: {pressure_stable}, io_stable: {io_stable}, io_double_stable: {io_double_stable}")
+        logger.debug(f"pressure_stable: {pressure_stable}, io_stable: {io_stable}, io_double_stable: {io_double_stable}")
 
         if pressure_stable and pressure == "medium":
             state.restore_pending = True
@@ -1996,22 +1976,22 @@ class DynamicBalancer:
           sometimes far under the app's working set;
         * free memory is only the gate.  PSI sets the gain, because a box that is
           85% full and not stalling does not need to be pulled at 5% a round;
-        * every candidate is checked for idleness first.  Measured: an active
-          target faults the pages straight back in within two seconds, so the
-          ~200 ms per chunk the caller pays buys nothing at all.
+        * every candidate is checked for idleness first.  An active target
+          faults the pages straight back in within seconds, so the per-chunk
+          block the caller pays for buys nothing at all.
         """
         if not self.control_manager.reclaim_enabled:
             return
 
         deficit, facts = self.control_manager.system_memory_deficit()
         if deficit <= 0:
-            logger.debug("[reclaim] system already under target (%.1f%% used)",
+            logger.info("[reclaim] system already under target (%.1f%% used)",
                          facts.get("used_fraction", 0) * 100)
             return
 
         candidates = self._reclaim_candidates()
         if not candidates:
-            logger.debug("[reclaim] deficit %d MB but no eligible auto-limited app",
+            logger.info("[reclaim] deficit %d MB but no eligible auto-limited app",
                          deficit // _MB)
             return
 
@@ -2037,7 +2017,7 @@ class DynamicBalancer:
             # the next sys-critical cap, and the disk timer clears it when the
             # disk calms down; either way this app comes back as a candidate.
             if entry.limit_parts.get('io_limited'):
-                logger.debug("[reclaim] skip %s: still under an io.max cap", key)
+                logger.info("[reclaim] skip %s: still under an io.max cap", key)
                 continue
             cgroup = entry.cgroups[0] if entry.cgroups else key
             elapsed = now - entry.last_cpu_sample_at if entry.last_cpu_sample_at else 0.0
@@ -2047,7 +2027,7 @@ class DynamicBalancer:
             entry.last_cpu_sample_at = now
             allowed, reason = self.control_manager.should_reclaim(cgroup, busy)
             if not allowed:
-                logger.debug("[reclaim] skip %s: %s", key, reason)
+                logger.info("[reclaim] skip %s: %s", key, reason)
                 continue
             current = self.control_manager.memory.read_current(cgroup) or 0
             if current <= 0:
@@ -2180,7 +2160,7 @@ class DynamicBalancer:
         allocating.  But *how often we are allowed to look* is tied to it: under
         critical the spacing drops to _SWAP_GROWTH_URGENT_INTERVAL, because the
         cost of one more look is a /proc/meminfo parse and the cost of not
-        looking was measured at two OOM kills.
+        looking is an OOM kill.
         """
         if not self.control_manager.swap.enabled:
             return
@@ -2334,15 +2314,15 @@ class DynamicBalancer:
         while self.is_running:
             try:
                 coming_app = self.bpf_monitor.app_pending_queue.get(block=True, timeout=5)
-                logger.info(f"_run_handle_loop: Processing app {coming_app}")
+                logger.debug(f"_run_handle_loop: Processing app {coming_app}")
 
                 priority = app_utils.get_app_priority(app_name=coming_app["app_name"])
-                logger.info(f"_run_handle_loop: App {coming_app['app_name']} priority is {priority}")
+                logger.debug(f"_run_handle_loop: App {coming_app['app_name']} priority is {priority}")
 
                 priority_num = app_utils.get_priority_value(priority)
                 logger.debug(f"_run_handle_loop: priority value is {priority_num}")
                 self.app_priority_queue.put((coming_app, priority_num))
-                logger.info(f"_run_handle_loop: Resource insufficient, {coming_app} app added to pending queue")
+                logger.debug(f"_run_handle_loop: Resource insufficient, {coming_app} app added to pending queue")
 
             except queue.Empty:
                 continue
@@ -2363,7 +2343,7 @@ class DynamicBalancer:
             self.bpf_monitor.add_to_monitorlist(monitored_names)
             logger.info(f"Monitoring execve() for: {', '.join(monitored_names)}")
 
-            logger.debug(f"monitor_apps: {monitor_apps}")
+            logger.info(f"monitor_apps: {monitor_apps}")
             for app in monitor_apps:
                 app_utils.adjust_oom_priority(app["app_id"], app["app_name"], app["priority"], app.get("cmdline", ""))
         else:
@@ -2419,7 +2399,7 @@ class DynamicBalancer:
                 current = self.control_manager.memory.read_current(cgroup) or 0
                 swapped = self.control_manager.memory.read_swap_current(cgroup) or 0
             except Exception as exc:
-                logger.debug("[auto-limit] could not read memory of %s: %s", cgroup, exc)
+                logger.error("[auto-limit] could not read memory of %s: %s", cgroup, exc)
                 continue
             total_bytes += current + swapped
         return total_bytes // _MB
@@ -2450,7 +2430,7 @@ class DynamicBalancer:
         working_set = self._app_working_set_mb([app_id] + list(extra_cgroup_ids),
                                                per_cg_mem_rss)
         if working_set <= 0:
-            logger.info(
+            logger.warning(
                 "[auto-limit] %s: no memory reading; falling back to the system "
                 "share %d MB", app_name, system_share)
             return system_share
@@ -2458,7 +2438,7 @@ class DynamicBalancer:
         # put the app in permanent reclaim rather than limit it.
         usage_share = max(1, int(working_set * rate))
         mem_high = min(system_share, usage_share)
-        logger.info(
+        logger.debug(
             "[auto-limit] %s: working set %d MB * %.2f = %d MB vs system share "
             "%d MB -> memory.high %d MB",
             app_name, working_set, rate, usage_share, system_share, mem_high)
@@ -2478,7 +2458,7 @@ class DynamicBalancer:
             or app_id
         )
         total_mem = self.resource_monitor.get_total_memory()
-        logger.info(f"Adjusting resources for app: {app_id}")
+        logger.debug(f"Adjusting resources for app: {app_id}")
 
         extra_cgroup_ids = target_app.get('extra_cgroups', [])
         manual_cgroups = [
@@ -2703,37 +2683,32 @@ class DynamicBalancer:
         to cap it at.
 
         Walks the candidates in descending-IO order and selects the first that is:
-          1. not a Critical app -- Critical apps are never throttled for disk IO, so a
-             Critical #1 consumer is skipped and the next candidate is considered;
-          2. not already under an auto disk-IO limit -- so successive critical ticks move
-             on to the *next* heavy consumer (limit the 2nd, then the 3rd, ...) instead of
-             re-limiting the same app;
-          3. itself doing enough disk IO for a cap to matter -- see
+          1. not a Critical app -- those are never throttled for disk IO;
+          2. not already under an auto disk-IO limit, so successive critical ticks
+             move on to the next heavy consumer instead of re-limiting one app;
+          3. doing enough disk IO for a cap to matter -- see
              :meth:`_qualifies_for_throttle`, which judges each disk the app touches
-             against that disk's media floor. Bandwidth alone is not a sufficient test: a
-             4k random workload is bandwidth-light but IOPS-heavy, and capping it *does*
+             against that disk's media floor. Bandwidth alone is not sufficient: a 4k
+             random workload is bandwidth-light but IOPS-heavy, and capping it does
              relieve the device.
 
-        Controlled non-critical apps are capped at their own priority's rates; uncontrolled
-        apps count as ``undefined`` (lowest tier), i.e. a heavy unmanaged writer is
-        throttled harder than a managed Low app.  The candidate's own sampled IO rate is
-        used as the gate (no extra per-app sampling).
+        Controlled non-critical apps are capped at their own priority's rates;
+        uncontrolled apps count as ``undefined`` (lowest tier), so a heavy unmanaged
+        writer is throttled harder than a managed Low app. The gate uses the
+        candidate's own sampled IO rate, with no extra per-app sampling.
 
-        A controlled app's cgroup set is resolved the same way the CPU/memory critical path
-        does it (:meth:`_resolve_controlled_target`): the top-consumer sample keys an app by
-        a single cgroup, and for ``process_names`` apps by a public app id that need not be
-        a systemd unit at all -- without resolving, ``set_disk_io_throttle`` cannot find an
+        A controlled app's cgroup set is resolved via :meth:`_resolve_controlled_target`,
+        as the CPU/memory critical path does: the top-consumer sample keys an app by a
+        single cgroup (or, for ``process_names`` apps, by a public id that need not be a
+        systemd unit), and without resolving it ``set_disk_io_throttle`` finds no
         ``io.max`` to write and the limit silently never lands.
 
-        :return: ``(should_adjust, is_controlled, app_id, limit_rates, target_app, index)``
-            where ``index`` is the candidate's position in *top_consumers* so the caller can
-            drop exactly the entry that was acted on.  When nothing is worth limiting --
-            every candidate is Critical, already limited, or below threshold -- returns
-            ``(False, False, None, None, None, None)`` even under critical pressure: there
-            is simply no useful throttle left to apply.
-
-        The same nothing-to-do answer is returned outright while our own reclaim
-        is still echoing through the disk signal (:data:`_RECLAIM_DISK_QUIET_SEC`).
+        :return: ``(should_adjust, is_controlled, app_id, limit_rates, target_app, index)``,
+            where ``index`` is the candidate's position in *top_consumers* so the caller
+            can drop exactly the entry acted on. Returns
+            ``(False, False, None, None, None, None)`` when nothing is worth limiting --
+            including while our own reclaim is still echoing through the disk signal
+            (:data:`_RECLAIM_DISK_QUIET_SEC`).
         """
         if self._in_reclaim_quiet_window():
             # Not a skip of one candidate but of the whole arm: the pressure
@@ -2780,7 +2755,7 @@ class DynamicBalancer:
                     app_id, app_name, candidate_cgroups)
             if excluded is not None:
                 logger.info(f"[disk-io] skip {cand}: excluded from auto-limit "
-                            f"({excluded.get('key')})")
+                             f"({excluded.get('key')})")
                 continue
             # 2) Already io-limited (auto) -- skip so we advance to the next heavy user.
             #    Checked under every id the candidate can appear as: this runs *before* the
@@ -3560,7 +3535,7 @@ class DynamicBalancer:
                 "read_iops": _to_pos_int("read_iops", default_riops),
             }
 
-        logger.debug(f"Priority '{priority}' limit rates: {result}")
+        logger.info(f"Priority '{priority}' limit rates: {result}")
         return result
 
     def set_resource_limit(
@@ -3582,9 +3557,8 @@ class DynamicBalancer:
         The disk-IO cap goes on *last*, after the reclaim, whenever the same
         request asks for both.  Reclaim writes the app's anon pages to swap, and
         swap bios carry the owning memcg's blkcg, so an ``io.max`` installed
-        first throttles the very reclaim the memory cap was asking for: a
-        measured 5.3 GB reclaim that took 7.6 s unthrottled would need ~9
-        minutes behind a 10 MB/s cap.  This is the manual-path counterpart of
+        first throttles the very reclaim the memory cap was asking for, turning
+        seconds of work into minutes.  This is the manual-path counterpart of
         :meth:`_clear_io_cap_before_sys_limit` -- but it defers rather than
         lifts, because here the io cap is the user's own request and must end up
         applied, not dropped.
@@ -4371,15 +4345,12 @@ class DynamicBalancer:
             # out of both the auto list and the controlled list -- invisible while still
             # throttled. So refuse; the operator must Take Control (adopt) it first.
             #
-            # But entry.is_controlled is stamped once, when the limit *fired*, from the
-            # sampled process identity. An app that was auto-limited before its
-            # process_names matched (or before it was taken under control) carries a stale
-            # False here even though it now has a DB row and is presented as a controlled
-            # AUTO_LIMITED row -- which is exactly what routes the UI here (lock_to_manual)
-            # instead of adopt_auto_limit. Re-check the *current* control state: if the app
-            # is controlled now, reconcile the entry in place (the same lightweight re-tag
-            # adopt does) and proceed. Only refuse when there is still no DB identity to
-            # keep it visible under Manual Control.
+            # But entry.is_controlled is stamped once, when the limit *fired*, from
+            # the sampled process identity -- so an app auto-limited before its
+            # process_names matched carries a stale False even though it now has a
+            # DB row. Re-check the *current* control state: if it is controlled now,
+            # reconcile the entry in place (the same re-tag adopt does) and proceed.
+            # Only refuse when there is still no DB identity to keep it visible.
             if not entry.is_controlled:
                 current_controlled, _ = app_utils.get_app_control_info(app_id)
                 if not current_controlled:
@@ -4476,7 +4447,6 @@ class DynamicBalancer:
         row with Limit/Restore/Edit already unlocked -- the operator does *not* need a
         second Lock to Manual click, and the pressure loop never re-grabs it. The cgroup
         caps are carried over untouched, so there is no release / crash window.
-        (This supersedes the earlier "entry stays source=auto" design.)
 
         :returns: ``(ok, message)`` -- *message* names the failure for the REST layer.
         """

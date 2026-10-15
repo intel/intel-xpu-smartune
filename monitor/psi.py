@@ -189,9 +189,9 @@ class PSIMonitor:
         For each resource: ``min(1, (Σ cgroup_rate) / system_rate)`` over the given cgroups,
         both taken from the ``some``-pressure total-delta method on the cgroup's
         ``<res>.pressure`` file vs the system PSI file (unit-independent ratio). Attribution
-        is pressure-based on purpose: a throughput/usage share was tried and was worse for
-        stall-driven loads (e.g. ``stress --io`` generates IO-wait via ``sync()`` while
-        moving almost no bytes, so a byte share collapsed to ~0 and under-discounted). When
+        is pressure-based rather than throughput-based on purpose: a stall-driven load can
+        generate heavy IO-wait while moving almost no bytes, so a byte share would collapse
+        to ~0 and under-discount. When
         the already-limited apps are the sole source of a resource's stalls the fraction
         approaches 1; when other (unlimited) tasks also stall it drops, leaving their (real)
         pressure intact. Aggregating over all limited cgroups means once every top consumer

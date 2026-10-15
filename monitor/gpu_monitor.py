@@ -1461,7 +1461,7 @@ class XeMonitor:
                 if total_delta > 0 and 0 <= active_delta <= total_delta:
                     pct = (active_delta / total_delta) * 100.0
                 elif total_delta > 0 and active_delta > total_delta:
-                    # PMU driver bug: active ticks exceed total ticks
+                    # Ignore inconsistent counters where active exceeds total.
                     vprint("    %s: PMU anomaly active=%d > total=%d, "
                            "reporting 0%%" % (eng["display_name"],
                                               active_delta, total_delta))

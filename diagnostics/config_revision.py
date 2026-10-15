@@ -1,17 +1,8 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Configuration-revision chain: versions the host's hardware/software
-# inventory so a BIOS/DIMM/disk/driver/firmware change becomes a diagnostics
-# event and a stable id other events (a benchmark run) can point back to.
-#
-# This module is NOT a collector -- monitor.system_info.collect_static_info()
-# already reads BIOS/CPU/memory/disk/GPU-XPU/NIC/GuC-HuC/driver-package
-# versions and already degrades a failed read to None (monitor/metrics/utils.
-# safe_read/run_cmd never raise). What is missing, and what this module adds,
-# is versioning: turning that point-in-time snapshot into a fingerprinted
-# chain, distinguishing "this field failed to read just now" from "this field
-# is genuinely gone", and emitting one diagnostics event per real change.
+# Track versioned hardware and software inventories, emitting a diagnostics
+# event when a confirmed inventory change creates a new revision.
 
 import hashlib
 import json
@@ -25,9 +16,8 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# A field must read as absent on two consecutive checks before it is called
-# "removed" -- a single failed dmidecode/lsblk/debugfs read must not be
-# mistaken for a DIMM or disk actually having been pulled.
+# Require consecutive absent reads before marking a field removed; one failed
+# read is not enough to distinguish removal from temporary unavailability.
 _REMOVED_AFTER_MISSES = 2
 
 _LOOP_STARTED = False
@@ -127,9 +117,7 @@ def _classify_and_diff(current: dict, prev_status: dict):
                     new_status[field] = {"value": None, "state": "removed", "miss_streak": miss_streak}
                     changes.append({"field": field, "previous": prev_value, "current": None, "change": "removed"})
                 else:
-                    # One failed read is not proof of removal -- keep the last
-                    # known value alive for fingerprinting until the streak
-                    # confirms it.
+                    # Retain the last known value until consecutive misses confirm removal.
                     new_status[field] = {"value": prev_value, "state": "unknown", "miss_streak": miss_streak}
             elif prev_state == "unknown":
                 miss_streak += 1
@@ -139,7 +127,7 @@ def _classify_and_diff(current: dict, prev_status: dict):
                 else:
                     new_status[field] = {"value": prev_value, "state": "unknown", "miss_streak": miss_streak}
             else:
-                # already unavailable/removed -- still absent, nothing new
+                # An already absent field has no new change to record.
                 new_status[field] = {"value": prev_value, "state": prev_state, "miss_streak": miss_streak}
         else:
             if prev_state in ("unavailable", "removed"):
@@ -296,9 +284,7 @@ def check_and_record_if_changed():
 
 
 def start_config_revision_loop():
-    """Start the background recheck thread. Idempotent, mirrors the detector
-    loop's started-flag + daemon Thread pattern. A short settle delay avoids
-    contending with other startup-time work for dmidecode/lsblk/debugfs reads."""
+    """Start the idempotent background inventory recheck thread."""
     global _LOOP_STARTED
     with _LOOP_START_LOCK:
         if _LOOP_STARTED:

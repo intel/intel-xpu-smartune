@@ -375,8 +375,8 @@ class CpuUsageSampler:
         return usage
 
 
-# The dashboard's poller. Primed at import, as psutil's own baseline used to be,
-# so the first get_cpu_dynamic() call already covers a real interval.
+# Shared sampler for dashboard CPU usage; primed so the first read covers an
+# actual sampling interval.
 _shared_usage_sampler = CpuUsageSampler()
 
 
@@ -393,16 +393,7 @@ def _get_cpu_base_freq_mhz() -> Optional[float]:
 
 
 def get_per_core_freq() -> List[Optional[Any]]:
-    """Per-core frequency records from sysfs, one per logical CPU.
-
-    Every reader of clock speed in this repo goes through here -- the dashboard's
-    pollers below, and the benchmark sampler (benchmark/service/sampler.py),
-    which used to call psutil directly and so had one collector that did not come
-    from monitor.metrics. There is no shared state to protect (unlike usage or
-    energy, this is a plain sysfs read), so it is the call itself being shared
-    rather than an instance: one place decides what "the frequency of a core" is
-    and what an unreadable core looks like (None, never 0.0).
-    """
+    """Return per-core frequency records, or an empty list if unavailable."""
     try:
         return list(psutil.cpu_freq(percpu=True) or [])
     except Exception as exc:

@@ -241,11 +241,11 @@ def reset_app_status():
             up_time=datetime.now()
         )
         if updated_count == 0:
-            logger.warning("No records were updated currently.")
+            logger.debug("Reset app statuses: no rows to reset")
         else:
             logger.info(f"Reset {updated_count} app statuses to 'NA'")
     except Exception as e:
-        logger.error(f"Failed to reset app statuses: {str(e)}")
+        logger.error(f"Failed to reset app statuses: {e}")
 
 
 def normalize_priority(raw, default="medium"):
@@ -747,7 +747,7 @@ def set_to_control():
             retmsg=f"App control {'enabled' if controlled else 'disabled'} and added to monitor"
         )
     except Exception as e:
-        logger.error(f"Control set failed: {str(e)}")
+        logger.error(f"Control set failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -782,7 +782,7 @@ def discover_search():
             retmsg=f"Found {len(candidates)} candidate(s) for keywords {keywords}"
         )
     except Exception as e:
-        logger.error(f"discover_search failed: {str(e)}")
+        logger.error(f"discover_search failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -818,7 +818,7 @@ def discover_extract():
             retmsg=f"Extracted fields from {len(pids)} pid(s)"
         )
     except Exception as e:
-        logger.error(f"discover_extract failed: {str(e)}")
+        logger.error(f"discover_extract failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1006,7 +1006,7 @@ def new_controlled_app():
             retmsg=f"Application '{name}' added"
         )
     except Exception as e:
-        logger.error(f"new_controlled_app failed: {str(e)}")
+        logger.error(f"new_controlled_app failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1071,7 +1071,7 @@ def merge_controlled_app_processes():
             retmsg=f"Process identities merged into '{target.get('name') or app_id}'"
         )
     except Exception as e:
-        logger.error(f"merge_controlled_app_processes failed: {str(e)}")
+        logger.error(f"merge_controlled_app_processes failed: {e}")
         return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
 
 
@@ -1205,7 +1205,7 @@ def set_controlled_app_processes():
             retmsg=f"Process identities updated for '{target.get('name') or app_id}'"
         )
     except Exception as e:
-        logger.error(f"set_controlled_app_processes failed: {str(e)}")
+        logger.error(f"set_controlled_app_processes failed: {e}")
         return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
 
 
@@ -1291,7 +1291,7 @@ def purge_controlled_app():
             retmsg=f"Application '{target_name or app_id}' purged; you can now re-add it"
         )
     except Exception as e:
-        logger.error(f"purge_controlled_app failed: {str(e)}")
+        logger.error(f"purge_controlled_app failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1374,7 +1374,7 @@ def get_controlled_app():
             retmsg=f"Found {len(result_data)} controlled apps"
         )
     except Exception as e:
-        logger.error(f"Get controlled apps failed: {str(e)}")
+        logger.error(f"Get controlled apps failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1398,7 +1398,7 @@ def check_running_apps():
             retmsg=f"Startup scan complete, detected {len(detected)} pre-existing monitored app(s)"
         )
     except Exception as e:
-        logger.error(f"check_running_apps failed: {str(e)}")
+        logger.error(f"check_running_apps failed: {e}")
         return construct_response(
             data=[],
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1444,7 +1444,7 @@ def get_pending_app():
             retmsg=f"Found {len(sorted_data)} pending apps (sorted by priority DESC)"
         )
     except Exception as e:
-        logger.error(f"Get pending apps failed: {str(e)}")
+        logger.error(f"Get pending apps failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1476,7 +1476,7 @@ def set_oom_score():
             retmsg="App OOM score set successfully"
         )
     except Exception as e:
-        logger.error(f"Set OOM score failed: {str(e)}")
+        logger.error(f"Set OOM score failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1506,7 +1506,7 @@ def kill_process_route():
             retmsg=msg
         )
     except Exception as e:
-        logger.error(f"Kill process failed: {str(e)}")
+        logger.error(f"Kill process failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1536,7 +1536,7 @@ def suspend_process_route():
             retmsg=msg
         )
     except Exception as e:
-        logger.error(f"Suspend process failed: {str(e)}")
+        logger.error(f"Suspend process failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1567,7 +1567,7 @@ def cancel_relaunch_app():
                 up_time=datetime.now()
             )
         except Exception as db_error:
-            logger.error(f"Update database failed for {app_id}: {str(db_error)}")
+            logger.error(f"Update database failed for {app_id}: {db_error}")
             update_db_result = False
 
         if result and update_db_result:
@@ -1582,7 +1582,7 @@ def cancel_relaunch_app():
                 retmsg="No matching app found or failed to cancel relaunch it"
             )
     except Exception as e:
-        logger.error(f"Cancel relaunch failed: {str(e)}")
+        logger.error(f"Cancel relaunch failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1635,7 +1635,7 @@ def app_resource_limit():
             retmsg="No matching app found or failed to set resource limit"
         )
     except Exception as e:
-        logger.error(f"Set resource limit failed: {str(e)}")
+        logger.error(f"Set resource limit failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1665,7 +1665,7 @@ def app_resource_limit_profile():
             retmsg="Successfully fetched resource limit profile"
         )
     except Exception as e:
-        logger.error(f"Get resource limit profile failed: {str(e)}")
+        logger.error(f"Get resource limit profile failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1701,7 +1701,7 @@ def app_resource_restore():
                 retmsg="No matching app found or failed to restore resource"
             )
     except Exception as e:
-        logger.error(f"Restore resource failed: {str(e)}")
+        logger.error(f"Restore resource failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1719,7 +1719,7 @@ def auto_limited_apps():
             retmsg=f"Found {len(payload.get('apps', []))} auto-limited apps"
         )
     except Exception as e:
-        logger.error(f"Get auto-limited apps failed: {str(e)}")
+        logger.error(f"Get auto-limited apps failed: {e}")
         return construct_response(
             data={"apps": [], "sys_pressure_level": "", "disk_pressure_level": ""},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1740,7 +1740,7 @@ def limit_snapshot():
             )
         return construct_response(data=_service.get_limit_snapshot(app_id))
     except Exception as e:
-        logger.error(f"Get limit snapshot failed: {str(e)}")
+        logger.error(f"Get limit snapshot failed: {e}")
         return construct_response(
             data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e)
         )
@@ -1755,7 +1755,7 @@ def interrupted_limit_status():
             return construct_response(data={'available': True, 'resources': []})
         return construct_response(data=_service.balancer.inspect_interrupted_limit(cgroups))
     except Exception as e:
-        logger.error(f"Check interrupted limit status failed: {str(e)}")
+        logger.error(f"Check interrupted limit status failed: {e}")
         return construct_response(data={'available': False, 'resources': []},
                                   retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
 
@@ -1788,7 +1788,7 @@ def auto_limit_restore():
             retmsg=msg
         )
     except Exception as e:
-        logger.error(f"Restore auto-limited app failed: {str(e)}")
+        logger.error(f"Restore auto-limited app failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1824,7 +1824,7 @@ def lock_to_manual():
             retmsg=msg
         )
     except Exception as e:
-        logger.error(f"Lock auto-limited app to manual failed: {str(e)}")
+        logger.error(f"Lock auto-limited app to manual failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1865,7 +1865,7 @@ def adopt_auto_limit():
             retmsg=msg
         )
     except Exception as e:
-        logger.error(f"Adopt auto-limit failed: {str(e)}")
+        logger.error(f"Adopt auto-limit failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1883,7 +1883,7 @@ def auto_limit_exclusions():
             retmsg=f"Found {len(rows)} auto-limit exclusions"
         )
     except Exception as e:
-        logger.error(f"Get auto-limit exclusions failed: {str(e)}")
+        logger.error(f"Get auto-limit exclusions failed: {e}")
         return construct_response(
             data=[],
             retcode=RetCode.EXCEPTION_ERROR,
@@ -1913,7 +1913,7 @@ def auto_limit_exclusion_remove():
             retmsg="No matching auto-limit exclusion found"
         )
     except Exception as e:
-        logger.error(f"Remove auto-limit exclusion failed: {str(e)}")
+        logger.error(f"Remove auto-limit exclusion failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,

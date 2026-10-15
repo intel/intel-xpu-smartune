@@ -34,7 +34,7 @@ class GovernorController:
     def __set_governor(self, governor="performance"):
         curr_governor = self.__get_governor()
         if curr_governor == governor:
-            logger.info(f"CPU governor already set to {governor}")
+            logger.debug(f"CPU governor already set to {governor}")
             return
 
         logger.info(f"Setting CPU governor to {governor}...")
@@ -46,7 +46,7 @@ class GovernorController:
                 stdout = subprocess.DEVNULL
             )
         except subprocess.CalledProcessError as e:
-            logger.warning(f"Error: {e}")
+            logger.error(f"Failed to set CPU governor to {governor}: {e}")
 
     def set_performance(self) -> bool:
         """Set CPU governor to performance"""

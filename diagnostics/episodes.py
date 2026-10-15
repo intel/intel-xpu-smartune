@@ -1,28 +1,12 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# System-pressure level tracking. This records pressure purely as informational,
-# point-in-time events: when the debounced pressure level crosses into or out of
-# an elevated band, one event is written. There is no OPEN..RESOLVED interval,
-# no episode correlation, and nothing for a user to act on -- a reader answers
-# "was there pressure around this time?" by scanning the transition records, and
-# derives a duration from two adjacent timestamps if needed.
+# Record debounced system-pressure transitions from persisted MonitorSnapshot
+# data. Events are point-in-time records; consumers can derive durations from
+# adjacent transitions. Reading persisted data also supports monitor-only mode.
 #
-# Why point events instead of intervals: an interval needs an "active until resolved"
-# lifecycle, which in turn needs restart/reboot reconciliation and leaves stale
-# "Active" rows when the paired resolve is lost. Point events are restart-safe by
-# construction -- if the process dies, it simply stops emitting; on restart it
-# re-establishes a baseline and records the next real change.
-#
-# Why it lives in diagnostics and is snapshot-driven: it reads ONLY the persisted
-# MonitorSnapshot pressure series, never the balancer's in-memory state. That is
-# exactly the plan invariant "diagnostics depends only on persisted storage", and
-# it is what makes pressure tracking available in monitor-only mode too -- monitor-
-# only already persists dynamic pressure snapshots every ~5s.
-#
-# The pure PressureLevelTracker below holds the debounce (hysteresis) logic with no
-# IO, so it is unit-testable by feeding a synthetic level sequence; the driver loop
-# wires it to snapshots and emit_event.
+# PressureLevelTracker contains the debounce logic; the driver reads snapshots
+# and emits confirmed transitions.
 
 import json
 import threading
@@ -38,8 +22,7 @@ _NORMAL = "normal"
 _BAND_RANK = {_NORMAL: 0, "high": 1, "critical": 2}
 _BAND_SEVERITY = {_NORMAL: "info", "high": "warning", "critical": "critical"}
 
-# Debounce dwell times give hysteresis: fast to flag a rising level, slow to clear a
-# falling one, so a level flapping around a boundary never spams records.
+# Dwell times debounce rising and falling transitions.
 TRIGGER_SECONDS = 30.0   # dwell before confirming a rise (to a more severe band)
 CLEAR_SECONDS = 60.0     # dwell before confirming a fall (to a less severe band)
 
@@ -61,8 +44,7 @@ class PressureLevelTracker:
     def __init__(self, trigger_seconds=TRIGGER_SECONDS, clear_seconds=CLEAR_SECONDS):
         self.trigger_seconds = trigger_seconds
         self.clear_seconds = clear_seconds
-        # Assume normal at start: if the machine (re)starts already under pressure,
-        # the first sustained sample confirms a rise and records it.
+        # Start at normal so sustained pressure after startup is recorded.
         self._confirmed = _NORMAL
         self._pending_dir = 0         # +1 diverging up, -1 diverging down, 0 settled
         self._pending_since = None    # ts divergence in this direction began
@@ -79,9 +61,8 @@ class PressureLevelTracker:
             self._pending_since = None
             return None
 
-        # Dwell is tracked by direction (rising vs falling from the confirmed band),
-        # not by exact band, so a level that keeps climbing (high->critical) does not
-        # keep restarting the timer. The change is confirmed to the *current* band.
+        # Track dwell by direction so continued movement in the same direction
+        # does not restart the timer; confirm the current band when it expires.
         direction = 1 if _BAND_RANK[band] > _BAND_RANK[self._confirmed] else -1
         if self._pending_dir != direction:
             self._pending_dir = direction

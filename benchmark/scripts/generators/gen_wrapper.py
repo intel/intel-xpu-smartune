@@ -300,14 +300,10 @@ def resolve_openvino_model_id(model_id: str, weight_format: str,
                               enable_precision_check: bool = False) -> str:
     """Resolve OpenVINO model id by score, optionally with precision probing.
 
-    TODO(smartune): this repeats work already cached. benchmark/service/
-    search_models.py enumerates the OpenVINO org and writes the source-model ->
-    OpenVINO-repo mapping to models_cache_openvino.json (its precision is parsed
-    from the repo name by search_models.precision_of), which the dashboard
-    already reads to offer per-model precisions. Consulting that file first would
-    make a build deterministic and drop these live searches. Left alone for now
-    because this file is part of the upstream vendor drop and re-syncing it must
-    stay a plain copy.
+    TODO(smartune): this repeats the mapping benchmark/service/search_models.py
+    already caches in models_cache_openvino.json. Consulting that file first
+    would make a build deterministic and drop these live searches. Left alone so
+    re-syncing this file from upstream stays a plain copy.
     """
     api = _get_hf_api()
     base_model = str(model_id).split('/')[-1].strip()
@@ -463,9 +459,8 @@ def _route_devices(route) -> List[str]:
 def _device_loop(body: str, route=None) -> str:
     """A shell loop that runs `body` once per requested device, with DEVICE set.
 
-    One idiom for all four backends: they used to spell the same three-device
-    sweep as three copy-pasted blocks, which is also why adding a fourth device
-    (or dropping one) had to be done four times over.
+    One idiom for all four backends, so adding or dropping a device is a
+    single edit.
     """
     return (f'    for device in {" ".join(_route_devices(route))}; do\n'
             f'        DEVICE=$device\n'

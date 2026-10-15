@@ -3,10 +3,9 @@
 
 """L0: swap headroom.  Fuel for the L2 reclaim path.
 
-memory.reclaim can only move anonymous pages somewhere, and that somewhere is
-swap.  Measured: with swap full (or memory.swap.max=0) the write returns EAGAIN
-in about 4 ms having done nothing at all, so the whole of L2 quietly stops
-working.  This module keeps that from happening.
+memory.reclaim can only move anonymous pages into swap, so with swap full (or
+memory.swap.max=0) the write returns EAGAIN having done nothing and the whole
+of L2 quietly stops working.  This module keeps that from happening.
 
 Two lines of defence, in order:
 
@@ -17,39 +16,26 @@ Two lines of defence, in order:
    is full.  Grown ahead of time, because growing it mid-crisis is too late.
 
 Growth normally triggers on *two* watermarks together, well before swap is
-exhausted: allocating the file costs milliseconds on ext4 and essentially
-nothing in disk writes, so there is no reason to wait until the memory is
-actually needed.
+exhausted: allocating the file is cheap, so there is no reason to wait.
 
-But exhausted swap alone is also sufficient, and that exception is not a
-nicety.  The two signals are *anti-correlated*: every anonymous page swap
-absorbs is a page that stops counting towards used_eff, so swap doing its job
-is precisely what keeps the memory watermark from being crossed.  Measured
-during a 3-way stress run, growth was refused eleven times in a row like this::
+Exhausted swap alone is also sufficient, and that exception is load-bearing:
+the two signals are *anti-correlated*, because every anonymous page swap
+absorbs stops counting towards used_eff.  Swap doing its job is precisely what
+keeps the memory watermark from being crossed, so an AND gate cannot fire in
+the one scenario it exists for -- full swap at moderate memory use.
 
-    [swap] mem 70.1% used, swap 0.0% free (24044/24044 MB) -> no growth
-           [memory below watermark (0.70 < 0.8)]
+Watermarks are evaluated against the *worst* sample in a short window, not the
+instant one.  Memory under a bursty allocator swings far faster than any poll
+interval, so an instantaneous read systematically misses the troughs -- and the
+troughs are what OOM-kill.
 
-Swap was completely full -- the state in which memory.reclaim returns EAGAIN
-and L2 stops working -- and the AND gate refused to grow because memory "only"
-looked 70% used.  Requiring both conditions made the gate unable to fire in the
-one scenario it exists for.
+Every threshold is a ratio of MemTotal or of the disk, never an absolute byte
+count, so the same config behaves sensibly on a 4 GB box and a 128 GB one.
 
-The watermarks are also evaluated against the *worst* sample in a short window
-rather than the instant one.  Memory under a bursty allocator swings far faster
-than any poll interval: measured, MemAvailable went 43% -> 1% -> 47% inside
-twenty seconds, so two subsystems sampling seconds apart disagreed by forty
-points and both were right.  An instantaneous read systematically misses the
-troughs, and the troughs are what OOM-kill.
-
-Every threshold here is a ratio of MemTotal or of the disk, never an absolute
-byte count.  The same config has to behave sensibly on a 4 GB box and a 128 GB
-one, so a number tuned against any single machine is a bug.
-
-Nothing here is persisted.  /etc/fstab is never written and the distro's own
-swap device is never touched, so a reboot puts the machine back exactly as it
-was; ``release()`` does the same without one.  Every method that changes the
-system takes ``dry_run`` and defaults it to True.
+Nothing is persisted.  /etc/fstab is never written and the distro's own swap
+device is never touched, so a reboot restores the machine exactly;
+``release()`` does the same without one.  Every method that changes the system
+takes ``dry_run`` and defaults it to True.
 """
 
 import os
@@ -87,28 +73,18 @@ CONDITIONAL_GROWTH_FS = frozenset({"btrfs"})
 MANAGED_NAME_RE = re.compile(r"^swap-(\d{2,})\.img$")
 MANAGED_NAME_FMT = "swap-%02d.img"
 
-# Swap priority is NOT something we can choose.
-#
-# This used to pass `swapon --priority -2`, intending our files to sit below the
-# distro's /swap.img so the kernel would fill theirs first and ours would take
-# only the overflow -- which would have made `swapoff` of our file a precise
-# redemption, pulling back exactly the pages smartune caused to be paged out.
-#
-# That never worked.  swapon(8) only sets SWAP_FLAG_PREFER for a *non-negative*
-# priority (SWAP_FLAG_PRIO_MASK cannot encode a negative one), so a negative
-# argument is silently dropped and the kernel auto-assigns instead.  Measured on
-# the test box with util-linux 2.39.3, all three files -- /swap.img and both of
-# ours -- came up at priority -1, i.e. equal, so the kernel round-robins across
-# them and our pages and the distro's are interleaved.
-#
-# Consequences, both accepted:
-#   - swapoff of our file also faults back pages that were never ours to hold.
-#     It is still bounded and still gated on headroom, just not surgical.
+# Swap priority is NOT something we can choose: swapon(8) only sets
+# SWAP_FLAG_PREFER for a *non-negative* priority (SWAP_FLAG_PRIO_MASK cannot
+# encode a negative one), so a negative argument is silently dropped and the
+# kernel auto-assigns. Our files therefore come up at the same priority as the
+# distro's /swap.img and the kernel round-robins across them, interleaving our
+# pages with theirs. Two accepted consequences:
+#   - swapoff of our file also faults back pages that were never ours. Still
+#     bounded and still gated on headroom, just not surgical.
 #   - Ownership is decided by directory + MANAGED_NAME_RE, never by priority,
 #     so /swap.img remains structurally ineligible for swapoff.
-# The real priority is read back from /proc/swaps after swapon and logged.
-# There is deliberately no MANAGED_SWAP_PRIORITY constant: there is no value it
-# could hold that the kernel would honour.
+# The real priority is read back from /proc/swaps after swapon and logged. There
+# is deliberately no MANAGED_SWAP_PRIORITY constant -- no value would be honoured.
 
 # swapoff has to fault every page back into RAM, so it needs headroom and it can
 # take a while.  Both numbers are guards against turning a shrink into an OOM.
@@ -126,16 +102,16 @@ SHRINK_HYSTERESIS = 0.15        # shrink below (grow_mem_watermark - this)
 SHRINK_IDLE_SEC = 600.0         # ...and only after this long uninterrupted
 
 # Predictive growth.  The two level-based arms below ask "is swap nearly gone
-# yet", which is a question that can only be answered too late: on the stress
-# run swap went from 93% free to 4% free in 30 seconds and the kill landed
-# before either arm was true.  The slope arm asks the useful question instead --
-# "at the rate it is draining, how long until it is gone" -- off the same window
-# the other arms already sample.
+# yet", a question that can only be answered too late -- swap can drain from
+# nearly free to nearly full in well under a minute, and the kill lands before
+# either arm is true.  The slope arm asks the useful question instead -- "at the
+# rate it is draining, how long until it is gone" -- off the same window the
+# other arms already sample.
 #
-# 90 s of lead: the monitor loop was measured blocked for up to 17 s during
-# critical, the urgent rate limiter adds another 10 s, and doubling that leaves
-# room for a drain that accelerates.  fallocate costs 91 ms, so erring long is
-# nearly free and erring short costs an OOM kill.
+# 90 s of lead: enough to cover the monitor loop blocking under critical plus
+# the urgent rate limiter, doubled to leave room for a drain that accelerates.
+# fallocate costs milliseconds, so erring long is nearly free and erring short
+# costs an OOM kill.
 GROW_LEAD_SEC = 90.0
 # Below this much window span a "slope" is two adjacent samples and noise.
 MIN_SLOPE_SPAN_SEC = 5.0
@@ -739,7 +715,7 @@ class SwapController:
                     handle.write(value)
             except OSError as exc:
                 # A failed compressor write must not be followed by enabling the
-                # pool -- that would allocate it with the old compressor.
+                # pool -- that would allocate it with the previous compressor.
                 result.reason = f"write {key} failed: {exc}"
                 logger.error(f"[swap] zswap {result.reason}")
                 return result

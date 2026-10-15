@@ -2,17 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # UI lease manager: lets the server shut itself down once no dashboard UI is
-# open any more. The packaged monitor is launched on demand by the desktop icon
-# and runs as root indefinitely; there is no reliable browser "close" event to
-# key off (the launcher xdg-opens the URL and exits). Instead each open UI tab
-# holds a *lease*: it POSTs a heartbeat every few seconds and (best-effort) a
-# release on pagehide. A watchdog thread stops the service once every lease has
-# lapsed, so closing the last tab/window quietly winds the service down.
+# open any more. There is no reliable browser "close" event to key off, so each
+# open UI tab holds a *lease* -- a heartbeat every few seconds plus a
+# best-effort release on pagehide. A watchdog stops the service once every lease
+# has lapsed.
 #
-# The manager tracks leases unconditionally (cheap), but only arms the watchdog
-# when enable() is called — the standalone dev run and the balancer process
-# leave it disarmed, so they never self-exit. See monitor.monitor_service, which
-# arms it only when SMARTUNE_UI_LEASE is set (by packaging/deb/app/run_monitor.sh).
+# Leases are tracked unconditionally (cheap), but the watchdog is only armed by
+# enable(), so the standalone dev run and the balancer process never self-exit.
+# monitor.monitor_service arms it only when SMARTUNE_UI_LEASE is set.
 
 import os
 import threading
@@ -37,18 +34,16 @@ def _env_float(name: str, default: float) -> float:
 class UiLeaseManager:
     """Track open-UI leases and, once armed, stop the service when the last lapses.
 
-    Each session_id maps to a monotonic deadline. A session is *active* while its
-    deadline is in the future. A heartbeat pushes the deadline out by
-    HEARTBEAT_GRACE; a release pulls it in to a short RELEASE_GRACE (prompt
-    shutdown on a genuine close, while still leaving a small window for a
-    bfcache restore / reload to re-heartbeat).
+    Each session_id maps to a monotonic deadline and is *active* while that
+    deadline is in the future. A heartbeat pushes it out by HEARTBEAT_GRACE; a
+    release pulls it in to the short RELEASE_GRACE, which still leaves a window
+    for a bfcache restore or reload to re-heartbeat.
     """
 
     def __init__(self):
-        # Grace/poll windows (seconds). Generous heartbeat grace so a merely
-        # backgrounded tab — whose timers the browser throttles to ~1/min — is
-        # not mistaken for a closed one; the release beacon handles the common
-        # close case promptly, this only backstops crashes / kills / lost network.
+        # Grace/poll windows (seconds). The heartbeat grace is generous because a
+        # backgrounded tab has its timers throttled to ~1/min and must not be
+        # mistaken for a closed one; the release beacon handles real closes.
         self.heartbeat_grace = _env_float("SMARTUNE_UI_HEARTBEAT_GRACE", 90.0)
         self.release_grace = _env_float("SMARTUNE_UI_RELEASE_GRACE", 12.0)
         # If a UI never connects at all (auth cancelled, xdg-open failed, ...),

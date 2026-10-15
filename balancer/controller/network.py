@@ -722,7 +722,7 @@ class NetworkController:
             if current_class_bw < stage_transition_point * 0.9:
                 self._limit_network_class(dev, classid, min_bw, max_bw, burst, direction=direction, level=key)
                 setattr(shaper, limit_stage_attr, stage_full)
-                logger.info(f"{dev} {direction.upper()} fully restoring {key} app class bandwidth to {max_bw} kbit/s")
+                logger.debug(f"{dev} {direction.upper()} fully restoring {key} app class bandwidth to {max_bw} kbit/s")
             else:
                 if limit_stage in (4, 2):
                     expected_total_bw = half_bw + actual_total_bw - min_bw
@@ -731,13 +731,13 @@ class NetworkController:
                 if expected_total_bw < critical_threshold:
                     if limit_stage in (4, 2):
                         self._limit_network_class(dev, classid, min_bw, half_bw, burst, direction=direction, level=key)
-                        logger.info(f"{dev} {direction.upper()} partially restoring {key} app class bandwidth to {half_bw} kbit/s")
+                        logger.debug(f"{dev} {direction.upper()} partially restoring {key} app class bandwidth to {half_bw} kbit/s")
                     else:
                         self._limit_network_class(dev, classid, min_bw, max_bw, burst, direction=direction, level=key)
-                        logger.info(f"{dev} {direction.upper()} fully restoring {key} app class bandwidth to {max_bw} kbit/s")
+                        logger.debug(f"{dev} {direction.upper()} fully restoring {key} app class bandwidth to {max_bw} kbit/s")
                     setattr(shaper, limit_stage_attr, stage_half)
                 else:
-                    logger.info(f"{dev} {direction.upper()} {key} app class kept at {stage_transition_point} kbit/s; full restore would exceed bandwidth threshold")
+                    logger.debug(f"{dev} {direction.upper()} {key} app class kept at {stage_transition_point} kbit/s; full restore would exceed bandwidth threshold")
 
     def _apply_bandwidth_limit(self, shaper, stage, direction, rates, limit_stage_attr):
         dev = shaper.dev if direction == "egress" else shaper.ifb_dev
@@ -767,15 +767,15 @@ class NetworkController:
             if current_stage_bw < stage_transition_point:
                 self._limit_network_class(dev, classid, min_bw, min_bw, burst, direction=direction, level=key)
                 setattr(shaper, limit_stage_attr, stage_full)
-                logger.info(f"{dev} {direction.upper()} throttling {key} class app bandwidth to {min_bw}")
+                logger.debug(f"{dev} {direction.upper()} throttling {key} class app bandwidth to {min_bw}")
             else:
                 self._limit_network_class(dev, classid, min_bw, half_bw, burst, direction=direction, level=key)
                 setattr(shaper, limit_stage_attr, stage_half if half_bw != min_bw else stage_full)
-                logger.info(f"{dev} {direction.upper()} throttling {key} class app bandwidth to {half_bw}")
+                logger.debug(f"{dev} {direction.upper()} throttling {key} class app bandwidth to {half_bw}")
         elif stage in (1, 3):
             self._limit_network_class(dev, classid, min_bw, min_bw, burst, direction=direction, level=key)
             setattr(shaper, limit_stage_attr, stage_full)
-            logger.info(f"{dev} {direction.upper()} re-throttling {key} class app bandwidth to {min_bw}")
+            logger.debug(f"{dev} {direction.upper()} re-throttling {key} class app bandwidth to {min_bw}")
 
     def _can_switch(self, cooldown, last_limit_time, last_recover_time):
         time_since_limit = time.time() - last_limit_time
@@ -1168,7 +1168,8 @@ class NetworkController:
         tx_pressure, rx_pressure, *_ = control_manager.update_network_pressure_level(network_data)
         tx_total_bw = shaper.total_bw * network_data['tx']
         rx_total_bw = shaper.total_bw * network_data['rx']
-        logger.debug(
+        _log = logger.info if tx_pressure != "low" or rx_pressure != "low" else logger.debug
+        _log(
             f"NetworkMonitor {shaper.dev} TX level: {tx_pressure} (pressure: {network_data['tx']:.2f}),"
             f" RX level: {rx_pressure} (pressure: {network_data['rx']:.2f})")
         if not (self.enable_network_control and self.enable_network_pressure_shaping):

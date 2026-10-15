@@ -78,7 +78,7 @@ class DataBaseModel(Model):
                 with db.atomic():
                     return cls.select(*query, **kwargs)
             except (IntegrityError, OperationalError) as e:
-                logger.error(f"Error querying data: {e}")
+                logger.error(f"Error querying {cls.__name__}: {e}")
                 return []
 
     @classmethod
@@ -104,7 +104,7 @@ class DataBaseModel(Model):
                         logger.debug(f"Record with ID {data['id']} already exists.")
                         return DBStatus.ALREADY_EXISTING
             except (IntegrityError, OperationalError) as e:
-                logger.error(f"Error inserting data: {e}")
+                logger.error(f"Error inserting {cls.__name__} id={data.get('id')}: {e}")
                 return DBStatus.FAILED
 
     @classmethod
@@ -125,7 +125,7 @@ class DataBaseModel(Model):
                         _bump_write_epoch(cls)
                     return updated_count
             except (IntegrityError, OperationalError) as e:
-                logger.error(f"Error batch updating data: {e}")
+                logger.error(f"Error batch updating {cls.__name__}: {e}")
                 return 0
 
     @classmethod
@@ -148,7 +148,7 @@ class DataBaseModel(Model):
                     _bump_write_epoch(cls)
                     return DBStatus.SUCCESS
             except (IntegrityError, OperationalError) as e:
-                logger.error(f"Error updating data: {e}")
+                logger.error(f"Error updating {cls.__name__} id={id}: {e}")
                 return None
 
     @classmethod
@@ -162,7 +162,7 @@ class DataBaseModel(Model):
                         _bump_write_epoch(cls)
                     return deleted_count
             except (IntegrityError, OperationalError) as e:
-                logger.error(f"Error deleting data: {e}")
+                logger.error(f"Error deleting {cls.__name__} id={id}: {e}")
                 return None
 
     @classmethod
@@ -197,9 +197,9 @@ class AIAppPriority(DataBaseModel):
     status = CharField(default="NA", max_length=32, null=True, help_text="app status, NA, running, pending, stopped", index=True)
     limit_overrides_json = TextField(null=True, help_text="per-app manual resource limit overrides (JSON)")
     # Snapshot of this app's config.yaml ``controlled_apps`` entry (bpf_name /
-    # process_names / commandline).  Those fields live only in the YAML, so a
-    # hand-deleted entry used to be unrecoverable; keeping a copy here lets the
-    # startup reconciliation print the exact block to paste back.
+    # process_names / commandline). Those fields live only in the YAML, so this
+    # copy is what lets the startup reconciliation print the exact block to
+    # paste back after a hand-deleted entry.
     config_meta_json = TextField(null=True, help_text="snapshot of the config.yaml controlled_apps entry (JSON)")
 
 
@@ -346,10 +346,10 @@ class OperationalEvent(DataBaseModel):
             except IntegrityError as e:
                 if dedup_key and "dedup_key" in str(e).lower():
                     return DBStatus.ALREADY_EXISTING
-                logger.error(f"Error inserting operational event: {e}")
+                logger.error(f"Error inserting operational event {event_type!r}: {e}")
                 return DBStatus.FAILED
             except OperationalError as e:
-                logger.error(f"Error inserting operational event: {e}")
+                logger.error(f"Error inserting operational event {event_type!r}: {e}")
                 return DBStatus.FAILED
 
     @classmethod

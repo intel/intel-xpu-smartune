@@ -40,9 +40,8 @@ def write_cgroup_file(content: str, target_file: str, allowed_roots=None) -> Non
     fall inside one of *allowed_roots* -- the configured cgroup mount by
     default -- otherwise a ``PermissionError`` is raised and nothing is written.
 
-    This is defence-in-depth: today every caller passes an internally-built
-    path, but because this process runs as root the guard makes sure a future
-    caller that forwards a tainted path (``../../etc/...``) cannot clobber an
+    Defence-in-depth: this process runs as root, so the guard stops a caller
+    that forwards a tainted path (``../../etc/...``) from clobbering an
     arbitrary file. ``PermissionError`` subclasses ``OSError``, so callers that
     already treat a failed write as an ``OSError`` handle a refusal unchanged.
     """
@@ -92,7 +91,7 @@ class ClientCallbackManager:
                     rec = AIAppPriority.query().where(AIAppPriority.app_id == data.get('app_id')).first()
                     current_status = str(getattr(rec, 'status', '') or '').lower()
                     if current_status in {'limited', 'a_limited'}:
-                        logger.info(
+                        logger.debug(
                             "Skip running overwrite for app_id=%s (current=%s)",
                             data.get('app_id'), current_status,
                         )
@@ -139,15 +138,14 @@ def get_cgroup_path_by_pid(pid):
 def dominant_cgroup_by_pids(pids) -> tuple:
     """Pick the cgroup that holds most of *pids*, as ``(cgroup_path, representative_pid)``.
 
-    The first matched PID is not a safe representative: an app started through a wrapper
-    (``sudo systemd-run --scope ...``) keeps the wrapper in the *launcher's* cgroup -- the
-    terminal's ``vte-spawn-*.scope`` -- while every worker it spawned lives in the scope
-    the app actually owns.  ``pids[0]`` is usually that wrapper (lowest PID, spawned
-    first), so the limit lands on the terminal and the workers run unthrottled.
+    ``pids[0]`` is not a safe representative: an app started through a wrapper
+    (``sudo systemd-run --scope ...``) leaves the wrapper in the launcher's
+    cgroup -- the terminal's ``vte-spawn-*.scope`` -- while the real workers live
+    in the scope the app owns. The wrapper is usually the lowest PID, so a limit
+    keyed off it lands on the terminal and the workers run unthrottled.
 
-    A majority vote over the matched PIDs cannot be fooled by a single stray process.
-    Ties break on the lexicographically-smallest path, matching the "primary cgroup"
-    convention used when an app legitimately spans several cgroups.
+    A majority vote cannot be fooled by a single stray process. Ties break on the
+    lexicographically-smallest path, matching the "primary cgroup" convention.
 
     Returns ``(None, None)`` when no PID has a readable cgroup.
     """
@@ -316,13 +314,12 @@ def _fetch_controlled_apps() -> Optional[List[Dict[str, Any]]]:
 def get_controlled_apps(priority: str = None):
     """ Get the list of all controlled apps with basic info (without dynamic data like pid/cgroup)
 
-    Served from an in-memory snapshot that is refreshed only when the table has
-    actually been written to (tracked by the model's write epoch).  This keeps
-    the throttle decision path off the database: it calls
-    :func:`get_app_control_info` once per candidate, every database access takes
-    a process-wide lock shared with the monitor's snapshot writer, and under a
-    saturated disk that lock has been observed held for minutes -- long enough
-    for the balancer to stop applying the limits that would have relieved it.
+    Served from an in-memory snapshot refreshed only when the table is actually
+    written to (tracked by the model's write epoch). This keeps the throttle
+    decision path off the database: every DB access takes a process-wide lock
+    shared with the monitor's snapshot writer, and a saturated disk can hold
+    that lock long enough to stop the balancer applying the very limits that
+    would relieve it.
     """
     global _controlled_apps_snapshot, _controlled_apps_epoch
 
@@ -351,24 +348,21 @@ def get_app_control_info(app_id: str = None, app_name: str = None):
     controlled_map = {app['app_id']: app for app in controlled_apps if app.get('app_id')}
     name_map = {app['app_name'].lower(): app for app in controlled_apps if app.get('app_name')}
 
-    # An app's identity is its process-name set, not just its display name: an app
-    # shown as "optimum" may actually run as "optimum-cli" (its configured
-    # process_names). The pressure loop samples the *process* name, so without also
-    # matching process_names the running process is judged uncontrolled and lands as a
-    # duplicate, undefined-priority auto-limited row instead of being attributed to the
-    # managed app. setdefault keeps the display-name mapping authoritative on collision.
+    # An app's identity is its process-name set, not just its display name: one
+    # shown as "optimum" may run as "optimum-cli". The pressure loop samples the
+    # *process* name, so without matching process_names too it reads as
+    # uncontrolled and lands as a duplicate auto-limited row. setdefault keeps
+    # the display-name mapping authoritative on collision.
     for app in controlled_apps:
         for pname in _get_app_process_names(app_id=app.get('app_id'), app_name=app.get('app_name')):
             if pname:
                 name_map.setdefault(pname.lower(), app)
 
-    # Match BOTH identities the top-consumer sampler produces against process_names:
-    #   * app_name — the kernel comm (e.g. "python" for a python-launched script), and
-    #   * app_id   — the *derived* program identity ("optimum-cli", resolved from the
-    #                cmdline for a process living in a shared session/scope).
-    # For a script launched from an SSH shell the comm is "python" while the derived id
-    # is "optimum-cli"; only the latter equals the configured process_name, so matching
-    # app_name alone still misses it and the app splits into a duplicate uncontrolled row.
+    # Match BOTH identities the top-consumer sampler produces against
+    # process_names: app_name is the kernel comm ("python" for a python-launched
+    # script) and app_id is the derived program identity ("optimum-cli", from the
+    # cmdline). Only the derived one equals the configured process_name for a
+    # wrapped launch, so matching app_name alone splits the app into a duplicate.
     lname = app_name.lower() if app_name else None
     aid = app_id.lower() if app_id else None
     is_controlled = (app_id in controlled_map
@@ -478,15 +472,14 @@ _DERIVE_PROCESS_NAME = None
 def derived_process_identity(info: dict) -> str:
     """Program identity of one process, using the wizard's own derivation rule.
 
-    ``monitor.app_discovery._derive_process_name`` is what wrote ``process_names`` into
-    config.yaml in the first place, so reusing it here makes matching symmetric with
-    writing: an interpreter/shell launch resolves to the script on both sides, and
-    ``python3 /opt/app/server.py`` -- configured as "server.py" -- stays findable even
-    though its argv0, comm and exe all read "python3".
+    ``monitor.app_discovery._derive_process_name`` is what wrote ``process_names``
+    into config.yaml, so reusing it keeps matching symmetric with writing:
+    ``python3 /opt/app/server.py`` -- configured as "server.py" -- stays findable
+    even though its argv0, comm and exe all read "python3".
 
-    Imported lazily on purpose: ``monitor/__init__`` pulls in ``res_monitor``, which
-    imports this module, so a top-level import would re-enter app_utils while it is still
-    half-initialised.
+    Imported lazily on purpose: ``monitor/__init__`` pulls in ``res_monitor``,
+    which imports this module, so a top-level import would re-enter app_utils
+    while it is still half-initialised.
     """
     global _DERIVE_PROCESS_NAME
     if _DERIVE_PROCESS_NAME is None:
@@ -505,37 +498,31 @@ def derived_process_identity(info: dict) -> str:
 def get_app_processes_by_exact_name(process_name: str) -> List[int]:
     """Find the PIDs of ``process_name`` without matching anything else.
 
-    Deliberately NOT a drop-in replacement for :func:`get_app_processes_for_app`. That one
-    is fuzzy (``pgrep -fi``, substring against the whole command line), which is the right
-    trade for "is this app running" -- there a miss is worse than an over-match. This
-    function is for the one place where the trade inverts: resolving which cgroups get a
-    resource limit written to them, where an over-match writes io.max into somebody else's
-    cgroup. Measured on the testing_io.sh workload, "fio_lo" under ``pgrep -fi`` reached 35
-    PIDs across 5 cgroups -- the app itself, plus ``fio_lo2`` (the app the test requires to
-    stay *unmanaged*), ``fio_lo3``, the terminal scope holding six ``sudo systemd-run``
-    launchers, and the session scope of an unrelated shell that merely had the string
-    "fio_lo" somewhere in its command line.
+    Deliberately NOT a drop-in replacement for :func:`get_app_processes_for_app`,
+    which is fuzzy (``pgrep -fi`` substring over the whole command line) -- the
+    right trade for "is this app running", where a miss is worse than an
+    over-match. Here the trade inverts: this resolves which cgroups get a
+    resource limit written, and an over-match writes io.max into somebody else's
+    cgroup.
 
     Two independent exact tests, either of which is enough:
 
-    * the configured name equals argv[0]'s basename, ``comm``, or the exe basename. All
-      three are checked because none alone is reliable: ``comm`` is truncated to 15
-      characters by the kernel, ``exe`` is unreadable for other users' processes, and
-      argv[0] can be rewritten by the process itself.
+    * the configured name equals argv[0]'s basename, ``comm``, or the exe
+      basename. All three are checked because none alone is reliable: ``comm``
+      is kernel-truncated to 15 characters, ``exe`` is unreadable for other
+      users' processes, and argv[0] can be rewritten by the process itself.
     * the configured name equals the process's derived identity (see
-      :func:`derived_process_identity`) -- this is what finds wrapped and interpreted
-      apps, whose configured name is a script rather than an executable.
+      :func:`derived_process_identity`), which is what finds wrapped and
+      interpreted apps whose configured name is a script, not an executable.
 
-    Neither test looks at the command line as a substring, so the union of the two cannot
-    over-match; it is only ever harder to miss than either test alone.
+    Neither test matches the command line as a substring, so their union cannot
+    over-match.
 
-    When both come up empty it reports what the fuzzy lookup *would* have found and still
-    returns nothing. Falling back to that result was the original plan, until the fallback
-    was measured: it can only fire when the app has no matching process, i.e. when it is
-    not running -- and then ``pgrep -fi`` returns whatever else happens to carry the name,
-    which in the measured case was the diagnostic shell command that mentioned it. Writing
-    a limit into that process's cgroup is worse than writing none, so the log line is the
-    deliverable here: it names the app whose ``process_names`` needs fixing.
+    When both come up empty it logs what the fuzzy lookup *would* have found and
+    still returns nothing: that path only fires when the app is not running, so
+    the fuzzy result is whatever else happens to carry the name, and writing a
+    limit into its cgroup is worse than writing none. The log line is the
+    deliverable -- it names the app whose ``process_names`` needs fixing.
     """
     q = (process_name or '').strip().lower()
     if not q:
@@ -555,10 +542,10 @@ def get_app_processes_by_exact_name(process_name: str) -> List[int]:
                 matched.add(int(info['pid']))
                 continue
 
-            # A derived identity that differs from the three fields above is always the
-            # basename of some argument -- the script the wrapper runs. Screening on that
-            # first keeps the derivation itself off the hot path: it re-reads config on
-            # every call, and this loop walks every process on the machine.
+            # A derived identity differing from the three fields above is always
+            # an argument basename -- the script the wrapper runs. Screening on
+            # that first keeps the derivation (which re-reads config) off this
+            # loop, which walks every process on the machine.
             if q not in {os.path.basename((t or '').strip()).lower() for t in cmdline[1:]}:
                 continue
             if derived_process_identity(info).strip().lower() == q:
@@ -582,10 +569,10 @@ def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.
     """
     Check whether the aggregate disk IO of a set of PIDs exceeds a threshold.
 
-    Measures actual block-layer bytes from each process's IO counters
-    (``/proc/<pid>/io`` read_bytes/write_bytes) over a short interval. No external tool
-    (previously ``iotop``) and no privileges beyond what smartune already runs with, so it
-    also works on hosts where iotop / kernel taskstats are unavailable.
+    Measures block-layer bytes from each process's IO counters
+    (``/proc/<pid>/io`` read_bytes/write_bytes) over a short interval. Needs no
+    external tool and no extra privileges, so it also works on hosts where
+    iotop / kernel taskstats are unavailable.
     :param running_pids: PIDs belonging to a single app
     :param threshold_mb: disk IO threshold in MB/s
     :return:
@@ -897,11 +884,11 @@ def _update_app_oom_score_adj(app_id: str, score: int) -> bool:
             logger.warning(f"No record updated for app_id: {app_id}")
             return False
 
-        logger.info(f"oom_score_adj updated - ID: {app_id}, New score: {score}")
+        logger.debug(f"oom_score_adj updated - ID: {app_id}, New score: {score}")
         return True
 
     except Exception as e:
-        logger.error(f"Update failed: {e}")
+        logger.error(f"oom_score_adj update failed for app_id {app_id}: {e}")
         return False
 
 
@@ -919,7 +906,7 @@ def update_app_status(app_id: str, status: str) -> bool:
         return True
 
     except Exception as e:
-        logger.error(f"Update failed: {e}")
+        logger.error(f"Status update failed for app_id {app_id}: {e}")
         return False
 
 
@@ -963,7 +950,6 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
             logger.warning(f"No cgroup found for any of {len(pids)} PID(s) of app {app_name}")
             return {}
 
-        # Log the process cmdline for the representative PID to confirm we found the right process
         try:
             proc_cmdline = psutil.Process(representative_pid).cmdline()
             logger.debug(f"[resource_usage] pid={representative_pid} cmdline={proc_cmdline}")
@@ -1170,20 +1156,13 @@ def check_app_running_status(app_id: str, app_name: str, cmdline: str = "") -> s
 
     Two modes depending on configuration:
 
-    **Multi-process mode** (``process_names`` is non-empty in ``controlled_apps``):
-        Any configured process name found among running processes is enough to
-        treat the app as running. This avoids false "stopped" for apps where
-        helper/child processes are optional or short-lived.
+    **Multi-process mode** (``process_names`` non-empty in ``controlled_apps``):
+        Any configured process name found among running processes is enough, so
+        apps with optional or short-lived helpers do not read as "stopped".
 
-    **Standard mode** (``process_names`` is empty / not configured):
-        Any single match is sufficient.  The function tries, in order:
-
-        1. ``app_name``  – searched with ``pgrep -f``
-        2. ``app_id`` basename (e.g. ``"benchmark.py"`` from ``"/path/to/benchmark.py"``)
-        3. ``cmdline`` first token (the executable basename, e.g. ``"gnome-calculator"``)
-
-        Returns ``"running"`` if any lookup finds at least one live PID;
-        otherwise ``"stopped"``.
+    **Standard mode** (``process_names`` empty): tries, in order, ``app_name``
+    via ``pgrep -f``, the ``app_id`` basename, then the ``cmdline`` first token.
+    Any single match is sufficient.
 
     :param app_id:   Unique app identifier (DB primary key).
     :param app_name: Human-readable display name.
@@ -1334,10 +1313,10 @@ def fetch_unregistered_apps() -> List[Dict[str, Any]]:
     """Apps the database still knows about but ``controlled_apps`` no longer lists.
 
     These are entries a user deleted from config.yaml by hand;
-    :func:`reconcile_controlled_apps` un-controls them at startup.  Surfacing
-    them alongside :func:`fetch_all_apps` is what lets the UI offer them for
-    re-enabling instead of forcing another trip through the wizard -- their row
-    still carries the priority, OOM score and saved limit overrides.
+    :func:`reconcile_controlled_apps` un-controls them at startup. Surfacing them
+    alongside :func:`fetch_all_apps` lets the UI offer them for re-enabling
+    instead of forcing another trip through the wizard -- their row still carries
+    the priority, OOM score and saved limit overrides.
 
     Same shape as :func:`fetch_all_apps`, plus ``previously_managed``.
     """
@@ -1372,11 +1351,10 @@ def fetch_unregistered_apps() -> List[Dict[str, Any]]:
 def restore_config_entry(app_id: str, app_name: str = "", cmdline: str = "") -> bool:
     """Write an app's ``controlled_apps`` entry back into config.yaml.
 
-    Called when re-enabling an app whose entry the user deleted by hand.  Without
-    it the app would be controlled in the database yet invisible to every
-    config-driven lookup (BPF match cache, process_names, multi-process maps) --
-    the very split state :func:`reconcile_controlled_apps` exists to resolve, and
-    the next restart would simply un-control it again.
+    Called when re-enabling an app whose entry the user deleted by hand. Without
+    it the app is controlled in the database yet invisible to every config-driven
+    lookup (BPF match cache, process_names, multi-process maps), so the next
+    restart would simply un-control it again.
 
     Returns True when an entry was written; False when one already exists, the
     app is unknown, or the write failed.
@@ -1420,9 +1398,8 @@ def diff_controlled_apps(config_apps, db_rows) -> tuple:
     * ``stale_meta`` – rows whose stored ``config_meta_json`` no longer matches
       their config entry and should be refreshed.
 
-    Rows that are already ``controlled=False`` and absent from config are left
-    alone: that is just a registration the user never enabled, and nothing keys
-    off it.
+    Rows already ``controlled=False`` and absent from config are left alone --
+    that is a registration the user never enabled.
 
     Kept free of database and config imports so it can be exercised directly.
     """
@@ -1524,15 +1501,11 @@ def reconcile_controlled_apps() -> Dict[str, list]:
 def _get_multi_process_app_resource_usage(app_id: str, app_name: str, process_names: list) -> dict:
     """Aggregate cgroup resource usage across all processes of a multi-process app.
 
-    Unlike the single-cgroup :func:`get_app_resource_usage`, this function:
-
-    1. Finds all running PIDs whose process name is in *process_names*.
-    2. Collects the unique set of cgroups those PIDs live in.
-    3. Samples CPU / IO stats from every cgroup simultaneously (single 0.5 s
-       sleep), then sums the deltas for a combined usage figure.
-
-    This handles apps that span multiple systemd units / cgroups (e.g. a
-    service that spawns a helper worker in a different slice).
+    Unlike the single-cgroup :func:`get_app_resource_usage`, this finds every PID
+    whose process name is in *process_names*, collects the unique cgroups they
+    live in, and samples all of them over one shared 0.5 s window before summing
+    the deltas. That covers apps spanning several systemd units (e.g. a service
+    whose helper worker lands in a different slice).
 
     :param app_id:        Unique app identifier (DB primary key).
     :param app_name:      Human-readable name, used only for log messages.
@@ -1619,9 +1592,8 @@ def _get_multi_process_app_resource_usage(app_id: str, app_name: str, process_na
     mem_bytes = sum(mem_per_cgroup.values())
     swap_bytes = sum(swap_per_cgroup.values())
 
-    # 1 s window: a compromise between sample stability and limit-path
-    # latency; the 0.5 s window made multi-process apps look idle when only
-    # one helper was active at sample time.
+    # 1 s window: long enough that a multi-process app with only one active
+    # helper does not read as idle, short enough for the limit path's latency.
     time.sleep(1)
 
     # --- Second snapshot ---

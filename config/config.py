@@ -173,10 +173,9 @@ class Config:
         return changed
 
     def update_limit_policy_for_priority(self, priority: str, limit_overrides: Optional[dict[str, Any]]) -> bool:
-        # NOTE: This method mutates the shared global limit_policy used by the auto-balancer.
-        # It is no longer called from the manual-limit flow (set_resource_limit now stores
-        # per-app overrides in the DB via limit_overrides_json).  Retained for admin/scripting
-        # use only; do not call it for per-app UI limits.
+        # NOTE: mutates the shared global limit_policy used by the auto-balancer.
+        # Admin/scripting use only -- per-app UI limits go through
+        # set_resource_limit, which stores overrides in limit_overrides_json.
         if not isinstance(limit_overrides, dict):
             return False
 
@@ -272,12 +271,9 @@ class Config:
     # ------------------------------------------------------------------
     # Generic YAML list helpers
     #
-    # The wizard / future UI editors need to add, remove and edit items in
-    # top-level YAML lists (controlled_apps, network_system_ports,
-    # testing_network_app, ...).  These helpers operate on *any* top-level
-    # list section while preserving comments and the existing indentation
-    # style, so each new "UI-editable section" does not need a bespoke
-    # YAML patcher.
+    # Add/remove/edit items in *any* top-level YAML list (controlled_apps,
+    # network_system_ports, testing_network_app, ...) while preserving comments
+    # and indentation, so a new UI-editable section needs no bespoke patcher.
     # ------------------------------------------------------------------
 
     @staticmethod

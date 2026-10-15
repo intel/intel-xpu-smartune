@@ -221,17 +221,12 @@ def normalize_request(
         # generator) -- and, as entry["_devices"] below, which group the model
         # lands in.
         #
-        # Those two used to be read from different keys, `device` here and
-        # `devices` there, and the page only ever sends `devices`. So the sweep
-        # silently fell back to the run-wide selection -- which Benchmark.tsx
-        # fills from the FIRST model in the payload -- while the grouping alone
-        # saw the real choice: "this model on CPU, that one on GPU" rendered two
-        # groups whose exported BENCH_DEVICES were right and whose models_input
-        # .json both said CPU, and the GPU half of the request was measured on
-        # the CPU. One read keeps the split and the sweep describing the same
-        # request.
+        # Both must come from ONE read: the sweep and the grouping reading
+        # different keys would let a per-model choice ("this one on CPU, that one
+        # on GPU") split into the right groups while every group swept the
+        # run-wide selection.
         #
-        # `device` is still accepted as an alias -- it is the name the pipeline's
+        # `devices` is what the page sends; `device` is accepted as an alias -- it is the name the pipeline's
         # own JSON uses, so a hand-written request may well spell it that way.
         # Absent both, the model inherits the run-wide selection.
         requested_devices = item.get("devices")

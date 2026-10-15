@@ -649,19 +649,14 @@ class AppIntercept(metaclass=SingletonMeta):
                               cmdline: str = "") -> int:
         """Adopt currently-running PIDs of an app into the BPF tracking state.
 
-        The BPF tracker emits "stopped" only after every PID it has seen
-        launch has exited (see :py:meth:`handle_exit_event`).  When an app
-        is already running at the moment the user adds it to control —
-        either via the dropdown form or the wizard — BPF never observed
-        the launch, so its exits would be ignored and the app's status in
-        the UI would stay "running" forever.
+        The BPF tracker emits "stopped" only after every PID it saw launch has
+        exited (see :py:meth:`handle_exit_event`), so an app already running
+        when the user adds it to control would stay "running" in the UI forever.
 
-        This method discovers the PIDs via ``process_names`` (preferred)
-        or the commandline-derived executable name and seeds them into
-        ``app_live_pids`` / ``monitored_app_launched`` so that subsequent
-        BPF exit events fire normally.
-
-        Returns the number of PIDs adopted (0 if none found).
+        Discovers the PIDs via ``process_names`` (preferred) or the
+        commandline-derived executable name and seeds them into
+        ``app_live_pids`` / ``monitored_app_launched`` so subsequent BPF exit
+        events fire normally. Returns the number of PIDs adopted.
         """
         # Prefer the configured process_names list so multi-process apps
         # (e.g. a wrapper script + its daemon) get every PID adopted.
@@ -701,24 +696,21 @@ class AppIntercept(metaclass=SingletonMeta):
     def scan_already_running_apps(self) -> list:
         """Scan currently running processes for monitored apps that pre-date the balancer.
 
-        Called once when the UI balancer tab is first opened to detect apps that
-        started before the balancer service (and were therefore missed by BPF).
-        Any matching process is registered in monitored_app_launched and a
-        "running" callback is sent so the UI and database reflect the correct state.
-        After this one-time scan, ongoing detection is left entirely to BPF.
+        Called once when the UI balancer tab is first opened, to pick up apps
+        that started before the balancer service and were therefore missed by
+        BPF. Matches are registered in monitored_app_launched and a "running"
+        callback is sent. Ongoing detection is left entirely to BPF afterwards.
 
-        Two scanning strategies are used:
+        Two passes:
 
-        1. **BPF comm/exe matching** (existing logic) – iterates live processes and
-           checks whether comm or exe matches a known monitored app via
-           :meth:`get_main_process`.  This covers normal single-process desktop apps.
-
-        2. **Multi-process apps** – for apps whose ``controlled_apps`` config entry
-           contains a non-empty ``process_names`` list, the BPF comm-matching path
-           may miss them (they are recognised by process name, not by bpf_name).
-           A second pass calls :func:`app_utils.check_app_running_status` for each
-           such app that was NOT already detected in pass 1, and emits the
-           appropriate "running" or "stopped" callback.
+        1. **comm/exe matching** – iterates live processes and checks comm/exe
+           against the monitored apps via :meth:`get_main_process`. Covers
+           normal single-process desktop apps.
+        2. **Multi-process apps** – apps configured with a non-empty
+           ``process_names`` are recognised by process name rather than
+           bpf_name, so pass 1 can miss them. For each one not already
+           detected, :func:`app_utils.check_app_running_status` decides whether
+           to emit a "running" or "stopped" callback.
 
         :return: list of dicts with keys app_id, app_name, pid for each detected app.
         """
@@ -844,8 +836,8 @@ if __name__ == "__main__":
         try:
             bpf_monitor.bpf.perf_buffer_poll(timeout=100)
         except KeyboardInterrupt:
-            logger.debug("\nExiting...")
+            logger.debug("Exiting app-intercept poll loop")
             break
         except Exception as e:
-            logger.debug(f"Error: {e}")
+            logger.error(f"App-intercept poll loop failed: {e}")
             break

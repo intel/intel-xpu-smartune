@@ -248,6 +248,6 @@ def child_home(env_root: Path) -> Path:
 
 
 def log_startup() -> None:
-    """INFO the description once, at service start."""
+    """Debug the description once, at service start."""
     for line in describe():
-        logger.info(f"Benchmark environment: {line}")
+        logger.debug(f"Benchmark environment: {line}")

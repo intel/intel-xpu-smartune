@@ -1,19 +1,8 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Standalone entry point for the monitor (telemetry) service.
-#
-# Unlike balance_service.py — which mounts the monitor blueprint inside the
-# balancer process — this module runs the monitor REST API on its own, without
-# any dependency on the balancer control logic (balancer/controller,
-# balancer/balancer). It is what keeps a usable, runnable monitor around even if
-# the balancer pieces are removed. Run it from the repository root:
-#     python -m monitor.monitor_service
-#
-# When run without the balancer, monitor_api has no SystemPressureMonitor
-# registered, so it falls back to lazily creating its own instance
-# (see monitor.monitor_api._get_system_pressure_monitor) and reports pure
-# system pressure state.
+# Standalone entry point for the monitor telemetry service. Run from the
+# repository root with ``python -m monitor.monitor_service``.
 
 import logging
 import os
@@ -25,9 +14,8 @@ from flask import Flask
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Tag log records with mode=monitor when this module is launched directly
-# (`python -m monitor.monitor_service`); setdefault keeps smartune.py's value
-# when it launches us. Must precede the utils.logger import below.
+# Set the service mode before importing the logger. Preserve a mode set by
+# smartune.py when it launches this module.
 os.environ.setdefault("SMARTUNE_MODE", "monitor")
 
 from db.DatabaseModel import init_database
@@ -59,20 +47,13 @@ from utils.ui_lease import get_ui_lease_manager
 
 app = Flask(__name__)
 app.register_blueprint(monitor_bp)
-# smartune_bp reports capabilities. The balancer-available flag stays False here,
-# so /smartune/capabilities returns 0 (monitor only).
+# Report capabilities for the monitor-only service.
 app.register_blueprint(smartune_bp)
-# auth_bp enforces the access token app-wide (before_app_request) and serves
-# /auth/login, so the monitor-only deployment is protected too.
+# Apply the shared access-token gate to monitor routes.
 app.register_blueprint(auth_bp)
-# The benchmark blueprint is optional: it is skipped when the feature is disabled
-# in config.yaml or when benchmark/ is absent from the deployment (this is the
-# variant that ships without it). Registering it after auth_bp is not required
-# (the gate is app-wide), but keeps the reading order "auth first, then the routes
-# it protects".
+# Benchmark and diagnostics routes are optional features mounted at startup.
 set_benchmark_available(mount_benchmark(app))
-# Diagnostics /diag/* API. Available in monitor-only too: its value is precisely
-# being able to inspect events/logs when the main service is degraded.
+# Mount diagnostics routes in monitor-only deployments as well.
 set_diagnostics_available(mount_diagnostics(app))
 # Serve the built dashboard (dashboard/dist) and route its /api/* calls to the
 # blueprints above, so the browser sees a full UI at the same https origin.
@@ -164,12 +145,8 @@ def main():
     except Exception as exc:
         logger.warning(f"Preload static info failed, will retry on first static request: {exc}")
 
-    # Start the background dynamic-info collector so history is persisted even
-    # in monitor-only mode.  Without this, history is only written when the
-    # balancer runs (balance_service) or when a client hits the full/single
-    # /dynamic_info endpoint — the dashboard's selective ?sections= requests do
-    # not persist, so History would otherwise stay empty here.  No-op when
-    # monitored_sections is [].
+    # Persist dynamic history in monitor-only mode. This is a no-op when no
+    # sections are configured for monitoring.
     _start_dynamic_info_auto_refresh()
     start_detector_loop()
 
@@ -184,9 +161,7 @@ def main():
                    "dashboard_ui": "mounted",
                })
 
-    # Packaged (desktop-launched) deployments set SMARTUNE_UI_LEASE so the
-    # service stops itself once the last dashboard UI is closed. Left unset in
-    # dev runs (python -m monitor.monitor_service), which then run until killed.
+    # Packaged deployments may stop the service when the last dashboard closes.
     if os.environ.get("SMARTUNE_UI_LEASE"):
         get_ui_lease_manager().enable(_request_ui_shutdown)
 

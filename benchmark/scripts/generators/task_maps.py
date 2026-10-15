@@ -5,9 +5,8 @@
 """
 Shared task maps and command helpers for the wrapper generator.
 
-Everything the generators used to duplicate about GenAI task naming and
-weight-format normalization lives here so that the single common generator
-(gen_wrapper.py) has one source of truth.
+GenAI task naming and weight-format normalization live here so that the single
+common generator (gen_wrapper.py) has one source of truth.
 """
 
 import sys
@@ -24,7 +23,7 @@ GLOBAL_VARS = load_global_vars()
 # Generic helpers
 # --------------------------------------------------------------------------- #
 def get_model_safe_name(model: str) -> str:
-    """Filesystem-safe model name (matches the historical replacement rules)."""
+    """Filesystem-safe model name."""
     return model.replace('/', '_').replace('.', '_')
 
 

@@ -136,8 +136,7 @@ def _iter_model_units(models_dir: Path,
     allowed_safe_names restricts the walk to those models. Filtering here rather
     than on the returned list is what keeps it cheap: an unrequested model's xml
     is skipped before it is opened, instead of being validated and then thrown
-    away. A tree holding several models used to be read in full on every run,
-    however few of them the run had asked for.
+    away.
     """
     leaf_dirs = set()
     for xml in models_dir.rglob('*.xml'):
@@ -471,7 +470,7 @@ def route_benchmark_from_dir(models_dir: str,
     if allowed_safe_names is not None:
         # units is already restricted to allowed_safe_names, so the names it
         # does carry are exactly the requested ones that the tree turned out to
-        # have -- the same set the unfiltered walk used to compute.
+        # have.
         found_safe_names = {_model_safe_name(name) for _, name, _ in units}
         for missing in sorted(allowed_safe_names - found_safe_names):
             result['failed_models'].append({

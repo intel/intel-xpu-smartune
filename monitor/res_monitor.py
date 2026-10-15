@@ -327,13 +327,8 @@ class ResourceMonitor:
         self._desktop_exe_to_app: dict[str, str] = {}
         self._build_desktop_identity_index()
 
-        # The balancer must never rank itself as a limit candidate: it reads /proc for
-        # every process on every tick, and psutil's read_count / write_count are syscall
-        # counts, not block-device operations, so those reads look like a huge IOPS load
-        # at almost no bandwidth. Excluding the whole cgroup rather than just our PID,
-        # because a limit is a property of a cgroup: any helper we spawn is inside it and
-        # every cap written there reaches us. The limit-path counterpart of
-        # :func:`is_own_process`. Resolved once -- our own cgroup does not change.
+        # Exclude the service's cgroup from limit candidates; cgroup limits also
+        # affect its child processes. Resolve it once during initialization.
         self._self_cgroup = ''
         try:
             own = get_cgroup_path_by_pid(os.getpid())
@@ -361,28 +356,11 @@ class ResourceMonitor:
                     self._proc_name_to_app[p] = app_id
 
     def _build_desktop_identity_index(self) -> None:
-        """Index every registered app by the exact names its processes can present.
+        """Index registered apps by the exact process identities they can present.
 
-        Replaces a substring test -- "does the app's name appear anywhere inside the
-        process name" -- under which an app claimed every process whose name merely began
-        with or contained it. Two apps whose names share a prefix are then indistinguishable,
-        and the traffic of one is reported against the other, so the limit is written to the
-        wrong app. (Seen with the disk-IO test workload, whose three binaries are named as
-        prefixes of one another; the same holds for any `foo` / `foo-worker` pair.)
-
-        The substring form was covering two differences that are real, and both are handled
-        exactly here instead:
-
-        * ``comm`` is truncated to 15 characters by the kernel, so a longer program name is
-          only ever observed in that form -- see :func:`_identity_keys`;
-        * an app is usually registered under a display name while its processes show the
-          executable from ``commandline``. That executable is resolved with the wizard's own
-          derivation rule, so an interpreter or shell launch indexes as the script rather
-          than as the interpreter -- indexing it as the interpreter would hand the app every
-          process on the machine that shares it, which is the same over-match in a new place.
-
-        First writer wins: when two apps claim one identity the earlier registration keeps
-        it, instead of the limit silently moving to whichever was configured last.
+        Identity keys account for kernel-truncated names and executable names
+        derived from wrapper or interpreter command lines. First registration
+        wins when multiple apps claim the same identity.
         """
         for app_id, app in self.desktop_apps.items():
             try:
@@ -393,29 +371,17 @@ class ResourceMonitor:
                 for name in (app.get('name') or '', derived, *(app.get('process_names') or [])):
                     for key in _identity_keys(name):
                         self._desktop_name_to_app.setdefault(key, app_id)
-                # Only when the executable IS the program: for a wrapper launch the
-                # derivation resolved past it, and indexing the wrapper path would match
-                # every process started through the same interpreter or shell.
+                # Avoid indexing wrapper executables as application identities.
                 if exe_token and derived.lower() == os.path.basename(exe_token).lower():
                     self._desktop_exe_to_app.setdefault(exe_token.lower(), app_id)
             except Exception as e:
                 logger.warning(f"Could not index registered app {app_id}: {e}")
 
     def _app_id_for_process(self, info: dict) -> str:
-        """Which configured multi-process app a running process belongs to, or ''.
+        """Return the configured app matching a process identity, or ``''``.
 
-        Every test here is an exact comparison against a configured process name. Asking
-        instead whether a configured name appears *anywhere* in the command line turns
-        every launcher into a match for the app it launches: `sudo systemd-run --scope
-        --unit=lo-io.scope /tmp/fio_lo` was reported as the app "fio_lo" while living in
-        the terminal's own scope, so that scope was merged into the app and then received
-        the app's io.max.
-
-        argv[0], comm and exe are all consulted because none is reliable alone: comm is
-        truncated to 15 characters by the kernel, exe is unreadable for other users'
-        processes, and argv[0] can be rewritten by the process itself. The derived
-        identity covers the apps the wizard recorded by script name rather than by
-        executable name, whose three exec fields all read "python3" or "bash".
+        Compare executable, process name, and command-line-derived identities
+        exactly; avoid substring matches against launcher arguments.
         """
         cmdline = info.get('cmdline') or []
         for name in (

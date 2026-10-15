@@ -1,16 +1,8 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Unified metric read façade. Symmetric to LogSource but for time series. Two
-# providers, both keyed on wall-clock so /diag/context can align them:
-#   * monitor  -- system time series from MonitorSnapshot (CPU/mem/GPU/pressure)
-#   * benchmark -- a run's 2Hz sampling CSV (time series) + windowed medians (KPI)
-#
-# The alignment is the whole point of answering "why is this job slow": the
-# benchmark sampler uses epoch seconds and MonitorSnapshot uses collected_at on
-# the same wall-clock, so a throughput dip lines up with the same-instant system
-# state (CPU throttled / GPU contended / pressure critical). New metric sources
-# implement the same read(scope, from, to) shape and plug in with zero changes.
+# Unified metric read façade for system snapshots and benchmark results. Both
+# providers use wall-clock timestamps so diagnostics can align their series.
 
 import json
 from pathlib import Path
@@ -153,25 +145,20 @@ def read_resource_utilization(start_time, end_time, limit=2000, max_points=120):
 
 
 def read_benchmark(job_id=None, start_time=None, end_time=None):
-    """A benchmark run's KPI summary + (when locatable) sampling time series.
+    """Return benchmark KPIs and any available sampling series for a job.
 
-    Prefers the live artifact tree, and falls back to the compact summary frozen
-    onto the job's completion event when that tree is gone -- a job deleted from
-    the Results tab keeps its numbers but not its sampling timeline or raw logs.
-    ``source`` says which was used ("disk" / "persisted" / None); ``summary`` is
-    the per-case KPI object both paths share so a client renders one shape.
-
-    Best-effort and guarded: benchmark may be absent. Reuses benchmark's own
-    results helpers rather than re-parsing CSV layouts."""
+    Prefer live artifacts, with the persisted completion-event summary as a
+    fallback. ``source`` identifies the result source; ``summary`` has a
+    consistent shape for both paths.
+    """
     result = {"kpi": None, "series": [], "run": None, "source": None, "summary": None}
     try:
         from benchmark.service import results  # noqa: F401
     except Exception:
         results = None
 
-    # Lifecycle events persist meta.run_name, which is the unique artifact prefix
-    # generated for a job. Never substitute the newest run: wrong evidence is
-    # worse than no evidence in a diagnostic context.
+    # Use the artifact prefix associated with this job; unrelated runs are not
+    # valid evidence for its diagnostics.
     if results is not None:
         try:
             run_dir = _run_dir_for_job(results, job_id)
@@ -181,8 +168,7 @@ def read_benchmark(job_id=None, start_time=None, end_time=None):
                 if medians:
                     result["kpi"] = medians
                 result["series"] = _read_sampling_series(run_dir, start_time, end_time)
-                # The same compact summary the persisted path returns, built from
-                # the live tree so both look identical to the dashboard.
+                # Keep the live and persisted summary shapes consistent.
                 result["summary"] = results.result_snapshot(run_name_for_job(job_id))
                 if result["summary"] or result["kpi"]:
                     result["source"] = "disk"

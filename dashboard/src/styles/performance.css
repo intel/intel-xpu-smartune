@@ -63,13 +63,60 @@
 .perf-host-context {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
   min-width: 0;
-  padding: 0;
+  color: var(--color-text);
+}
+
+/* The host chip is the only link here, so it carries the weight of the
+   "System Health" eyebrow beside it rather than reading as muted metadata. */
+.perf-host-context-link {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 10px;
   border: 0;
+  border-left: 1px solid var(--color-border);
   background: transparent;
   color: var(--color-text);
   cursor: pointer;
   font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.perf-host-context-link b {
+  color: var(--color-text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.perf-host-context-link > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.perf-host-context-link:hover,
+.perf-host-context-link:focus-visible {
+  color: var(--color-tab-accent);
+}
+
+.perf-host-context-link:focus-visible {
+  outline: 1px solid var(--color-tab-accent);
+  outline-offset: 4px;
+}
+
+.perf-host-context-facts {
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  min-width: 0;
 }
 
 .perf-host-context-item {
@@ -77,8 +124,6 @@
   align-items: baseline;
   gap: 4px;
   min-width: 0;
-  padding: 0 10px;
-  border-left: 1px solid var(--color-border);
   color: var(--color-text-muted);
   font-size: 11px;
   white-space: nowrap;
@@ -91,20 +136,21 @@
   text-transform: uppercase;
 }
 
+.perf-host-context-sep {
+  color: var(--color-text-muted);
+  font-size: 11px;
+  opacity: 0.6;
+}
+
 .perf-host-context-icon {
-  margin-left: 2px;
+  align-self: center;
   color: var(--color-text-muted);
   font-size: 12px;
 }
 
-.perf-host-context:hover .perf-host-context-icon,
-.perf-host-context:focus-visible .perf-host-context-icon {
+.perf-host-context-link:hover .perf-host-context-icon,
+.perf-host-context-link:focus-visible .perf-host-context-icon {
   color: var(--color-tab-accent);
-}
-
-.perf-host-context:focus-visible {
-  outline: 1px solid var(--color-tab-accent);
-  outline-offset: 4px;
 }
 
 .perf-header-controls {
@@ -118,8 +164,15 @@
   position: sticky;
   /* Pin below the sticky application header. */
   top: var(--app-sticky-top, 128px);
-  z-index: 25;
-  margin-bottom: 12px;
+  z-index: 30;
+  /* Opaque, and wider than the content box: without this the trend chart, the
+     pressure cards and the resource cards all scroll visibly *through* the
+     pinned row.  The negative side margins (cancelled by the matching padding)
+     let the background reach the full content width. */
+  margin: 0 -8px 12px;
+  padding: 12px 12px 12px;
+  background: var(--color-bg);
+  border-bottom: 1px solid var(--color-border);
 }
 
 .perf-section-title {
@@ -380,29 +433,37 @@
   transition: transform 0.3s ease, box-shadow 0.3s ease;
 }
 
+/* Decorative corner brackets, traced along the card's own rounded corners.
+   They used to be inset 12px, which put them *inside* the content box: on a
+   card with 10px body padding (the resource summary cards) the horizontal rule
+   ran straight through the status dot and the title, which read as the title
+   overlapping something. Anchored to the border they can never collide with
+   content, whatever padding a card uses. */
 .perf-card::before,
 .perf-card::after {
   content: '';
   position: absolute;
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
   border: 2px solid rgba(90, 169, 255, 0.5);
   opacity: 0.6;
   pointer-events: none;
 }
 
 .perf-card::before {
-  top: 12px;
-  left: 12px;
+  top: -1px;
+  left: -1px;
   border-right: none;
   border-bottom: none;
+  border-top-left-radius: 16px;
 }
 
 .perf-card::after {
-  bottom: 12px;
-  right: 12px;
+  bottom: -1px;
+  right: -1px;
   border-left: none;
   border-top: none;
+  border-bottom-right-radius: 16px;
 }
 
 .perf-card:hover {
@@ -517,6 +578,18 @@
 
 .perf-device-drawer .perf-core-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+/* The drill-down is a wide centred modal, not the old 720px side drawer, so the
+   per-core grid gets the columns that width can carry. */
+.perf-device-modal .perf-core-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+@media (max-width: 1280px) {
+  .perf-device-modal .perf-core-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .perf-trend-dot {
@@ -2062,8 +2135,9 @@
     flex-wrap: wrap;
   }
 
-  .perf-host-context-item {
-    padding: 2px 8px;
+  .perf-host-context-link {
+    padding-left: 0;
+    border-left: 0;
   }
 
   .perf-root::before {

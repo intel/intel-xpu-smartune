@@ -1963,23 +1963,23 @@ const SETTINGS_TABS: SettingsTabDef[] = [
   },
 ]
 
-// Heading of a group in the left rail. Larger and brighter than the tabs under it (which
-// are muted until selected) plus a gap above the second group: as small uppercase muted
-// text it read as *less* important than its own children.
-function TabGroupLabel({ text, first }: { text: string; first?: boolean }) {
-  return (
-    <span
-      style={{
-        display: 'block',
-        fontSize: 13,
-        fontWeight: 600,
-        color: COLORS.text,
-        marginTop: first ? 0 : 12,
-      }}
-    >
-      {text}
-    </span>
-  )
+/**
+ * Split the tab list into the clusters the top navigation renders.
+ *
+ * A tab carrying `group` opens a new cluster and every tab after it belongs to
+ * that cluster until the next one. Same data the old left rail read, laid out
+ * horizontally: the rail could afford a heading row per group, a nav bar cannot,
+ * so the heading sits above its row of pills instead.
+ */
+function groupTabs(tabs: SettingsTabDef[]): Array<{ name: string; tabs: SettingsTabDef[] }> {
+  const groups: Array<{ name: string; tabs: SettingsTabDef[] }> = []
+  for (const tab of tabs) {
+    if (tab.group || groups.length === 0) {
+      groups.push({ name: tab.group ?? '', tabs: [] })
+    }
+    groups[groups.length - 1].tabs.push(tab)
+  }
+  return groups
 }
 
 // A tab whose card holds edits that have not been written yet.
@@ -2094,33 +2094,49 @@ export default function SettingsModal({ active: _active, balancerEnabled, onActi
 
   const titleFor = (key: string) => tabs.find((tab) => tab.key === key)?.title ?? key
 
-  // Only the second group onwards gets a gap above it; the first sits right under the header.
-  const firstGroupKey = tabs.find((tab) => tab.group)?.key
+  const navGroups = groupTabs(tabs)
 
-  const items = tabs.flatMap((tab) => [
-    // Heading rows are items so they sit in the rail's flow; disabled makes them
-    // unselectable rather than a tab that looks broken when clicked.
-    ...(tab.group
-      ? [{
-        key: `group:${tab.group}`,
-        label: <TabGroupLabel text={tab.group} first={tab.key === firstGroupKey} />,
-        disabled: true,
-        children: null,
-      }]
-      : []),
-    {
-      key: tab.key,
-      // Indented under its group heading, so the rail reads as heading > pages.
-      label: (
-        <Space size={6} style={{ paddingLeft: 10 }}>
-          {tab.icon}
-          <span>{tab.title}</span>
-          {dirtyTabs.includes(tab.key) && <UnsavedDot />}
-        </Space>
-      ),
-      children: <SettingsTabContext.Provider value={tab.key}>{tab.panel}</SettingsTabContext.Provider>,
-    },
-  ])
+  const items = tabs.map((tab) => ({
+    key: tab.key,
+    // Rendered by the custom nav bar below, not by the tab strip.
+    label: tab.title,
+    children: <SettingsTabContext.Provider value={tab.key}>{tab.panel}</SettingsTabContext.Provider>,
+  }))
+
+  const selectTab = (key: string) => {
+    setActiveTab(key)
+    refreshDirty()
+  }
+
+  // Replaces the tab strip entirely. The groups are what made the left rail
+  // readable with eight pages in it, so they survive the move to the top as
+  // labelled clusters rather than being flattened into one long row.
+  const navBar = (
+    <nav className="settings-nav" aria-label="Settings sections">
+      {navGroups.map((group, index) => (
+        <div className="settings-nav__group" key={group.name || `group-${index}`}>
+          {group.name && <span className="settings-nav__group-title">{group.name}</span>}
+          <div className="settings-nav__items" role="tablist">
+            {group.tabs.map((tab) => (
+              <button
+                key={tab.key}
+                type="button"
+                role="tab"
+                className="settings-nav__item"
+                data-active={tab.key === activeTab || undefined}
+                aria-selected={tab.key === activeTab}
+                onClick={() => selectTab(tab.key)}
+              >
+                {tab.icon}
+                <span>{tab.title}</span>
+                {dirtyTabs.includes(tab.key) && <UnsavedDot />}
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
+    </nav>
+  )
 
   return (
     <div className="settings-page">
@@ -2166,14 +2182,14 @@ export default function SettingsModal({ active: _active, balancerEnabled, onActi
         {/* No destroyOnHidden: a visited pane stays mounted, so switching tabs keeps
             both the edits and the save handle of the page left behind. Panes are still
             created lazily, so only the tab in view has loaded its config. */}
+        {/* Tabs is kept purely for its pane lifecycle -- the custom bar above
+            replaces its strip.  Same renderTabBar escape hatch the app shell
+            uses for its own hidden strip. */}
         <Tabs
-          tabPosition="left"
           items={items}
           activeKey={activeTab}
-          onChange={(key) => {
-            setActiveTab(key)
-            refreshDirty()
-          }}
+          onChange={selectTab}
+          renderTabBar={() => navBar}
           className="settings-page__tabs"
           style={{ minHeight: 440 }}
         />

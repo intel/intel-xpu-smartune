@@ -94,7 +94,7 @@ All endpoints return a standardized JSON structure:
 | App | `/app/resource_limit_profile` | POST | Get limit profile | Defaults + bounds for UI |
 | App | `/app/resource_restore` | POST | Restore resources | Remove limits by app_id |
 | App | `/app/limit_snapshot` | POST | Live limit snapshot | Ownership + effective caps + pids |
-| App | `/app/interrupted_limit_status` | POST | Probe kernel caps by cgroup | Recovers an interrupted lifecycle |
+| App | `/app/interrupted_limit_status` | POST | Probe kernel caps by cgroup | Recovers interrupted lifecycles; one or many |
 | App | `/app/auto_limited_apps` | POST | List pressure-driven limits | Rows + live pressure levels |
 | App | `/app/auto_limit_restore` | POST | Release one auto limit | Also excludes the app |
 | App | `/app/lock_to_manual` | POST | Hand an auto limit to the user | No cgroup release; ownership flip only |
@@ -1114,20 +1114,33 @@ Or query by name:
 
 **Purpose:** Probe the kernel directly for the cgroups of an interrupted control lifecycle. Used when the registry entry was lost (service restart) but the cgroup caps may still be in place, so the UI can tell whether there is anything left to restore.
 
+Accepts one lifecycle (`cgroups`) or several at once (`groups`). Prefer `groups` when checking a list: a page showing N interrupted lifecycles otherwise costs N round-trips on every load and every refresh, for what is a handful of cgroupfs reads.
+
 **Request:**
 
 | Type | Parameter | Required | Format | Description |
 |------|-----------|----------|--------|-------------|
-| Body | cgroups | No | string[] | Cgroup basenames to inspect; empty or missing returns `{available: true, resources: []}` |
+| Body | cgroups | No | string[] | Cgroup basenames of a single lifecycle; empty or missing returns `{available: true, resources: []}` |
+| Body | groups | No | string[][] | One cgroup list per lifecycle. Takes precedence over `cgroups` and switches the response to the batch shape. An empty inner list yields `{available: true, resources: []}` for that entry |
 
-**Request Example:**
+**Request Example (single):**
 ```json
 {
   "cgroups": ["app-com.example.app.scope"]
 }
 ```
 
-**Response:**
+**Request Example (batch):**
+```json
+{
+  "groups": [
+    ["app-com.example.app.scope"],
+    ["app-com.example.other.scope", "app-com.example.other-2.scope"]
+  ]
+}
+```
+
+**Response (single):**
 ```json
 {
   "retcode": 0,
@@ -1139,12 +1152,27 @@ Or query by name:
 }
 ```
 
+**Response (batch):**
+```json
+{
+  "retcode": 0,
+  "retmsg": "success",
+  "data": {
+    "results": [
+      { "available": true, "resources": ["cpu", "memory"] },
+      { "available": true, "resources": [] }
+    ]
+  }
+}
+```
+
 **Response Fields:**
 
 | Field | Type | Description |
 |-------|------|-------------|
 | available | bool | `false` when a cgroup's control files could not be read at all — treat as "unknown", not as "no limit" |
 | resources | string[] | Union across the given cgroups of `cpu` / `memory` / `disk_io`, i.e. which controllers currently hold a non-`max` value |
+| results | object[] | Batch form only: one `{available, resources}` per entry of `groups`, in the same order |
 
 **Notes:**
 - Reads `cpu.max`, `memory.high` and `io.max` from cgroupfs rather than asking systemd. `systemctl show` keeps reporting whatever systemd last set even after a direct write replaced it, so drift would be invisible exactly where it matters.

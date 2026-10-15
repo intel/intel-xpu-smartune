@@ -11,7 +11,7 @@ import {
   Space,
   Badge,
   Button,
-  Drawer,
+  Modal,
   Tooltip as AntTooltip,
 } from 'antd'
 import {
@@ -35,6 +35,7 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
+  Customized,
 } from 'recharts'
 import { COLORS, getGpuChartColors, getPressureColor, getPressureLabel } from '../styles/theme'
 import { api, getLatestServerTime } from '../api/client'
@@ -68,7 +69,8 @@ const QUIET_PROBE_INTERVAL_MS = 30000
 // endpoints, so they refresh on their own relaxed beat.
 const COCKPIT_REFRESH_INTERVAL_MS = 10000
 const COCKPIT_DIAG_WINDOW_SEC = 3600
-const HOME_TOP_APP_COUNT = 4
+// Matches the default row count of the Applications tab this card links into.
+const HOME_TOP_APP_COUNT = 3
 const HOME_APP_CANDIDATE_COUNT = 10
 const REFRESH_INTERVAL_OPTIONS = [
   { label: '2s', value: 2000 },
@@ -237,6 +239,34 @@ function formatEffectiveControl(app: AppInfo): string | null {
 const padSeriesLeft = (values: Array<number | null>, length: number): Array<number | null> => {
   if (values.length >= length) return values.slice(-length)
   return [...Array(length - values.length).fill(null), ...values]
+}
+
+// Cut the visible window out of a stored series, anchoring its left edge to the
+// last sample taken *before* the window when the window happens to open on a
+// gap.
+//
+// Slots are a fixed `refreshIntervalMs` wide but samples do not always arrive
+// that fast: while the tab is in the background the poll drops to 10s, so four
+// of every five slots are null. `connectNulls` bridges those gaps invisibly in
+// the middle of the chart -- but it cannot bridge a *leading* one, so whenever
+// the window's first slots were null the whole curve started a chunk of the way
+// in and the left of the chart read as missing data. The sample is real, just
+// older than the window; carrying it in makes the leading edge behave like
+// every interior gap already does.
+//
+// A series that simply has not filled the window yet (fresh page load) is left
+// alone: there is no earlier sample to anchor to and the blank is honest.
+const windowSeries = (values: Array<number | null>, length: number): Array<number | null> => {
+  if (values.length <= length) return padSeriesLeft(values, length)
+  const slice = values.slice(-length)
+  if (isNumber(slice[0])) return slice
+  for (let index = values.length - length - 1; index >= 0; index -= 1) {
+    if (isNumber(values[index])) {
+      slice[0] = values[index]
+      break
+    }
+  }
+  return slice
 }
 
 // Re-bucket a slot-indexed trend series from one slot width to another, keeping
@@ -2063,6 +2093,97 @@ function ActiveControlsCard({ summary, onOpen }: { summary: ControlCockpitSummar
   )
 }
 
+// Width reserved to the right of the plot for the end-of-line series labels.
+const TREND_LABEL_GUTTER = 58
+// Minimum vertical distance between two labels before they are pushed apart.
+const TREND_LABEL_MIN_GAP = 13
+
+/**
+ * Names every curve at its right-hand end, with overlap resolved across series.
+ *
+ * A per-`Line` `LabelList` cannot do this: each one only knows its own point, so
+ * two series sitting at the same utilization stack their text on top of each
+ * other -- which is the whole problem this solves. `Customized` hands the chart's
+ * axis scales and plot offset to one component, so all the end points can be
+ * laid out together: sorted by height, then separated by a fixed minimum gap and
+ * clamped back inside the plot area.
+ */
+function TrendEndLabels(props: {
+  // Deliberately not named `series` / `data`: Customized clones this element
+  // with the chart's own props and state spread over it, so any name recharts
+  // already uses would be silently overwritten.
+  trendSeries?: Array<{ key: string; label: string; color: string }>
+  trendData?: Array<Record<string, number | null>>
+  // Injected by recharts' Customized: the y scale keyed by axis id, and the
+  // plot rectangle inside the chart's margins.
+  yAxisMap?: Record<string, { scale?: (value: number) => number }>
+  offset?: { top?: number; left?: number; width?: number; height?: number }
+}) {
+  const { trendSeries: series = [], trendData: data = [], yAxisMap, offset } = props
+  const scale = yAxisMap?.['0']?.scale
+  if (!scale || !offset || typeof offset.top !== 'number' || typeof offset.height !== 'number') return null
+
+  const plotTop = offset.top
+  const plotBottom = offset.top + offset.height
+  const plotRight = (offset.left ?? 0) + (offset.width ?? 0)
+
+  // The newest sample of each series; a series with nothing in the window is
+  // simply not labelled rather than being pinned to zero.
+  const anchors = series
+    .map((item) => {
+      for (let index = data.length - 1; index >= 0; index -= 1) {
+        const value = data[index]?.[item.key]
+        if (isNumber(value)) return { ...item, y: scale(value) }
+      }
+      return null
+    })
+    .filter((item): item is { key: string; label: string; color: string; y: number } => (
+      item !== null && Number.isFinite(item.y)
+    ))
+
+  if (!anchors.length) return null
+
+  // De-overlap: walk top-down pushing collisions apart, then bottom-up to pull
+  // back anything that was pushed past the bottom edge.
+  const laidOut = [...anchors].sort((left, right) => left.y - right.y)
+  const positions = laidOut.map((item) => item.y)
+  for (let index = 1; index < positions.length; index += 1) {
+    const minimum = positions[index - 1] + TREND_LABEL_MIN_GAP
+    if (positions[index] < minimum) positions[index] = minimum
+  }
+  const lowest = plotBottom - TREND_LABEL_MIN_GAP / 2
+  if (positions.length && positions[positions.length - 1] > lowest) {
+    positions[positions.length - 1] = lowest
+    for (let index = positions.length - 2; index >= 0; index -= 1) {
+      const maximum = positions[index + 1] - TREND_LABEL_MIN_GAP
+      if (positions[index] > maximum) positions[index] = maximum
+    }
+  }
+
+  return (
+    <g className="perf-trend-end-labels" pointerEvents="none">
+      {laidOut.map((item, index) => {
+        const labelY = Math.max(plotTop + 5, Math.min(plotBottom, positions[index]))
+        return (
+          <g key={item.key}>
+            {/* Connector from the curve's end to its displaced label. */}
+            <polyline
+              points={`${plotRight},${item.y} ${plotRight + 6},${labelY} ${plotRight + 10},${labelY}`}
+              fill="none"
+              stroke={item.color}
+              strokeOpacity={0.6}
+              strokeWidth={1}
+            />
+            <text x={plotRight + 13} y={labelY + 3.5} fill={item.color} fontSize={10} fontWeight={600}>
+              {item.label}
+            </text>
+          </g>
+        )
+      })}
+    </g>
+  )
+}
+
 function SystemHealthTrend({
   data,
   trendWindow,
@@ -2076,6 +2197,7 @@ function SystemHealthTrend({
 }) {
   const [hiddenSeries, setHiddenSeries] = useState<Set<string>>(() => new Set())
   const xTicks = data.length > 1 ? [0, data.length - 1] : [0]
+  const visibleSeries = series.filter((item) => !hiddenSeries.has(item.key))
   const toggleSeries = (key: string) => {
     setHiddenSeries((current) => {
       const next = new Set(current)
@@ -2117,7 +2239,8 @@ function SystemHealthTrend({
       </div>
       <div className="perf-system-health-chart">
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={data} margin={{ top: 4, right: 8, bottom: 8, left: 8 }}>
+          {/* The right margin is the gutter TrendEndLabels draws its names into. */}
+          <LineChart data={data} margin={{ top: 4, right: TREND_LABEL_GUTTER, bottom: 8, left: 8 }}>
             <CartesianGrid vertical={false} stroke={`${COLORS.border}88`} strokeDasharray="3 3" />
             <YAxis
               domain={[0, 100]}
@@ -2141,9 +2264,11 @@ function SystemHealthTrend({
               labelFormatter={(value) => Number(value) === data.length - 1 ? 'Now' : `${trendWindow} ago`}
               formatter={(value: number, name: string) => [`${value.toFixed(1)}%`, name]}
             />
-            {series.map((item) => !hiddenSeries.has(item.key) && (
+            {visibleSeries.map((item) => (
               <Line key={item.key} type="monotone" dataKey={item.key} name={item.label} stroke={item.color} strokeWidth={2} dot={false} connectNulls />
             ))}
+            {/* Last, so the labels paint above the lines. */}
+            <Customized component={TrendEndLabels} trendSeries={visibleSeries} trendData={data} />
           </LineChart>
         </ResponsiveContainer>
       </div>
@@ -3730,7 +3855,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
       // until data fills in from the right, rather than stretching whatever
       // points exist across the full chart width.
       const values = trends[key] || []
-      return padSeriesLeft(values, trendPoints)
+      return windowSeries(values, trendPoints)
     },
     [trends, trendPoints],
   )
@@ -4192,20 +4317,29 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
       <div className="perf-header perf-header--sticky">
         <div className="perf-header-title">
           <Text className="perf-section-eyebrow">System Health</Text>
-          <AntTooltip title="Open system information">
-            <button
-              type="button"
-              className="perf-host-context"
-              aria-label={`Open About. Host ${hostContext.host}, OS ${hostContext.os}, kernel ${hostContext.kernel}, uptime ${hostContext.uptime}`}
-              onClick={() => onNavigate?.('about')}
-            >
-              <span className="perf-host-context-item"><b>Host</b>{hostContext.host}</span>
+          {/* Only the host opens About; the rest is read-only context. Making
+              every chip a link meant OS / kernel / uptime all navigated away. */}
+          <div className="perf-host-context">
+            <AntTooltip title="Open system information">
+              <button
+                type="button"
+                className="perf-host-context-link"
+                aria-label={`Open About for host ${hostContext.host}`}
+                onClick={() => onNavigate?.('about')}
+              >
+                <b>Host</b>
+                <span>{hostContext.host}</span>
+                <InfoCircleOutlined className="perf-host-context-icon" aria-hidden="true" />
+              </button>
+            </AntTooltip>
+            <span className="perf-host-context-facts">
               <span className="perf-host-context-item"><b>OS</b>{hostContext.os}</span>
+              <span className="perf-host-context-sep" aria-hidden="true">-</span>
               <span className="perf-host-context-item"><b>Kernel</b>{hostContext.kernel}</span>
+              <span className="perf-host-context-sep" aria-hidden="true">-</span>
               <span className="perf-host-context-item"><b>Uptime</b>{hostContext.uptime}</span>
-              <InfoCircleOutlined className="perf-host-context-icon" aria-hidden="true" />
-            </button>
-          </AntTooltip>
+            </span>
+          </div>
         </div>
         <div className="perf-header-controls">
             <Space size={6}>
@@ -4588,15 +4722,19 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
       )}
 
       {/* Device drill-down: the deep per-device telemetry opens here on demand
-          instead of always occupying the page (design doc §7). */}
-      <Drawer
+          instead of always occupying the page (design doc §7).  A centred modal
+          rather than a side drawer -- the per-core and per-engine grids need
+          most of the window's width to be readable.  The drawer class is kept so
+          the existing light-theme rules for this content still apply. */}
+      <Modal
         open={deviceDetail !== null}
-        onClose={() => setDeviceDetail(null)}
-        width="min(720px, 100vw)"
-        placement="right"
+        onCancel={() => setDeviceDetail(null)}
+        width="min(1240px, 80vw)"
+        centered
+        footer={null}
         destroyOnClose
-        rootClassName="perf-device-drawer"
-        styles={{ body: { padding: 16 } }}
+        rootClassName="perf-device-drawer perf-device-modal"
+        styles={{ body: { padding: 16, maxHeight: '76vh', overflowY: 'auto' } }}
         title={deviceDetail?.kind === 'gpu'
           ? `${selectedGpuDevice?.displayLabel || 'GPU'} - device detail`
           : deviceDetail?.kind === 'disk'
@@ -4771,7 +4909,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
             sparkMode={sparkMode}
           />
         )}
-      </Drawer>
+      </Modal>
     </div>
   )
 }

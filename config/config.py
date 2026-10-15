@@ -3,6 +3,8 @@
 
 import os
 import re
+import stat
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -168,8 +170,30 @@ class Config:
             changed = self._replace_yaml_scalar_line(lines, yaml_path, value) or changed
 
         if changed:
-            with open(target, "w", encoding="utf-8") as f:
-                f.writelines(lines)
+            directory = os.path.dirname(os.path.abspath(target))
+            original_stat = os.stat(target)
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=directory,
+                    prefix=".smartune-config-", delete=False,
+                ) as f:
+                    temp_path = f.name
+                    os.fchown(f.fileno(), original_stat.st_uid, original_stat.st_gid)
+                    os.fchmod(f.fileno(), stat.S_IMODE(original_stat.st_mode))
+                    f.writelines(lines)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, target)
+                temp_path = None
+                dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            finally:
+                if temp_path is not None:
+                    os.unlink(temp_path)
         return changed
 
     def update_limit_policy_for_priority(self, priority: str, limit_overrides: Optional[dict[str, Any]]) -> bool:

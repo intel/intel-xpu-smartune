@@ -14,6 +14,7 @@ EVENT_CATALOG = (
     ("LOG_EXCEPTION", "Service exception", "SmarTune emitted an exception or traceback.", "platform", True),
     ("PLATFORM_SERVICE_STARTED", "Service started", "SmarTune service start was recorded.", "platform", False),
     ("PLATFORM_SERVICE_STOPPED", "Service stopped", "SmarTune service shutdown completed.", "platform", False),
+    ("AUTH_ACCESS_DENIED", "API access denied", "An unauthenticated API request was rejected.", "platform", False),
     ("CONTROL_CPU_LIMIT_APPLIED", "CPU limit applied", "SmarTune applied a CPU limit to a workload.", "platform", False),
     ("CONTROL_CPU_LIMIT_RECOVERED", "CPU limit recovered", "SmarTune restored a workload's CPU limit.", "platform", False),
     ("CONTROL_CPU_LIMIT_FAILED", "CPU limit failed", "SmarTune could not apply or restore a workload's CPU limit.", "platform", False),

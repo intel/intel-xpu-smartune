@@ -37,25 +37,34 @@ KEY_DIR="$SCRIPT_DIR/key"
 CERT_FILE="$KEY_DIR/b_server.crt"
 KEY_FILE="$KEY_DIR/b_server.key"
 
-mkdir -p "$KEY_DIR"
+# The directory must not be writable by a non-root user: otherwise a key can
+# be replaced after its ownership and mode have been checked.
+sudo install -d -o root -g root -m 755 "$KEY_DIR"
+if [ -L "$CERT_FILE" ] || [ -L "$KEY_FILE" ]; then
+    echo "Refusing symlinked TLS certificate or private key." >&2
+    exit 1
+fi
 if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
     echo "Certificate and key already exist. Skipping generation."
 else
     echo "Generating certificate..."
-    openssl req -x509 -newkey rsa:4096 \
+    sudo openssl req -x509 -newkey rsa:4096 \
         -keyout "$KEY_FILE" -out "$CERT_FILE" \
         -days 365 -nodes -subj "/CN=localhost" \
         -addext "subjectAltName=IP:127.0.0.1"
 
-    if [ $? -eq 0 ]; then
-        echo "Certificate generated successfully"
-        chmod 644 "$CERT_FILE"
-        chmod 600 "$KEY_FILE"
-    else
+    if [ $? -ne 0 ]; then
         echo "Certificate generation failed" >&2
         exit 1
     fi
+    echo "Certificate generated successfully"
 fi
+
+# Ensure existing and newly generated TLS files have the expected ownership
+# and permissions before starting the service.
+sudo chown root:root "$CERT_FILE" "$KEY_FILE"
+sudo chmod 644 "$CERT_FILE"
+sudo chmod 600 "$KEY_FILE"
 
 PYTHON_BIN="$(command -v python3)"
 

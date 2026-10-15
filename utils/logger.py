@@ -248,6 +248,21 @@ def prune_old_logs(log_dir, prefix=LOG_PREFIX, keep=LOG_RETENTION):
 # --- base logger configuration --------------------------------------------
 
 
+class _NoFollowFileHandler(logging.FileHandler):
+    """A FileHandler that refuses to follow a symlink planted at the log path.
+
+    Plain ``logging.FileHandler`` opens via builtin ``open()``, which follows
+    symlinks -- a pre-placed link at the timestamped log path would redirect
+    every log write to an attacker-chosen target. ``O_NOFOLLOW`` makes that
+    raise ``OSError`` instead, which the caller's existing ``except OSError``
+    already treats as "log dir unwritable" and degrades to console-only."""
+
+    def _open(self):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+        fd = os.open(self.baseFilename, flags, 0o600)
+        return os.fdopen(fd, self.mode, encoding=self.encoding)
+
+
 class Logger:
     """Configures the shared base logger. Kept as a class for backward
     compatibility with ``Logger(...).get_logger()`` callers. The file handler is
@@ -281,7 +296,7 @@ class Logger:
         if log_file:
             try:
                 os.makedirs(os.path.dirname(log_file), exist_ok=True)
-                file_handler = logging.FileHandler(log_file)
+                file_handler = _NoFollowFileHandler(log_file)
                 file_handler.setFormatter(file_formatter)
                 file_handler.stream.reconfigure(encoding="utf-8")
                 self.logger.addHandler(file_handler)

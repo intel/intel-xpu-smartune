@@ -10,10 +10,13 @@ import hashlib
 import hmac
 import os
 import secrets
+import threading
+import time
 
 from flask import Blueprint, request
 
 from features import DASHBOARD_ENDPOINT
+from diagnostics import emit_event
 from utils.http_utils import RetCode, construct_response
 from utils.logger import get_logger
 logger = get_logger(__name__)
@@ -81,7 +84,10 @@ def _provision_api_token():
     try:
         os.makedirs(_KEY_DIR, exist_ok=True)
         # Create with 0600 up front so the token is never briefly world-readable.
-        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # O_NOFOLLOW refuses a pre-planted symlink at TOKEN_FILE instead of
+        # following it and truncating whatever it points at; the OSError (ELOOP)
+        # this raises is handled by the except block below.
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(token + "\n")
         logger.info(
@@ -148,6 +154,15 @@ def _enforce_api_token():
     if _token_is_valid(provided):
         return None
 
+    emit_event(
+        "AUTH_ACCESS_DENIED", severity="warning", category="platform.security",
+        impact="refused", summary="Unauthorized API request rejected",
+        attributes={
+            "method": request.method,
+            "path": request.url_rule.rule if request.url_rule else "<unmatched>",
+            "remote_addr": request.remote_addr or "unknown",
+        },
+    )
     response = construct_response(
         data={"authenticated": False},
         retcode=RetCode.UNAUTHORIZED,
@@ -155,6 +170,70 @@ def _enforce_api_token():
     )
     response.status_code = 401
     return response
+
+
+# Track failed login attempts per source IP within a fixed window and apply a
+# temporary lockout when the limit is reached.
+
+_LOGIN_FAILURE_WINDOW_SEC = 60.0
+_LOGIN_FAILURE_LIMIT = 20
+_LOGIN_LOCKOUT_SEC = 30.0
+
+_login_failures_lock = threading.Lock()
+_login_failures = {}  # remote_addr -> [failure_epoch, ...] within the window
+_login_lockout_until = {}  # remote_addr -> epoch when the lockout lifts
+
+
+def _login_rate_limited(remote_addr):
+    """True (and left locked) if *remote_addr* is currently past the failure
+    threshold. Also opportunistically prunes stale entries for this key."""
+    now = time.time()
+    with _login_failures_lock:
+        until = _login_lockout_until.get(remote_addr)
+        if until is not None:
+            if now < until:
+                return True
+            del _login_lockout_until[remote_addr]
+        timestamps = _login_failures.get(remote_addr)
+        if timestamps:
+            fresh = [t for t in timestamps if now - t < _LOGIN_FAILURE_WINDOW_SEC]
+            if fresh:
+                _login_failures[remote_addr] = fresh
+            else:
+                _login_failures.pop(remote_addr, None)
+    return False
+
+
+def _record_login_failure(remote_addr):
+    """Record one failed attempt; lock the key out once it crosses the limit
+    within the window. Never stores the attempted token value."""
+    now = time.time()
+    locked_out = False
+    with _login_failures_lock:
+        timestamps = [t for t in _login_failures.get(remote_addr, ()) if now - t < _LOGIN_FAILURE_WINDOW_SEC]
+        timestamps.append(now)
+        if len(timestamps) >= _LOGIN_FAILURE_LIMIT:
+            _login_lockout_until[remote_addr] = now + _LOGIN_LOCKOUT_SEC
+            _login_failures.pop(remote_addr, None)
+            locked_out = True
+        else:
+            _login_failures[remote_addr] = timestamps
+    if locked_out:
+        logger.warning(f"/auth/login rate limit: locking out {remote_addr} for {_LOGIN_LOCKOUT_SEC:.0f}s "
+                        f"after {_LOGIN_FAILURE_LIMIT} invalid attempts in {_LOGIN_FAILURE_WINDOW_SEC:.0f}s")
+        emit_event(
+            "AUTH_LOGIN_RATE_LIMITED", severity="warning", category="platform.security",
+            impact="refused",
+            summary=f"Locked out {remote_addr} from /auth/login after repeated invalid attempts",
+            attributes={"failure_limit": _LOGIN_FAILURE_LIMIT, "window_sec": _LOGIN_FAILURE_WINDOW_SEC,
+                        "lockout_sec": _LOGIN_LOCKOUT_SEC},
+        )
+
+
+def _clear_login_failures(remote_addr):
+    with _login_failures_lock:
+        _login_failures.pop(remote_addr, None)
+        _login_lockout_until.pop(remote_addr, None)
 
 
 @auth_bp.route('/auth/login', methods=['POST'])
@@ -166,6 +245,16 @@ def login():
     endpoints still require the token to be presented on every request.
     """
     try:
+        remote_addr = request.remote_addr or "unknown"
+        if _login_rate_limited(remote_addr):
+            response = construct_response(
+                data={"authenticated": False},
+                retcode=RetCode.TOO_MANY_REQUESTS,
+                retmsg="Too many invalid login attempts; try again later.",
+            )
+            response.status_code = 429
+            return response
+
         data = request.get_json(silent=True) or {}
         token = data.get('pwd')
         if not token:
@@ -175,10 +264,12 @@ def login():
                 retmsg="Token is required",
             )
         if _token_is_valid(token):
+            _clear_login_failures(remote_addr)
             return construct_response(
                 data={"authenticated": True},
                 retmsg="Authentication successful",
             )
+        _record_login_failure(remote_addr)
         return construct_response(
             data={"authenticated": False},
             retcode=RetCode.UNAUTHORIZED,

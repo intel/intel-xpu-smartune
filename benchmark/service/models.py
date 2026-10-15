@@ -176,7 +176,7 @@ def _announce() -> None:
 def _cache_age_days() -> Optional[float]:
     """Age of the cached list in days, or None if there is no usable cache."""
     payload = _read_cache()
-    if payload is None:
+    if payload is None or not isinstance(payload.get("models"), list) or not payload["models"]:
         return None
     stamp = payload.get("updated_at")
     if not stamp:

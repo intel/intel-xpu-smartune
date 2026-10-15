@@ -1,8 +1,19 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-from flask import jsonify, make_response
+from flask import jsonify, make_response, request
 from enum import Enum, IntEnum
+from werkzeug.serving import WSGIRequestHandler
+
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
+
+
+class QuietWSGIRequestHandler(WSGIRequestHandler):
+    """Use a product-only Server header for Werkzeug responses."""
+
+    def version_string(self):
+        return "SmarTune"
+
 
 class CustomEnum(Enum):
     @classmethod
@@ -35,6 +46,7 @@ class RetCode(IntEnum, CustomEnum):
     UNAUTHORIZED = 401
     NOT_EXISTING = 404
     CONFLICT = 409
+    TOO_MANY_REQUESTS = 429
     SERVER_ERROR = 500
 
 def get_json_result(retcode=RetCode.SUCCESS, retmsg='success',
@@ -71,3 +83,28 @@ def construct_response(retcode=RetCode.SUCCESS,
     response.headers["Access-Control-Allow-Headers"] = "*"
     response.headers["Access-Control-Expose-Headers"] = "Authorization"
     return response
+
+
+def apply_request_limits(app, max_bytes=MAX_REQUEST_BYTES):
+    """Bound request-body size app-wide and return a generic JSON 413."""
+    app.config["MAX_CONTENT_LENGTH"] = max_bytes
+
+    def _too_large_response():
+        return make_response(
+            get_json_result(
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="Request body exceeds the maximum allowed size.",
+            ),
+            413,
+        )
+
+    @app.before_request
+    def _reject_oversized_body():
+        length = request.content_length
+        if length is not None and length > max_bytes:
+            return _too_large_response()
+        return None
+
+    @app.errorhandler(413)
+    def _payload_too_large(_err):
+        return _too_large_response()

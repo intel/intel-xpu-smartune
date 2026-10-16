@@ -91,13 +91,6 @@ PRECISION_TOKENS = {
 # the two lists below do not match character for character on purpose.
 EXPAND_FIELDS = ["baseModels", "pipeline_tag", "downloads", "likes", "lastModified"]
 
-# What stage 1 must have to be useful at all. If the CLI rejects the full field
-# set above (an older `hf` that does not know one of them), the listing is retried
-# with just this -- degrading to the metadata-free behaviour rather than to an
-# empty model list.
-EXPAND_MINIMAL = ["baseModels"]
-
-
 def find_hf():
     """Locate the `hf` CLI: explicit override, then the benchmark venv, then PATH.
 
@@ -630,13 +623,15 @@ def main():
     seen = set()
     for author in authors:
         got = run_ls(hf, env, author=author, expand=EXPAND_FIELDS)
-        if got is None:
-            # Most likely an `hf` that does not know one of the expanded fields.
-            # Losing the metadata costs a nicer detail pane; losing the listing
-            # costs the whole feature, so drop back to the fields we must have.
-            print(f"author={author}: retrying without the optional expand fields",
+        if got is None and hf:
+            print(f"author={author}: retrying CLI listing without expanded metadata",
                   file=sys.stderr)
-            got = run_ls(hf, env, author=author, expand=EXPAND_MINIMAL) or []
+            got = run_ls(hf, env, author=author)
+        if got is None:
+            print(f"ERROR: could not list models for {author}; see the preceding "
+                  "warning. Keeping the previous cache.",
+                  file=sys.stderr)
+            return 1
         print(f"author={author}: {len(got)} models", file=sys.stderr)
         for r in got:
             mid = r.get("id")
@@ -644,6 +639,10 @@ def main():
                 seen.add(mid)
                 rows.append(r)
     # Keep download-desc order for the dropdown; --sort already did this per author.
+    if not rows:
+        print("ERROR: the Hub returned no models; keeping the previous cache.",
+              file=sys.stderr)
+        return 1
 
     # ---- stage 2: derive source models ----
     ov_models = []          # [{id, source, method, precision, ...meta}]
@@ -667,12 +666,6 @@ def main():
                 if src:
                     index[ov_id]["source"] = src
                     index[ov_id]["method"] = "search"
-
-    write_json(OV_CACHE_FILE, {
-        "updated_at": now, "authors": authors,
-        "count": len(ov_models), "models": ov_models,
-    })
-    print(f"wrote {len(ov_models)} OpenVINO repos -> {OV_CACHE_FILE}", file=sys.stderr)
 
     # ---- source-model list for the UI (deduped, first-seen order = popularity) ----
     # One entry per source model, folding in every OpenVINO repo that maps to it.
@@ -704,6 +697,17 @@ def main():
         entry["likes"] = max(entry["likes"], m.get("likes") or 0)
         if entry["task"] is None:
             entry["task"] = m.get("task")
+
+    if not sources:
+        print("ERROR: no source models could be resolved; keeping the previous cache.",
+              file=sys.stderr)
+        return 1
+
+    write_json(OV_CACHE_FILE, {
+        "updated_at": now, "authors": authors,
+        "count": len(ov_models), "models": ov_models,
+    })
+    print(f"wrote {len(ov_models)} OpenVINO repos -> {OV_CACHE_FILE}", file=sys.stderr)
 
     # ---- memory footprint: weights, kv-cache/token, logits, per-variant size --
     if not args.no_memory and sources:

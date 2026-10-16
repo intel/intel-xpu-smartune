@@ -37,7 +37,7 @@ except ModuleNotFoundError as exc:
         return None
 from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, fetch_unregistered_apps, get_priority_value, get_app_processes_for_app, get_cgroup_path_by_pid, reconcile_controlled_apps, restore_config_entry, serialize_config_meta
 from utils import quiet_mode
-from utils.http_utils import RetCode, construct_response
+from utils.http_utils import RetCode, construct_response, apply_request_limits, QuietWSGIRequestHandler
 from utils.logger import get_logger
 logger = get_logger(__name__)
 try:
@@ -47,6 +47,7 @@ except Exception:  # pragma: no cover
         return None
 
 app = Flask(__name__)
+apply_request_limits(app)
 app.register_blueprint(monitor_bp)
 app.register_blueprint(smartune_bp)
 app.register_blueprint(auth_bp)
@@ -530,6 +531,13 @@ def set_priority():
                 retcode=RetCode.NOT_EXISTING,
                 retmsg="Application record not found in database"
             )
+        if result != DBStatus.SUCCESS:
+            logger.error("Failed to persist priority for app_id=%s: %s", app_id, result)
+            return construct_response(
+                data={},
+                retcode=RetCode.EXCEPTION_ERROR,
+                retmsg="Failed to update application priority in database"
+            )
 
         _service.rebuild_controlled_map()
         app_record = AIAppPriority.query().where(AIAppPriority.app_id == app_id).get()
@@ -580,6 +588,13 @@ def set_network_priority():
                 data={},
                 retcode=RetCode.NOT_EXISTING,
                 retmsg="Application record not found in database"
+            )
+        if result != DBStatus.SUCCESS:
+            logger.error("Failed to persist network priority for app_id=%s: %s", app_id, result)
+            return construct_response(
+                data={},
+                retcode=RetCode.EXCEPTION_ERROR,
+                retmsg="Failed to update application network priority in database"
             )
 
         return construct_response(
@@ -1467,6 +1482,17 @@ def set_oom_score():
             )
 
         app_info = AIAppPriority.query().filter(AIAppPriority.app_id == app_id).first()
+        if app_info is None:
+            emit_event(
+                "APP_OOM_SCORE_REFUSED", severity="warning", category="platform.control",
+                app_id=app_id, impact="refused",
+                summary="Refused /app/set_oom_score for an unregistered app_id",
+            )
+            return construct_response(
+                data={},
+                retcode=RetCode.NOT_EXISTING,
+                retmsg="Unknown app_id; register the application before setting its OOM priority."
+            )
 
         logger.debug(f"set_oom_score: app_info: {app_info}")
         adjust_oom_priority(app_id, app_info.name, app_info.priority, app_info.cmdline)
@@ -1607,6 +1633,22 @@ def app_resource_limit():
                 retcode=RetCode.ARGUMENT_ERROR,
                 retmsg="app_id, app_name and priority must be provided"
             )
+
+        # Use the registered app identity when locating processes to limit.
+        app_record = AIAppPriority.query().filter(AIAppPriority.app_id == app_id).first()
+        if not app_record or not app_record.controlled:
+            emit_event(
+                "APP_RESOURCE_LIMIT_REFUSED", severity="warning", category="platform.control",
+                app_id=app_id, impact="refused",
+                summary="Refused /app/resource_limit for an unregistered/non-controlled app_id",
+                attributes={"requested_app_name": app_name, "requested_priority": priority},
+            )
+            return construct_response(
+                data={},
+                retcode=RetCode.NOT_EXISTING,
+                retmsg="Unknown or non-controlled app_id; register and enable control before applying a resource limit."
+            )
+        app_name = app_record.name
 
         result = _service.resource_limit(
             app_id, app_name, priority,
@@ -2062,7 +2104,8 @@ def main():
         # the dashboard's continuous /monitor polling. Concurrent handling keeps the
         # UI responsive when the Diagnostics page fires its request batch.
         app.run(host=host, port=port, debug=False, use_reloader=False,
-                threaded=True, ssl_context=ssl_context)
+                threaded=True, ssl_context=ssl_context,
+                request_handler=QuietWSGIRequestHandler)
     except KeyboardInterrupt:
         pass
     except Exception as exc:

@@ -12,6 +12,7 @@ from flask import Blueprint, request
 
 import psutil
 
+from diagnostics.sanitize import scrub_text
 from db.DatabaseModel import MonitorSnapshot
 from monitor import ResourceMonitor, PSIMonitor, PressureAnalyzer
 from monitor.system_info import (
@@ -987,7 +988,7 @@ def get_processes():
                     'status': info.get('status') or '',
                     'create_time': info.get('create_time'),
                     'cgroup': get_cgroup_path_by_pid(info['pid']) or '',
-                    'cmdline': cmdline,
+                    'cmdline': scrub_text(cmdline),
                     'is_self': is_self,
                     'balancer_candidate': balancer_candidate,
                 })
@@ -1054,7 +1055,7 @@ def get_process_detail():
                 'num_fds': _safe(p.num_fds),
                 'nice': _safe(p.nice),
                 'create_time': _safe(p.create_time),
-                'cmdline': ' '.join(cmdline_parts),
+                'cmdline': scrub_text(' '.join(cmdline_parts)),
             }
         return construct_response(data=detail, retmsg="Successfully retrieved process detail")
     except psutil.NoSuchProcess:

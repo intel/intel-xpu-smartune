@@ -44,8 +44,10 @@ except Exception:  # pragma: no cover
     def emit_event(*_a, **_k):
         return None
 from utils.ui_lease import get_ui_lease_manager
+from utils.http_utils import apply_request_limits, QuietWSGIRequestHandler
 
 app = Flask(__name__)
+apply_request_limits(app)
 app.register_blueprint(monitor_bp)
 # Report capabilities for the monitor-only service.
 app.register_blueprint(smartune_bp)
@@ -179,7 +181,8 @@ def main():
         # blocking /diag/* query would stall the dashboard's continuous /monitor
         # polling. See balance_service.py for the same rationale.
         app.run(host=host, port=port, debug=False, use_reloader=False,
-                threaded=True, ssl_context=ssl_context)
+                threaded=True, ssl_context=ssl_context,
+                request_handler=QuietWSGIRequestHandler)
     except (KeyboardInterrupt, SystemExit):
         pass
     except Exception as exc:

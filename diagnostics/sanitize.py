@@ -37,6 +37,9 @@ _COOKIE_HEADER_RE = re.compile(r"(?i)(cookie\s*:\s*)([^\n,;]+)")
 _HF_RE = re.compile(r"(?i)\bhf_[A-Za-z0-9]{8,}\b")
 _BEARER_RE = re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._\-]+)")
 
+# Redact URL userinfo while preserving the scheme and host for diagnostics.
+_URL_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^/\s:@]+:[^/\s@]+)@")
+
 # Keys whose value should be dropped wholesale when scrubbing a dict.
 _SECRET_KEY_RE = re.compile(_KV_KEYS + r"$", re.IGNORECASE)
 
@@ -47,6 +50,7 @@ def scrub_text(text):
         return text
     out = _AUTH_HEADER_RE.sub(lambda m: f"{m.group(1)}{_REDACTED}", text)
     out = _COOKIE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_REDACTED}", out)
+    out = _URL_CRED_RE.sub(lambda m: f"{m.group(1)}{_REDACTED}@", out)
     out = _KV_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_REDACTED}", out)
     out = _FLAG_RE.sub(lambda m: f"{m.group(1)}{_REDACTED}", out)
     out = _BEARER_RE.sub(lambda m: f"{m.group(1)}{_REDACTED}", out)

@@ -400,16 +400,17 @@ export default function BenchCompare({ matrix, onOpenCase }: Props) {
   const [view, setView] = useState<View>('job')
   const [chart, setChart] = useState<ChartKind>('bar')
   const dims = matrix?.dimensions
+  const matrixRows = matrix?.rows
   // The last press of Run, until the reader widens it -- and whatever a later
   // run adds. Everything-by-default puts a fresh three-bar comparison in among
   // however many the machine has accumulated; see useDimension.
-  const latest = useMemo(() => latestJobRows(matrix?.rows ?? []), [matrix?.rows])
+  const latest = useMemo(() => latestJobRows(matrixRows ?? []), [matrixRows])
   const [models, setModels] = useDimension(dims?.models, distinctOf(latest, 'model'))
   const [devices, setDevices] = useDimension(dims?.devices, distinctOf(latest, 'device'))
   const [precisions, setPrecisions] = useDimension(dims?.precisions, distinctOf(latest, 'precision'))
   const [metricKeys, setMetricKeys] = useState<string[] | null>(null)
   const metricIndex = useMemo(() => indexMetrics(matrix?.metrics), [matrix?.metrics])
-  const labels = useMemo(() => jobLabels(matrix?.rows ?? []), [matrix?.rows])
+  const labels = useMemo(() => jobLabels(matrixRows ?? []), [matrixRows])
 
   // Jobs, newest first -- the axis the backend deliberately does not sort
   // alphabetically (see results.py). Both job controls read from it.
@@ -474,7 +475,7 @@ export default function BenchCompare({ matrix, onOpenCase }: Props) {
     (view === 'job' ? soloJob === null : jobs.length === 0)
 
   const rows = useMemo(() => {
-    const all = matrix?.rows ?? []
+    const all = matrixRows ?? []
     return all.filter(
       (row) =>
         passesDimension(row.model, models) &&
@@ -484,7 +485,7 @@ export default function BenchCompare({ matrix, onOpenCase }: Props) {
           ? (row.job || row.run) === soloJob
           : passesDimension(row.job || row.run, jobs)),
     )
-  }, [matrix?.rows, models, devices, precisions, jobs, soloJob, view])
+  }, [matrixRows, models, devices, precisions, jobs, soloJob, view])
 
   // One case per test: the best of however many times it was run.
   //

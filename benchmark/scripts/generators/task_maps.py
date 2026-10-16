@@ -140,7 +140,7 @@ def genai_task_specific_opt(task: str, route_params: Dict = None) -> str:
 
     elif task == 'visual_text_gen':
         prompt = route_params.get('prompt', 'Describe this image in detail.')
-        images = route_params.get('images', 'synthetic_448x448.jpg')
+        images = route_params.get('images', 'dog.jpg')
         infer_count = route_params.get('max_new_tokens', 128)
         opts.append(f'-p "{prompt}"')
         opts.append(f'-i "{images}"')

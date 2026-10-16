@@ -42,6 +42,12 @@ echo "Using DIR_ENV_ROOT: ${DIR_ENV_ROOT}"
 
 OPENVINO_GENAI_REPO="https://github.com/openvinotoolkit/openvino.genai.git"
 
+# Sample assets for the llm_bench harness, fetched from OpenVINO's storage.
+SAMPLE_ASSETS=(
+    "https://storage.openvinotoolkit.org/models_contrib/speech/2021.2/librispeech_s5/how_are_you_doing_today.wav test_audio.wav"
+    "https://storage.openvinotoolkit.org/data/test_data/images/dog.jpg dog.jpg"
+)
+
 # Version report paths
 VERSION_REPORT="${DIR_LOGS}/setup_versions.txt"
 VERSION_REPORT_SCRIPT="${DIR_AGENTIC_ROOT}/report_tool_versions.py"
@@ -99,9 +105,19 @@ else
     echo ""
 fi
 
-# Stage sample assets used by the llm_bench harness.
-cp "${DIR_AGENTIC_ROOT}/test_audio.wav" "${DIR_GENAI}/tools/llm_bench/"
-cp "${DIR_AGENTIC_ROOT}/synthetic_448x448.jpg" "${DIR_GENAI}/tools/llm_bench/"
+# Stage sample assets used by the llm_bench harness. An asset already present is
+# kept, so a re-run does not need the network for it.
+for asset in "${SAMPLE_ASSETS[@]}"; do
+    read -r asset_url asset_name <<< "${asset}"
+    asset_path="${DIR_GENAI}/tools/llm_bench/${asset_name}"
+    if [[ -s "${asset_path}" ]]; then
+        echo "✓ Sample asset present: ${asset_name}"
+        continue
+    fi
+    echo "Downloading sample asset: ${asset_url}"
+    curl -fsSL --retry 3 -o "${asset_path}.part" -- "${asset_url}"
+    mv -f -- "${asset_path}.part" "${asset_path}"
+done
 
 # Generate version report if script exists
 if [[ -f "${VERSION_REPORT_SCRIPT}" ]]; then

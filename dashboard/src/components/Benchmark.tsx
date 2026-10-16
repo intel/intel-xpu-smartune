@@ -433,7 +433,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     const model = models.find((m) => m.id === id)
     if (!model) return // list not loaded yet; this effect re-runs when it is
     if (model.memory) return // already enriched (an object is present)
-    void loadMemoryFor([id])
+    loadMemoryFor([id])
   }, [openModelId, models, loadMemoryFor])
 
   // Both result views use one matrix snapshot.
@@ -487,10 +487,10 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   // stay null ("environment not installed") with no way to recover. The REST
   // read is the authoritative fallback; the stream still pushes later changes.
   useEffect(() => {
-    void loadEnv()
-    void loadModels()
-    void loadResults()
-    void loadPreflight()
+    loadEnv()
+    loadModels()
+    loadResults()
+    loadPreflight()
   }, [loadEnv, loadModels, loadResults, loadPreflight])
 
   // Select the newest benchmarked model once both result and model data arrive.
@@ -568,7 +568,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
       }
       // Gap, or an overlap we cannot trim by bytes. Ask for the exact span.
       const target = jobRef.current
-      if (target && target.id === delta.job_id) void catchUp(target)
+      if (target && target.id === delta.job_id) catchUp(target)
     },
     [appendChunk, catchUp],
   )
@@ -614,7 +614,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
               // is also the refresh that clears a block the user has just gone
               // and resolved before running again. Also worth doing after a
               // setup or a download: the balancer moved on meanwhile.
-              void loadPreflight()
+              loadPreflight()
             }
             break
           }
@@ -632,10 +632,10 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
             // also sends this when a job finishes, and a run that has just
             // downloaded weights changes the list whether or not a search
             // happens to be in flight at the same moment.
-            void loadModels()
+            loadModels()
             break
           case 'results':
-            void loadResults()
+            loadResults()
             break
         }
       },
@@ -934,7 +934,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         setRerun({ stage, ids, conflicts, edits })
         return
       }
-      void launchRun(stage, ids, edits)
+      launchRun(stage, ids, edits)
     },
     [launchRun, matrix?.rows, params],
   )
@@ -980,7 +980,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
             setDiskLoading(false)
           }
         })()
-        void loadMemoryFor(unpriced).finally(() => setDiskPricing(false))
+        loadMemoryFor(unpriced).finally(() => setDiskPricing(false))
         return
       }
       // The request the plan is rendered from, and the one the run will send.
@@ -1025,7 +1025,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
       // footprints, so a model never opened in its drawer has none yet; each is
       // a hub round trip, so they are not waited for -- the rows fill in as
       // they arrive, exactly as the download's disk check does it.
-      void loadMemoryFor(ids.filter((id) => !models.find((m) => m.id === id)?.memory))
+      loadMemoryFor(ids.filter((id) => !models.find((m) => m.id === id)?.memory))
       // The plan holds the single execution slot while it runs, which is why
       // the review's Run waits for it: there is nothing to start until it is
       // done either way. A refusal here is the same refusal a run would get --
@@ -1125,7 +1125,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   const keepAndRun = useCallback(() => {
     const pending = rerun
     setRerun(null)
-    if (pending) void launchRun(pending.stage, pending.ids, pending.edits)
+    if (pending) launchRun(pending.stage, pending.ids, pending.edits)
   }, [launchRun, rerun])
 
   const discardAndRun = useCallback(async () => {
@@ -1152,7 +1152,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
       }
       setRerun(null)
       await loadResults()
-      void launchRun(pending.stage, pending.ids, pending.edits)
+      launchRun(pending.stage, pending.ids, pending.edits)
     } catch (e) {
       // The old results are still there, so the run is not started: the user
       // asked for a clean slate and did not get one.
@@ -1193,7 +1193,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         if (!cancelled) message.error(e instanceof Error ? e.message : String(e))
       }
     }
-    void poll()
+    poll()
     const timer = window.setInterval(poll, 1200)
     return () => {
       cancelled = true
@@ -1210,7 +1210,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     // The plan holds the single execution slot until it finishes. Backing out
     // before then cancels it so the slot frees at once; a plan that has already
     // ended just 404s here, which is harmless.
-    if (jobId) void api.cancelBenchRun(jobId).catch(() => {})
+    if (jobId) api.cancelBenchRun(jobId).catch(() => {})
   }, [runReview])
 
   const cancelJob = useCallback(async () => {

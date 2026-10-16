@@ -62,11 +62,11 @@ export function useMonitoredSections(
   // Initial load + refetch whenever the tab regains focus / visibility.
   useEffect(() => {
     if (!active) return
-    void refresh()
+    refresh()
 
-    const onFocus = () => { void refresh() }
+    const onFocus = () => { refresh() }
     const onVisibility = () => {
-      if (document.visibilityState === 'visible') void refresh()
+      if (document.visibilityState === 'visible') refresh()
     }
     window.addEventListener('focus', onFocus)
     document.addEventListener('visibilitychange', onVisibility)
@@ -84,7 +84,7 @@ export function useMonitoredSections(
     if (!active) return
     if (!sourceUpdatedAt || !Number.isFinite(sourceUpdatedAt)) return
     if (sourceUpdatedAt <= updatedAt) return
-    void refresh()
+    refresh()
   }, [active, sourceUpdatedAt, updatedAt, refresh])
 
   const sectionSet = useMemo(() => new Set<string>(sections), [sections])

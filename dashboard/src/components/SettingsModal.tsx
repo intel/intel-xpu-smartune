@@ -307,7 +307,7 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
   }, [form, notifyDirty])
 
   useEffect(() => {
-    void doLoad()
+    doLoad()
   }, [doLoad])
 
   const onSave = async (): Promise<SaveOutcome> => {
@@ -448,7 +448,7 @@ function MonitoredSectionsCard() {
   }, [applyData])
 
   useEffect(() => {
-    void load()
+    load()
   }, [load])
 
   const handleSave = async (): Promise<SaveOutcome> => {
@@ -571,7 +571,7 @@ function DiagnosticsEventsPanel() {
   }, [eventOptions])
 
   useEffect(() => {
-    void api.getDiagEventCatalog()
+    api.getDiagEventCatalog()
       .then((data) => {
         const events = data.events ?? []
         setEventOptions(events)
@@ -1325,7 +1325,7 @@ function AutoControlPanel() {
   }, [form, notifyDirty])
 
   useEffect(() => {
-    void load()
+    load()
   }, [load])
 
   const onSave = async (): Promise<SaveOutcome> => {
@@ -1370,7 +1370,7 @@ function AutoControlPanel() {
           okText: 'Reload latest values',
           cancelText: 'Cancel',
           onOk: () => {
-            void load()
+            load()
             publishNotice({
               title: 'Smartune control updated',
               description: 'Another client changed Smartune control settings. Your form has been reloaded.',
@@ -2080,7 +2080,7 @@ export default function SettingsModal({ active: _active, balancerEnabled, onActi
       message.info('No unsaved changes on this page')
       return
     }
-    void runSave(pending)
+    runSave(pending)
   }
 
   const saveAll = () => {
@@ -2089,7 +2089,7 @@ export default function SettingsModal({ active: _active, balancerEnabled, onActi
       message.info('No unsaved changes')
       return
     }
-    void runSave(pending)
+    runSave(pending)
   }
 
   const titleFor = (key: string) => tabs.find((tab) => tab.key === key)?.title ?? key

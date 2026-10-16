@@ -14,6 +14,7 @@ import {
   Modal,
   Form,
   InputNumber,
+  Select,
   Tooltip,
   message,
 } from 'antd'
@@ -27,6 +28,13 @@ import { ProcessActionsMenu, useProcessDetail } from './ProcessActions'
 import { buildGpuLabelMap } from '../utils/gpu'
 
 const { Text, Title } = Typography
+
+// How many rows both tables show.  Capped at 10 on purpose: the server's
+// background refresher only pre-computes that many entries
+// (_APP_STATS_CACHE_N in monitor/monitor_api.py), and asking for more would
+// just return the same ten.
+const TOP_COUNT_OPTIONS = [3, 5, 10]
+const DEFAULT_TOP_COUNT = 3
 
 // Fields shared by both tables that drive the row's Operation menu and its
 // expandable child-process list.  pids spans every process the app owns.
@@ -341,6 +349,8 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [settingsVisible, setSettingsVisible] = useState(false)
+  // Row count for both tables, user-selectable from the toolbar.
+  const [topCount, setTopCount] = useState(DEFAULT_TOP_COUNT)
   const { openDetail, detailModal } = useProcessDetail()
 
   const fetchData = useCallback(async () => {
@@ -349,8 +359,8 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
       // The process list backs the expandable child rows (joined by PID); its
       // failure must not blank the app tables, so it is tolerated separately.
       const [resourceData, diskData, procData, dynData] = await Promise.all([
-        api.getAppResourceStats(3),
-        api.getAppDiskIoStats(3),
+        api.getAppResourceStats(topCount),
+        api.getAppDiskIoStats(topCount),
         api.getProcesses(true, true).catch(() => null),
         api.getDynamicInfo(['gpu']).catch(() => null),
       ])
@@ -406,11 +416,12 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
       setLoading(false)
       setRefreshing(false)
     }
-  }, [])
+  }, [topCount])
 
   // No periodic polling here: this tab refreshes on demand only.  Entering the
   // tab pulls once so the tables are never blank / badly stale; after that the
   // user drives updates with the Refresh button (or an Operation-menu action).
+  // Changing the row count re-fetches through the same effect.
   useEffect(() => {
     if (active) fetchData()
   }, [active, fetchData])
@@ -878,6 +889,16 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
             aria-label="Manual refresh"
           >
           </Button>
+        </Tooltip>
+        <Tooltip title="How many applications each table lists">
+          <Select
+            size="small"
+            value={topCount}
+            onChange={setTopCount}
+            style={{ width: 86 }}
+            aria-label="Rows per table"
+            options={TOP_COUNT_OPTIONS.map((count) => ({ value: count, label: `Top ${count}` }))}
+          />
         </Tooltip>
         {lastUpdated && (
           <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>

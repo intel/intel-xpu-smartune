@@ -1061,6 +1061,44 @@
   position: relative;
 }
 
+/* Caption for the chart's Y axis, sat directly over the domain tick labels.
+   Left in the flow it rendered above the chart and read as the panel's title
+   instead of as an axis label.  Width/left match EVENT_TIMELINE_LABEL_WIDTH and
+   EVENT_TIMELINE_LEFT_GUTTER in Diagnostics.tsx; the severity legend occupies
+   the right half of this row, so the two do not collide. */
+.diagnostics-event-domain-heading {
+  position: absolute;
+  top: 6px;
+  left: 12px;
+  width: 176px;
+  z-index: 1;
+  color: var(--diagnostics-text-muted, #8c8c8c);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-align: right;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+/* Says so, rather than leaving an empty plot that reads as a broken chart. */
+.diagnostics-event-timeline-empty {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 1;
+  transform: translate(-50%, -50%);
+  color: var(--diagnostics-text-muted, #8c8c8c);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.diagnostics-overview-window-hint {
+  display: block;
+  padding: 0 8px 6px;
+  font-size: 12px;
+}
+
 .diagnostics-collapsible-heading {
   padding: 0 !important;
   color: var(--diagnostics-text, #d9d9d9) !important;

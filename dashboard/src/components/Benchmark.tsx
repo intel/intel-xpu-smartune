@@ -714,6 +714,43 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   )
 
   /**
+   * Reinstall an environment that is already in place.
+   *
+   * The usual install path refuses this (the assets exist, so the server answers
+   * CONFLICT), which is right when nothing changed -- but it is exactly what is
+   * needed after a requirements file is edited by hand. Forced from the start
+   * rather than through the conflict dialog: there is no ambiguity about what
+   * was asked for, only about whether the cost is wanted, so the confirmation
+   * states the cost.
+   */
+  const rebuildAll = useCallback(
+    (ovVersion: string) => {
+      Modal.confirm({
+        title: 'Rebuild the benchmark environment?',
+        width: 560,
+        content: (
+          <Space direction="vertical" size={4} style={{ marginTop: 8 }}>
+            <Text>
+              The base environment{ovVersion ? ` and the OpenVINO ${ovVersion} runtime` : ''} are
+              reinstalled from the current requirements.
+            </Text>
+            <Paragraph type="warning" style={{ marginTop: 8, marginBottom: 0 }}>
+              This re-downloads several GB of wheels and takes a while. The existing
+              environment is moved aside, not deleted. Other installed runtimes are
+              left alone.
+            </Paragraph>
+          </Space>
+        ),
+        okText: 'Rebuild all',
+        okButtonProps: { danger: true },
+        cancelText: 'Cancel',
+        onOk: () => startSetup(true, ovVersion || undefined),
+      })
+    },
+    [startSetup],
+  )
+
+  /**
    * Explain a refused run, and offer the one place it can be resolved.
    *
    * Deliberately a dialog and not a toast: the user has to do something
@@ -1677,6 +1714,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         ov={defaults.ov}
         ovChoices={ovOptions}
         onSetup={(version) => void startSetup(false, version)}
+        onRebuildAll={rebuildAll}
       />
     </div>
   )

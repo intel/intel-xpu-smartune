@@ -470,8 +470,14 @@ export const api = {
   },
   getLimitSnapshot: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<LimitSnapshotData>('/app/limit_snapshot', payload),
-  getInterruptedLimitStatus: (payload: { cgroups: string[] }) =>
-    post<{ available: boolean; resources: string[] }>('/app/interrupted_limit_status', payload),
+  // One result per entry, in order. Checked in a batch rather than per
+  // lifecycle: verifying a page full of interrupted lifecycles one request each
+  // produced a burst of dozens of POSTs on every open and every auto-refresh.
+  // The endpoint still accepts the single `{cgroups}` form; nothing here needs it.
+  getInterruptedLimitStatuses: (payload: { groups: string[][] }) =>
+    post<{ results: Array<{ available: boolean; resources: string[] }> }>(
+      '/app/interrupted_limit_status', payload,
+    ),
   clearControlLifecycleWithoutRuntimeState: (payload: { protection_id: string }) =>
     post<{ cleared: boolean }>('/diag/control-lifecycles/clear-without-runtime-state', payload),
   getAutoLimitedApps: () => post<AutoLimitedAppsData>('/app/auto_limited_apps'),

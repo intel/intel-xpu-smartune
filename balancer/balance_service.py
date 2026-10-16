@@ -1748,9 +1748,31 @@ def limit_snapshot():
 
 @app.route('/app/interrupted_limit_status', methods=['POST'])
 def interrupted_limit_status():
-    """Check whether an interrupted lifecycle still has kernel limits."""
+    """Check whether interrupted lifecycles still have kernel limits.
+
+    ``groups`` inspects several lifecycles in one request and answers with one
+    result per entry, in order.  The diagnostics page has to verify every
+    interrupted lifecycle it lists, which as one request each meant a burst of
+    dozens of POSTs every time the page opened or auto-refreshed.  The work
+    itself is a handful of cgroupfs reads; the round-trips were the cost.
+
+    ``cgroups`` (one lifecycle) stays supported and answers in the original
+    flat shape.
+    """
     try:
-        cgroups = (request.get_json() or {}).get('cgroups') or []
+        body = request.get_json() or {}
+        groups = body.get('groups')
+        if isinstance(groups, list):
+            results = []
+            for entry in groups:
+                cgroups = entry if isinstance(entry, list) else []
+                results.append(
+                    _service.balancer.inspect_interrupted_limit(cgroups)
+                    if cgroups else {'available': True, 'resources': []}
+                )
+            return construct_response(data={'results': results})
+
+        cgroups = body.get('cgroups') or []
         if not isinstance(cgroups, list) or not cgroups:
             return construct_response(data={'available': True, 'resources': []})
         return construct_response(data=_service.balancer.inspect_interrupted_limit(cgroups))

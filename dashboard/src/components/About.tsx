@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import { Alert, Button, Card, Col, Descriptions, Modal, Row, Space, Spin, Typography, Timeline } from 'antd'
+import { Alert, Button, Card, Descriptions, Modal, Space, Spin, Typography, Timeline } from 'antd'
 import { InfoCircleOutlined, ReloadOutlined, RobotOutlined } from '@ant-design/icons'
 import { api } from '../api/client'
 import type { PackageInfo, StaticInfoData } from '../api/types'
@@ -201,27 +201,39 @@ function summarizeGpuNamesByCard(staticInfo?: StaticInfoData | null): string {
   return mapped.join(' | ')
 }
 
+/**
+ * One configuration card.
+ *
+ * `hero` is the Software & Drivers card at the centre of the page: same content
+ * shape, but given the weight that makes it read as the subject the hardware
+ * cards are arranged around rather than one more tile among them.
+ */
 function SectionCard({
   title,
   items,
   descColumns = 1,
+  hero = false,
 }: {
   title: string
   items: Array<{ label: string; value: React.ReactNode }>
   descColumns?: number
+  hero?: boolean
 }) {
   return (
     <Card
-      className="perf-card perf-rise"
-      bodyStyle={{ padding: 14 }}
+      className={`perf-card perf-rise about-card${hero ? ' about-card--hero' : ''}`}
+      bodyStyle={{ padding: hero ? 18 : 14 }}
       style={{ height: '100%' }}
     >
-      <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>{title}</Text>
+      <div className="about-card__title">
+        {hero && <InfoCircleOutlined aria-hidden="true" />}
+        <Text style={{ color: COLORS.text, fontSize: hero ? 15 : 13, fontWeight: 600 }}>{title}</Text>
+      </div>
       <Descriptions
         size="small"
         column={descColumns}
         style={{ marginTop: 8 }}
-        labelStyle={{ color: COLORS.textMuted, fontSize: 12, width: 140 }}
+        labelStyle={{ color: COLORS.textMuted, fontSize: 12, width: hero ? 118 : 140 }}
         contentStyle={{ color: COLORS.text, fontSize: 12, wordBreak: 'break-word' }}
       >
         {items.map((item) => (
@@ -496,7 +508,7 @@ export default function About({ active }: Props) {
             open={featuresOpen}
             onCancel={() => setFeaturesOpen(false)}
             footer={null}
-            width={760}
+            width="min(1040px, 92vw)"
           >
                 <Timeline
                   style={{ marginTop: 8 }}
@@ -615,27 +627,24 @@ export default function About({ active }: Props) {
                 />
           </Modal>
 
-          <Text style={{ color: COLORS.textMuted, fontSize: 12, display: 'block', marginBottom: 8 }}>
-            Software Configuration
-          </Text>
-          <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+          {/* Software at the centre with the hardware cards flowing around it:
+              the software stack is the one thing on this page that describes the
+              whole machine, and reading it first used to mean scrolling past a
+              full-width block to reach anything specific. The hero is placed
+              explicitly and the rest auto-flows (dense) into the columns beside
+              it; see .about-layout in about.css for the breakpoints. */}
+          <div className="about-layout">
             {softwareSections.map((section) => (
-              <Col key={`soft-${section.title}`} xs={24}>
-                <SectionCard title={section.title} items={section.items} descColumns={2} />
-              </Col>
+              <div className="about-layout__hero" key={`soft-${section.title}`}>
+                <SectionCard title={section.title} items={section.items} descColumns={2} hero />
+              </div>
             ))}
-          </Row>
-
-          <Text style={{ color: COLORS.textMuted, fontSize: 12, display: 'block', marginBottom: 8 }}>
-            Hardware Configuration
-          </Text>
-          <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
             {hardwareSections.map((section) => (
-              <Col key={`hw-${section.title}`} xs={24} md={12} xl={6}>
+              <div className="about-layout__cell" key={`hw-${section.title}`}>
                 <SectionCard title={section.title} items={section.items} />
-              </Col>
+              </div>
             ))}
-          </Row>
+          </div>
         </>
       )}
     </div>

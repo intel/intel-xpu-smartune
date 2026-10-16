@@ -1193,17 +1193,32 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
       const result = await api.getDiagControlLifecycles({ limit: 100 })
       if (token !== controlLifecyclesRefreshSeq.current) return
       const lifecycles = result.lifecycles || []
-      const verified = await Promise.all(lifecycles.map(async (lifecycle) => {
-        if (lifecycle.status !== 'requires_verification' || !lifecycle.cgroups?.length) return lifecycle
+      // Every interrupted lifecycle has to be checked against the kernel, but
+      // in one request rather than one each: a page listing N of them used to
+      // fire N POSTs on open and again on every auto-refresh tick.
+      const pending = lifecycles.filter(
+        (lifecycle) => lifecycle.status === 'requires_verification' && !!lifecycle.cgroups?.length,
+      )
+      let statuses: Array<{ available: boolean; resources: string[] } | undefined> = []
+      if (pending.length) {
         try {
-          const result = await api.getInterruptedLimitStatus({ cgroups: lifecycle.cgroups })
-          if (!result.available) return lifecycle
-          if (result.resources.length === 0) return { ...lifecycle, status: 'recovered', active_resources: [] }
-          return { ...lifecycle, status: 'active', active_resources: result.resources }
+          const batch = await api.getInterruptedLimitStatuses({
+            groups: pending.map((lifecycle) => lifecycle.cgroups as string[]),
+          })
+          statuses = batch.results || []
         } catch {
-          return lifecycle
+          // Verification is best-effort: leave the rows as requires_verification
+          // rather than failing the whole lifecycle load over it.
+          statuses = []
         }
-      }))
+      }
+      const statusByLifecycle = new Map(pending.map((lifecycle, index) => [lifecycle, statuses[index]]))
+      const verified = lifecycles.map((lifecycle) => {
+        const status = statusByLifecycle.get(lifecycle)
+        if (!status?.available) return lifecycle
+        if (status.resources.length === 0) return { ...lifecycle, status: 'recovered', active_resources: [] }
+        return { ...lifecycle, status: 'active', active_resources: status.resources }
+      })
       if (token !== controlLifecyclesRefreshSeq.current) return
       setControlLifecycles(verified)
     } catch (error) {
@@ -2314,7 +2329,13 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
         <div className='diagnostics-overview-header'>
           <Text className='diagnostics-overview-heading'>Selected time range overview</Text>
         </div>
-        {eventsLoading ? null : eventOverview.total === 0 ? (
+        {/* The replacement empty state is only right when the whole fetched
+            range is empty.  When the range has events and only the brushed
+            window does not, the strip below is kept and every counter simply
+            reads 0 -- it is derived from overviewTimelineEvents, which is
+            already window-scoped -- so the user can see what the window holds
+            and drag on to another one. */}
+        {eventsLoading ? null : allDisplayedEvents.length === 0 ? (
           <div className='diagnostics-overview-empty'>
             <div>
               <Text strong>No events in this view</Text>
@@ -2334,6 +2355,11 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
           </div>
         ) : (
           <div className='diagnostics-overview-sections'>
+            {eventOverview.total === 0 ? (
+              <Text className='diagnostics-overview-window-hint' type='secondary'>
+                No events in the selected window. Drag the timeline below to another window.
+              </Text>
+            ) : null}
             <div className='diagnostics-overview-summary-strip'>
               <div className='diagnostics-overview-inline-group' aria-label='Event profile'>
                 <Tooltip title='Show all events in the selected range'>
@@ -2498,7 +2524,11 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
         ) : null}
       </section>
 
-      {eventsLoading || eventOverview.total > 0 ? (
+      {/* Gated on the whole fetched range, not the brushed window.  Window-scoped
+          gating unmounted the chart *and the brush with it* as soon as the
+          window was dragged onto a quiet stretch, leaving no control to drag
+          back out with. */}
+      {eventsLoading || allDisplayedEvents.length > 0 ? (
       <section className='diagnostics-event-activity' aria-label='Event activity timeline'>
         <div className='diagnostics-panel-heading'>
           <Text strong>Event activity</Text>
@@ -2510,10 +2540,13 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
             ) : null}
           </Space>
         </div>
-        {eventsLoading ? null : displayedEvents.length ? (
+        {eventsLoading ? null : allDisplayedEvents.length ? (
           <>
             <div className='diagnostics-event-timeline diagnostics-event-timeline--selectable' style={{ height: Math.max(220, eventTimeline.lanes.length * 46 + 72) }}>
               <span className='diagnostics-event-domain-heading'>Domain</span>
+              {eventTimeline.points.length === 0 ? (
+                <span className='diagnostics-event-timeline-empty'>No events in this window</span>
+              ) : null}
               <ResponsiveContainer width='100%' height='100%'>
                 <ScatterChart
                   margin={{ top: 8, right: 16, left: EVENT_TIMELINE_LEFT_GUTTER, bottom: 0 }}

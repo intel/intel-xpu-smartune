@@ -10,6 +10,11 @@
 // line, and the page belongs to the models and their results instead. Not once
 // ever, though: a further OpenVINO version is installed from the same button,
 // which is why the version is picked here rather than implied.
+//
+// Rebuild all is the third case: the requirements changed under an environment
+// that is already installed and reads as Ready, so nothing here would otherwise
+// ask to be rebuilt. It moves the base venv *and* the selected runtime aside and
+// installs both again from the current requirements.
 
 import React from 'react'
 import { Alert, Button, Descriptions, Divider, Drawer, Select, Space, Table, Tag, Tooltip, Typography } from 'antd'
@@ -31,6 +36,9 @@ interface Props {
   ov: string
   ovChoices: string[]
   onSetup: (version: string) => void
+  // Force a reinstall of an environment that is already in place -- the path for
+  // "I edited the requirements". Confirmed by the caller, not here.
+  onRebuildAll?: (version: string) => void
 }
 
 export function versionSummary(versions: Record<string, string | null>): string {
@@ -154,6 +162,7 @@ export default function BenchEnvDrawer({
   ov,
   ovChoices,
   onSetup,
+  onRebuildAll,
 }: Props) {
   const ready = !!env?.ready
   const installedOvs = env?.ov_versions ?? []
@@ -218,6 +227,21 @@ export default function BenchEnvDrawer({
         >
           {ready && versionInstalled ? `Rebuild OV ${version}` : `Install OV ${version}`}
         </Button>
+        {onRebuildAll && (
+          <Tooltip title="Reinstall the base environment and the selected runtime from the current requirements">
+            <Button
+              danger
+              size="small"
+              icon={<ReloadOutlined />}
+              // Only offered for an environment that exists: on a fresh machine
+              // the install button above is the one that applies.
+              disabled={busy || !!env?.probing || !version || !env?.venv_exists}
+              onClick={() => onRebuildAll(version)}
+            >
+              Rebuild all
+            </Button>
+          </Tooltip>
+        )}
       </Space>
       <Divider style={{ margin: '12px 0' }} />
 
@@ -264,6 +288,13 @@ export default function BenchEnvDrawer({
         Setup and benchmark runs share a single execution slot, so only one of them
         can be in progress at a time.
       </Paragraph>
+      {onRebuildAll && (
+        <Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0, fontSize: 12 }}>
+          Edited a requirements file by hand? Rebuild all reinstalls the base
+          environment and the selected runtime from it. The old ones are moved
+          aside, not deleted.
+        </Paragraph>
+      )}
     </Drawer>
   )
 }

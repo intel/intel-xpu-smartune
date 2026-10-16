@@ -234,7 +234,7 @@ export function sendHeartbeat(sessionId: string): Promise<void> {
 
 export function sendUiRelease(sessionId: string): void {
   const token = getToken()
-  void fetch('/api/smartune/ui/release', {
+  fetch('/api/smartune/ui/release', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

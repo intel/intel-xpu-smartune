@@ -534,7 +534,7 @@ export default function LiveResourceTiles({
     (next: boolean) => {
       // Switching it back on returns to the safe state, so nobody needs warning.
       if (next) {
-        void applyQuiet(true)
+        applyQuiet(true)
         return
       }
       Modal.confirm({

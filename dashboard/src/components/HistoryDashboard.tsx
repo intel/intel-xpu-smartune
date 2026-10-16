@@ -760,8 +760,8 @@ function buildNetworkTrendPoints(items: HistorySnapshotItem[]): { points: Networ
     const pressureInterfaces = dynamic?.pressure?.network_interfaces ?? network?.pressure_interfaces
     const perNic = network?.per_nic ?? (network?.interfaces
       ? Object.fromEntries(Object.entries(network.interfaces).map(([name, value]) => [name, {
-          rx_mbps: toNumber(value?.rx_bytes_per_sec) != null ? (value.rx_bytes_per_sec as number) / 1_000_000 : null,
-          tx_mbps: toNumber(value?.tx_bytes_per_sec) != null ? (value.tx_bytes_per_sec as number) / 1_000_000 : null,
+          rx_mbps: toNumber(value?.rx_bytes_per_sec) != null ? (value?.rx_bytes_per_sec as number) / 1_000_000 : null,
+          tx_mbps: toNumber(value?.tx_bytes_per_sec) != null ? (value?.tx_bytes_per_sec as number) / 1_000_000 : null,
         }]))
       : undefined)
     if (perNic && typeof perNic === 'object') {

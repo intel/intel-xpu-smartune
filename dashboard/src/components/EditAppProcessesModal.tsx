@@ -238,10 +238,10 @@ export function EditAppProcessesModal({ open, app, onClose, onSuccess }: Props) 
 
   const rowSelection: TableRowSelection<DiscoverCandidate> = {
     onSelect: (record, checked) => {
-      if (checked) void extractCandidates([record])
+      if (checked) extractCandidates([record])
     },
     onSelectAll: (checked, _rows, changeRows) => {
-      if (checked) void extractCandidates(changeRows)
+      if (checked) extractCandidates(changeRows)
     },
     getCheckboxProps: () => ({ disabled: extracting }),
   }

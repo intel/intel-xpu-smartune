@@ -1982,9 +1982,9 @@ function DiagnosticsSummaryCard({
         const statusLabel = summary?.attentionCount ? 'Attention' : 'Healthy'
   return (
     <CockpitCard title="System Diagnostics" onOpen={onOpen}>
-      {status === 'unavailable' && summary === null ? (
+      {status === 'unavailable' && !summary ? (
         <div className="perf-cockpit-empty">Diagnostics unavailable · retrying</div>
-      ) : summary === null ? (
+      ) : !summary ? (
         <div className="perf-cockpit-empty"><Spin size="small" /></div>
       ) : (
         <div className="perf-diag-overview">
@@ -2044,7 +2044,7 @@ function ActiveControlsCard({ summary, onOpen }: { summary: ControlCockpitSummar
     : summary?.auto ? COLORS.orange : COLORS.accent
   return (
     <CockpitCard title="Resource Controls" onOpen={onOpen}>
-      {summary === null ? (
+      {!summary ? (
         <div className="perf-cockpit-empty"><Spin size="small" /></div>
       ) : (
         <div className="perf-control-overview">
@@ -3680,7 +3680,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
   useEffect(() => {
     if (!active || !showPressureSection) return
     let cancelled = false
-    void Promise.allSettled([
+    Promise.allSettled([
       api.getConfig<{ thresholds?: ThresholdSet }>('system_pressure'),
       api.getConfig<{ disk_thresholds?: ThresholdSet }>('disk_pressure'),
       api.getConfig<{ network_thresholds?: ThresholdSet }>('network_pressure'),
@@ -3818,7 +3818,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
     }
     // Nothing monitored → nothing to fetch (a bare request would pull everything).
     if (!monitoredSectionList.length) return
-    void fetchDynamicRef.current()
+    fetchDynamicRef.current()
   }, [active, monitoredSectionsKey, monitoredSectionList.length])
 
   // A run ending is the moment collection resumes, and it arrives on the
@@ -3830,7 +3830,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
       (event) => {
         if (event.type !== 'job' || event.job.status === 'running') return
         setQuietActive(false)
-        if (active) void fetchDynamicRef.current()
+        if (active) fetchDynamicRef.current()
       },
       [active],
     ),

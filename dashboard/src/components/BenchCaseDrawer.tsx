@@ -348,8 +348,8 @@ export default function BenchCaseDrawer({ open, row, metrics, onClose }: Props) 
     // samples are thousands of numbers, and the drawer is closed most of the
     // time.
     if (open) {
-      void loadLog()
-      void loadTimeline()
+      loadLog()
+      loadTimeline()
     }
   }, [open, loadLog, loadTimeline])
 

@@ -1,6 +1,7 @@
 .perf-root {
   position: relative;
-  padding: 20px 0 32px;
+  /* No top padding: .app-content-area already spaces the page from the header. */
+  padding: 0 0 32px;
   isolation: isolate;
   background: var(--color-bg);
 }
@@ -170,7 +171,7 @@
      pinned row.  The negative side margins (cancelled by the matching padding)
      let the background reach the full content width. */
   margin: 0 -8px 12px;
-  padding: 12px 12px 12px;
+  padding: 8px 12px;
   background: var(--color-bg);
   border-bottom: 1px solid var(--color-border);
 }

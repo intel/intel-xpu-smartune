@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
-"""Regenerate the figures embedded in docs/pressure_algorithm.md.
+"""Regenerate the figures embedded in docs/design/pressure-algorithm.md.
 
 Dependency-free (pure-Python SVG, no matplotlib/numpy so it runs anywhere the
-project does). Emits vector SVGs into docs/images/, which render inline on
+project does). Emits vector SVGs into docs/design/images/, which render inline on
 GitHub and in most markdown viewers.
 
-    python3 docs/pressure_model_figures.py
+    python3 docs/design/pressure_model_figures.py
 
 Each figure mirrors a formula in monitor/pressure.py or monitor/disk_pressure.py
 so the doc stays in sync with the code -- if you tune a default there, re-run this.

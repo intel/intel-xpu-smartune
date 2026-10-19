@@ -1,0 +1,176 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1480" height="786" viewBox="0 0 1480 786" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<rect x="8" y="8" width="104" height="150" rx="2" fill="#1b5fd6" stroke="none" stroke-width="1.2"/>
+<text x="60.0" y="79.0" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">UI layer</text>
+<text x="60.0" y="99.0" font-size="11.5" fill="#e6edff" font-weight="normal" text-anchor="middle">UI /</text>
+<text x="60.0" y="113.0" font-size="11.5" fill="#e6edff" font-weight="normal" text-anchor="middle">Dashboard</text>
+<rect x="118" y="8" width="1354" height="150" rx="2" fill="#ffffff" stroke="#1b5fd6" stroke-width="1.5"/>
+<rect x="118" y="8" width="8" height="150" rx="0" fill="#1b5fd6" stroke="none" stroke-width="1.2"/>
+<rect x="140" y="16" width="1316" height="84" rx="2" fill="#ffffff" stroke="#1b4fb8" stroke-width="1.6"/>
+<text x="162" y="40" font-size="17" fill="#1f2937" font-weight="bold" text-anchor="start">React Dashboard</text>
+<rect x="160.0" y="54" width="149.0" height="34" rx="2" fill="#d6e6fb" stroke="#5b8bd8" stroke-width="1.2"/>
+<text x="234.5" y="76" font-size="13.5" fill="#1d4ed8" font-weight="bold" text-anchor="middle">Home</text>
+<rect x="321.0" y="54" width="149.0" height="34" rx="2" fill="#d6e6fb" stroke="#5b8bd8" stroke-width="1.2"/>
+<text x="395.5" y="76" font-size="13.5" fill="#1d4ed8" font-weight="bold" text-anchor="middle">Applications</text>
+<rect x="482.0" y="54" width="149.0" height="34" rx="2" fill="#d6e6fb" stroke="#5b8bd8" stroke-width="1.2"/>
+<text x="556.5" y="76" font-size="13.5" fill="#1d4ed8" font-weight="bold" text-anchor="middle">History</text>
+<rect x="643.0" y="54" width="149.0" height="34" rx="2" fill="#d6e6fb" stroke="#5b8bd8" stroke-width="1.2"/>
+<text x="717.5" y="76" font-size="13.5" fill="#1d4ed8" font-weight="bold" text-anchor="middle">Control center</text>
+<rect x="804.0" y="54" width="149.0" height="34" rx="2" fill="#d6e6fb" stroke="#5b8bd8" stroke-width="1.2"/>
+<text x="878.5" y="76" font-size="13.5" fill="#1d4ed8" font-weight="bold" text-anchor="middle">Models</text>
+<rect x="965.0" y="54" width="149.0" height="34" rx="2" fill="#d6e6fb" stroke="#5b8bd8" stroke-width="1.2"/>
+<text x="1039.5" y="76" font-size="13.5" fill="#1d4ed8" font-weight="bold" text-anchor="middle">System diagnostics</text>
+<rect x="1126.0" y="54" width="149.0" height="34" rx="2" fill="#d6e6fb" stroke="#5b8bd8" stroke-width="1.2"/>
+<text x="1200.5" y="76" font-size="13.5" fill="#1d4ed8" font-weight="bold" text-anchor="middle">Settings</text>
+<rect x="1287.0" y="54" width="149.0" height="34" rx="2" fill="#d6e6fb" stroke="#5b8bd8" stroke-width="1.2"/>
+<text x="1361.5" y="76" font-size="13.5" fill="#1d4ed8" font-weight="bold" text-anchor="middle">About</text>
+<rect x="140" y="108" width="1316" height="40" rx="2" fill="#bcd6ee" stroke="#8fb3dc" stroke-width="1.2"/>
+<text x="797.0" y="134" font-size="15" fill="#1f2937" font-weight="bold" text-anchor="middle">REST API / SSE (Service → Dashboard)</text>
+<rect x="8" y="164" width="104" height="82" rx="2" fill="#0f8f80" stroke="none" stroke-width="1.2"/>
+<text x="60.0" y="201.0" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">Service</text>
+<text x="60.0" y="221.0" font-size="11.5" fill="#e6edff" font-weight="normal" text-anchor="middle">Service /</text>
+<text x="60.0" y="235.0" font-size="11.5" fill="#e6edff" font-weight="normal" text-anchor="middle">API</text>
+<rect x="118" y="164" width="1354" height="82" rx="2" fill="#e8f6f1" stroke="#0f8f80" stroke-width="1.5"/>
+<rect x="118" y="164" width="8" height="82" rx="0" fill="#0f8f80" stroke="none" stroke-width="1.2"/>
+<rect x="140.0" y="173" width="638.0" height="64" rx="2" fill="#ffffff" stroke="#1b4fb8" stroke-width="1.6"/>
+<text x="158.0" y="199" font-size="15.5" fill="#1f2937" font-weight="bold" text-anchor="start">SmarTune API Service</text>
+<text x="158.0" y="223" font-size="12.5" fill="#1d4ed8" font-weight="normal" text-anchor="start">Flask · HTTPS · token auth · SSE events · /smartune /monitor /bench /diag</text>
+<rect x="818.0" y="173" width="638.0" height="64" rx="2" fill="#ffffff" stroke="#1b4fb8" stroke-width="1.6"/>
+<text x="836.0" y="199" font-size="15.5" fill="#1f2937" font-weight="bold" text-anchor="start">Database</text>
+<text x="836.0" y="223" font-size="12.5" fill="#1d4ed8" font-weight="normal" text-anchor="start">SQLite: app priorities · resource snapshots · history archives · diagnostic events</text>
+<rect x="8" y="252" width="104" height="232" rx="2" fill="#1b5fd6" stroke="none" stroke-width="1.2"/>
+<text x="60.0" y="364.0" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">Features</text>
+<text x="60.0" y="384.0" font-size="11.5" fill="#e6edff" font-weight="normal" text-anchor="middle">Policy /</text>
+<text x="60.0" y="398.0" font-size="11.5" fill="#e6edff" font-weight="normal" text-anchor="middle">features</text>
+<rect x="118" y="252" width="1354" height="232" rx="2" fill="#e8f6f1" stroke="#1b5fd6" stroke-width="1.5"/>
+<rect x="118" y="252" width="8" height="232" rx="0" fill="#1b5fd6" stroke="none" stroke-width="1.2"/>
+<rect x="140.0" y="264" width="422.6666666666667" height="208" rx="3" fill="#ffffff" stroke="#1b4fb8" stroke-width="1.6"/>
+<rect x="140.0" y="264" width="422.6666666666667" height="34" rx="3" fill="#1b5fd6" stroke="none" stroke-width="1.2"/>
+<text x="351.33333333333337" y="287.0" font-size="16" fill="#ffffff" font-weight="bold" text-anchor="middle">Balancer</text>
+<rect x="150.0" y="308" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="162.0" y="327" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Dynamic Balancer</text>
+<text x="162.0" y="345" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">Core scheduling loop</text>
+<rect x="355.33333333333337" y="308" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="367.33333333333337" y="327" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Priority Queue</text>
+<text x="367.33333333333337" y="345" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">Critical → Low</text>
+<rect x="150.0" y="362" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="162.0" y="381" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">App Intercept (eBPF)</text>
+<text x="162.0" y="399" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">execve hook · pause / resume</text>
+<rect x="355.33333333333337" y="362" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="367.33333333333337" y="381" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Control Manager</text>
+<text x="367.33333333333337" y="399" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">Resource control · thread pool</text>
+<rect x="586.6666666666667" y="264" width="422.6666666666667" height="208" rx="3" fill="#ffffff" stroke="#1b4fb8" stroke-width="1.6"/>
+<rect x="586.6666666666667" y="264" width="422.6666666666667" height="34" rx="3" fill="#1b5fd6" stroke="none" stroke-width="1.2"/>
+<text x="798.0000000000001" y="287.0" font-size="16" fill="#ffffff" font-weight="bold" text-anchor="middle">Diagnostics</text>
+<rect x="596.6666666666667" y="308" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="608.6666666666667" y="327" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Event Sources</text>
+<text x="608.6666666666667" y="345" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">Logs · journal · benchmark</text>
+<rect x="802.0000000000001" y="308" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="814.0000000000001" y="327" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Event Ledger</text>
+<text x="814.0000000000001" y="345" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">emit_event · episodes · retention</text>
+<rect x="596.6666666666667" y="362" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="608.6666666666667" y="381" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Detectors &amp; Alerts</text>
+<text x="608.6666666666667" y="399" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">Built-in &amp; custom rules</text>
+<rect x="802.0000000000001" y="362" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="814.0000000000001" y="381" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Control Lifecycle</text>
+<text x="814.0000000000001" y="399" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">Limit → restore timeline</text>
+<rect x="596.6666666666667" y="416" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="608.6666666666667" y="435" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Insights &amp; Reports</text>
+<text x="608.6666666666667" y="453" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">Advice · digest · log query</text>
+<rect x="1033.3333333333335" y="264" width="422.6666666666667" height="208" rx="3" fill="#ffffff" stroke="#1b4fb8" stroke-width="1.6"/>
+<rect x="1033.3333333333335" y="264" width="422.6666666666667" height="34" rx="3" fill="#1b5fd6" stroke="none" stroke-width="1.2"/>
+<text x="1244.6666666666667" y="287.0" font-size="16" fill="#ffffff" font-weight="bold" text-anchor="middle">Benchmark</text>
+<rect x="1043.3333333333335" y="308" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="1055.3333333333335" y="327" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Model Catalog</text>
+<text x="1055.3333333333335" y="345" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">HuggingFace · local models</text>
+<rect x="1248.6666666666667" y="308" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="1260.6666666666667" y="327" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Env Manager</text>
+<text x="1260.6666666666667" y="345" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">venv · OpenVINO runtimes</text>
+<rect x="1043.3333333333335" y="362" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="1055.3333333333335" y="381" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Job Runner</text>
+<text x="1055.3333333333335" y="399" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">Single-slot · log stream</text>
+<rect x="1248.6666666666667" y="362" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="1260.6666666666667" y="381" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">HW Sampler</text>
+<text x="1260.6666666666667" y="399" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">Per-run XPU metrics</text>
+<rect x="1043.3333333333335" y="416" width="197.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="1055.3333333333335" y="435" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Results</text>
+<text x="1055.3333333333335" y="453" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">Run artifacts · compare</text>
+<rect x="8" y="490" width="104" height="178" rx="2" fill="#0f8f80" stroke="none" stroke-width="1.2"/>
+<text x="60.0" y="575.0" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">Core</text>
+<text x="60.0" y="595.0" font-size="11.5" fill="#e6edff" font-weight="normal" text-anchor="middle">Shared</text>
+<text x="60.0" y="609.0" font-size="11.5" fill="#e6edff" font-weight="normal" text-anchor="middle">capabilities</text>
+<rect x="118" y="490" width="1354" height="178" rx="2" fill="#e8f6f1" stroke="#0f8f80" stroke-width="1.5"/>
+<rect x="118" y="490" width="8" height="178" rx="0" fill="#0f8f80" stroke="none" stroke-width="1.2"/>
+<rect x="140.0" y="502" width="646.0" height="154" rx="3" fill="#ffffff" stroke="#1b4fb8" stroke-width="1.6"/>
+<rect x="140.0" y="502" width="646.0" height="34" rx="3" fill="#1b5fd6" stroke="none" stroke-width="1.2"/>
+<text x="463.0" y="525.0" font-size="16" fill="#ffffff" font-weight="bold" text-anchor="middle">Monitor</text>
+<rect x="150.0" y="546" width="203.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="162.0" y="565" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">PSI Monitor</text>
+<text x="162.0" y="583" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">PSI data · score</text>
+<rect x="361.33333333333337" y="546" width="203.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="373.33333333333337" y="565" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Resource Monitor</text>
+<text x="373.33333333333337" y="583" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">GPU · NPU · CPU · MEM · DISK</text>
+<rect x="572.6666666666667" y="546" width="203.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="584.6666666666667" y="565" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Network Monitor</text>
+<text x="584.6666666666667" y="583" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">Window samples · throughput</text>
+<rect x="150.0" y="600" width="203.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="162.0" y="619" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Pressure Analyzer</text>
+<text x="162.0" y="637" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">Score · Low → Critical</text>
+<rect x="361.33333333333337" y="600" width="203.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="373.33333333333337" y="619" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">System Info</text>
+<text x="373.33333333333337" y="637" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">HW topology · XPU telemetry</text>
+<rect x="810.0" y="502" width="646.0" height="154" rx="3" fill="#ffffff" stroke="#1b4fb8" stroke-width="1.6"/>
+<rect x="810.0" y="502" width="646.0" height="34" rx="3" fill="#1b5fd6" stroke="none" stroke-width="1.2"/>
+<text x="1133.0" y="525.0" font-size="16" fill="#ffffff" font-weight="bold" text-anchor="middle">Controllers</text>
+<rect x="820.0" y="546" width="203.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="832.0" y="565" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">CPU Controller</text>
+<text x="832.0" y="583" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">cgroup cpu.max</text>
+<rect x="1031.3333333333333" y="546" width="203.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="1043.3333333333333" y="565" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Memory Controller</text>
+<text x="1043.3333333333333" y="583" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">memory.high / memory.max</text>
+<rect x="1242.6666666666667" y="546" width="203.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="1254.6666666666667" y="565" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Disk IO Controller</text>
+<text x="1254.6666666666667" y="583" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">io.max · bps / iops</text>
+<rect x="820.0" y="600" width="203.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="832.0" y="619" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Network IO Controller</text>
+<text x="832.0" y="637" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">tc / HTB · iptables</text>
+<rect x="1031.3333333333333" y="600" width="203.33333333333334" height="46" rx="2" fill="#f4f8fe" stroke="#9fb8e3" stroke-width="1.2"/>
+<text x="1043.3333333333333" y="619" font-size="14" fill="#1f2937" font-weight="bold" text-anchor="start">Governor Controller</text>
+<text x="1043.3333333333333" y="637" font-size="12" fill="#1d4ed8" font-weight="normal" text-anchor="start">CPU frequency governor</text>
+<rect x="8" y="674" width="104" height="52" rx="2" fill="#0f8f80" stroke="none" stroke-width="1.2"/>
+<text x="60.0" y="705.0" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">OS</text>
+<rect x="118" y="674" width="1354" height="52" rx="2" fill="#0f8f80" stroke="#0f8f80" stroke-width="1.5"/>
+<rect x="118" y="674" width="8" height="52" rx="0" fill="#0f8f80" stroke="none" stroke-width="1.2"/>
+<rect x="140.0" y="684" width="154.0" height="32" rx="2" fill="#c9cdd3" stroke="#9aa1aa" stroke-width="1.2"/>
+<text x="217.0" y="705.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">cgroups v2</text>
+<rect x="306.0" y="684" width="154.0" height="32" rx="2" fill="#c9cdd3" stroke="#9aa1aa" stroke-width="1.2"/>
+<text x="383.0" y="705.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">Linux PSI</text>
+<rect x="472.0" y="684" width="154.0" height="32" rx="2" fill="#c9cdd3" stroke="#9aa1aa" stroke-width="1.2"/>
+<text x="549.0" y="705.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">eBPF / BCC</text>
+<rect x="638.0" y="684" width="154.0" height="32" rx="2" fill="#c9cdd3" stroke="#9aa1aa" stroke-width="1.2"/>
+<text x="715.0" y="705.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">tc / HTB · iptables</text>
+<rect x="804.0" y="684" width="154.0" height="32" rx="2" fill="#c9cdd3" stroke="#9aa1aa" stroke-width="1.2"/>
+<text x="881.0" y="705.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">sysfs / Intel PMT</text>
+<rect x="970.0" y="684" width="154.0" height="32" rx="2" fill="#c9cdd3" stroke="#9aa1aa" stroke-width="1.2"/>
+<text x="1047.0" y="705.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">procfs</text>
+<rect x="1136.0" y="684" width="154.0" height="32" rx="2" fill="#c9cdd3" stroke="#9aa1aa" stroke-width="1.2"/>
+<text x="1213.0" y="705.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">systemd journal</text>
+<rect x="1302.0" y="684" width="154.0" height="32" rx="2" fill="#c9cdd3" stroke="#9aa1aa" stroke-width="1.2"/>
+<text x="1379.0" y="705.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">i915 / Xe · intel_vpu</text>
+<rect x="8" y="732" width="104" height="46" rx="2" fill="#1b5fd6" stroke="none" stroke-width="1.2"/>
+<text x="60.0" y="760.0" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">HW</text>
+<rect x="118" y="732" width="1354" height="46" rx="2" fill="#1b5fd6" stroke="#1b5fd6" stroke-width="1.5"/>
+<rect x="118" y="732" width="8" height="46" rx="0" fill="#1b5fd6" stroke="none" stroke-width="1.2"/>
+<rect x="140.0" y="740" width="209.33333333333334" height="30" rx="2" fill="#a9cdf2" stroke="#7fa9d8" stroke-width="1.2"/>
+<text x="244.66666666666669" y="760.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">CPU</text>
+<rect x="361.33333333333337" y="740" width="209.33333333333334" height="30" rx="2" fill="#a9cdf2" stroke="#7fa9d8" stroke-width="1.2"/>
+<text x="466.00000000000006" y="760.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">iGPU / dGPU</text>
+<rect x="582.6666666666667" y="740" width="209.33333333333334" height="30" rx="2" fill="#a9cdf2" stroke="#7fa9d8" stroke-width="1.2"/>
+<text x="687.3333333333334" y="760.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">NPU</text>
+<rect x="804.0" y="740" width="209.33333333333334" height="30" rx="2" fill="#a9cdf2" stroke="#7fa9d8" stroke-width="1.2"/>
+<text x="908.6666666666666" y="760.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">DRAM</text>
+<rect x="1025.3333333333335" y="740" width="209.33333333333334" height="30" rx="2" fill="#a9cdf2" stroke="#7fa9d8" stroke-width="1.2"/>
+<text x="1130.0000000000002" y="760.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">SSD / HDD</text>
+<rect x="1246.6666666666667" y="740" width="209.33333333333334" height="30" rx="2" fill="#a9cdf2" stroke="#7fa9d8" stroke-width="1.2"/>
+<text x="1351.3333333333335" y="760.0" font-size="13.5" fill="#1f2937" font-weight="bold" text-anchor="middle">NIC</text>
+</svg>

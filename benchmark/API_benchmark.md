@@ -8,7 +8,7 @@ benchmark feature is present and enabled — check `GET /smartune/capabilities`
 (`benchmark: 1`) before offering the tab.
 
 Base URL, TLS, authentication and the unified `{retcode, retmsg, data}` envelope are the
-same as the rest of the product; see the [Backend API Guide](../docs/API_ENDPOINTS.md) for
+same as the rest of the product; see the [Backend API Guide](../docs/reference/api.md) for
 those and for the shared `RetCode` table. Auth is applied app-wide by `smartune_api`'s
 `before_app_request` gate, so none of these routes carries a per-route token check — with
 one exception noted under `GET /bench/events`.
@@ -426,7 +426,7 @@ then cached, so a second open is free.
 
 **Notes:**
 - A measured run raises quiet mode, which suspends the balancer's automatic control for its
-  duration. See the [Balancer Guide](../docs/balancer_guide.md).
+  duration. See the [Balancer Guide](../docs/design/balancer.md).
 
 ---
 

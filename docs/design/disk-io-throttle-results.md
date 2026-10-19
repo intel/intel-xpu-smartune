@@ -7,17 +7,17 @@ What the disk-IO channel actually buys you, measured end to end: three workloads
 over one NVMe, the disk channel reaches `critical`, and SmarTune caps the throttleable
 ones so the **Critical-priority app keeps the device**.
 
-[`docs/pressure_algorithm.md`](pressure_algorithm.md) explains how the score and the level
+[`docs/pressure-algorithm.md`](pressure-algorithm.md) explains how the score and the level
 are computed. This document starts where that one stops — at `disk_level = critical` — and
 shows what the caps do to real throughput.
 
-Two full runs of [`balancer/test/testing_io.sh`](../balancer/test/testing_io.sh) on the
+Two full runs of [`balancer/test/testing_io.sh`](../../balancer/test/testing_io.sh) on the
 same machine are used throughout:
 
 | | raw log | difference |
 |---|---|---|
-| **Run A** | [`testing_io_resoult.txt`](../balancer/test/testing_io_resoult.txt) | `fio_lo2` **unregistered** → capped at the `undefined` rates |
-| **Run B** | [`testing_io_resoult_sec.txt`](../balancer/test/testing_io_resoult_sec.txt) | `fio_lo2` **registered at Low** → capped at the `Low` rates |
+| **Run A** | [`testing_io_resoult.txt`](../../balancer/test/testing_io_resoult.txt) | `fio_lo2` **unregistered** → capped at the `undefined` rates |
+| **Run B** | [`testing_io_resoult_sec.txt`](../../balancer/test/testing_io_resoult_sec.txt) | `fio_lo2` **registered at Low** → capped at the `Low` rates |
 
 Everything else — hardware, profile, durations — is identical, so the pair isolates one
 variable: which priority row the rates come from.
@@ -55,23 +55,23 @@ cgroup paths:
 
 ```
 disk USE model + io PSI  ──►  disk_level  ──►  candidate selection  ──►  io.max
-   (pressure_algorithm.md)      critical        (priority rules)        (per disk)
+   (pressure-algorithm.md)      critical        (priority rules)        (per disk)
 ```
 
 1. **`high` arms, `critical` fires.** At `high` the top disk-IO consumers are resolved and
    logged but nothing is written; only `critical` applies a cap
-   ([`balancer.py:904`](../balancer/balancer/balancer.py#L904)).
+   ([`balancer.py:904`](../../balancer/balancer/balancer.py#L904)).
 2. **One candidate per critical tick**, walked in descending-IO order
-   ([`_handle_disk_io_stressed`](../balancer/balancer/balancer.py#L1657)). A candidate is
+   ([`_handle_disk_io_stressed`](../../balancer/balancer/balancer.py#L1657)). A candidate is
    skipped when it is a **Critical** app, when it is already under an auto io-limit (so the
    next tick moves on to the next heavy user), or when it is doing too little I/O on that
-   disk for a cap to relieve anything ([`_qualifies_for_throttle`](../balancer/balancer/balancer.py#L539)).
+   disk for a cap to relieve anything ([`_qualifies_for_throttle`](../../balancer/balancer/balancer.py#L539)).
 3. **Rates come from the app's priority row**; an unmanaged app counts as `undefined`, the
    strictest tier. The row is scaled by the disk's media class and written as `io.max` on
-   the stressed disks only ([`_scaled_io_limits`](../balancer/balancer/balancer.py#L577)).
+   the stressed disks only ([`_scaled_io_limits`](../../balancer/balancer/balancer.py#L577)).
 
 The two rows that matter here, from `limit_policy.disk_io.rate` in
-[`config/config.yaml`](../config/config.yaml) (`media_scale.nvme = 1.0`, so these land
+[`config/config.yaml`](../../config/config.yaml) (`media_scale.nvme = 1.0`, so these land
 unscaled):
 
 | priority | write MB/s | read MB/s | write IOPS | read IOPS |

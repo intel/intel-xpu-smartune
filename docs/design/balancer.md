@@ -18,7 +18,7 @@ That decision has two possible sources:
 
 The two are mutually exclusive: an app only ever carries one of them. Auto skips any cgroup that already carries a manual limit, and limiting an app by hand also pulls it out of the auto candidate pool (an exclusion).
 
-> How the pressure score itself is computed is covered in [pressure_algorithm.md](pressure_algorithm.md). This document only covers what happens once it has been computed.
+> How the pressure score itself is computed is covered in [pressure-algorithm.md](pressure-algorithm.md). This document only covers what happens once it has been computed.
 
 ---
 
@@ -204,7 +204,7 @@ What the handover does when the switch goes off: no cgroup is written, the limit
 
 # Part II — Manual Control: What the User Can Do
 
-Everything here comes from the dashboard's Balance page, or from calling the REST API directly (full definitions in [API_ENDPOINTS.md](API_ENDPOINTS.md)).
+Everything here comes from the dashboard's Balance page, or from calling the REST API directly (full definitions in [API_ENDPOINTS.md](../reference/api.md)).
 
 ### Limit and restore
 
@@ -410,12 +410,12 @@ The "Where" column has three values:
 
 | Topic | File |
 |---|---|
-| Main decision loop, auto limit/restore, manual limit API implementation | [balancer/balancer/balancer.py](../balancer/balancer/balancer.py) |
-| REST / SSE endpoints | [balancer/balance_service.py](../balancer/balance_service.py) |
-| cgroup writes (CPU/memory/IO) | [balancer/controller/controller.py](../balancer/controller/controller.py) |
-| Governor, swap, reclaim scheduling | [balancer/controller/control_manager.py](../balancer/controller/control_manager.py) |
-| eBPF launch interception | [balancer/controller/app_intercept.py](../balancer/controller/app_intercept.py) |
-| Network tc / iptables | [balancer/controller/network.py](../balancer/controller/network.py) |
-| Pressure score computation | [monitor/pressure.py](../monitor/pressure.py), [monitor/disk_pressure.py](../monitor/disk_pressure.py) |
-| Config read/write endpoints | [monitor/monitor_api.py](../monitor/monitor_api.py) |
-| Defaults | [config/config.yaml](../config/config.yaml) |
+| Main decision loop, auto limit/restore, manual limit API implementation | [balancer/balancer/balancer.py](../../balancer/balancer/balancer.py) |
+| REST / SSE endpoints | [balancer/balance_service.py](../../balancer/balance_service.py) |
+| cgroup writes (CPU/memory/IO) | [balancer/controller/controller.py](../../balancer/controller/controller.py) |
+| Governor, swap, reclaim scheduling | [balancer/controller/control_manager.py](../../balancer/controller/control_manager.py) |
+| eBPF launch interception | [balancer/controller/app_intercept.py](../../balancer/controller/app_intercept.py) |
+| Network tc / iptables | [balancer/controller/network.py](../../balancer/controller/network.py) |
+| Pressure score computation | [monitor/pressure.py](../../monitor/pressure.py), [monitor/disk_pressure.py](../../monitor/disk_pressure.py) |
+| Config read/write endpoints | [monitor/monitor_api.py](../../monitor/monitor_api.py) |
+| Defaults | [config/config.yaml](../../config/config.yaml) |

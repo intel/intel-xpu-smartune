@@ -38,7 +38,7 @@ Key Words:
 ```
 
 For every scenario the balancer acts on under Auto and Manual control, what each one adjusts, and a
-lookup table of all tunable parameters, see the [Balancer Guide](../docs/balancer_guide.md).
+lookup table of all tunable parameters, see the [Balancer Guide](../docs/design/balancer.md).
 
 # Network Control & Monitor Design
 The network control and monitoring module is designed as an independent component,

@@ -138,7 +138,7 @@ def main():
     logger.info("Starting Monitor Service...")
     if not os.path.exists(CERT_FILE) or not os.path.exists(KEY_FILE):
         logger.error(f"Certificate files not found: {CERT_FILE}, {KEY_FILE}, "
-                     f"please run 'start_smartune.sh -m' to generate them.")
+                     f"please run 'bash start_smartune.sh -m' to generate them.")
         return
 
     init_database()

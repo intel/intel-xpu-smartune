@@ -8,7 +8,7 @@ feature is present in the deployment — check `GET /smartune/capabilities` (`di
 before offering the tab.
 
 Base URL, TLS, authentication and the unified `{retcode, retmsg, data}` envelope are the
-same as the rest of the product; see the [Backend API Guide](../docs/API_ENDPOINTS.md) for
+same as the rest of the product; see the [Backend API Guide](../docs/reference/api.md) for
 those and for the shared `RetCode` table. Auth is applied app-wide by `smartune_api`'s
 `before_app_request` gate, so none of these routes carries a per-route token check.
 

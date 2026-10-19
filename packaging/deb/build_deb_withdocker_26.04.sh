@@ -1,8 +1,44 @@
 #!/bin/bash
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
+#
+# Build the SmarTune .deb inside a clean, reproducible Ubuntu 26.04 container.
+#
+# Use this instead of build_deb.sh when your host is NOT Ubuntu 26.04, or when
+# you want a reproducible build that doesn't depend on your host's installed
+# packages. It builds the Ubuntu 26.04 builder image (Dockerfile.ubuntu2604),
+# runs the build inside it, and writes the resulting .deb to ./build/.
+#
+# All arguments are forwarded verbatim to build_deb.sh (the image ENTRYPOINT),
+# so the same options apply: [VERSION] and --full/--all (full package) etc.
+# HTTP(S)/no_proxy env vars are detected and passed through automatically.
+#
+# Requires: Docker.
 
 set -euo pipefail
+
+usage() {
+    cat <<EOF
+Build the SmarTune .deb in a reproducible Ubuntu 26.04 Docker container.
+
+Usage: $(basename "$0") [VERSION] [OPTIONS]
+
+    (no option)   Build the monitor-only package (smartune-monitor).
+    --full        Build the full package (smartune: balancer + monitor).
+    VERSION       Override the package version (e.g. 1.5.1).
+    -h, --help    Show this help and exit.
+
+Examples:
+    $(basename "$0")              # monitor-only .deb -> ./build/
+    $(basename "$0") --full       # full .deb         -> ./build/
+
+Output: ./build/smartune[-monitor]_<ver>_amd64.deb
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+esac
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$HERE" rev-parse --show-toplevel)"

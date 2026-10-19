@@ -206,7 +206,7 @@ function formatMemoryGb(memoryMb?: number | null): string {
   return `${Math.round(memoryMb)} MB`
 }
 
-function formatEffectiveControl(app: AppInfo): string | null {
+function formatEffectiveControl(app: Pick<AppInfo, 'effective'>): string | null {
   const effective = app.effective
   const parts: string[] = []
   const toPercent = (rate: number | null | undefined): string | null =>
@@ -3741,18 +3741,36 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
 
   const fetchControlSummary = useCallback(async () => {
     if (!active || !balancerEnabled) return
-    await api.getControlledApps().then(
-      (apps) => {
-        const list = Array.isArray(apps) ? apps : []
+    // Registered apps and engine-throttled unregistered apps come from separate endpoints;
+    // count both, the same way the Control center table merges them.
+    await Promise.allSettled([api.getControlledApps(), api.getAutoLimitedApps()]).then(
+      ([controlledResult, autoResult]) => {
+        if (controlledResult.status === 'rejected' && autoResult.status === 'rejected') return
+        const list = controlledResult.status === 'fulfilled' && Array.isArray(controlledResult.value)
+          ? controlledResult.value
+          : []
         const limited = list.filter((app) => ['AUTO_LIMITED', 'MANUAL_LIMITED'].includes(app.control_status || ''))
-        const featured = limited.find((app) => app.control_status === 'AUTO_LIMITED') ?? limited[0]
+        const controlledIds = new Set(list.map((app) => app.app_id))
+        const unregisteredAuto = autoResult.status === 'fulfilled'
+          ? (autoResult.value.apps ?? []).filter(
+            (app) => !app.is_controlled
+              && !controlledIds.has(app.app_id)
+              && !controlledIds.has(app.effective_app_id),
+          )
+          : []
+        const autoApps = [
+          ...limited.filter((app) => app.control_status === 'AUTO_LIMITED'),
+          ...unregisteredAuto,
+        ]
+        const manualCount = limited.filter((app) => app.control_status === 'MANUAL_LIMITED').length
+        const featured = autoApps[0] ?? limited[0]
         const nextSummary: ControlCockpitSummary = {
-          auto: limited.filter((app) => app.control_status === 'AUTO_LIMITED').length,
-          manual: limited.filter((app) => app.control_status === 'MANUAL_LIMITED').length,
+          auto: autoApps.length,
+          manual: manualCount,
           featured: featured
             ? { name: featured.app_name || featured.app_id, limit: formatEffectiveControl(featured) }
             : null,
-          remaining: Math.max(0, limited.length - 1),
+          remaining: Math.max(0, autoApps.length + manualCount - 1),
         }
         setControlSummary((current) => {
           const unchanged = current
@@ -3764,7 +3782,6 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
           return unchanged ? current : nextSummary
         })
       },
-      () => {},
     )
   }, [active, balancerEnabled])
 

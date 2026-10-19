@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="755" viewBox="0 0 1400 755" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="30" y="44" font-size="24" fill="#1b2a5c" font-weight="bold" text-anchor="start">SmarTune — One interface to observe, limit, and validate heterogeneous XPU resources</text>
+<rect x="30" y="86" width="1340" height="42" rx="6" fill="#1b2a5c" stroke="none" stroke-width="1.2"/>
+<text x="700.0" y="113" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">One shared foundation: upper-layer frameworks no longer build their own monitoring and throttling — plug in and get the full resource stack.</text>
+<rect x="30" y="142" width="1340" height="82" rx="8" fill="#eef3fb" stroke="#c7d4ea" stroke-width="1.2"/>
+<text x="115" y="188.0" font-size="15" fill="#1b2a5c" font-weight="bold" text-anchor="middle">Who uses it</text>
+<rect x="205.0" y="152" width="277.75" height="62" rx="6" fill="#ffffff" stroke="#9fb3d6" stroke-width="1.2"/>
+<text x="343.875" y="178" font-size="15" fill="#1b2a5c" font-weight="bold" text-anchor="middle">AI Agent / Copilot frameworks</text>
+<text x="343.875" y="198" font-size="13" fill="#475569" font-weight="normal" text-anchor="middle">e.g. AI Box</text>
+<rect x="496.75" y="152" width="277.75" height="62" rx="6" fill="#ffffff" stroke="#9fb3d6" stroke-width="1.2"/>
+<text x="635.625" y="178" font-size="15" fill="#1b2a5c" font-weight="bold" text-anchor="middle">Apps &amp; container workloads</text>
+<text x="635.625" y="198" font-size="13" fill="#475569" font-weight="normal" text-anchor="middle">AI inference · video analytics</text>
+<rect x="788.5" y="152" width="277.75" height="62" rx="6" fill="#ffffff" stroke="#9fb3d6" stroke-width="1.2"/>
+<text x="927.375" y="178" font-size="15" fill="#1b2a5c" font-weight="bold" text-anchor="middle">OEM / ODM &amp; solution providers</text>
+<text x="927.375" y="198" font-size="13" fill="#475569" font-weight="normal" text-anchor="middle">Platform selection · tuning &amp; validation</text>
+<rect x="1080.25" y="152" width="277.75" height="62" rx="6" fill="#ffffff" stroke="#9fb3d6" stroke-width="1.2"/>
+<text x="1219.125" y="178" font-size="15" fill="#1b2a5c" font-weight="bold" text-anchor="middle">Ops &amp; end users</text>
+<text x="1219.125" y="198" font-size="13" fill="#475569" font-weight="normal" text-anchor="middle">Resource dashboard · alerts · troubleshooting</text>
+<rect x="30" y="238" width="1340" height="78" rx="8" fill="#eef3fb" stroke="#c7d4ea" stroke-width="1.2"/>
+<text x="115" y="275.0" font-size="15" fill="#1b2a5c" font-weight="bold" text-anchor="middle">Unified access</text>
+<text x="115" y="295.0" font-size="12" fill="#475569" font-weight="normal" text-anchor="middle">Read state / write policy</text>
+<rect x="205.0" y="254" width="569.5" height="46" rx="8" fill="#2563c9" stroke="none" stroke-width="1.2"/>
+<text x="489.75" y="282.0" font-size="14" fill="#ffffff" font-weight="bold" text-anchor="middle">REST API / SSE event stream</text>
+<rect x="788.5" y="254" width="569.5" height="46" rx="8" fill="#2563c9" stroke="none" stroke-width="1.2"/>
+<text x="1073.25" y="282.0" font-size="14" fill="#ffffff" font-weight="bold" text-anchor="middle">Built-in dashboard UI</text>
+<rect x="30" y="330" width="1340" height="285" rx="8" fill="#ffffff" stroke="#2563c9" stroke-width="2"/>
+<rect x="40" y="340" width="1320" height="36" rx="6" fill="#1b2a5c" stroke="none" stroke-width="1.2"/>
+<text x="700.0" y="364" font-size="16" fill="#ffffff" font-weight="bold" text-anchor="middle">SmarTune platform services  ·  Observe → Control → Validate → Diagnose</text>
+<rect x="44.0" y="388" width="319.0" height="46" rx="6" fill="#2563c9" stroke="none" stroke-width="1.2"/>
+<text x="203.5" y="416.0" font-size="14" fill="#ffffff" font-weight="bold" text-anchor="middle">Resource monitoring</text>
+<rect x="44.0" y="444" width="319.0" height="159" rx="6" fill="#f1f5fb" stroke="#c7d4ea" stroke-width="1.2"/>
+<text x="54.0" y="466" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="66.0" y="466.0" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Real-time XPU utilization: CPU / iGPU /</text>
+<text x="66.0" y="483.25" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">dGPU / NPU</text>
+<text x="54.0" y="505.5" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="66.0" y="505.5" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Memory, disk I/O and network throughput</text>
+<text x="54.0" y="527.75" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="66.0" y="527.75" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Static info: hardware topology, drivers,</text>
+<text x="66.0" y="545.0" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">firmware versions</text>
+<text x="54.0" y="567.25" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="66.0" y="567.25" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">System pressure &amp; bottleneck scoring (PSI)</text>
+<rect x="375.0" y="388" width="319.0" height="46" rx="6" fill="#2563c9" stroke="none" stroke-width="1.2"/>
+<text x="534.5" y="416.0" font-size="14" fill="#ffffff" font-weight="bold" text-anchor="middle">Resource control</text>
+<rect x="375.0" y="444" width="319.0" height="159" rx="6" fill="#f1f5fb" stroke="#c7d4ea" stroke-width="1.2"/>
+<text x="385.0" y="466" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="397.0" y="466.0" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Per-app CPU / GPU / NPU compute quotas</text>
+<text x="385.0" y="488.25" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="397.0" y="488.25" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Memory, I/O and bandwidth caps with</text>
+<text x="397.0" y="505.5" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">priority policies</text>
+<text x="385.0" y="527.75" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="397.0" y="527.75" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Reclaim idle resources, protect critical</text>
+<text x="397.0" y="545.0" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">apps</text>
+<text x="385.0" y="567.25" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="397.0" y="567.25" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Multiple apps run side by side</text>
+<rect x="706.0" y="388" width="319.0" height="46" rx="6" fill="#2563c9" stroke="none" stroke-width="1.2"/>
+<text x="865.5" y="416.0" font-size="14" fill="#ffffff" font-weight="bold" text-anchor="middle">Model management &amp; benchmarking</text>
+<rect x="706.0" y="444" width="319.0" height="159" rx="6" fill="#f1f5fb" stroke="#c7d4ea" stroke-width="1.2"/>
+<text x="716.0" y="466" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="728.0" y="466.0" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Local model repository: one-click download</text>
+<text x="728.0" y="483.25" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">/ run / unload</text>
+<text x="716.0" y="505.5" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="728.0" y="505.5" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Model lifecycle: versions · updates ·</text>
+<text x="728.0" y="522.75" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">cleanup</text>
+<text x="716.0" y="545.0" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="728.0" y="545.0" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Model × platform benchmarks, visualized</text>
+<text x="716.0" y="567.25" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="728.0" y="567.25" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Recommend the best models for Intel</text>
+<text x="728.0" y="584.5" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">platforms</text>
+<rect x="1037.0" y="388" width="319.0" height="46" rx="6" fill="#2563c9" stroke="none" stroke-width="1.2"/>
+<text x="1196.5" y="416.0" font-size="14" fill="#ffffff" font-weight="bold" text-anchor="middle">Logs &amp; anomaly insights</text>
+<rect x="1037.0" y="444" width="319.0" height="159" rx="6" fill="#f1f5fb" stroke="#c7d4ea" stroke-width="1.2"/>
+<text x="1047.0" y="466" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="1059.0" y="466.0" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Unified runtime log and event collection</text>
+<text x="1047.0" y="488.25" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="1059.0" y="488.25" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Anomaly alerts: frequency drops,</text>
+<text x="1059.0" y="505.5" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">overheating, resource exhaustion</text>
+<text x="1047.0" y="527.75" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="1059.0" y="527.75" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Root-cause clues and history replay</text>
+<text x="1047.0" y="550.0" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">•</text>
+<text x="1059.0" y="550.0" font-size="12.5" fill="#334155" font-weight="normal" text-anchor="start">Readable state and diagnostics for agents</text>
+<rect x="30" y="629" width="1340" height="112" rx="10" fill="#1b2a5c" stroke="none" stroke-width="1.2"/>
+<text x="115" y="673" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">Heterogeneous</text>
+<text x="115" y="692" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">platform layer</text>
+<text x="115" y="711" font-size="12" fill="#c7d2fe" font-weight="normal" text-anchor="middle">OS &amp; hardware</text>
+<rect x="205.0" y="645" width="154.14285714285714" height="36" rx="7" fill="#23396f" stroke="#7f95c8" stroke-width="1.2"/>
+<text x="282.07142857142856" y="669" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">CPU</text>
+<rect x="371.1428571428571" y="645" width="154.14285714285714" height="36" rx="7" fill="#23396f" stroke="#7f95c8" stroke-width="1.2"/>
+<text x="448.21428571428567" y="669" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">iGPU</text>
+<rect x="537.2857142857142" y="645" width="154.14285714285714" height="36" rx="7" fill="#23396f" stroke="#7f95c8" stroke-width="1.2"/>
+<text x="614.3571428571428" y="669" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">dGPU</text>
+<rect x="703.4285714285714" y="645" width="154.14285714285714" height="36" rx="7" fill="#23396f" stroke="#7f95c8" stroke-width="1.2"/>
+<text x="780.5" y="669" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">NPU</text>
+<rect x="869.5714285714286" y="645" width="154.14285714285714" height="36" rx="7" fill="#23396f" stroke="#7f95c8" stroke-width="1.2"/>
+<text x="946.6428571428571" y="669" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">Memory</text>
+<rect x="1035.7142857142858" y="645" width="154.14285714285714" height="36" rx="7" fill="#23396f" stroke="#7f95c8" stroke-width="1.2"/>
+<text x="1112.7857142857144" y="669" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">Disk</text>
+<rect x="1201.857142857143" y="645" width="154.14285714285714" height="36" rx="7" fill="#23396f" stroke="#7f95c8" stroke-width="1.2"/>
+<text x="1278.9285714285716" y="669" font-size="15" fill="#ffffff" font-weight="bold" text-anchor="middle">Network</text>
+<text x="780.5" y="717" font-size="14" fill="#dbe4ff" font-weight="normal" text-anchor="middle">Collection &amp; enforcement: XPU telemetry · Linux PSI · cgroup v2 · eBPF · driver / firmware interfaces</text>
+</svg>

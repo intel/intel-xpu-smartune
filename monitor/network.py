@@ -25,7 +25,7 @@ also scaled by an activity gate ``min(1, pps/min_pps_activity)`` so a near-idle 
 (tiny ratio denominator) cannot false-trip on a handful of stray drops.
 
 Model constants are live-overridable from ``config.network_pressure_model`` via
-:meth:`NetworkMonitor._model`. See ``docs/pressure_algorithm.md`` Part IV.
+:meth:`NetworkMonitor._model`. See ``docs/design/pressure-algorithm.md`` Part IV.
 """
 
 import math

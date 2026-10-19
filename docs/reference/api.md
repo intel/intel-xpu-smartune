@@ -11,8 +11,8 @@ Every API the product serves, and where it is documented:
 | Authentication & service | `/auth/*`, `/smartune/*` | Below, [Part 1](#part-1-authentication--application-management) | Always |
 | Application management | `/app/*` | Below, [Part 1](#part-1-authentication--application-management) | Balancer is present (`capabilities: 1`) |
 | System monitor & config | `/monitor/*` | Below, [Part 2](#part-2-system-monitor) | Always |
-| Benchmark | `/bench/*` | [benchmark/API_benchmark.md](../benchmark/API_benchmark.md) | `benchmark: 1` |
-| Diagnostics | `/diag/*` | [diagnostics/API_diagnostics.md](../diagnostics/API_diagnostics.md) | `diagnostics: 1` |
+| Benchmark | `/bench/*` | [benchmark/API_benchmark.md](../../benchmark/API_benchmark.md) | `benchmark: 1` |
+| Diagnostics | `/diag/*` | [diagnostics/API_diagnostics.md](../../diagnostics/API_diagnostics.md) | `diagnostics: 1` |
 
 Query `GET /smartune/capabilities` to find out which optional features a given server has.
 The base information, authentication and the `RetCode` table below apply to every endpoint,

@@ -17,7 +17,7 @@ Built with **Vite + React 18 + TypeScript + Ant Design v5**.
 
 ```bash
 cd dashboard
-./start_dashboard.sh        # auto-installs Node.js if missing, then starts the dev server
+bash start_dashboard.sh        # auto-installs Node.js if missing, then starts the dev server
 ```
 
 Open **http://localhost:39527** in your browser.
@@ -132,7 +132,7 @@ npm run preview      # serve the production build locally
 | **System Overview** | Live CPU, Memory, Disk I/O, Network panels; iGPU / dGPU / NPU placeholder panels |
 | **App Resources** | Per-application resource consumption (CPU %, Memory MB, I/O rate) |
 | **Process Resources** | Per-process details: PID, name, CPU avg %, RSS, I/O read rate |
-| **Pressure** | System / Disk I/O / Network I/O pressure gauges with **LOW / MEDIUM / HIGH / CRITICAL** badges |
+| **Pressure** | System / Disk I/O / Network I/O pressure bars with **LOW / MEDIUM / HIGH / CRITICAL** badges |
 | **App Management** | Add apps to control list, set priority, limit/restore resources, keep-alive, delete |
 
 ---

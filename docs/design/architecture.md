@@ -24,6 +24,7 @@ intel-xpu-smartune/
 ├── smartune.py                 # Single entry point: -a (balancer + monitor) / -m (monitor only)
 ├── start_smartune.sh           # Start script: -a (default, all) / -m (monitor only)
 ├── start_smartune_service.sh   # systemd entry script (cert-gen + launch, no sudo/trap)
+├── setup_venv.sh               # Creates/refreshes .smartune-venv (used by both start scripts)
 ├── smartune.service            # systemd unit template
 ├── smartune_api.py             # Shared API for both services (incl. app-wide auth-token gate)
 ├── features.py                 # Mounts benchmark/, diagnostics/ and dashboard/dist when present

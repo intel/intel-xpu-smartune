@@ -59,6 +59,8 @@ interface MemoryTrendPoint {
   bandwidthTotal: number | null
   bandwidthRead: number | null
   bandwidthWrite: number | null
+  swapUsedGb: number | null
+  swapUsagePercent: number | null
 }
 
 interface DiskTrendPoint {
@@ -622,6 +624,8 @@ function buildMemoryTrendPoints(items: HistorySnapshotItem[]): MemoryTrendPoint[
       bandwidthTotal: toNumber(bandwidth?.total_gb_s),
       bandwidthRead: toNumber(bandwidth?.read_gb_s),
       bandwidthWrite: toNumber(bandwidth?.write_gb_s),
+      swapUsedGb: toNumber(dynamic?.memory?.swap_used_gb),
+      swapUsagePercent: toNumber(dynamic?.memory?.swap_usage_percent),
     }
   })
 }
@@ -2219,6 +2223,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
         { header: 'mem_bw_total_gbs', key: 'bwTotal', width: 16 },
         { header: 'mem_bw_read_gbs', key: 'bwRead', width: 16 },
         { header: 'mem_bw_write_gbs', key: 'bwWrite', width: 16 },
+        { header: 'swap_used_gb', key: 'swap_used', width: 14 },
         { header: 'swap_util_pct', key: 'swap', width: 14 },
         { header: 'swap_total_gb', key: 'swap_total', width: 14 },
       ],
@@ -2229,6 +2234,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
         bwTotal: d?.memory?.bandwidth?.total_gb_s ?? null,
         bwRead: d?.memory?.bandwidth?.read_gb_s ?? null,
         bwWrite: d?.memory?.bandwidth?.write_gb_s ?? null,
+        swap_used: d?.memory?.swap_used_gb ?? null,
         swap: d?.memory?.swap_usage_percent ?? null,
         swap_total: d?.memory?.swap_total_gb ?? null,
       }),
@@ -2722,6 +2728,10 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
             { key: 'bandwidthTotal', name: 'BW Total', color: COLORS.accent, unit: 'GB/s' },
             { key: 'bandwidthRead', name: 'BW Read', color: '#22d3ee', unit: 'GB/s' },
             { key: 'bandwidthWrite', name: 'BW Write', color: METRIC_COLORS.write, unit: 'GB/s' },
+            { key: 'swapUsagePercent', name: 'Swap Usage', color: '#f472b6', unit: '%', dasharray: '5 3' },
+            // A third unit: a chart has only two Y axes, so with % and GB/s both on this
+            // would be drawn against the % axis. Off by default for that reason.
+            { key: 'swapUsedGb', name: 'Swap Used', color: '#a78bfa', unit: 'GB', defaultOn: false },
           ]}
           order={6}
         />

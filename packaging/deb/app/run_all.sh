@@ -23,8 +23,8 @@ cd "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/logs"
 
 # 1. The venv must already exist (built by postinst). Don't self-heal here.
-if [ ! -x "$INSTALL_DIR/venv/bin/python" ]; then
-    echo "[smartune] ERROR: venv missing at $INSTALL_DIR/venv — reinstall the package." >&2
+if [ ! -x "$INSTALL_DIR/smartune-venv/bin/python" ]; then
+    echo "[smartune] ERROR: venv missing at $INSTALL_DIR/smartune-venv — reinstall the package." >&2
     exit 1
 fi
 
@@ -69,4 +69,4 @@ export SMARTUNE_UI_LEASE=1
 
 # 4. Launch the combined balancer + monitor (port 9001, serves the dashboard UI
 # and its /api). smartune.py -a handles the balancer/ chdir + sys.path setup.
-exec "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/smartune.py" -a
+exec "$INSTALL_DIR/smartune-venv/bin/python" "$INSTALL_DIR/smartune.py" -a

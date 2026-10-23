@@ -344,6 +344,8 @@ interface GpuDeviceView {
   powerGpu: number | null
   powerPkg: number | null
   vramUsage: number | null
+  vramTotalGb: number | null
+  vramAvailableGb: number | null
   euCount: number | null
   pciId: string | null
   pcieLink: {
@@ -399,6 +401,21 @@ function formatNumber(value: number | null, decimals = 1): string {
 function formatPercent(value?: number | null, decimals = 1): string {
   if (!isNumber(value)) return 'N/A'
   return `${value.toFixed(decimals)}%`
+}
+
+// Packet loss for the NIC card: the worse of the two directions, so a one-way
+// problem is not hidden. N/A when neither direction has a ratio.
+function formatWorstPacketLoss(
+  pressure?: { rx?: { drop_ratio_pct?: number | null }; tx?: { drop_ratio_pct?: number | null } } | null,
+): string {
+  const values = [pressure?.rx?.drop_ratio_pct, pressure?.tx?.drop_ratio_pct].filter(isNumber)
+  return values.length ? formatPercent(Math.max(...values), 2) : 'N/A'
+}
+
+// "used / total GB" for swap; just the used figure when the total is unknown.
+function formatSwapUsed(used?: number | null, total?: number | null): string {
+  if (!isNumber(used)) return 'N/A'
+  return isNumber(total) ? `${used.toFixed(1)} / ${total.toFixed(1)} GB` : `${used.toFixed(1)} GB`
 }
 
 function formatMetric(value?: number | null, unit?: string, decimals = 1): string {
@@ -637,6 +654,12 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
     const vramDyn = dynamicGpu?.vram?.[cardKey] || dynamicVramEntries[index]?.[1]
     const vramStatic = staticGpu?.vram?.[cardKey] || staticVramEntries[index]?.[1]
     const vramUsage = normalizePercent(vramDyn?.usage_percent ?? vramStatic?.usage_percent ?? null)
+    const vramTotalBytes = vramDyn?.total_bytes ?? vramStatic?.total_bytes ?? null
+    const vramTotalGb = isNumber(vramTotalBytes) && vramTotalBytes > 0 ? vramTotalBytes / (1024 ** 3) : null
+    const vramUsedBytes = vramDyn?.used_bytes ?? null
+    const vramAvailableGb = vramTotalGb !== null && isNumber(vramUsedBytes)
+      ? Math.max(vramTotalGb - vramUsedBytes / (1024 ** 3), 0)
+      : null
 
     // Determine iGPU vs dGPU. Authoritative source: Intel iGPU is always at
     // bus 00, device 02 (e.g. 0000:00:02.0). Fall back to qdev.dev_type when
@@ -723,6 +746,8 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
       powerGpu: qdev?.power_w?.gpu ?? null,
       powerPkg: qdev?.power_w?.pkg ?? qdev?.power_w?.card ?? null,
       vramUsage,
+      vramTotalGb,
+      vramAvailableGb,
       euCount: staticGpu?.eu_count?.[cardKey] ?? null,
       pciId,
       pcieLink: {
@@ -2675,7 +2700,11 @@ function GpuSummaryCard({
   return (
     <ResourceSummaryCard
       title={device.displayLabel}
-      subtitle={formatGpuSummaryName(device)}
+      subtitle={
+        device.label !== 'iGPU' && isNumber(device.vramTotalGb)
+          ? `${formatGpuSummaryName(device)} | ${device.vramTotalGb.toFixed(1)} GB VRAM`
+          : formatGpuSummaryName(device)
+      }
       accent={accent}
       status={device.status === 'Throttle' ? 'critical' : device.status === 'Busy' ? 'warning' : device.status.toLowerCase() as SummaryCardStatus}
       statusColor={device.statusColor}
@@ -3154,6 +3183,7 @@ function GpuDeviceCard({
             ? `Freq ${formatFreqRange(device.freqBounds.min_mhz, device.freqBounds.max_mhz)}`
             : null,
           device.label === 'iGPU' && isNumber(device.euCount) ? `EU ${device.euCount}` : null,
+          device.label !== 'iGPU' && isNumber(device.vramTotalGb) ? `VRAM ${device.vramTotalGb.toFixed(1)} GB` : null,
         ].filter(Boolean).join(' | ') || 'No static info'}
       </Text>
 
@@ -3220,6 +3250,11 @@ function GpuDeviceCard({
             <Text style={{ color: COLORS.text, fontSize: 11, fontWeight: 600 }}>
               {formatPercent(device.vramUsage)}
             </Text>
+            {device.label !== 'iGPU' && isNumber(device.vramAvailableGb) && (
+              <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>
+                ({formatMetric(device.vramAvailableGb, 'GB', 1)} available)
+              </Text>
+            )}
           </span>
           {/* Engine */}
           <Text style={{ color: COLORS.textMuted, fontSize: 10, flexShrink: 0, marginLeft: 4 }}>Engine</Text>
@@ -3984,13 +4019,18 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
 
   const staticMemory = staticInfo?.memory
   const dynamicTotalGb = dynamicInfo?.memory?.total_gb
+  const memoryUsedGb = isNumber(dynamicTotalGb) && isNumber(dynamicInfo?.memory?.available_gb)
+    ? Math.max(dynamicTotalGb - dynamicInfo.memory.available_gb, 0)
+    : null
   const dynamicSwapTotalGb = dynamicInfo?.memory?.swap_total_gb
   const memorySnapshotMeta = useMemo(() => {
     if (staticMemory) {
       const parts: string[] = []
       const totalGb = staticMemory.total_gb
       if (totalGb != null && isNumber(totalGb)) parts.push(`${totalGb.toFixed(1)} GB`)
-      const swapTotalGb = staticMemory.swap_total_gb ?? dynamicSwapTotalGb
+      // Live value first: the balancer can add swap at runtime, and the static
+      // snapshot is read once, so it would go stale.
+      const swapTotalGb = dynamicSwapTotalGb ?? staticMemory.swap_total_gb
       if (isNumber(swapTotalGb)) parts.push(`Swap ${swapTotalGb.toFixed(1)} GB`)
       // Memory type (e.g. LPDDR5) from devices or ddr_speeds
       const memTypes = [...new Set(
@@ -4003,11 +4043,11 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
       const speedStr = (configuredSpeed && configuredSpeed !== 'Unknown')
         ? configuredSpeed
         : (staticMemory.ddr_speeds?.length ? staticMemory.ddr_speeds.join('/') : null)
-      if (speedStr) parts.push(speedStr)
+      if (speedStr) parts.push(`Speed ${speedStr}`)
       else if (!memTypes.length) parts.push('DDR N/A')
-      // Theoretical peak DRAM bandwidth, after capacity/type/speed.
+      // Theoretical DRAM bandwidth ceiling (MT/s x bus width), not a measured peak.
       const peak = staticMemory.max_bandwidth_gb_s
-      if (isNumber(peak)) parts.push(`${peak.toFixed(0)} GB/s`)
+      if (isNumber(peak)) parts.push(`Theoretical BW ${peak.toFixed(0)} GB/s`)
       return parts.join(' | ')
     }
     const parts: string[] = []
@@ -4553,7 +4593,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
             metrics={[
               { label: 'Available', value: formatMetric(dynamicInfo?.memory?.available_gb, 'GB', 1) },
               { label: 'Bandwidth', value: formatMetric(dynamicInfo?.memory?.bandwidth?.total_gb_s, 'GB/s', 1) },
-              { label: 'Swap Used', value: formatMetric(dynamicInfo?.memory?.swap_used_gb, 'GB', 1) },
+              { label: 'Swap Used', value: formatSwapUsed(dynamicInfo?.memory?.swap_used_gb, dynamicInfo?.memory?.swap_total_gb) },
             ]}
             series={getSeries('util:memory')}
             trendWindow={trendWindow}
@@ -4600,7 +4640,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
             <Col xs={24} md={12} xxl={8} key={`nic-${nic.nicName}`} className="perf-resource-order--network">
               <ResourceSummaryCard
                 title={`Network: ${nic.nicName}`}
-                subtitle={`Peak bandwidth ${formatNetworkSpeed(nic.bandwidth)}`}
+                subtitle={`Link speed ${formatNetworkSpeed(nic.bandwidth)}`}
                 accent={PERF_COLORS.network}
                 status={networkState.status}
                 statusColor={networkState.color}
@@ -4610,7 +4650,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
                 metrics={[
                   { label: 'Receive (RX)', value: formatBytesRate(nic.rxRate) },
                   { label: 'Send (TX)', value: formatBytesRate(nic.txRate) },
-                  { label: 'Link Speed', value: formatNetworkSpeed(nic.bandwidth) },
+                  { label: 'Packet Loss', value: formatWorstPacketLoss(nic.pressure) },
                 ]}
                 series={getSeries(`util:network:${nic.nicName}`)}
                 trendWindow={trendWindow}
@@ -4624,7 +4664,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
             <ResourceSummaryCard
               title={networkNicCards.length === 1 ? `Network: ${networkNicCards[0].nicName}` : 'Network'}
               subtitle={networkNicCards.length === 1
-                ? `Peak bandwidth ${formatNetworkSpeed(networkNicCards[0].bandwidth)}`
+                ? `Link speed ${formatNetworkSpeed(networkNicCards[0].bandwidth)}`
                 : staticInfo?.network
                   ? [
                       `${formatPlain(staticInfo.network.nic_count ?? 0)} NIC(s)`,
@@ -4647,7 +4687,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
               metrics={[
                 { label: 'Receive (RX)', value: formatBytesRate(networkNicCards.length === 1 ? networkNicCards[0].rxRate : fallbackRxRate) },
                 { label: 'Send (TX)', value: formatBytesRate(networkNicCards.length === 1 ? networkNicCards[0].txRate : fallbackTxRate) },
-                { label: 'Link Speed', value: formatNetworkSpeed(networkNicCards.length === 1 ? networkNicCards[0].bandwidth : fbStaticPeakMbps) },
+                { label: 'Packet Loss', value: formatWorstPacketLoss(networkNicCards.length === 1 ? networkNicCards[0].pressure : undefined) },
               ]}
               series={getSeries(networkNicCards.length === 1 ? `util:network:${networkNicCards[0].nicName}` : 'util:network')}
               trendWindow={trendWindow}
@@ -4839,8 +4879,10 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
             series={getSeries('util:memory')}
             subtitle={memorySnapshotMeta}
             details={[
-              { label: 'Available', value: formatMetric(dynamicInfo?.memory?.available_gb, 'GB', 1), source: 'dynamic' },
-              { label: 'Total', value: formatMetric(dynamicInfo?.memory?.total_gb ?? staticInfo?.memory?.total_gb, 'GB', 1), source: 'dynamic' },
+              { label: 'RAM Available', value: formatMetric(dynamicInfo?.memory?.available_gb, 'GB', 1), source: 'dynamic' },
+              { label: 'RAM Total', value: formatMetric(dynamicInfo?.memory?.total_gb ?? staticInfo?.memory?.total_gb, 'GB', 1), source: 'dynamic' },
+              { label: 'RAM Used', value: formatMetric(memoryUsedGb, 'GB', 1), source: 'dynamic' },
+              { label: 'Swap Total', value: formatMetric(dynamicInfo?.memory?.swap_total_gb ?? staticInfo?.memory?.swap_total_gb, 'GB', 1), source: 'dynamic' },
               { label: 'Swap Used', value: formatMetric(dynamicInfo?.memory?.swap_used_gb, 'GB', 1), source: 'dynamic' },
               { label: 'Swap Usage', value: formatPercent(dynamicInfo?.memory?.swap_usage_percent), source: 'dynamic' },
               { label: 'BW Total', value: formatMetric(dynamicInfo?.memory?.bandwidth?.total_gb_s, 'GB/s', 1), source: 'dynamic' },
@@ -4893,7 +4935,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
               unit="%"
               statusColor={isNumber(utilization) && utilization >= BUSY_UTIL_THRESHOLD ? COLORS.red : PERF_COLORS.network}
               series={getSeries(deviceDetail.name ? `util:network:${deviceDetail.name}` : 'util:network')}
-              subtitle={`Peak bandwidth ${formatNetworkSpeed(nic?.bandwidth ?? fbStaticPeakMbps)}`}
+              subtitle={`Link speed ${formatNetworkSpeed(nic?.bandwidth ?? fbStaticPeakMbps)}`}
               details={[
                 { label: 'Receive Bandwidth', value: formatBytesRate(rxRate), source: 'dynamic' },
                 { label: 'Receive Utilization', value: formatPercent(nic?.rxUtil ?? fallbackRxUtil), source: 'dynamic' },

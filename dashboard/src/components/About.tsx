@@ -96,7 +96,7 @@ function summarizeGpuPcie(
 
 function summarizeGpuPerDevice(
   staticInfo?: StaticInfoData | null,
-): Array<{ label: string; engines: string; gtFreqs: string; driverName: string | null; euCount: number | null }> {
+): Array<{ label: string; engines: string; gtFreqs: string; driverName: string | null; euCount: number | null; vramTotalGb: number | null }> {
   if (!staticInfo) return []
 
   const cardKeySet = new Set<string>()
@@ -146,6 +146,8 @@ function summarizeGpuPerDevice(
 
     const driverName = staticInfo.gpu.driver_names?.[cardKey] ?? null
     const euCount = staticInfo.gpu.eu_count?.[cardKey] ?? null
+    const vramTotalBytes = staticInfo.gpu.vram?.[cardKey]?.total_bytes ?? null
+    const vramTotalGb = typeof vramTotalBytes === 'number' && vramTotalBytes > 0 ? vramTotalBytes / (1024 ** 3) : null
 
     return {
       label: labels[cardKey] || cardKey,
@@ -153,6 +155,7 @@ function summarizeGpuPerDevice(
       gtFreqs: gtFreqs || 'N/A',
       driverName,
       euCount,
+      vramTotalGb,
     }
   })
 }
@@ -348,6 +351,7 @@ export default function About({ active }: Props) {
         { label: 'Driver', value: driverLabel },
         ...(pcieKeys.has(cardKey) ? [{ label: 'PCIe', value: pcieText }] : []),
         ...(gpu.driverName === 'i915' && typeof gpu.euCount === 'number' ? [{ label: 'EU Count', value: `${gpu.euCount}` }] : []),
+        ...(pcieKeys.has(cardKey) && typeof gpu.vramTotalGb === 'number' ? [{ label: 'VRAM', value: `${gpu.vramTotalGb.toFixed(1)} GB` }] : []),
         { label: 'Engines', value: gpu.engines },
         { label: 'GT0/GT1 Freq', value: gpu.gtFreqs },
       ]
@@ -402,7 +406,7 @@ export default function About({ active }: Props) {
             { label: 'Swap', value: typeof staticInfo.memory.swap_total_gb === 'number' && staticInfo.memory.swap_total_gb > 0
               ? `${staticInfo.memory.swap_total_gb.toFixed(1)} GB`
               : 'Not configured' },
-            { label: 'Peak bandwidth', value: typeof staticInfo.memory.max_bandwidth_gb_s === 'number'
+            { label: 'Theoretical BW', value: typeof staticInfo.memory.max_bandwidth_gb_s === 'number'
               ? `${staticInfo.memory.max_bandwidth_gb_s.toFixed(1)} GB/s`
               : 'N/A' },
           ]
@@ -438,7 +442,7 @@ export default function About({ active }: Props) {
             items: [
               { label: 'NIC count', value: formatPlain(staticInfo.network.nic_count) },
               { label: 'Primary NIC', value: formatPlain(staticInfo.network.primary_interface) },
-              { label: 'Peak speed', value: formatNetworkSpeed(staticInfo.network.network_peak_mbps) },
+              { label: 'Link speed', value: formatNetworkSpeed(staticInfo.network.network_peak_mbps) },
             ],
           }]
       ),

@@ -15,10 +15,14 @@
 set -e
 
 INSTALL_DIR="/opt/intel/smartune"
-VENV="$INSTALL_DIR/venv"
+VENV="$INSTALL_DIR/smartune-venv"
+LEGACY_VENV="$INSTALL_DIR/venv"
 REQ="$INSTALL_DIR/requirements.txt"
 WHEELS="$INSTALL_DIR/wheels"
 STAMP="$VENV/.deps_ok"
+
+# Clear the generically named venv left by earlier package versions.
+rm -rf "$LEGACY_VENV" 2>/dev/null || true
 
 # venv mode, recorded by build_deb.sh alongside the wheels:
 #   isolated  monitor-only deb — a clean venv (default if the marker is absent).
@@ -55,7 +59,11 @@ if [ -x "$VENV/bin/python" ]; then
     [ "$have" = "$want" ] || rm -rf "$VENV"
 fi
 if [ ! -x "$VENV/bin/python" ]; then
-    python3 -m venv "${SSP[@]}" "$VENV"
+    if ! python3 -m venv "${SSP[@]}" "$VENV"; then
+        rm -rf "$VENV"
+        echo "[smartune] ERROR: could not create $VENV. Is python3-venv installed? (sudo apt install -y python3-venv)" >&2
+        exit 1
+    fi
 fi
 
 # The bundled native wheels are built for one CPython minor (see build_deb.sh).
@@ -71,7 +79,10 @@ fi
 
 # --no-index + --find-links: install strictly from the bundled wheels, never
 # reaching the network. Fails loudly if a required wheel is absent.
-"$VENV/bin/python" -m pip install --no-index --find-links="$WHEELS" -r "$REQ"
+if ! "$VENV/bin/python" -m pip install --no-index --find-links="$WHEELS" -r "$REQ"; then
+    echo "[smartune] ERROR: installing the bundled Python wheels failed (see pip output above)." >&2
+    exit 1
+fi
 
 echo "$req_hash" > "$STAMP"
 echo "[smartune] Python environment ready."

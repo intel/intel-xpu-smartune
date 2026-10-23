@@ -336,6 +336,11 @@ def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         bandwidth = memory.get("bandwidth") or {}
         payload["memory"] = {
             "usage_percent": to_float(memory.get("usage_percent")),
+            "total_gb": to_float(memory.get("total_gb")),
+            "available_gb": to_float(memory.get("available_gb")),
+            "swap_total_gb": to_float(memory.get("swap_total_gb")),
+            "swap_used_gb": to_float(memory.get("swap_used_gb")),
+            "swap_usage_percent": to_float(memory.get("swap_usage_percent")),
             "bandwidth": {
                 "total_gb_s": to_float(bandwidth.get("total_gb_s")),
                 "read_gb_s": to_float(bandwidth.get("read_gb_s")),

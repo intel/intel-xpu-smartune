@@ -27,5 +27,12 @@ else
     echo "Certificate generated successfully"
 fi
 
-PYTHON_BIN="$(command -v python3)"
+# Build/refresh the .smartune-venv virtual environment (no-op when up to date).
+# On failure, say so clearly; systemd then retries per Restart=on-failure.
+if ! bash "$SCRIPT_DIR/setup_venv.sh"; then
+    echo "[smartune] ERROR: Python environment setup failed; service not started." >&2
+    exit 1
+fi
+
+PYTHON_BIN="$SCRIPT_DIR/.smartune-venv/bin/python"
 exec "$PYTHON_BIN" "$SCRIPT_DIR/smartune.py"

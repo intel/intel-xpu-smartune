@@ -49,27 +49,23 @@ and [Pressure algorithm](docs/design/pressure-algorithm.md).
 
 ## Quick Start (run from source)
 
-**1. Install Python dependencies** (from the repository root):
-
-```bash
-sudo pip install -r requirements.txt --break-system-packages
-```
-
-**2. Start the backend** (from the repository root):
+**1. Start the backend** (from the repository root). On first run the script
+creates a `.smartune-venv` virtual environment and installs `requirements.txt`
+automatically:
 
 ```bash
 bash start_smartune.sh        # balancer + monitor (port 9001)
 # bash start_smartune.sh -m   # monitor only
 ```
 
-**3. Start the frontend** in a second terminal:
+**2. Start the frontend** in a second terminal:
 
 ```bash
 cd dashboard
 bash start_dashboard.sh       # dev server on port 39527
 ```
 
-**4. Open the dashboard** in a browser, using the host machine's IP address:
+**3. Open the dashboard** in a browser, using the host machine's IP address:
 
 ```text
 http://<host-ip>:39527/

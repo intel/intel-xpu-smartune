@@ -16,7 +16,7 @@ case "$1" in
         # downloaded models and IR — is also derived, but regenerating it costs
         # hours and tens of GB of downloads, so it is treated as user state and
         # kept until `purge`.
-        rm -rf "$INSTALL_DIR/venv" 2>/dev/null || true
+        rm -rf "$INSTALL_DIR/smartune-venv" 2>/dev/null || true
         systemctl daemon-reload 2>/dev/null || true
         update-desktop-database /usr/share/applications 2>/dev/null || true
         ;;

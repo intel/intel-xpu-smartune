@@ -31,3 +31,4 @@ benchmark/**/__pycache__/
 # Fallback location for search_models.py's caches when it is run standalone
 # (a configured service writes them under the runtime tree instead).
 benchmark/service/models_cache*.json
+.smartune-venv/

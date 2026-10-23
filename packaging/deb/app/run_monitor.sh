@@ -18,8 +18,8 @@ cd "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/logs"
 
 # 1. The venv must already exist (built by postinst). Don't self-heal here.
-if [ ! -x "$INSTALL_DIR/venv/bin/python" ]; then
-    echo "[smartune] ERROR: venv missing at $INSTALL_DIR/venv — reinstall the package." >&2
+if [ ! -x "$INSTALL_DIR/smartune-venv/bin/python" ]; then
+    echo "[smartune] ERROR: venv missing at $INSTALL_DIR/smartune-venv — reinstall the package." >&2
     exit 1
 fi
 
@@ -62,4 +62,4 @@ chmod 600 "$TOKEN_FILE"
 export SMARTUNE_UI_LEASE=1
 
 # 4. Launch the monitor (port 9001, serves both the dashboard UI and its /api).
-exec "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/smartune.py" -m
+exec "$INSTALL_DIR/smartune-venv/bin/python" "$INSTALL_DIR/smartune.py" -m

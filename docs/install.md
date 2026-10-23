@@ -81,7 +81,8 @@ first; the service replaces step 2, and the dashboard still comes from the
 [dev server](#3-run-the-dashboard-dev-server).
 
 ```bash
-# 1. Make sure the logs dir exists:
+# 1. Make sure the logs dir exists (the service creates .smartune-venv and installs
+#    requirements.txt on its first start, so the first start can take a while):
 mkdir -p logs
 
 # 2. Install the unit file (path filled automatically from $(pwd)):

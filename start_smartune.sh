@@ -66,7 +66,16 @@ sudo chown root:root "$CERT_FILE" "$KEY_FILE"
 sudo chmod 644 "$CERT_FILE"
 sudo chmod 600 "$KEY_FILE"
 
-PYTHON_BIN="$(command -v python3)"
+# Python environment: setup_venv.sh creates .smartune-venv and installs
+# requirements.txt on first run (and when requirements.txt changes). It runs
+# under sudo because the service itself runs as root.
+VENV_DIR="$SCRIPT_DIR/.smartune-venv"
+if ! sudo bash "$SCRIPT_DIR/setup_venv.sh"; then
+    echo "SmarTune was NOT started: Python environment setup failed (see errors above)." >&2
+    exit 1
+fi
+
+PYTHON_BIN="$VENV_DIR/bin/python"
 
 # Refuse to start a second instance. If SmarTune is already running, leave the
 # existing service untouched and exit *before* installing the cleanup trap, so

@@ -162,7 +162,9 @@ def _parse_debugfs_uc_info(kind: str) -> Optional[List[Dict[str, Any]]]:
                 fw_path = m.group(1)
             elif s.startswith("status:"):
                 status = s.split(":", 1)[1].strip()
-            elif "found" in s and "version" in s:
+            elif "found" in s and "version" in s and "compatibility" not in s:
+                # Skip "found compatibility version" (GuC interface ABI, e.g.
+                # 1.x) -- the firmware release version is the one reported.
                 m = re.search(r"(\d+(?:\.\d+)+)", s)
                 if m:
                     version = m.group(1)

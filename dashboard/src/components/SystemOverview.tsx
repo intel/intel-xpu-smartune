@@ -4202,9 +4202,9 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
   })()
 
   const cpuSecondaryFrequency = isNumber(dynamicInfo?.cpu?.e_core_freq_mhz)
-    ? { label: 'E-Core Frequency', value: formatMetric(dynamicInfo.cpu.e_core_freq_mhz, 'MHz', 0) }
+    ? { label: 'E-Core Freq', value: formatMetric(dynamicInfo.cpu.e_core_freq_mhz, 'MHz', 0) }
     : isNumber(dynamicInfo?.cpu?.lpe_core_freq_mhz)
-      ? { label: 'LPE-Core Frequency', value: formatMetric(dynamicInfo.cpu.lpe_core_freq_mhz, 'MHz', 0) }
+      ? { label: 'LPE-Core Freq', value: formatMetric(dynamicInfo.cpu.lpe_core_freq_mhz, 'MHz', 0) }
       : { label: 'Logical Cores', value: formatPlain(staticInfo?.cpu?.core_count?.logical) }
 
   const coreGroups = useMemo<Array<{ label: string; type: 'P' | 'E' | 'LPE' | 'Core'; indices: number[] }>>(() => {
@@ -4525,10 +4525,11 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
             primaryValue={cpuTrendValue}
             primaryUnit="%"
             metrics={[
-              { label: 'P-Core Frequency', value: formatMetric(dynamicInfo?.cpu?.p_core_freq_mhz, 'MHz', 0) },
+              { label: 'P-Core Freq', value: formatMetric(dynamicInfo?.cpu?.p_core_freq_mhz, 'MHz', 0) },
               cpuSecondaryFrequency,
               { label: 'Temperature', value: formatMetric(dynamicInfo?.cpu?.temperature_c, '°C', 1) },
               { label: 'Pkg Power', value: formatMetric(dynamicInfo?.cpu?.pkg_power_w, 'W', 2) },
+              { label: 'IOWait', value: formatMetric(dynamicInfo?.cpu?.iowait_total, '%', 1) },
             ]}
             series={getSeries('util:cpu')}
             trendWindow={trendWindow}

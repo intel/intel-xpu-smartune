@@ -315,6 +315,7 @@ def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         cpu = data.get("cpu") or {}
         payload["cpu"] = {
             "usage_total": to_float(cpu.get("usage_total")),
+            "iowait_total": to_float(cpu.get("iowait_total")),
             "p_core_usage": to_float(cpu.get("p_core_usage")),
             "e_core_usage": to_float(cpu.get("e_core_usage")),
             "lpe_core_usage": to_float(cpu.get("lpe_core_usage")),

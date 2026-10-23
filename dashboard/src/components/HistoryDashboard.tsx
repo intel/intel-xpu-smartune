@@ -39,6 +39,7 @@ interface CpuMemTrendPoint {
   timestamp: string
   ts: number
   cpuUtilization: number | null
+  cpuIowait: number | null
   pCoreUtilization: number | null
   eCoreUtilization: number | null
   lpeCoreUtilization: number | null
@@ -597,6 +598,7 @@ function buildCpuMemTrendPoints(items: HistorySnapshotItem[]): CpuMemTrendPoint[
       timestamp: label,
       ts,
       cpuUtilization: toNumber(dynamic?.cpu?.usage_total),
+      cpuIowait: toNumber(dynamic?.cpu?.iowait_total ?? null),
       pCoreUtilization: toNumber(dynamic?.cpu?.p_core_usage),
       eCoreUtilization: toNumber(dynamic?.cpu?.e_core_usage),
       lpeCoreUtilization: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.lpe_core_usage as number | null),
@@ -2142,6 +2144,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
       'CPU',
       [
         { header: 'util_pct', key: 'util', width: 10 },
+        { header: 'iowait_pct', key: 'iowait', width: 12 },
         { header: 'p_core_util_pct', key: 'p_util', width: 16 },
         { header: 'e_core_util_pct', key: 'e_util', width: 16 },
         { header: 'lpe_core_util_pct', key: 'lpe_util', width: 18 },
@@ -2152,6 +2155,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
       ],
       (d) => ({
         util: d?.cpu?.usage_total ?? null,
+        iowait: d?.cpu?.iowait_total ?? null,
         p_util: d?.cpu?.p_core_usage ?? null,
         e_util: d?.cpu?.e_core_usage ?? null,
         lpe_util: (d?.cpu as Record<string, unknown> | undefined)?.lpe_core_usage ?? null,
@@ -2682,7 +2686,8 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
           height={280}
           showBrush
           allSeries={[
-            { key: 'cpuUtilization', name: 'CPU Total', color: COLORS.accent, unit: '%' },
+            { key: 'cpuUtilization', name: 'CPU Util', color: COLORS.accent, unit: '%' },
+            { key: 'cpuIowait', name: 'CPU IOWait', color: '#f472b6', unit: '%', dasharray: '2 2', defaultOn: false },
             { key: 'pCoreUtilization', name: 'P-Core Util', color: '#e07b54', unit: '%' },
             ...(cpuPerCoreInfo.eCoreIndices.length
               ? [{ key: 'eCoreUtilization', name: 'E-Core Util', color: COLORS.green, unit: '%' }]

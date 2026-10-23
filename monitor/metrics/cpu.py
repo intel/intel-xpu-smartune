@@ -303,19 +303,18 @@ def _avg(values: List[Optional[float]], indices: List[int]) -> Optional[float]:
 
 
 def _busy_and_span(times) -> tuple:
-    """``(busy, busy + idle)`` for one core's cpu_times, using psutil's definition.
+    """``(busy, total)`` for one core's cpu_times, using psutil's definition.
 
     Mirrors psutil's own ``_cpu_busy_time`` / ``_cpu_tot_time`` so a reading from
-    :class:`CpuUsageSampler` matches what ``psutil.cpu_percent()`` would have
-    said: guest time is already counted inside user/nice, and iowait is dropped
-    from both the busy time and the interval (the CPU is not executing, but it is
-    not idle either).
+    :class:`CpuUsageSampler` matches ``psutil.cpu_percent()`` and top: guest time
+    is already counted inside user/nice, and iowait is idle time, so it counts
+    toward the total but not toward busy.
     """
     total = sum(times)
     total -= getattr(times, "guest", 0.0) + getattr(times, "guest_nice", 0.0)
     iowait = getattr(times, "iowait", 0.0)
     busy = total - times.idle - iowait
-    return busy, busy + times.idle
+    return busy, total
 
 
 class CpuUsageSampler:
@@ -336,6 +335,9 @@ class CpuUsageSampler:
 
     def __init__(self) -> None:
         self._prev = None
+        # System-wide iowait % over the interval the last sample() covered (top's
+        # "wa"), or None when that interval could not be measured.
+        self.last_iowait_total: Optional[float] = None
         self.prime()
 
     def prime(self) -> None:
@@ -353,7 +355,12 @@ class CpuUsageSampler:
         None rather than a divide-by-zero or a fabricated 0.0; an unreadable
         cpu_times yields an empty list. Both are cases the caller has to render
         as "unknown", which is not the same fact as "idle".
+
+        The same interval's system-wide iowait share is left in
+        :attr:`last_iowait_total`. It is deliberately not reported per core:
+        a task waiting on I/O belongs to no CPU, so per-core iowait is noise.
         """
+        self.last_iowait_total = None
         try:
             current = psutil.cpu_times(percpu=True)
         except Exception:
@@ -363,6 +370,8 @@ class CpuUsageSampler:
             return [None] * len(current)
 
         usage: List[Optional[float]] = []
+        iowait_sum = 0.0
+        span_sum = 0.0
         for before, after in zip(previous, current):
             busy_before, span_before = _busy_and_span(before)
             busy_after, span_after = _busy_and_span(after)
@@ -372,6 +381,11 @@ class CpuUsageSampler:
                 continue
             percent = 100.0 * (busy_after - busy_before) / span
             usage.append(round(max(0.0, min(100.0, percent)), 2))
+            iowait_sum += getattr(after, "iowait", 0.0) - getattr(before, "iowait", 0.0)
+            span_sum += span
+        if span_sum > 0:
+            self.last_iowait_total = round(
+                max(0.0, min(100.0, 100.0 * iowait_sum / span_sum)), 2)
         return usage
 
 
@@ -478,6 +492,7 @@ def get_cpu_dynamic() -> Dict[str, Any]:
 
     return {
         "usage_total": round(total_usage, 2),
+        "iowait_total": _shared_usage_sampler.last_iowait_total,
         "per_core_usage": [round(v, 2) for v in usage_per_core],
         "per_core_freq_mhz": per_core_freq,
         "p_core_usage": _avg(usage_per_core, p_cores),

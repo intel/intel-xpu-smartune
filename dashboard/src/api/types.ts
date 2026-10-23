@@ -904,6 +904,9 @@ export interface DynamicInfoData {
   quiet_mode?: { active: boolean; cached_at: number | null }
   cpu: {
     usage_total: number | null
+    // System-wide share of CPU time spent idle with I/O outstanding (top's "wa").
+    // Optional: snapshots taken before it was collected do not carry it.
+    iowait_total?: number | null
     per_core_usage: number[]
     per_core_freq_mhz: Array<number | null>
     p_core_usage: number | null

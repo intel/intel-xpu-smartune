@@ -227,6 +227,7 @@ class LimitedApp:
     adopted_from_auto: bool = False           # retain the auto-limit cgroup scope in Manual Control
     frozen: bool = False                      # manual Freeze is active (cgroup.freeze=1 on every cgroup)
     frozen_at: float = 0.0                    # epoch seconds when it was frozen
+    freeze_notified: bool = False             # the "still frozen" reminder was sent for this freeze
     # --- L2 (memory.reclaim) state.  No restore path reads these: reclaim is a
     # one-shot move of pages to swap, and the app faults back whatever it still
     # needs, so there is nothing to undo when the limit is lifted.
@@ -3281,6 +3282,33 @@ class DynamicBalancer:
                 f"restoring its {entry.source} limit")
             self._restore_entry(entry, notify=True)
 
+        self._notify_long_frozen()
+
+    def _notify_long_frozen(self) -> None:
+        """Remind the UI, once per freeze, that an app has stayed frozen too long.
+
+        Freeze has no timeout of its own (the user may mean it), but a forgotten
+        freeze silently starves the app and times out its network peers.
+        """
+        after = float(getattr(self.config, "freeze_notify_after", 0) or 0)
+        if after <= 0:
+            return
+        now = time.time()
+        due = []
+        with self.all_limits.lock:
+            for entry in self.all_limits.apps.values():
+                if entry.frozen and not entry.freeze_notified and now - entry.frozen_at >= after:
+                    entry.freeze_notified = True
+                    due.append((entry.public_app_id, entry.app_name))
+        for app_id, app_name in due:
+            logger.warning(f"App {app_name} ({app_id}) has been frozen for over {after:.0f}s")
+            app_utils.callback_manager.send_callback_notification({
+                'app_id': app_id,
+                'app_name': app_name,
+                'status': 'app_frozen_long',
+                'purpose': "notify"
+            }, False)
+
     def cancel_relaunch_by_app_id(self, app_id: str) -> bool:
         """Remove queue items for the given app_id and terminate the associated process."""
         def condition(item):
@@ -4074,6 +4102,7 @@ class DynamicBalancer:
                 return False, "Limit was restored while freezing"
             found[1].frozen = freeze
             found[1].frozen_at = time.time() if freeze else 0.0
+            found[1].freeze_notified = False
         logger.info(f"{'Froze' if freeze else 'Thawed'} app {app_id} ({len(done)} cgroup(s))")
         return True, "Frozen" if freeze else "Unfrozen"
 

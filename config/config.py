@@ -63,6 +63,9 @@ class Config:
     # so its (now-stale) cgroup limit can be restored. Kept independent of
     # monitor_idle_check_interval so detection latency stays short.
     limit_reap_interval: float = 2
+    # Seconds a manually frozen app may stay frozen before the UI is reminded once
+    # that it is still frozen. 0 disables the reminder.
+    freeze_notify_after: float = 600
     network_thresholds: dict = None
     # Calibration knobs for the NIC pressure model (NetworkMonitor._model): EMA smoothing,
     # distress decay, per-core pps budget, and drop/fifo/softnet half-points. Optional and

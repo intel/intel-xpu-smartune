@@ -30,7 +30,10 @@ export const FREEZE_RISKS: string[] = [
   'On an NPU the device may take a while to free up: work already submitted keeps running '
   + '(about 20 s measured for an 8B model).',
   'Memory held on the device is not released.',
-  'On a GPU the usage reading may not drop while the app is frozen, although the device is '
-  + 'actually free for other apps; judge by how the higher-priority app performs.',
-  'Restore lifts the limits and unfreezes the app.',
+  'On a GPU the frequency and utilization readings may not drop while the app is frozen. Its '
+  + 'context may stay loaded, so the GPU stays awake and keeps counting as busy, although it is '
+  + 'doing almost no work and the resources are free for other apps. Power usually drops; judge '
+  + 'by power or by how the higher-priority app performs.',
+  'Unfreeze resumes the app and keeps the limits. Restore is available only after unfreezing. '
+  + 'If the app closes while frozen, everything is cleared automatically.',
 ]

@@ -76,12 +76,6 @@
   display: inline-block;
 }
 
-.diagnostics-alert-filter .ant-segmented-item-selected {
-  background: #5794f2;
-  color: #fff;
-  box-shadow: none;
-}
-
 .diagnostics-search {
   width: min(260px, 100%);
 }
@@ -1485,6 +1479,16 @@
   border-bottom: 0;
 }
 
+.diagnostics-alerts-table .ant-table-row {
+  cursor: pointer;
+}
+
+.diagnostics-alert-tag {
+  flex: 0 0 auto;
+  margin-inline-end: 0;
+  font-size: 11px;
+}
+
 .diagnostics-drawer-list-item {
   display: block;
   margin-top: 4px;
@@ -1712,13 +1716,11 @@
   color: var(--color-text);
 }
 
-:root[data-theme='light'] .diagnostics-time-range-segmented .ant-segmented-item-label,
-:root[data-theme='light'] .diagnostics-alert-filter .ant-segmented-item-label {
+:root[data-theme='light'] .diagnostics-time-range-segmented .ant-segmented-item-label {
   color: var(--color-text-muted) !important;
 }
 
-:root[data-theme='light'] .diagnostics-time-range-segmented .ant-segmented-item-selected .ant-segmented-item-label,
-:root[data-theme='light'] .diagnostics-alert-filter .ant-segmented-item-selected .ant-segmented-item-label {
+:root[data-theme='light'] .diagnostics-time-range-segmented .ant-segmented-item-selected .ant-segmented-item-label {
   color: #ffffff !important;
 }
 
@@ -2100,4 +2102,17 @@
   .diagnostics-history-tabs .ant-tabs-nav {
     overflow-x: auto;
   }
+}
+.diagnostics-alert-mark-select {
+  min-width: 190px;
+}
+
+.diagnostics-alert-range-hint {
+  margin-bottom: 8px;
+}
+
+/* The alert opened from the header or a row click, so it stays findable after
+   the range re-centers on it. */
+.diagnostics-alerts-table .diagnostics-alert-row--focused > td {
+  background: var(--color-accent-soft) !important;
 }

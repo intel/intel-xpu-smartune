@@ -32,8 +32,9 @@ Across the top, a set of cards summarize the selected range:
   control, benchmark, …) generated the events.
 - **Resource average utilization** — average load over the window, for context.
 
-Cards are actionable — for example, *View alerts in the selected range* and
-*View advice items for the selected range* filter the lists below.
+Cards are actionable — for example, *View alerts active in the selected range*
+opens the [Alerts](#alerts) list and scrolls to it, and *View advice items for
+the selected range* filters the advice list.
 
 ## Event activity timeline
 
@@ -45,17 +46,98 @@ the **severity legend**). This is the fastest way to spot a burst of activity.
 
 - **Zoom** into a span to narrow the range, and **Reset zoom** to go back.
 
-## Events, alerts, and logs
+## Alerts
 
-Below the timeline are the detailed tables.
+An **alert** is a problem that may need you to act. Alerts are *derived from
+events*, but only a fixed set of event types creates one:
 
-**Events / Alerts.** Search and filter the event list by **severity**,
-**domain**, **kind**, and **source**. **Alerts** are the higher-severity events
-derived from this stream. Select any row to open **Event Detail** with the full
-context of that event.
+| Event type | Severity | What closes the alert |
+|---|---|---|
+| `PLATFORM_KERNEL_PANIC` | critical | Acknowledging it |
+| `RESOURCE_MEMORY_OOM_KILL` | critical | Acknowledging it |
+| `DEVICE_GPU_HANG` | critical | Acknowledging it |
+| `PLATFORM_SERVICE_CRASHED` | critical | The same service starts again |
+| `PLATFORM_SYSTEMD_RESTART_LOOP` | error | 2 minutes without a new detection (escalates to critical when detected 3 times in 5 minutes) |
+| `CONTROL_CPU_LIMIT_FAILED` | error | The CPU limit recovers |
+| `CONTROL_MEMORY_LIMIT_FAILED` | error | The memory limit recovers |
+| `CONTROL_DISK_IO_LIMIT_FAILED` | error | The disk I/O limit recovers |
 
-<!-- Screenshot: the Event Detail panel open for one event. -->
-![Event detail](images/diagnostics-event-detail.png)
+Every other event — including events from your own custom rules — stays
+diagnostic evidence only, even when its severity is error or critical. The ⓘ
+icon next to the **Alerts** heading shows this **Alert policy** in the
+dashboard.
+
+**Open and Closed.** An alert is **Open** while someone may still need to act,
+and **Closed** once whatever ends it has happened (see the table above). The
+first three types are one-off faults with no recovery signal, so
+**acknowledging them is what closes them** — investigate first, then
+acknowledge.
+
+**Repeats are merged.** Repeated detections of the same event type in the same
+scope (app, service, control lifecycle, …) are grouped into one alert and
+counted in **Times detected**, instead of raising new alerts. Notifications for
+the same alert are sent at most once every 5 minutes. If the alert fires again
+after it has closed, that is a new occurrence with its own row.
+
+<!-- Screenshot: the Alerts section — Open/Closed switch, handling filter, and
+     the alert table with at least one open and one closed alert. -->
+![Alerts](images/diagnostics-alerts.png)
+
+### The Alerts list
+
+The **Alerts** section lists every alert that was open at some point in the
+selected time range:
+
+- Switch between **Open** and **Closed**.
+- For open alerts, filter by how they are being handled: **Needs attention**,
+  **Acknowledged**, or **Silenced**.
+- Columns show the **Status** (with `ACK` / `SILENCED` marks), **Severity**,
+  **Scope**, **First detected**, **Closed**, **Duration**, **Times detected**,
+  and a **Lifecycle** hint — for an open alert, what will close it; for a closed
+  one, what closed it.
+- **Investigate** opens the investigation view for the event behind the alert.
+- If the selected range ends in the past and newer alerts have opened since, a
+  hint offers **Jump to now**.
+
+In the **event list**, events that create alerts carry an `ALERT · OPEN` or
+`ALERT · CLOSED` tag in the Summary column, so you can see whether the alert the
+event belongs to is still open. Hover a closed tag to see when and why it
+closed. A plain `ALERT` tag means the event is of an alerting type, but its
+alert is not in the loaded alert list.
+
+### Acknowledge and silence
+
+Handle current alerts from the **Current alerts** panel behind the bell icon in
+the header (see [Getting started](getting-started.md#4-a-tour-of-the-dashboard)):
+
+- **Acknowledge** — you've seen it. For kernel panic, OOM kill, and GPU hang
+  this also **closes** the alert; for the other types it only marks the alert as
+  being handled, and it stays open until its recovery condition is met.
+- **Silence** — stop notifications for **30 minutes** or **2 hours**.
+
+Acknowledge and silence apply to the current occurrence only: if the alert
+fires again after closing, or its severity is escalated, it needs attention
+again.
+
+Select an alert in the panel to jump here with the page centered on that alert's
+time span; **View all alerts** opens the Alerts list scoped to a range ending
+now.
+
+<!-- Screenshot: the Current alerts panel opened from the bell icon. -->
+![Current alerts panel](images/alert-center.png)
+
+## Events and logs
+
+Below the alerts are the detailed tables.
+
+**Events.** Search and filter the event list by **severity**, **domain**,
+**kind**, and **source**. Select **Details** on any row for the full context of
+that event, or **Investigate** to open the investigation view, which also lists
+the **Alerts in window** — every alert open during that window, including ones
+that have since closed.
+
+<!-- Screenshot: the event list, including a row with an ALERT tag. -->
+![Event list](images/diagnostics-event-detail.png)
 
 **Logs.** Search log messages within the selected range and filter by **log
 level** and **log source**.
@@ -74,7 +156,9 @@ revisiting. From a diagnostics context you can also take direct action, such as
 ## Export a report
 
 Use **Diagnostics report** to **download the complete report as JSON** for the
-selected range — handy for sharing an investigation or attaching to a bug.
+selected range — handy for sharing an investigation or attaching to a bug. Its
+**Alert activity** card covers every alert that was open at some point in the
+range, including ones that have since closed.
 
 <!-- Screenshot: the Diagnostics report export control / dialog. -->
 ![Diagnostics report export](images/diagnostics-report.png)

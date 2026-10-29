@@ -314,10 +314,11 @@ export const api = {
     const data = await get<DiagEventsData>(`/diag/events?event_id=${encodeURIComponent(eventId)}&limit=1`)
     return data.events?.[0] ?? null
   },
-  getDiagAlerts: (active = true, limit = 100, notifyable = false) =>
-    get<DiagAlertsData>(`/diag/alerts?active=${active ? 'true' : 'false'}&limit=${limit}&notifyable=${notifyable ? 'true' : 'false'}`),
+  getDiagAlerts: (active = true, limit = 100, notifyable = false, range?: { from: number; to: number }) =>
+    get<DiagAlertsData>(`/diag/alerts?active=${active ? 'true' : 'false'}&limit=${limit}&notifyable=${notifyable ? 'true' : 'false'}${range ? `&from=${range.from}&to=${range.to}` : ''}`),
   acknowledgeDiagAlert: (dedupKey: string) =>
-    post<{ acknowledged: boolean }>(`/diag/alerts/${encodeURIComponent(dedupKey)}/acknowledge`),
+    // ``closed`` is true for one-off faults, which acknowledging also closes.
+    post<{ acknowledged: boolean; closed: boolean }>(`/diag/alerts/${encodeURIComponent(dedupKey)}/acknowledge`),
   silenceDiagAlert: (dedupKey: string, minutes: 30 | 120) =>
     post<{ silenced_until: string }>(`/diag/alerts/${encodeURIComponent(dedupKey)}/silence`, { minutes }),
   getDiagLogs: (params: DiagLogQuery = {}) => {

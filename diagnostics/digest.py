@@ -83,12 +83,12 @@ class DigestGenerator:
                      if start_time is not None and end_time is not None else [])
         config_changes = [revision for revision in revisions if revision.get("change_summary")]
         active_alerts = event_store.query_alerts(active_only=True, limit=100)
-        range_alerts = event_store.query_alerts(active_only=False, limit=100)
-        if start_time is not None and end_time is not None:
-            range_alerts = [
-                alert for alert in range_alerts
-                if start_time <= (self._event_epoch({"ts_utc": alert.get("last_fired_at")}) or -1) < end_time
-            ]
+        # Every occurrence active at some point in the range, matching the
+        # dashboard's alert history view.
+        range_alerts = event_store.query_alerts(
+            active_only=False, limit=100,
+            start_time=start_time, end_time=end_time - 1 if end_time is not None else None,
+        )
         digest = Digest(
             period={"kind": kind, "from": start_time, "to": end_time, "boot_id": boot_id},
             generated_at=datetime.now(timezone.utc).isoformat(),

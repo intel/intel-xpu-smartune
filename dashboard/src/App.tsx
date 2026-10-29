@@ -1,5 +1,5 @@
-import React, { useState, useCallback, useEffect } from 'react'
-import { Tabs, Layout, Typography, Space, Alert, Badge, Button, Dropdown, Empty, Tag, notification, Tooltip, Menu, Avatar } from 'antd'
+import React, { useState, useCallback, useEffect, useMemo } from 'react'
+import { Tabs, Layout, Typography, Space, Alert, Badge, Button, Dropdown, Empty, Tag, message, notification, Tooltip, Menu, Avatar } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   DashboardOutlined,
@@ -23,6 +23,7 @@ import {
   FundOutlined,
   UserOutlined,
   DownOutlined,
+  ExportOutlined,
 } from '@ant-design/icons'
 import SettingsModal from './components/SettingsModal'
 import SystemOverview from './components/SystemOverview'
@@ -32,6 +33,7 @@ import Balance from './components/Balance'
 import Benchmark from './components/Benchmark'
 import HistoryDashboard from './components/HistoryDashboard'
 import Diagnostics from './components/Diagnostics'
+import type { AlertsRequest } from './components/Diagnostics'
 import About from './components/About'
 import LoginGate from './components/LoginGate'
 import { COLORS } from './styles/theme'
@@ -42,10 +44,22 @@ import { useUiLease } from './hooks/useUiLease'
 import { useBenchEvent, useBenchStream } from './hooks/useBenchEvents'
 import { useAppEvents } from './hooks/useAppEvents'
 import type { DiagAlert } from './api/types'
+import { alertHandlingMark } from './utils/alertPolicy'
+import type { AlertHandlingMark } from './utils/alertPolicy'
 
 const { Header, Content, Sider } = Layout
 
 const BENCHMARK_TAB = 'models'
+
+// The header alert center shows only the first few alerts needing attention;
+// the rest are one click away in Diagnostics.
+const ALERT_CENTER_MAX_ITEMS = 5
+const ALERT_SEVERITY_ORDER = ['critical', 'error', 'warning', 'info']
+
+function alertSeverityRank(severity: string): number {
+  const index = ALERT_SEVERITY_ORDER.indexOf(severity)
+  return index === -1 ? ALERT_SEVERITY_ORDER.length : index
+}
 
 function HealthDiagnosticsIcon({ className }: { className?: string }) {
   return (
@@ -101,6 +115,8 @@ interface AppProps {
 
 export default function App({ colorMode, onColorModeChange }: AppProps) {
   const [activeTab, setActiveTab] = useState('overview')
+  const [alertCenterOpen, setAlertCenterOpen] = useState(false)
+  const [alertCenterExpanded, setAlertCenterExpanded] = useState(false)
   const [workloadView, setWorkloadView] = useState('resources')
   const [settingsSection, setSettingsSection] = useState<string | null>(null)
   const [settingsTabIntent, setSettingsTabIntent] = useState<{ key: string; requestId: number } | null>(null)
@@ -119,9 +135,10 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   // Gate the whole app behind a valid access token. A stored token is assumed
   // valid until the server rejects a request with 401 (handled below).
   const [authed, setAuthed] = useState(() => !!getToken())
-  const [activeAlertCount, setActiveAlertCount] = useState(0)
-  const [activeAlerts, setActiveAlerts] = useState<DiagAlert[]>([])
-  const [diagnosticsOpenAlertsSignal, setDiagnosticsOpenAlertsSignal] = useState(0)
+  // The header alert center is the one place for current (active) alerts.
+  const [currentAlerts, setCurrentAlerts] = useState<DiagAlert[]>([])
+  const [diagnosticsAlertsRequest, setDiagnosticsAlertsRequest] = useState<AlertsRequest | null>(null)
+  const [alertCenterActionKey, setAlertCenterActionKey] = useState<string | null>(null)
   const [diagnosticsRangeIntent, setDiagnosticsRangeIntent] = useState<{ window: '1h'; requestId: number } | null>(null)
   // While a bootstrap token from the URL hash (desktop launcher) is being
   // validated, hold rendering so the login gate does not flash before we know
@@ -167,26 +184,27 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
       })
   }, [authed])
 
+  const loadAlerts = useCallback(() => {
+    api.getDiagAlerts(true, 200)
+      .then((data) => setCurrentAlerts(data.alerts || []))
+      .catch(() => {})
+  }, [])
+
   useEffect(() => {
     if (!authed || !diagnosticsEnabled) return undefined
-    let cancelled = false
-    const loadAlerts = () => {
-      api.getDiagAlerts(true, 100, true)
-        .then((data) => {
-          if (!cancelled) {
-            setActiveAlerts(data.alerts || [])
-            setActiveAlertCount(data.alerts?.length || 0)
-          }
-        })
-        .catch(() => {})
-    }
     loadAlerts()
     const timer = window.setInterval(loadAlerts, 30000)
-    return () => {
-      cancelled = true
-      window.clearInterval(timer)
-    }
-  }, [authed, diagnosticsEnabled])
+    return () => window.clearInterval(timer)
+  }, [authed, diagnosticsEnabled, loadAlerts])
+
+  const alertCenterGroups = useMemo(() => {
+    const groups: Record<AlertHandlingMark, DiagAlert[]> = { needs_attention: [], acknowledged: [], silenced: [] }
+    for (const alert of currentAlerts) groups[alertHandlingMark(alert)].push(alert)
+    // Most severe first; the server order (latest fire first) breaks ties.
+    groups.needs_attention.sort((a, b) => alertSeverityRank(a.severity) - alertSeverityRank(b.severity))
+    return groups
+  }, [currentAlerts])
+  const needsAttentionCount = alertCenterGroups.needs_attention.length
 
   // Hold an open-UI lease while logged in so the packaged monitor can stop
   // itself once the last dashboard tab is closed. No-op against a server that
@@ -272,10 +290,28 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
     setAuthed(false)
   }, [])
 
-  const openCurrentAlerts = useCallback(() => {
+  // Leaving the header only makes sense to use Diagnostics context: its Alerts
+  // section, or one alert's row there.
+  const openInDiagnostics = useCallback((request: { kind: 'current' } | { kind: 'locate'; alert: DiagAlert }) => {
+    setAlertCenterOpen(false)
+    setAlertCenterExpanded(false)
     setActiveTab('diagnostics')
-    setDiagnosticsOpenAlertsSignal((signal) => signal + 1)
+    setDiagnosticsAlertsRequest((previous) => ({ requestId: (previous?.requestId ?? 0) + 1, ...request }))
   }, [])
+
+  // Quick triage from the header without leaving the current page.
+  const runAlertCenterAction = useCallback(async <T,>(alert: DiagAlert, action: () => Promise<T>, success: string | ((result: T) => string)) => {
+    setAlertCenterActionKey(alert.dedup_key)
+    try {
+      const result = await action()
+      loadAlerts()
+      message.success(typeof success === 'function' ? success(result) : success)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Unable to update alert')
+    } finally {
+      setAlertCenterActionKey(null)
+    }
+  }, [loadAlerts])
 
   const formatAlertTime = useCallback((value: string) => {
     const date = new Date(value)
@@ -291,39 +327,105 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
     return COLORS.accent
   }, [])
 
+  // The header only triages what needs attention now; handled (ack / silenced)
+  // alerts live in Diagnostics. Long lists start collapsed and expand in place.
+  const alertCenterList = alertCenterExpanded
+    ? alertCenterGroups.needs_attention
+    : alertCenterGroups.needs_attention.slice(0, ALERT_CENTER_MAX_ITEMS)
+  const alertCenterOverflow = needsAttentionCount - ALERT_CENTER_MAX_ITEMS
+  const handledSummary = (['acknowledged', 'silenced'] as const)
+    .filter((mark) => alertCenterGroups[mark].length > 0)
+    .map((mark) => `${alertCenterGroups[mark].length} ${mark}`)
+    .join(' · ')
   const alertCenter = (
     <div className="app-alert-center">
       <div className="app-alert-center__header">
-        <Typography.Text strong style={{ color: COLORS.text }}>Alerts</Typography.Text>
-        <Typography.Text className="app-alert-center__count">{activeAlertCount} need attention</Typography.Text>
+        <Typography.Text strong style={{ color: COLORS.text }}>Current alerts</Typography.Text>
+        <Typography.Text className="app-alert-center__count">{needsAttentionCount} need attention</Typography.Text>
       </div>
-      {activeAlerts.length ? (
+      {alertCenterList.length ? (
         <div className="app-alert-center__list">
-          {activeAlerts.slice(0, 5).map((alert) => (
-            <button
-              key={alert.dedup_key}
-              type="button"
-              onClick={openCurrentAlerts}
-              className="app-alert-center__item"
-            >
-              <div className="app-alert-center__item-title">
-                <Tag color={alertColor(alert.severity)} style={{ marginInlineEnd: 0, textTransform: 'uppercase' }}>{alert.severity}</Tag>
-                <Typography.Text ellipsis style={{ color: COLORS.text, flex: 1, minWidth: 0, fontSize: 13 }}>
-                  {alert.summary || alert.event_type}
-                </Typography.Text>
+          {alertCenterList.map((alert) => (
+            <div key={alert.dedup_key} className="app-alert-center__item">
+              <Tooltip title="Show in Diagnostics" placement="left" mouseEnterDelay={0.5}>
+                <button
+                  type="button"
+                  onClick={() => openInDiagnostics({ kind: 'locate', alert })}
+                  className="app-alert-center__item-main"
+                >
+                  <div className="app-alert-center__item-title">
+                    <Tag color={alertColor(alert.severity)} style={{ marginInlineEnd: 0, textTransform: 'uppercase' }}>{alert.severity}</Tag>
+                    <Typography.Text ellipsis style={{ color: COLORS.text, flex: 1, minWidth: 0, fontSize: 13 }}>
+                      {alert.summary || alert.event_type}
+                    </Typography.Text>
+                    {/* Same "leaves this view" marker as the Home cockpit cards. */}
+                    <ExportOutlined className="app-alert-center__nav-icon" aria-hidden="true" />
+                  </div>
+                  <Typography.Text className="app-alert-center__item-meta">
+                    {alert.scope || 'System'} · Latest {formatAlertTime(alert.last_fired_at)} · Detected {alert.fire_count}×
+                  </Typography.Text>
+                </button>
+              </Tooltip>
+              <div className="app-alert-center__item-actions">
+                {/* Both actions share one filled, neutral style: the fill keeps
+                    them from reading as tags, and matching styles keep the pair
+                    from reading as a toggle with one option selected. No icons:
+                    a check mark reads as "already acknowledged". */}
+                <Button
+                  size="small"
+                  color="default"
+                  variant="filled"
+                  loading={alertCenterActionKey === alert.dedup_key}
+                  onClick={() => void runAlertCenterAction(alert, () => api.acknowledgeDiagAlert(alert.dedup_key), (result) => (result.closed ? 'Alert acknowledged and closed' : 'Alert acknowledged'))}
+                >
+                  Acknowledge
+                </Button>
+                <Dropdown
+                  trigger={['click']}
+                  disabled={alertCenterActionKey === alert.dedup_key}
+                  menu={{
+                    items: [
+                      { key: '30', label: '30 minutes' },
+                      { key: '120', label: '2 hours' },
+                    ],
+                    onClick: ({ key }) => {
+                      const minutes = Number(key) as 30 | 120
+                      void runAlertCenterAction(
+                        alert,
+                        () => api.silenceDiagAlert(alert.dedup_key, minutes),
+                        `Alert silenced for ${minutes === 30 ? '30 minutes' : '2 hours'}`,
+                      )
+                    },
+                  }}
+                >
+                  <Button size="small" color="default" variant="filled">
+                    Silence <DownOutlined className="app-alert-center__caret" />
+                  </Button>
+                </Dropdown>
               </div>
-              <Typography.Text className="app-alert-center__item-meta">
-                {alert.scope || 'System'} · Latest {formatAlertTime(alert.last_fired_at)}
-              </Typography.Text>
-            </button>
+            </div>
           ))}
+          {alertCenterOverflow > 0 ? (
+            <button
+              type="button"
+              className="app-alert-center__more"
+              onClick={() => setAlertCenterExpanded((expanded) => !expanded)}
+            >
+              {alertCenterExpanded ? 'Show less' : `Show ${alertCenterOverflow} more`}
+            </button>
+          ) : null}
         </div>
       ) : (
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No alerts need attention" style={{ margin: '20px 0' }} />
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description="No alerts need attention"
+          style={{ margin: '20px 0' }}
+        />
       )}
       <div className="app-alert-center__footer">
-        <Button type="link" size="small" onClick={openCurrentAlerts} style={{ padding: 0 }}>
-          Open alert history
+        <Typography.Text className="app-alert-center__count">{handledSummary}</Typography.Text>
+        <Button type="link" size="small" onClick={() => openInDiagnostics({ kind: 'current' })} style={{ padding: 0 }}>
+          View all alerts <ExportOutlined />
         </Button>
       </div>
     </div>
@@ -432,7 +534,8 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
             children: (
               <Diagnostics
                 active={activeTab === 'diagnostics'}
-                openAlertsSignal={diagnosticsOpenAlertsSignal}
+                alertsRequest={diagnosticsAlertsRequest}
+                currentAlerts={currentAlerts}
                 rangeIntent={diagnosticsRangeIntent}
                 onOpenHistory={(range) => {
                   setHistoryRangeIntent(range)
@@ -661,16 +764,22 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
             {diagnosticsEnabled ? (
               <Dropdown
                 trigger={['click']}
+                open={alertCenterOpen}
+                onOpenChange={(open) => {
+                  setAlertCenterOpen(open)
+                  // Reopening starts from the short list again.
+                  if (!open) setAlertCenterExpanded(false)
+                }}
                 dropdownRender={() => alertCenter}
                 overlayStyle={{ paddingTop: 6 }}
               >
                 <Button
                   type="text"
                   size="small"
-                  aria-label={`Open alerts, ${activeAlertCount} need attention`}
+                  aria-label={`Open alerts, ${needsAttentionCount} need attention`}
                   style={{ color: COLORS.textMuted }}
                 >
-                  <Badge count={activeAlertCount} size="small" offset={[2, -1]}>
+                  <Badge count={needsAttentionCount} size="small" offset={[2, -1]}>
                     <BellOutlined style={{ color: COLORS.textMuted }} />
                   </Badge>
                 </Button>

@@ -73,7 +73,10 @@ def assemble_context(*, scope_kind, scope_value, start_time=None, end_time=None)
         "events": events,
         "control_actions": control_actions,
         "concurrent_jobs": concurrent_jobs,
-        "alerts": event_store.query_alerts(active_only=True, limit=100),
+        # Alert occurrences that overlap the evidence window (active or since
+        # resolved), not whatever happens to be active now.
+        "alerts": event_store.query_alerts(
+            active_only=False, start_time=start_time, end_time=end_time, limit=100),
         "metrics": metrics_window,
         "logs": logs,
     }

@@ -46,10 +46,14 @@ def get_events():
 
     Query params: severity, category, source, event_type, app_id, job_id,
     impact, resource_type, protection_id, episode_id, boot_id, keyword,
-    from/to (epoch seconds), limit, offset.
+    from/to (epoch seconds), limit, offset. ``alertable=true`` keeps only
+    event types that have an alert policy (the alert history view).
     """
     try:
         from diagnostics import event_store
+        from diagnostics.alerts import ALERT_POLICIES
+
+        alertable = (request.args.get("alertable") or "").lower() in ("1", "true", "yes")
 
         events = event_store.query_events(
             event_id=_str_arg("event_id"),
@@ -57,6 +61,7 @@ def get_events():
             category=_str_arg("category"),
             source=_str_arg("source"),
             event_type=_str_arg("event_type"),
+            event_types=list(ALERT_POLICIES) if alertable else None,
             app_id=_str_arg("app_id"),
             job_id=_str_arg("job_id"),
             impact=_str_arg("impact"),
@@ -87,6 +92,7 @@ def get_alerts():
         alerts = event_store.query_alerts(
             active_only=active_only, notifyable_only=notifyable_only,
             limit=_int_arg("limit", 100),
+            start_time=_int_arg("from"), end_time=_int_arg("to"),
         )
         return construct_response(data={"alerts": alerts, "count": len(alerts)})
     except Exception as exc:
@@ -96,11 +102,12 @@ def get_alerts():
 
 @diag_bp.route("/alerts/<dedup_key>/acknowledge", methods=["POST"])
 def acknowledge_alert(dedup_key):
-    from db.DatabaseModel import AlertState
+    from diagnostics import alerts
 
-    if not AlertState.acknowledge(dedup_key, datetime.now(timezone.utc).isoformat(timespec="seconds")):
+    found, closed = alerts.acknowledge(dedup_key)
+    if not found:
         return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg="Active alert not found")
-    return construct_response(data={"acknowledged": True})
+    return construct_response(data={"acknowledged": True, "closed": closed})
 
 
 @diag_bp.route("/alerts/<dedup_key>/silence", methods=["POST"])

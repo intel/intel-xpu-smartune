@@ -14,7 +14,7 @@ import {
 } from 'recharts'
 import dayjs, { type Dayjs } from 'dayjs'
 import { api } from '../api/client'
-import type { BenchQuietModeState, DynamicInfoData, HistoryData, HistoryRetentionData, HistorySnapshotItem, GpuUsageDevice, StaticInfoData } from '../api/types'
+import type { BenchQuietModeState, DynamicInfoData, HistoryData, HistoryRetentionData, HistorySnapshotItem, GpuUsageDevice } from '../api/types'
 import { COLORS, getGpuChartColors } from '../styles/theme'
 import { useMonitoredSections } from '../hooks/useMonitoredSections'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
@@ -141,16 +141,8 @@ interface CpuPerCoreInfo {
 
 type RangePreset = '5m' | '15m' | '1h' | '6h' | '24h' | 'custom'
 
-interface HistoryNetworkExtra {
-  utilization_percent?: number | null
-}
-
 interface HistoryNpuSmiExtra {
   utilization_percent?: number | null
-  parsed?: {
-    utilization?: number | null
-    utilization_percent?: number | null
-  } | null
 }
 
 const RANGE_PRESET_OPTIONS: Array<{ label: string; value: RangePreset }> = [
@@ -511,26 +503,10 @@ function getPressurePeak(dynamic: DynamicInfoData | null): number | null {
   return Math.max(...values)
 }
 
-function getNetworkUsage(dynamic: DynamicInfoData | null): number | null {
-  if (!dynamic) return null
-  const network = dynamic.network as DynamicInfoData['network'] & HistoryNetworkExtra
-  // utilization_percent is already a percentage (0-100) from backend; use toNumber to avoid normalizePercent ×100
-  const utilization = toNumber(network?.utilization_percent)
-  if (utilization != null) return utilization
-  // Fallback: NetworkMonitor rx/tx fractions (0-1) stored in the pressure section.
-  const p = dynamic.pressure as { network_rx?: unknown; network_tx?: unknown } | undefined
-  const rx = normalizePressureFraction(p?.network_rx)
-  const tx = normalizePressureFraction(p?.network_tx)
-  const vals = [rx, tx].filter((v): v is number => v != null)
-  return vals.length > 0 ? Math.max(...vals) : null
-}
-
 function getNpuUsage(dynamic: DynamicInfoData | null): number | null {
   if (!dynamic?.npu?.npu_smi) return null
   const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & HistoryNpuSmiExtra
-  const direct = normalizePercent(npuSmi.utilization_percent)
-  if (direct != null) return direct
-  return normalizePercent(npuSmi.parsed?.utilization_percent ?? npuSmi.parsed?.utilization)
+  return normalizePercent(npuSmi.utilization_percent)
 }
 
 function normalizeEngineUtil(device: GpuUsageDevice, key: EngineKey): number | null {
@@ -563,7 +539,7 @@ function buildPressureTrendPoints(items: HistorySnapshotItem[]): PressureTrendPo
     const dynamic = toDynamicData(item)
     const { ts, label } = buildTimestamp(item)
     // System pressure: use persisted composite score (0-1 → 0-100%); fall back to
-    // PSI peak for older snapshots that predate the score field being stored.
+    // PSI peak when the pressure monitor produced no score for this sample.
     const scoreRaw = (dynamic?.pressure as Record<string, unknown> | undefined)?.score
     const systemPressure = isNumber(scoreRaw as number | null)
       ? Math.round((scoreRaw as number) * 100)
@@ -707,42 +683,18 @@ function buildDiskTrendPoints(items: HistorySnapshotItem[]): { points: DiskTrend
         write_mb?: number | null
         max_throughput_mb?: number | null
         usage_percent?: number | null
-      } | number | null>
+      }>
     }) | undefined
     const perDisk = disk?.per_disk
     if (perDisk && typeof perDisk === 'object') {
       for (const [name, val] of Object.entries(perDisk)) {
         diskNameSet.add(name)
-        if (val && typeof val === 'object' && ('util' in val || 'read_mb' in val)) {
-          // New format
-          point[`${name}:util`] = normalizePercent(val.util)
-          point[`${name}:capUsedPct`] = normalizePercent(val.usage_percent)
-          point[`${name}:read`] = toNumber(val.read_mb)
-          point[`${name}:write`] = toNumber(val.write_mb)
-          const tp = toNumber(val.max_throughput_mb)
-          if (tp != null && tp > 0) maxTpMap[name] = tp
-        } else {
-          // Old format: single utilization number
-          point[`${name}:util`] = typeof val === 'number' ? normalizePercent(val) : null
-          point[`${name}:capUsedPct`] = null
-          point[`${name}:read`] = null
-          point[`${name}:write`] = null
-        }
-      }
-    } else if (disk?.disk_io) {
-      for (const [name, diskData] of Object.entries(disk.disk_io)) {
-        diskNameSet.add(name)
-        if (diskData == null || typeof diskData !== 'object') {
-          point[`${name}:util`] = null
-          point[`${name}:capUsedPct`] = null
-          point[`${name}:read`] = null
-          point[`${name}:write`] = null
-          continue
-        }
-        point[`${name}:util`] = normalizePercent(diskData.utilization)
-        point[`${name}:capUsedPct`] = normalizePercent(diskData.usage_percent)
-        point[`${name}:read`] = toNumber(diskData.read_kb_per_sec != null ? diskData.read_kb_per_sec / 1024 : null)
-        point[`${name}:write`] = toNumber(diskData.write_kb_per_sec != null ? diskData.write_kb_per_sec / 1024 : null)
+        point[`${name}:util`] = normalizePercent(val.util)
+        point[`${name}:capUsedPct`] = normalizePercent(val.usage_percent)
+        point[`${name}:read`] = toNumber(val.read_mb)
+        point[`${name}:write`] = toNumber(val.write_mb)
+        const tp = toNumber(val.max_throughput_mb)
+        if (tp != null && tp > 0) maxTpMap[name] = tp
       }
     }
     return point
@@ -759,125 +711,47 @@ function buildNetworkTrendPoints(items: HistorySnapshotItem[]): { points: Networ
     const point: NetworkTrendPoint = { timestamp: label, ts }
 
     const network = dynamic?.network as (DynamicInfoData['network'] & {
-      per_nic?: Record<string, { util?: number | null; rx_mbps?: number | null; tx_mbps?: number | null; rx?: number | null; tx?: number | null; speed_mbps?: number | null } | number | null>
-      interfaces?: Record<string, { rx_bytes_per_sec?: number | null; tx_bytes_per_sec?: number | null }>
+      per_nic?: Record<string, { util?: number | null; rx_mbps?: number | null; tx_mbps?: number | null; speed_mbps?: number | null }>
       pressure_interfaces?: DynamicInfoData['pressure']['network_interfaces']
     }) | undefined
     const pressureInterfaces = dynamic?.pressure?.network_interfaces ?? network?.pressure_interfaces
-    const perNic = network?.per_nic ?? (network?.interfaces
-      ? Object.fromEntries(Object.entries(network.interfaces).map(([name, value]) => [name, {
-          rx_mbps: toNumber(value?.rx_bytes_per_sec) != null ? (value?.rx_bytes_per_sec as number) / 1_000_000 : null,
-          tx_mbps: toNumber(value?.tx_bytes_per_sec) != null ? (value?.tx_bytes_per_sec as number) / 1_000_000 : null,
-        }]))
-      : undefined)
-    if (perNic && typeof perNic === 'object') {
-      for (const [name, val] of Object.entries(perNic)) {
-        nicNameSet.add(name)
-        if (val && typeof val === 'object') {
-          const speed = toNumber(val.speed_mbps)
-          const rxMbps = toNumber(val.rx_mbps)
-          const txMbps = toNumber(val.tx_mbps)
-          point[`${name}:rxUtil`] = speed && speed > 0 && rxMbps != null
-            ? Math.min(rxMbps / speed * 100, 100)
-            : null
-          point[`${name}:txUtil`] = speed && speed > 0 && txMbps != null
-            ? Math.min(txMbps / speed * 100, 100)
-            : null
-          point[`${name}:rx`] = toNumber(val.rx_mbps) ?? null
-          point[`${name}:tx`] = toNumber(val.tx_mbps) ?? null
-          const pressure = pressureInterfaces?.[name]
-          point[`${name}:rxLoss`] = toNumber(pressure?.rx?.drop_ratio_pct)
-          point[`${name}:rxCongestion`] = toNumber(pressure?.rx?.distress_pct)
-          point[`${name}:txLoss`] = toNumber(pressure?.tx?.drop_ratio_pct)
-          point[`${name}:txCongestion`] = toNumber(pressure?.tx?.distress_pct)
-          const sp = toNumber(val.speed_mbps)
-          if (sp != null && sp > 0) speedMap[name] = sp
-        } else {
-          // Old format: single utilization number
-          point[`${name}:rxUtil`] = null
-          point[`${name}:txUtil`] = null
-          point[`${name}:rx`] = null
-          point[`${name}:tx`] = null
-          point[`${name}:rxLoss`] = null
-          point[`${name}:rxCongestion`] = null
-          point[`${name}:txLoss`] = null
-          point[`${name}:txCongestion`] = null
-        }
-      }
-    } else {
-      // Fallback: use aggregated utilization_percent as single line (already 0-100 from backend)
-      const aggUtil = toNumber((network as DynamicInfoData['network'] & HistoryNetworkExtra)?.utilization_percent)
-      if (aggUtil != null) {
-        nicNameSet.add('total')
-        // The legacy aggregate has no direction split; do not present it as RX.
-        point['total:rxUtil'] = null
-        point['total:txUtil'] = null
-        point['total:rx'] = null
-        point['total:tx'] = null
-        point['total:rxLoss'] = null
-        point['total:rxCongestion'] = null
-        point['total:txLoss'] = null
-        point['total:txCongestion'] = null
-      }
+    for (const [name, val] of Object.entries(network?.per_nic ?? {})) {
+      nicNameSet.add(name)
+      const speed = toNumber(val.speed_mbps)
+      const rxMbps = toNumber(val.rx_mbps)
+      const txMbps = toNumber(val.tx_mbps)
+      point[`${name}:rxUtil`] = speed && speed > 0 && rxMbps != null
+        ? Math.min(rxMbps / speed * 100, 100)
+        : null
+      point[`${name}:txUtil`] = speed && speed > 0 && txMbps != null
+        ? Math.min(txMbps / speed * 100, 100)
+        : null
+      point[`${name}:rx`] = rxMbps
+      point[`${name}:tx`] = txMbps
+      const pressure = pressureInterfaces?.[name]
+      point[`${name}:rxLoss`] = toNumber(pressure?.rx?.drop_ratio_pct)
+      point[`${name}:rxCongestion`] = toNumber(pressure?.rx?.distress_pct)
+      point[`${name}:txLoss`] = toNumber(pressure?.tx?.drop_ratio_pct)
+      point[`${name}:txCongestion`] = toNumber(pressure?.tx?.distress_pct)
+      if (speed != null && speed > 0) speedMap[name] = speed
     }
     return point
   })
   return { points, nicNames: Array.from(nicNameSet).sort(), nicSpeeds: speedMap }
 }
 
-function getNpuFreqMhz(dynamic: DynamicInfoData | null): number | null {
+// The history writer derives these top-level fields from npu_smi.parsed.
+function npuSmiField(dynamic: DynamicInfoData | null, field: string): number | null {
   if (!dynamic?.npu?.npu_smi) return null
-  const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & { frequency_mhz?: number | null; parsed?: Record<string, unknown> | null }
-  // Try top-level first (from history payload), then parsed
-  const direct = toNumber(npuSmi.frequency_mhz)
-  if (direct != null) return direct
-  return toNumber((npuSmi.parsed as Record<string, unknown> | null)?.frequency_mhz as number | null)
+  return toNumber((dynamic.npu.npu_smi as unknown as Record<string, number | null | undefined>)[field])
 }
 
-function getNpuPowerW(dynamic: DynamicInfoData | null): number | null {
-  if (!dynamic?.npu?.npu_smi) return null
-  const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & { power_w?: number | null; parsed?: Record<string, unknown> | null }
-  const direct = toNumber(npuSmi.power_w)
-  if (direct != null) return direct
-  return toNumber((npuSmi.parsed as Record<string, unknown> | null)?.power_w as number | null)
-}
-
-function getNpuDdrBwMib(dynamic: DynamicInfoData | null): number | null {
-  if (!dynamic?.npu?.npu_smi) return null
-  const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & { noc_bandwidth_mib_per_s?: number | null; parsed?: Record<string, unknown> | null }
-  const direct = toNumber(npuSmi.noc_bandwidth_mib_per_s)
-  if (direct != null) return direct
-  return toNumber((npuSmi.parsed as Record<string, unknown> | null)?.noc_bandwidth_mib_per_s as number | null)
-}
-
-function getNpuTemperatureC(dynamic: DynamicInfoData | null): number | null {
-  if (!dynamic?.npu?.npu_smi) return null
-  const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & { temperature_c?: number | null; parsed?: Record<string, unknown> | null }
-  const direct = toNumber(npuSmi.temperature_c)
-  if (direct != null) return direct
-  return toNumber((npuSmi.parsed as Record<string, unknown> | null)?.temperature_c as number | null)
-}
-
-function getNpuTileCount(dynamic: DynamicInfoData | null): number | null {
-  if (!dynamic?.npu?.npu_smi) return null
-  const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & { tile_config?: number | null; parsed?: Record<string, unknown> | null }
-  const direct = toNumber(npuSmi.tile_config)
-  if (direct != null) return direct
-  const parsed = npuSmi.parsed as Record<string, unknown> | null
-  const tc = parsed?.tile_config
-  return typeof tc === 'number' ? tc : null
-}
-
-function getNpuMemoryMb(dynamic: DynamicInfoData | null): number | null {
-  if (!dynamic?.npu?.npu_smi) return null
-  const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & { memory_mb?: number | null; parsed?: Record<string, unknown> | null }
-  const direct = toNumber(npuSmi.memory_mb)
-  if (direct != null) return direct
-  // Fallback: parse from memory_bytes in parsed data
-  const parsed = npuSmi.parsed as Record<string, unknown> | null
-  const mb = parsed?.memory_bytes
-  return typeof mb === 'number' && mb > 0 ? mb / (1024 * 1024) : null
-}
+const getNpuFreqMhz = (dynamic: DynamicInfoData | null) => npuSmiField(dynamic, 'frequency_mhz')
+const getNpuPowerW = (dynamic: DynamicInfoData | null) => npuSmiField(dynamic, 'power_w')
+const getNpuDdrBwMib = (dynamic: DynamicInfoData | null) => npuSmiField(dynamic, 'noc_bandwidth_mib_per_s')
+const getNpuTemperatureC = (dynamic: DynamicInfoData | null) => npuSmiField(dynamic, 'temperature_c')
+const getNpuTileCount = (dynamic: DynamicInfoData | null) => npuSmiField(dynamic, 'tile_config')
+const getNpuMemoryMb = (dynamic: DynamicInfoData | null) => npuSmiField(dynamic, 'memory_mb')
 
 function buildNpuTrendPoints(items: HistorySnapshotItem[]): NpuTrendPoint[] {
   return [...items].reverse().map((item) => {
@@ -1689,12 +1563,6 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
     })
   }, [allSections])
 
-  // Static info for NIC link speeds & disk throughput caps
-  const [staticInfo, setStaticInfo] = useState<StaticInfoData | null>(null)
-  useEffect(() => {
-    if (!active) return
-    api.getStaticInfo().then(setStaticInfo).catch(() => {})
-  }, [active])
 
   // Whether a benchmark run currently has history writing suspended, so the
   // live end of these charts stopping can be explained rather than read as a
@@ -1943,17 +1811,8 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
   }, [dynamicItems])
   const { points: networkTrendPoints, nicNames, nicSpeeds } = useMemo(() => {
     const { points, nicNames: nn, nicSpeeds: sp } = buildNetworkTrendPoints(dynamicItems)
-    // Merge with static info NIC speeds as fallback (history data may lack speed_mbps)
-    const merged = { ...sp }
-    if (staticInfo?.network?.network_speeds_mbps && typeof staticInfo.network.network_speeds_mbps === 'object') {
-      for (const [name, speed] of Object.entries(staticInfo.network.network_speeds_mbps)) {
-        if (typeof speed === 'number' && speed > 0 && !merged[name]) {
-          merged[name] = speed
-        }
-      }
-    }
-    return { points: downsampleWithGaps(points, MAX_CHART_POINTS, (p) => sumMetrics(p as unknown as Record<string, unknown>)), nicNames: nn, nicSpeeds: merged }
-  }, [dynamicItems, staticInfo])
+    return { points: downsampleWithGaps(points, MAX_CHART_POINTS, (p) => sumMetrics(p as unknown as Record<string, unknown>)), nicNames: nn, nicSpeeds: sp }
+  }, [dynamicItems])
   const npuTrendPoints = useMemo(() => {
     const raw = buildNpuTrendPoints(dynamicItems)
     return downsampleWithGaps(raw, MAX_CHART_POINTS, (p) => Math.abs(p.npuUtilization ?? 0) + Math.abs(p.npuFreqMhz ?? 0) + Math.abs(p.npuPowerW ?? 0) + Math.abs(p.npuTemperatureC ?? 0) + Math.abs(p.npuMemoryMb ?? 0))
@@ -2257,10 +2116,11 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
 
     // ── Network ───────────────────────────────────────────────────────────
     {
+      // History stores per-NIC rates as per_nic (Mbit/s), not the live interfaces map.
+      const perNicOf = (d: DynamicInfoData | null) => (d?.network as { per_nic?: Record<string, { rx_mbps?: number | null; tx_mbps?: number | null }> } | undefined)?.per_nic ?? {}
       const nicNames = new Set<string>()
       for (const { data } of dyn) {
-        const ifs = data?.network?.interfaces ?? {}
-        Object.keys(ifs).forEach((n) => nicNames.add(n))
+        Object.keys(perNicOf(data)).forEach((n) => nicNames.add(n))
       }
       const nics = [...nicNames].sort()
       const netCols: Array<Partial<ExcelJS.Column>> = [
@@ -2269,8 +2129,8 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
       ]
       for (const n of nics) {
         netCols.push(
-          { header: `${n}_rx_bytes_per_sec`, key: `${n}_rx`, width: 22 },
-          { header: `${n}_tx_bytes_per_sec`, key: `${n}_tx`, width: 22 },
+          { header: `${n}_rx_mbps`, key: `${n}_rx`, width: 18 },
+          { header: `${n}_tx_mbps`, key: `${n}_tx`, width: 18 },
         )
       }
       addSheet('Network', netCols, (d) => {
@@ -2279,9 +2139,9 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
           total_tx: d?.network?.total?.tx_bytes_per_sec ?? null,
         }
         for (const n of nics) {
-          const ni = d?.network?.interfaces?.[n]
-          row[`${n}_rx`] = ni?.rx_bytes_per_sec ?? null
-          row[`${n}_tx`] = ni?.tx_bytes_per_sec ?? null
+          const ni = perNicOf(d)[n]
+          row[`${n}_rx`] = ni?.rx_mbps ?? null
+          row[`${n}_tx`] = ni?.tx_mbps ?? null
         }
         return row
       })

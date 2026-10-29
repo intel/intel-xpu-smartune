@@ -21,7 +21,7 @@ those and for the shared `RetCode` table. Auth is applied app-wide by `smartune_
 | `/diag/event-catalog` | GET | Built-in diagnostic event metadata for Settings |
 | `/diag/events` | GET | Filtered operational-event query |
 | `/diag/alerts` | GET | Derived alerts, active-only by default |
-| `/diag/alerts/<dedup_key>/acknowledge` | POST | Acknowledge one active alert |
+| `/diag/alerts/<dedup_key>/acknowledge` | POST | Acknowledge one active alert (closes one-off faults) |
 | `/diag/alerts/<dedup_key>/silence` | POST | Silence one active alert for 30 or 120 minutes |
 | `/diag/control-lifecycles` | GET | Resource-limit lifecycles reconstructed from events |
 | `/diag/control-lifecycles/clear-without-runtime-state` | POST | Close an orphaned lifecycle |
@@ -92,6 +92,7 @@ they are combined with AND.
 | Query | episode_id | No | string | Scope to one pressure episode |
 | Query | boot_id | No | string | Scope to one boot session |
 | Query | keyword | No | string | Free-text match |
+| Query | alertable | No | bool | `true` keeps only event types that have an alert policy (default `false`) |
 | Query | from | No | int | Window start (epoch seconds) |
 | Query | to | No | int | Window end (epoch seconds) |
 | Query | limit | No | int | Max rows (default `200`) |
@@ -137,13 +138,29 @@ GET /diag/events?severity=warning&app_id=com.example.app&from=1755760000&to=1755
 
 **Purpose:** List derived diagnostics alerts. Defaults to the currently active ones.
 
+Only the event types in `ALERT_POLICIES` (`diagnostics/alerts.py`) create alerts. Repeated
+events with the same event type and scope are merged into one alert, identified by
+`dedup_key` = `<EVENT_TYPE>::<scope>`, where scope is the first of `protection_id`,
+`job_id`, `app_id`, `service`, `source` that is set.
+
+Each alert row is one **occurrence** (active → resolved). Active occurrences come from
+`AlertState`. Resolved ones come from `AlertEpisode`, which keeps one row per occurrence,
+so the same `dedup_key` can appear several times in history.
+
 **Request:**
 
 | Type | Parameter | Required | Format | Description |
 |------|-----------|----------|--------|-------------|
-| Query | active | No | bool | `false` / `0` / `no` includes resolved alerts (default `true`) |
-| Query | notifyable | No | bool | `true` restricts to alerts eligible for notification (default `false`) |
+| Query | active | No | bool | `false` / `0` / `no` also returns resolved occurrences (default `true`) |
+| Query | notifyable | No | bool | `true` restricts to active alerts that are neither acknowledged nor silenced (default `false`) |
+| Query | from | No | int | Window start (epoch seconds) |
+| Query | to | No | int | Window end (epoch seconds) |
 | Query | limit | No | int | Max rows (default `100`) |
+
+**Request Example:**
+```
+GET /diag/alerts?active=false&from=1792998000&to=1793001600&limit=100
+```
 
 **Response:**
 ```json
@@ -153,13 +170,29 @@ GET /diag/events?severity=warning&app_id=com.example.app&from=1755760000&to=1755
   "data": {
     "alerts": [
       {
-        "dedup_key": "pressure:critical:sustained",
-        "severity": "warning",
-        "first_seen": "2026-10-13T09:12:00+00:00",
-        "last_seen": "2026-10-13T09:40:00+00:00",
-        "count": 7,
+        "episode_id": "3f6b0c8e9a2d5b1e7c4f0a9d8e6b2c1a",
+        "dedup_key": "CONTROL_MEMORY_LIMIT_FAILED::auto:com.example.app:1792998123",
+        "event_type": "CONTROL_MEMORY_LIMIT_FAILED",
+        "summary": "Failed to apply memory limit for com.example.app",
+        "scope": "auto:com.example.app:1792998123",
+        "severity": "error",
+        "status": "resolved",
+        "first_fired_at": "2026-10-29T09:12:00+00:00",
+        "last_fired_at": "2026-10-29T09:14:30+00:00",
+        "fire_count": 3,
+        "last_event_id": "a1b2c3d4e5f6...",
         "acknowledged_at": null,
-        "silenced_until": null
+        "silenced_until": null,
+        "silence_reason": null,
+        "resolved_at": "2026-10-29T09:20:05+00:00",
+        "resolved_event_id": "f6e5d4c3b2a1...",
+        "severity_origin": "producer",
+        "baseline_severity": null,
+        "escalation_rule_id": null,
+        "escalation_rule_version": null,
+        "escalation_reason": null,
+        "escalation_evidence": null,
+        "escalated_at": null
       }
     ],
     "count": 1
@@ -167,12 +200,29 @@ GET /diag/events?severity=warning&app_id=com.example.app&from=1755760000&to=1755
 }
 ```
 
+**Notes:**
+- `status` is `active` or `resolved`. `episode_id` is set only for resolved occurrences
+  (`null` for active ones); use it as the row key for history.
+- With `from` / `to`, only occurrences whose span `[first_fired_at, resolved_at or now]`
+  overlaps the window are returned, and `limit` applies after that filter.
+- Results are ordered by `last_fired_at`, newest first.
+- `fire_count` is the number of detections in this occurrence; it starts again from `1`
+  when a resolved alert fires again.
+- `acknowledged_at` and `silenced_until` belong to the current occurrence. A new
+  occurrence clears them, and a severity escalation clears `acknowledged_at`.
+- `count` is the number of rows returned.
+
 ---
 
 ### POST /diag/alerts/&lt;dedup_key&gt;/acknowledge
 
-**Purpose:** Mark one active alert as acknowledged. The alert stays in the list; it is
-simply no longer treated as unseen.
+**Purpose:** Acknowledge one active alert.
+
+For one-off faults that have no recovery event (`PLATFORM_KERNEL_PANIC`,
+`RESOURCE_MEMORY_OOM_KILL`, `DEVICE_GPU_HANG`, i.e. policies with `close_on_ack`),
+acknowledging also **closes** the alert: it is resolved with `resolved_event_id = null` and
+archived as a resolved occurrence. For every other type the alert stays active and is only
+marked as handled until its recovery condition is met.
 
 **Request:** `dedup_key` in the path; no body.
 
@@ -181,11 +231,12 @@ simply no longer treated as unseen.
 {
   "retcode": 0,
   "retmsg": "success",
-  "data": {"acknowledged": true}
+  "data": {"acknowledged": true, "closed": false}
 }
 ```
 
 **Notes:**
+- `closed` is `true` when the acknowledgement also closed the alert.
 - Returns `RetCode.ARGUMENT_ERROR` with `Active alert not found` when the key matches no
   active alert — including when it matches an alert that has already resolved.
 
@@ -452,6 +503,8 @@ GET /diag/context?job_id=bench-20261013-0912
 - `findings_only=true` without both `from` and `to` returns `RetCode.ARGUMENT_ERROR` with
   `findings_only requires from & to`.
 - No scope and no window returns `provide one of job_id/app_id, or from & to`.
+- `alerts` in the full context lists the alert occurrences that overlap the evidence window
+  (active or since resolved), not whatever is active now.
 
 ---
 
@@ -529,3 +582,5 @@ GET /diag/digest?period=day&date=2026-10-13
   `RetCode.ARGUMENT_ERROR`.
 - A `ValueError` from the generator (e.g. a malformed `date`) also surfaces as
   `RetCode.ARGUMENT_ERROR` with the underlying message.
+- `range_alerts` holds every alert occurrence that was active at some point in the period
+  (including ones resolved since); `active_alerts` holds the alerts active right now.

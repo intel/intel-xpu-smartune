@@ -253,6 +253,8 @@ export interface DiagControlLifecycleQuery {
 }
 
 export interface DiagAlert {
+  // Set for a closed occurrence; a dedup_key can have several in history.
+  episode_id?: string | null
   dedup_key: string
   first_fired_at: string
   last_fired_at: string

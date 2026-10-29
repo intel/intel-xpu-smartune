@@ -440,6 +440,9 @@ export interface AppInfo {
   // Cgroups recorded when the active limit was applied. Unlike process_status_rows,
   // this remains available when a live process scan cannot find the process yet.
   limited_scopes?: string[]
+  // Manual Freeze (cgroup.freeze) is active; frozen_at is epoch seconds.
+  frozen?: boolean
+  frozen_at?: number | null
 }
 
 export interface ProcessStatusRow {

@@ -93,6 +93,7 @@ All endpoints return a standardized JSON structure:
 | App | `/app/resource_limit` | POST | Set resource limit | cgroup-based, overridable |
 | App | `/app/resource_limit_profile` | POST | Get limit profile | Defaults + bounds for UI |
 | App | `/app/resource_restore` | POST | Restore resources | Remove limits by app_id |
+| App | `/app/freeze` | POST | Freeze/unfreeze a limited app | cgroup.freeze; manual limits only |
 | App | `/app/limit_snapshot` | POST | Live limit snapshot | Ownership + effective caps + pids |
 | App | `/app/interrupted_limit_status` | POST | Probe kernel caps by cgroup | Recovers interrupted lifecycles; one or many |
 | App | `/app/auto_limited_apps` | POST | List pressure-driven limits | Rows + live pressure levels |
@@ -726,11 +727,15 @@ Or query by name:
       "cgroup": "",
       "process_names": ["example", "example-worker"],
       "remark": "Critical service",
-      "status": "running"
+      "status": "running",
+      "frozen": false,
+      "frozen_at": null
     }
   ]
 }
 ```
+
+`frozen` / `frozen_at` (epoch seconds, `null` when not frozen) report the manual Freeze state set through `/app/freeze`.
 
 ---
 
@@ -1023,6 +1028,49 @@ Or query by name:
 }
 ```
 
+**Notes:**
+- If the app was frozen through `/app/freeze`, restore lifts the limits first and thaws last, so the app does not resume straight into a `memory.high` / `io.max` stall. A failed limit restore still thaws the app.
+
+---
+
+#### POST /app/freeze
+
+**Purpose:** Freeze or unfreeze an app that carries a manual limit, using the cgroup v2 freezer (`cgroup.freeze`) on every cgroup of the limit. This is an escalation for GPU/NPU-bound apps that need little CPU, memory or disk per unit time, so the ordinary limit cannot slow them down. Unlike `/app/suspend_process` (SIGSTOP on one process), the whole cgroup is stopped atomically and the app receives no signal.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | app_id | Yes | string | Public application identifier |
+| Body | freeze | Yes | boolean | `true` to freeze, `false` to thaw (the limits stay in place) |
+
+**Request Example:**
+```json
+{
+  "app_id": "com.example.app",
+  "freeze": true
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Frozen",
+  "data": {}
+}
+```
+
+**Notes:**
+- Manual limits only. An app with no manual limit returns `RetCode.OPERATING_ERROR` with `App has no manual limit; apply a limit first`.
+- A missing `app_id`, or a `freeze` that is not a boolean, returns `RetCode.ARGUMENT_ERROR`.
+- Idempotent: repeating the current state succeeds with `Already frozen` or `Not frozen`.
+- Freezing waits up to 10 s for `cgroup.events` to report `frozen 1`; on timeout, or if any cgroup fails, it returns `RetCode.OPERATING_ERROR`. Cgroups already frozen in the same call are thawed again, so an app is never left half-frozen.
+- If the limit is restored while the freeze is being written, the call fails with `Limit was restored while freezing` and the cgroups are thawed.
+- A freeze takes effect on the cgroup in milliseconds, but an NPU keeps running work it already has: usage fell only after about 20 s in a measurement with an 8B model.
+- Every freeze is recorded in `/run/smartune/frozen_cgroups.json` (override with the `SMARTUNE_FREEZE_STATE` environment variable) before it is written. On startup the balancer thaws exactly the recorded cgroups, never other frozen cgroups on the host (e.g. `docker pause`).
+- The state is reported as `frozen` / `frozen_at` in `/app/limit_snapshot` and `/app/get_controlled_app`. `/app/resource_restore` undoes both the limits and the freeze.
+
 ---
 
 #### POST /app/limit_snapshot
@@ -1057,6 +1105,8 @@ Or query by name:
     "limit_parts": {"cpu_mem_limited": true, "io_limited": false},
     "limited_at": 1755764400.12,
     "adopted_from_auto": false,
+    "frozen": false,
+    "frozen_at": null,
     "effective": {
       "cpu_mem": {"limited": true, "cpu_rate": 0.5, "mem_rate": 0.2},
       "disk_io": {
@@ -1102,6 +1152,8 @@ Or query by name:
 | effective.cpu_mem | object | Whether CPU/memory is capped and at what rates |
 | effective.disk_io | object | Whether `io.max` is in place, on which disks (empty = every disk), and with what MB/s + IOPS |
 | adopted_from_auto | bool | `true` when this manual limit came from `/app/lock_to_manual` or `/app/adopt_auto_limit` |
+| frozen | bool | `true` while the app is frozen through `/app/freeze` (manual limits only) |
+| frozen_at | number | Epoch seconds when it was frozen; `null` when not frozen |
 | auto_detail | object | Present only for auto limits: why it fired, the level at the time, and `partial_parts` for channels already half-restored. `null` for manual limits |
 
 **Notes:**

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, List, Optional, Tuple
 
@@ -15,6 +16,7 @@ from controller.memory import (
     MemoryController,
     ReclaimOutcome,
 )
+from controller import freeze
 from controller.governor import GovernorController
 from controller.swap import ActionResult, GrowthPlan, SwapController
 from config.config import b_config
@@ -499,6 +501,32 @@ class ControlManager:
         which also means growth and shrink cannot be in flight together.
         """
         return self._executor.submit(self.shrink_swap_if_idle, dry_run)
+
+    def freeze_cgroup(self, cgroup: str, frozen: bool) -> Tuple[bool, str]:
+        """Freeze or thaw one cgroup via cgroup.freeze (manual Freeze action).
+
+        A freeze is recorded *before* it is written, so a crash between the two
+        cannot leave a frozen cgroup the next start does not know about.
+        """
+        path = self.memory.get_full_path(cgroup)
+        if not os.path.isdir(path):
+            if not frozen:
+                # Nothing left to thaw; just drop the record.
+                freeze.record(cgroup, False)
+                return True, "cgroup already gone"
+            return False, f"cgroup {cgroup} no longer exists"
+        if frozen:
+            freeze.record(cgroup, True)
+        ok, msg = freeze.set_frozen(path, frozen)
+        if ok and not frozen:
+            freeze.record(cgroup, False)
+        elif not ok and frozen and freeze.is_frozen(path) is not True:
+            freeze.record(cgroup, False)
+        return ok, msg
+
+    def thaw_leftover_frozen(self) -> List[str]:
+        """Startup safety net: thaw cgroups a previous run froze and never thawed."""
+        return freeze.thaw_recorded(self.memory.get_full_path)
 
     def adjust_resources(self, app_id: str, policy: str, **resource_kwargs):
         """Adjust resources with optional parameters"""

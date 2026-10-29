@@ -468,6 +468,14 @@ export const api = {
     if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
     return res.data.data
   },
+  // Manual limits only. Restore (resourceRestore) lifts the limits and thaws.
+  freezeApp: async (payload: Pick<AppIdPayload, 'app_id'> & { freeze: boolean }) => {
+    const res = await client.post<ApiResponse<void>>(
+      '/app/freeze', payload, { timeout: 30_000 },
+    )
+    if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
+    return res.data.data
+  },
   getLimitSnapshot: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<LimitSnapshotData>('/app/limit_snapshot', payload),
   // One result per entry, in order. Checked in a batch rather than per

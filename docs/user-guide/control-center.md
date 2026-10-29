@@ -77,13 +77,55 @@ For **Critical** apps, enable keep-alive so SmarTune reduces the chance the
 system OOM-killer terminates them under memory pressure (via `oom_score_adj`),
 while it keeps monitoring the process for stability.
 
+## Freezing an app
+
+Use **Freeze** only when a manual limit is not enough. Apps that mainly run
+on a GPU or NPU need very little CPU, memory or disk per unit of time, so the
+limit may not reduce how much of the device they use. Freezing pauses the whole
+app, which frees the device for higher-priority apps.
+
+Freeze is available on manually limited apps:
+
+- Click **Freeze** on a limited app, or turn on **Freeze the app** in the Limit
+  dialog to apply it together with a new limit.
+- The app shows a **Frozen** tag, and the limits stay in place.
+- Click **Unfreeze** to let the app run again; the limits remain.
+
+![Freezing and unfreezing a manually limited app](images/control-center-freeze.png)
+
+In the screenshot:
+
+1. Click **Limit** on an app.
+2. **Freeze the app** is off by default. Turn it on to freeze the app together
+   with the new limit.
+3. Once the app is limited, the action button becomes **Freeze** (or
+   **Unfreeze** while it is frozen).
+4. In the dialog that opens, switch **Freeze the app** off and click **Apply**
+   to unfreeze only; the limits stay in place.
+5. **Restore** lifts the limits and unfreezes the app in one step.
+
+Before you freeze, be aware that:
+
+- The app makes no progress while frozen. Network or RPC requests and
+  heartbeats can time out.
+- Everything in the same scope is frozen together (a terminal tab is one scope).
+- On an NPU the device may take a while to free up: work already submitted keeps
+  running (about 20 s measured for an 8B model).
+- Memory held on the device is not released.
+- On a GPU the usage reading may not drop while the app is frozen, although the
+  device is actually free; judge by how the higher-priority app performs.
+
+If SmarTune stops while an app is frozen, it unfreezes that app the next time it
+starts.
+
 ## Restoring limits
 
 You are always in control of releasing limits:
 
 - **Restore now** — release a specific active limit immediately instead of
   waiting for staged recovery.
-- **Restore Resources** — lift the app's limits back to normal.
+- **Restore Resources** — lift the app's limits back to normal. If the app
+  is frozen, it is unfrozen as well.
 
 <!-- Screenshot: Restore Resources on a manually limited app (Manual Control tab). -->
 ![Restore Resources on a manual limit](images/control-center-restore-manual.png)

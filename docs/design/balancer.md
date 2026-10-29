@@ -212,8 +212,9 @@ Everything here comes from the dashboard's Balance page, or from calling the RES
 |---|---|---|
 | Limit by hand | `/app/resource_limit` | Four groups of values, see the table below. `target_cgroups` limits only the named running instances |
 | Query the adjustable range | `/app/resource_limit_profile` | Returns current values, bounds and dropdown options; used by the UI dialog |
-| Restore | `/app/resource_restore` | Only returns manual limits; auto limits are left alone |
+| Restore | `/app/resource_restore` | Only returns manual limits (and thaws a frozen app); auto limits are left alone |
 | Query the snapshot | `/app/limit_snapshot` | The values actually written out right now |
+| Freeze | `/app/freeze` | Manual limits only. Writes `cgroup.freeze` on every cgroup of the limit, as an escalation for GPU/NPU-bound apps the ordinary limit cannot slow down. Restore lifts the limits first and thaws last |
 
 What the manual limit dialog lets you set:
 
@@ -226,7 +227,16 @@ What the manual limit dialog lets you set:
 
 The manual path derives "current usage" from a peak latch (the highest reading observed this round), so a second sample cannot ratchet the limit tighter and tighter.
 
-<sub>Code: `balancer.py#get_resource_limit_profile`, `balancer.py#_get_limit_rate_bounds`, `balancer.py#_install_resource_limit`</sub>
+#### Freeze
+
+A GPU/NPU-bound app needs little CPU, memory or disk per unit of time, so the limits above may not reduce its use of the device. Freeze pauses the whole app through `cgroup.freeze` and is the user's escalation, never applied automatically.
+
+- Per cgroup, not per PID: a multi-process app stops atomically and sees no signal. A failure part-way thaws the cgroups already frozen, so an app is never left half-frozen.
+- Every freeze is recorded in `/run/smartune/frozen_cgroups.json` (`SMARTUNE_FREEZE_STATE`) *before* the write. On startup only the recorded cgroups are thawed, so a crash cannot leave an app frozen and `docker pause` and the like are untouched.
+- Restore lifts the limits first, then thaws, so the app does not resume straight into a `memory.high` / `io.max` stall. A failed limit restore still thaws.
+- Takes effect on the cgroup in milliseconds, but an NPU only frees up once its in-flight jobs drain (about 20 s measured), so a short on/off duty cycle does not work, and `cpu.max` has no effect on such an app.
+
+<sub>Code: `balancer.py#get_resource_limit_profile`, `balancer.py#_get_limit_rate_bounds`, `balancer.py#_install_resource_limit`, `balancer.py#set_freeze`, `controller/freeze.py`</sub>
 
 ### Taking over from Auto
 

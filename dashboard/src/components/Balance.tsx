@@ -40,10 +40,11 @@ import {
   LockOutlined,
   EditOutlined,
   ControlOutlined,
+  PauseCircleOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
-import { MEMORY_RECOVERY_HINT } from '../utils/messages'
+import { MEMORY_RECOVERY_HINT, FREEZE_WHY, FREEZE_RISKS } from '../utils/messages'
 import { api } from '../api/client'
 import type {
   AppInfo,
@@ -87,6 +88,9 @@ interface LimitDialogState {
   open: boolean
   submitting: boolean
   loadingProfile: boolean
+  // 'limited': the app already carries a manual limit, so the dialog only offers the
+  // Freeze switch (limit values change via Restore, then Limit again). Absent = new limit.
+  mode?: 'limited'
 }
 
 interface LimitFormValues {
@@ -822,6 +826,9 @@ export default function Balance({
   })
   const [resourceSectionExpanded, setResourceSectionExpanded] = useState(false)
   const [networkSectionExpanded, setNetworkSectionExpanded] = useState(false)
+  // Freeze switch in the Limit dialog. Freeze belongs to the limit: it is applied together
+  // with it, and Restore undoes both.
+  const [freezeOn, setFreezeOn] = useState(false)
   const [limitForm, setLimitForm] = useState<LimitFormValues>({
     applyResourceLimit: true,
     networkPriority: 'low',
@@ -1200,7 +1207,16 @@ export default function Balance({
 
   }
 
+  // Reopen the dialog for an app that is already limited: only the Freeze switch is live.
+  // The Freeze / Unfreeze button asked for the opposite of the current state, so the
+  // switch opens already set to it.
+  const handleLimitSettings = (app: AppInfo) => {
+    setFreezeOn(!app.frozen)
+    setLimitDialog({ app, open: true, loadingProfile: false, submitting: false, mode: 'limited' })
+  }
+
   const handleResourceLimit = async (app: AppInfo) => {
+    setFreezeOn(false)
     setLimitDialog({ app, open: true, loadingProfile: true, submitting: false })
     setResourceSectionExpanded(true)
     setNetworkSectionExpanded(true)
@@ -1226,6 +1242,19 @@ export default function Balance({
 
     setLimitDialog((prev) => ({ ...prev, submitting: true }))
     try {
+      if (limitDialog.mode === 'limited') {
+        const app = limitDialog.app
+        if (freezeOn !== Boolean(app.frozen)) {
+          await api.freezeApp({ app_id: app.app_id, freeze: freezeOn })
+          messageApi.success(freezeOn
+            ? `${app.app_name} is frozen`
+            : `${app.app_name} is running again (limits kept)`)
+        }
+        setLimitDialog({ app: null, open: false, loadingProfile: false, submitting: false })
+        await fetchData()
+        return
+      }
+
       const priority = limitDialog.app.priority ?? 'medium'
       const networkPriority = normalizeNetworkPriority(limitForm.networkPriority)
       const shouldApplyResourceLimit = Boolean(limitForm.applyResourceLimit)
@@ -1287,6 +1316,15 @@ export default function Balance({
 
       if (resourceSkippedMessage) {
         messageApi.warning(resourceSkippedMessage)
+        if (freezeOn) messageApi.warning('Not frozen: no limit was applied.')
+      }
+      if (resourceApplied && freezeOn) {
+        try {
+          await api.freezeApp({ app_id: limitDialog.app.app_id, freeze: true })
+          messageApi.success(`${limitDialog.app.app_name} is frozen`)
+        } catch (e: unknown) {
+          messageApi.error(`Limit applied, but freezing failed: ${e instanceof Error ? e.message : 'unknown error'}`)
+        }
       }
       if (resourceApplied) {
         messageApi.success(
@@ -1509,7 +1547,13 @@ export default function Balance({
         return (
           <Space size={6} wrap>
             {runtimeHintTag(combined.runtime)}
-            {limitSummaryTag(combined.limitSummary)}
+            {record.frozen && record.control_status === 'MANUAL_LIMITED'
+              ? (
+                <Tag color="blue" icon={<PauseCircleOutlined />} style={{ marginInlineEnd: 0 }}>
+                  Frozen
+                </Tag>
+              )
+              : limitSummaryTag(combined.limitSummary)}
             {combined.runtime === 'Pending' && (
               <Tooltip title="Cancel Relaunch">
                 <Button
@@ -1651,6 +1695,7 @@ export default function Balance({
           <Space size={4} wrap={false}>
             {detailsButton}
             {isLimited ? (
+              <>
               <Tooltip title="Restore Resources">
                 <Button
                   size="small"
@@ -1662,6 +1707,19 @@ export default function Balance({
                   Restore
                 </Button>
               </Tooltip>
+              <Tooltip title={record.frozen
+                ? 'Unfreeze this app (the resource limits stay in place)'
+                : 'Freeze this app to free the GPU/NPU for others (use only if the limit is not enough)'}>
+                <Button
+                  size="small"
+                  icon={<PauseCircleOutlined />}
+                  onClick={() => handleLimitSettings(record)}
+                  style={{ borderColor: COLORS.accent, color: COLORS.accent }}
+                >
+                  {record.frozen ? 'Unfreeze' : 'Freeze'}
+                </Button>
+              </Tooltip>
+              </>
             ) : (
               <Tooltip title={hasSelectedRunningCgroup ? 'Apply Resource Limit' : 'Select at least one running process scope first'}>
                 <Button
@@ -2535,7 +2593,7 @@ export default function Balance({
           const isManagedAuto = cs === 'AUTO_LIMITED' && detailApp.controlled !== false
           const statusLabel =
             cs === 'AUTO_LIMITED' ? '⚠️ Auto circuit-breaking'
-              : cs === 'MANUAL_LIMITED' ? '🟠 Manual limited'
+              : cs === 'MANUAL_LIMITED' ? (detailApp.frozen ? '🧊 Frozen (limits kept)' : '🟠 Manual limited')
                 : '🟢 Normal (not limited)'
           const partial = auto?.partial_parts
           const formatPercent = (rate: number | null | undefined) =>
@@ -2690,7 +2748,7 @@ export default function Balance({
           setNetworkSectionExpanded(false)
         }}
         onOk={submitResourceLimit}
-        okText="Apply Changes"
+        okText={limitDialog.mode === 'limited' ? 'Apply' : 'Apply Changes'}
         confirmLoading={limitDialog.submitting}
         maskClosable={false}
         // The request installs cgroup limits and then reclaims memory, so it
@@ -2711,11 +2769,34 @@ export default function Balance({
                 description="Waiting for systemd to update the app's cgroup. This can take several seconds; keep this dialog open."
               />
             )}
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              The limit is applied to all instances of this app running right now (matched by name).
-              Use the process checkboxes in the expanded app row to choose specific scopes.
-            </Text>
-            {targetRows.length > 0 && (
+            {limitDialog.mode === 'limited' ? (
+              <>
+                <Alert
+                  type="info"
+                  showIcon
+                  message="This app is already limited"
+                  description="To change the limit values, Restore the app and apply a new limit. Here you can freeze or unfreeze it; the limits stay in place."
+                />
+                {(limitDialog.app?.limited_scopes ?? []).length > 0 && (
+                  <div>
+                    <Text type="secondary" style={{ fontSize: 12 }}>Limited scopes</Text>
+                    <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      {(limitDialog.app?.limited_scopes ?? []).map((scope) => (
+                        <Tag key={scope} color="blue" style={{ marginBottom: 0, maxWidth: '100%', whiteSpace: 'normal', wordBreak: 'break-all' }}>
+                          Scope: {scope}
+                        </Tag>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                The limit is applied to all instances of this app running right now (matched by name).
+                Use the process checkboxes in the expanded app row to choose specific scopes.
+              </Text>
+            )}
+            {limitDialog.mode !== 'limited' && targetRows.length > 0 && (
               <div>
                 <Text type="secondary" style={{ fontSize: 12 }}>Target</Text>
                 <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -2731,7 +2812,31 @@ export default function Balance({
                 </div>
               </div>
             )}
-            {renderLimitSettings(limitForm, setLimitForm)}
+            {limitDialog.mode !== 'limited' && renderLimitSettings(limitForm, setLimitForm)}
+
+            {/* Freeze belongs to the limit: the same dialog applies both, and Restore undoes both. */}
+            <div style={{ borderTop: `1px solid ${COLORS.border}`, paddingTop: 12 }}>
+              <Space size={8} align="center">
+                <Switch
+                  checked={freezeOn}
+                  disabled={limitDialog.mode !== 'limited' && !limitForm.applyResourceLimit}
+                  onChange={setFreezeOn}
+                  aria-label="Freeze the app"
+                />
+                <Text strong>Freeze the app</Text>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  (only if the limit alone does not free enough of the GPU/NPU)
+                </Text>
+              </Space>
+              <div style={{ marginTop: 8, fontSize: 12, color: COLORS.textMuted }}>
+                <p style={{ marginBottom: 6 }}>{FREEZE_WHY}</p>
+                {freezeOn && (
+                  <ul style={{ paddingLeft: 18, marginBottom: 0 }}>
+                    {FREEZE_RISKS.map((risk) => <li key={risk}>{risk}</li>)}
+                  </ul>
+                )}
+              </div>
+            </div>
           </Space>
         </div>
       </Modal>

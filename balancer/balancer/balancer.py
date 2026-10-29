@@ -225,6 +225,8 @@ class LimitedApp:
     limited_at: float = 0.0                   # epoch seconds when the limit was applied
     protection_id: str = ""                   # stable control-event lifecycle identity
     adopted_from_auto: bool = False           # retain the auto-limit cgroup scope in Manual Control
+    frozen: bool = False                      # manual Freeze is active (cgroup.freeze=1 on every cgroup)
+    frozen_at: float = 0.0                    # epoch seconds when it was frozen
     # --- L2 (memory.reclaim) state.  No restore path reads these: reclaim is a
     # one-shot move of pages to swap, and the app faults back whatever it still
     # needs, so there is nothing to undo when the limit is lifted.
@@ -1005,6 +1007,13 @@ class DynamicBalancer:
         """
         self.network_controller.setup_tc_classes_and_filters()
         self.is_running = True
+
+        # A previous run may have died while an app was frozen; nothing in the
+        # (process-lifetime) registry knows about it, so thaw what we recorded.
+        try:
+            self.control_manager.thaw_leftover_frozen()
+        except Exception:
+            logger.error("Failed to thaw leftover frozen cgroups", exc_info=True)
 
         self.monitor_thread = threading.Thread(target=self._run_monitor_resource_loop, daemon=True)
         self.monitor_thread.start()
@@ -3007,6 +3016,9 @@ class DynamicBalancer:
                         restore_success = False
                         failed_parts['io_limited'] = True
 
+            if entry.frozen and not self._thaw_cgroups(cgroups):
+                restore_success = False
+
             if gone == len(cgroups):
                 logger.info(f"All cgroups for {source} limited app {key} already gone; limit already cleared")
             elif restore_success:
@@ -4017,6 +4029,54 @@ class DynamicBalancer:
         logger.warning(f"No resource limits successfully applied for {app_name}")
         return False
 
+    def _thaw_cgroups(self, cgroups: list) -> bool:
+        """Thaw every cgroup in *cgroups*; True only if all are thawed (or gone)."""
+        all_ok = True
+        for cg in cgroups:
+            ok, msg = self.control_manager.freeze_cgroup(cg, False)
+            if not ok:
+                logger.error(f"Failed to thaw cgroup {cg}: {msg}")
+                all_ok = False
+        return all_ok
+
+    def set_freeze(self, app_id: str, freeze: bool) -> "tuple[bool, str]":
+        """Freeze (or unfreeze, keeping the limits) a manually limited app.
+
+        Manual limits only: freeze is the user's escalation when the ordinary
+        limit cannot slow a GPU/NPU-bound app.  ``set_restore_resource`` lifts the
+        limits and then thaws, so Restore always undoes both.
+        """
+        with self.all_limits.lock:
+            found = self.all_limits.by_public_id(app_id, source="manual")
+            if found is None:
+                return False, "App has no manual limit; apply a limit first"
+            key, entry = found
+            cgroups = list(entry.cgroups) or [key]
+            if entry.frozen == freeze:
+                return True, "Already frozen" if freeze else "Not frozen"
+
+        done = []
+        for cg in cgroups:
+            ok, msg = self.control_manager.freeze_cgroup(cg, freeze)
+            if not ok:
+                logger.error(f"{'Freeze' if freeze else 'Thaw'} failed for {app_id} ({cg}): {msg}")
+                if freeze:
+                    self._thaw_cgroups(done)   # don't leave a half-frozen app
+                return False, msg
+            done.append(cg)
+
+        with self.all_limits.lock:
+            found = self.all_limits.by_public_id(app_id, source="manual")
+            if found is None:
+                # Restored while we were writing: its thaw ran before our freeze landed.
+                if freeze:
+                    self._thaw_cgroups(done)
+                return False, "Limit was restored while freezing"
+            found[1].frozen = freeze
+            found[1].frozen_at = time.time() if freeze else 0.0
+        logger.info(f"{'Froze' if freeze else 'Thawed'} app {app_id} ({len(done)} cgroup(s))")
+        return True, "Frozen" if freeze else "Unfrozen"
+
     def set_restore_resource(self, app_id: str) -> bool:
         """Restore resource limits for the given app_id (manual/UI path).
 
@@ -4040,6 +4100,7 @@ class DynamicBalancer:
                 protection_id = entry.protection_id
                 resource_parts = entry.resource_parts
                 priority = entry.priority
+                was_frozen = entry.frozen
                 self.all_limits.apps.pop(effective_app_id, None)
                 # The user gave the app back; drop the "manual_limit" exemption so the
                 # pressure loop may manage it again.
@@ -4051,6 +4112,7 @@ class DynamicBalancer:
                 protection_id = ""
                 resource_parts = {}
                 priority = "undefined"
+                was_frozen = False
 
         effective_app_id = effective_app_ids[0]
         extra_effective_ids = effective_app_ids[1:]
@@ -4079,6 +4141,12 @@ class DynamicBalancer:
                     restored_parts['io_limited'] = True
                 for extra_id in extra_effective_ids:
                     self.io_ctl.restore_disk_io_throttle(extra_id)
+
+            # Thaw last: limits are already lifted, so the app does not resume
+            # straight into a memory.high / io.max stall.  A failed limit restore
+            # must not leave the app frozen, so this runs regardless.
+            if was_frozen and not self._thaw_cgroups(effective_app_ids):
+                restore_success = False
 
             if restore_success:
                 app_utils.update_app_status(app_id, "running")
@@ -4185,6 +4253,8 @@ class DynamicBalancer:
                 "limit_parts": dict(entry.limit_parts or {}),
                 "limited_at": entry.limited_at or None,
                 "adopted_from_auto": entry.adopted_from_auto,
+                "frozen": entry.frozen,
+                "frozen_at": entry.frozen_at or None,
             }
             snapshot.update(self._entry_control_view(entry))
             return snapshot

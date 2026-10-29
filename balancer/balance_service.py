@@ -135,6 +135,9 @@ class DynamicService:
     def restore_resource(self, app_id):
         return self.balancer.set_restore_resource(app_id)
 
+    def freeze_resource(self, app_id, freeze):
+        return self.balancer.set_freeze(app_id, freeze)
+
     def get_limit_snapshot(self, app_id):
         return self.balancer.get_limit_snapshot(app_id)
 
@@ -1382,6 +1385,8 @@ def get_controlled_app():
                 # The limit registry is authoritative while process discovery is live
                 # data and may briefly find no matching process after a relaunch.
                 "limited_scopes": limit_snapshot.get("cgroups", []),
+                "frozen": bool(limit_snapshot.get("frozen", False)),
+                "frozen_at": limit_snapshot.get("frozen_at"),
             })
 
         return construct_response(
@@ -1744,6 +1749,36 @@ def app_resource_restore():
             )
     except Exception as e:
         logger.error(f"Restore resource failed: {e}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/freeze', methods=['POST'])
+def app_freeze():
+    """Freeze or unfreeze a manually limited app (cgroup.freeze).  Restore undoes it."""
+    try:
+        data = request.get_json() or {}
+        app_id = data.get('app_id', "")
+        freeze = data.get('freeze')
+
+        if not app_id or not isinstance(freeze, bool):
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="app_id and boolean freeze must be provided"
+            )
+
+        ok, msg = _service.freeze_resource(app_id, freeze)
+        return construct_response(
+            data={},
+            retcode=RetCode.SUCCESS if ok else RetCode.OPERATING_ERROR,
+            retmsg=msg
+        )
+    except Exception as e:
+        logger.error(f"Freeze app failed: {e}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,

@@ -233,6 +233,7 @@ A GPU/NPU-bound app needs little CPU, memory or disk per unit of time, so the li
 
 - Per cgroup, not per PID: a multi-process app stops atomically and sees no signal. A failure part-way thaws the cgroups already frozen, so an app is never left half-frozen.
 - Every freeze is recorded in `/run/smartune/frozen_cgroups.json` (`SMARTUNE_FREEZE_STATE`) *before* the write. On startup only the recorded cgroups are thawed, so a crash cannot leave an app frozen and `docker pause` and the like are untouched.
+- The reaper sends a one-off `app_frozen_long` notification once an app has been frozen for `freeze_notify_after`; there is no automatic thaw.
 - Restore lifts the limits first, then thaws, so the app does not resume straight into a `memory.high` / `io.max` stall. A failed limit restore still thaws.
 - Takes effect on the cgroup in milliseconds, but an NPU only frees up once its in-flight jobs drain (about 20 s measured), so a short on/off duty cycle does not work, and `cpu.max` has no effect on such an app.
 
@@ -346,6 +347,7 @@ The "Where" column has three values:
 | `regular_update_sys_pressure_time` | 5s | Pressure data refreshes more slowly | 🖥 |
 | `monitor_idle_check_interval` | 10s | Sparser decisions (clamped to [2, 30] and never below the item above) | 📄 |
 | `limit_reap_interval` | 2s | Leftover limits from exited apps are cleared more slowly | 📄 |
+| `freeze_notify_after` | 600s | A forgotten freeze is reminded later (0 = never) | 📄 |
 | `cooldown_time` | 15s | A longer gap between repeated notifications | 📄 |
 | `STABLE_PERIOD` | 1800s | The system channel recovers more slowly | 🔒 `balancer.py#_MonitorLoopState` |
 | `STABLE_DISK_IO_PERIOD` | 300s | The disk channel recovers more slowly (full restore = 2×) | 🔒 `balancer.py#_MonitorLoopState` |

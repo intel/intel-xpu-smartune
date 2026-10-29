@@ -171,6 +171,7 @@ cooldown_time: 15 # Cooldown period (seconds) to avoid frequent notifications
 regular_update_sys_pressure_time: 5
 monitor_idle_check_interval: 10  # Pressure check interval (seconds) when the balancer is idle
 limit_reap_interval: 2  # How often (seconds) to check whether a limited app closed and restore its stale limit
+freeze_notify_after: 600  # Remind the UI once when a manually frozen app has stayed frozen this long (seconds; 0 = off)
 app_priority:
   critical: 100
   high: 80

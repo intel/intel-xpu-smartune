@@ -40,6 +40,7 @@ import { api, getToken, clearToken, setUnauthorizedHandler, consumeUrlToken, log
 import { GlobalConfigNoticesProvider, useGlobalConfigNotices } from './hooks/useGlobalConfigNotices'
 import { useUiLease } from './hooks/useUiLease'
 import { useBenchEvent, useBenchStream } from './hooks/useBenchEvents'
+import { useAppEvents } from './hooks/useAppEvents'
 import type { DiagAlert } from './api/types'
 
 const { Header, Content, Sider } = Layout
@@ -233,6 +234,37 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
       [benchTabActive, notify],
     ),
     authed && benchmarkEnabled,
+  )
+
+  // A freeze the user forgot silently starves the app, so the reminder must reach them
+  // on any tab, not only in Control Center (whose own stream is subscribed only while
+  // that tab is open).
+  useAppEvents(
+    useCallback(
+      (event) => {
+        if (event.purpose !== 'notify' || event.status !== 'app_frozen_long') return
+        notify.warning({
+          key: `frozen-long-${event.app_id}`,
+          message: `${event.app_name} is still frozen`,
+          description: 'It has been frozen for a while. Unfreeze it in Control Center if it is no longer needed.',
+          duration: 0,
+          btn: (
+            <Button
+              type="primary"
+              size="small"
+              onClick={() => {
+                setActiveTab('optimizer')
+                notify.destroy(`frozen-long-${event.app_id}`)
+              }}
+            >
+              Open Control Center
+            </Button>
+          ),
+        })
+      },
+      [notify],
+    ),
+    authed,
   )
 
   const handleLogout = useCallback(() => {

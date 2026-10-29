@@ -84,25 +84,21 @@ on a GPU or NPU need very little CPU, memory or disk per unit of time, so the
 limit may not reduce how much of the device they use. Freezing pauses the whole
 app, which frees the device for higher-priority apps.
 
-Freeze is available on manually limited apps:
+Freeze is a separate step after Limit, available on manually limited apps:
 
-- Click **Freeze** on a limited app, or turn on **Freeze the app** in the Limit
-  dialog to apply it together with a new limit.
-- The app shows a **Frozen** tag, and the limits stay in place.
-- Click **Unfreeze** to let the app run again; the limits remain.
+- Limit the app first. The row then shows **Restore** and **Freeze**.
+- Click **Freeze** and confirm. The app shows a **Frozen** tag next to its limit
+  tag, **Restore** is disabled, and **Freeze** becomes **Unfreeze**.
+- Click **Unfreeze** to let the app run again; the limits remain. If it fails,
+  the button stays, so click it again to retry.
+- Once unfrozen, **Restore** is available again and lifts the limits.
+- If an app stays frozen for 10 minutes, a reminder appears once, on whichever page you are on, so a forgotten
+  freeze does not go unnoticed (`freeze_notify_after`, 0 turns it off).
+- If a frozen app closes, its limits and freeze are cleared automatically.
 
 ![Freezing and unfreezing a manually limited app](images/control-center-freeze.png)
 
-In the screenshot:
-
-1. Click **Limit** on an app.
-2. **Freeze the app** is off by default. Turn it on to freeze the app together
-   with the new limit.
-3. Once the app is limited, the action button becomes **Freeze** (or
-   **Unfreeze** while it is frozen).
-4. In the dialog that opens, switch **Freeze the app** off and click **Apply**
-   to unfreeze only; the limits stay in place.
-5. **Restore** lifts the limits and unfreezes the app in one step.
+Top: the confirmation dialog shown when you click **Freeze**. Bottom: a frozen app, with the **Frozen** tag next to its limit tag, **Restore** disabled and **Unfreeze** available.
 
 Before you freeze, be aware that:
 
@@ -112,8 +108,11 @@ Before you freeze, be aware that:
 - On an NPU the device may take a while to free up: work already submitted keeps
   running (about 20 s measured for an 8B model).
 - Memory held on the device is not released.
-- On a GPU the usage reading may not drop while the app is frozen, although the
-  device is actually free; judge by how the higher-priority app performs.
+- On a GPU the frequency and utilization readings may not drop while the app is
+  frozen. Its context may stay loaded, so the GPU stays awake and keeps counting
+  as busy, although it is doing almost no work and the device is free for other
+  apps. Power usually drops; judge by power or by how the higher-priority app
+  performs.
 
 If SmarTune stops while an app is frozen, it unfreezes that app the next time it
 starts.
@@ -124,8 +123,8 @@ You are always in control of releasing limits:
 
 - **Restore now** — release a specific active limit immediately instead of
   waiting for staged recovery.
-- **Restore Resources** — lift the app's limits back to normal. If the app
-  is frozen, it is unfrozen as well.
+- **Restore Resources** — lift the app's limits back to normal. Unfreeze a
+  frozen app first; Restore is disabled until then.
 
 <!-- Screenshot: Restore Resources on a manually limited app (Manual Control tab). -->
 ![Restore Resources on a manual limit](images/control-center-restore-manual.png)

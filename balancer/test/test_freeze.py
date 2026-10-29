@@ -15,6 +15,7 @@ Run:  python3 balancer/test/test_freeze.py
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -233,6 +234,78 @@ class RestoreOrderTests(unittest.TestCase):
                 mock.patch.object(balancer_mod.app_utils, "callback_manager"), \
                 mock.patch.object(balancer_mod, "_emit_control_events"):
             self.assertFalse(b.set_restore_resource("app-1"))
+
+
+class MultiCgroupTests(unittest.TestCase):
+    """An app added with several PIDs owns several cgroups; freeze mirrors the limit."""
+
+    CGS = ("a.scope", "b.scope", "c.scope")
+
+    def test_freeze_and_unfreeze_cover_every_cgroup(self):
+        calls = []
+        b = _balancer(calls, _entry(cgroups=self.CGS))
+        self.assertTrue(b.set_freeze("app-1", True)[0])
+        self.assertTrue(b.set_freeze("app-1", False)[0])
+        self.assertEqual(calls, [("freeze", c) for c in self.CGS] + [("thaw", c) for c in self.CGS])
+
+    def test_restore_thaws_every_cgroup_the_limit_covered(self):
+        calls = []
+        entry = _entry(cgroups=self.CGS)
+        entry.frozen = True
+        self.assertTrue(RestoreOrderTests()._restore(entry, calls))
+        self.assertEqual([c for c in calls if c[0] == "thaw"], [("thaw", c) for c in self.CGS])
+
+    def test_closed_frozen_app_is_thawed_and_its_records_dropped(self):
+        calls = []
+        entry = _entry(cgroups=self.CGS)
+        entry.frozen = True
+        b = _balancer(calls)
+        with mock.patch.object(b, "_cgroup_exists", return_value=False), \
+                mock.patch.object(balancer_mod.app_utils, "update_app_status"), \
+                mock.patch.object(balancer_mod.app_utils, "callback_manager"), \
+                mock.patch.object(balancer_mod, "_emit_control_events"):
+            b._restore_entry(entry, notify=True)
+        # Gone cgroups need no limit restore, but freeze_cgroup is still asked to
+        # thaw so it can drop the crash-safety record.
+        self.assertFalse([c for c in calls if c[0].startswith("restore")])
+        self.assertEqual([c for c in calls if c[0] == "thaw"], [("thaw", c) for c in self.CGS])
+
+
+class FrozenTooLongTests(unittest.TestCase):
+    def _run(self, entry, after=600):
+        b = _balancer([], entry)
+        b.config.freeze_notify_after = after
+        with mock.patch.object(balancer_mod.app_utils, "callback_manager") as cb:
+            b._notify_long_frozen()
+            b._notify_long_frozen()
+        return b, cb.send_callback_notification.call_args_list
+
+    def test_reminds_once_after_the_threshold(self):
+        entry = _entry()
+        entry.frozen, entry.frozen_at = True, time.time() - 601
+        _, sent = self._run(entry)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0].args[0]["status"], "app_frozen_long")
+        self.assertEqual(sent[0].args[0]["purpose"], "notify")
+
+    def test_no_reminder_before_the_threshold_or_when_unfrozen_or_disabled(self):
+        young = _entry()
+        young.frozen, young.frozen_at = True, time.time() - 10
+        self.assertEqual(self._run(young)[1], [])
+        unfrozen = _entry()
+        self.assertEqual(self._run(unfrozen)[1], [])
+        old = _entry()
+        old.frozen, old.frozen_at = True, time.time() - 9999
+        self.assertEqual(self._run(old, after=0)[1], [])
+
+    def test_a_new_freeze_can_remind_again(self):
+        entry = _entry()
+        b = _balancer([], entry)
+        b.set_freeze("app-1", True)
+        entry.freeze_notified = True
+        b.set_freeze("app-1", False)
+        b.set_freeze("app-1", True)
+        self.assertFalse(entry.freeze_notified)
 
 
 if __name__ == "__main__":

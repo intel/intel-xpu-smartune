@@ -3,6 +3,7 @@
 
 import os
 import json
+import uuid
 from peewee import (
     AutoField,
     BigIntegerField,
@@ -309,7 +310,7 @@ class OperationalEvent(DataBaseModel):
     # boot_id scopes dedup_key to the current boot so a legitimate recurrence
     # after a reboot is never treated as the same event. dedup_key is the
     # write-level idempotency key (distinct from AlertState.dedup_key, which
-    # only throttles notifications): a unique index (see _apply_migrations)
+    # only throttles notifications): a unique index (see _create_extra_indexes)
     # rejects a duplicate insert instead of the producer's in-memory seen-set
     # having to catch every case, which it cannot across a service restart.
     boot_id = CharField(max_length=64, null=True, index=True)
@@ -354,13 +355,14 @@ class OperationalEvent(DataBaseModel):
 
     @classmethod
     def query_events(cls, *, event_id=None, severity=None, category=None, source=None,
-                     event_type=None, app_id=None, job_id=None,
+                     event_type=None, event_types=None, app_id=None, job_id=None,
                      impact=None, resource_type=None, protection_id=None, episode_id=None,
                      boot_id=None, config_revision_id=None,
                      keyword=None, start_time=None, end_time=None,
                      limit=200, offset=0):
         """Filtered, newest-first event query. ``start_time``/``end_time`` are
-        epoch seconds matched against the inherited ``create_time``."""
+        epoch seconds matched against the inherited ``create_time``;
+        ``event_types`` keeps events whose type is any of the given ones."""
         with db_lock:
             try:
                 with db.atomic():
@@ -378,6 +380,8 @@ class OperationalEvent(DataBaseModel):
                     ):
                         if value:
                             query = query.where(field == value)
+                    if event_types:
+                        query = query.where(cls.event_type.in_(list(event_types)))
                     if keyword:
                         query = query.where(
                             cls.summary.contains(keyword) | cls.event_type.contains(keyword))
@@ -520,7 +524,7 @@ class AlertState(DataBaseModel):
     resolved_event_id = CharField(max_length=32, null=True)
     scope = CharField(max_length=96, null=True, index=True)
     severity = CharField(max_length=16, null=True, index=True)
-    severity_origin = CharField(max_length=16, default="producer", null=True, help_text="producer | rule_escalated")
+    severity_origin = CharField(max_length=16, default="producer", null=True, help_text="producer | rule_escalated", index=True)
     baseline_severity = CharField(max_length=16, null=True, help_text="severity before escalation (snapshot at first escalation)")
     escalation_rule_id = CharField(max_length=64, null=True)
     escalation_rule_version = IntegerField(null=True)
@@ -559,8 +563,10 @@ class AlertState(DataBaseModel):
                         _bump_write_epoch(cls)
                         return True, 1
                     should_notify = row.status != "active" or (now - int(row.update_time or 0)) >= max(0, cooldown_seconds)
-                    count = int(row.fire_count or 0) + 1
                     became_active = row.status != "active"
+                    # A new occurrence counts from 1, like first_fired_at below;
+                    # the previous occurrence's count lives on in AlertEpisode.
+                    count = 1 if became_active else int(row.fire_count or 0) + 1
                     fields = dict(
                         last_fired_at=ts_utc, fire_count=count, last_event_id=event_id,
                         severity=(row.severity if row.status == "active" and row.severity_origin == "rule_escalated" else severity),
@@ -649,6 +655,32 @@ class AlertState(DataBaseModel):
                 return False
 
     @classmethod
+    def close_acknowledged(cls, dedup_key, ts_utc):
+        """Acknowledge and close an active alert in one step, for alerts with no
+        recovery signal (an operator having seen it is what ends it). The
+        occurrence is archived like any other resolution, with no
+        ``resolved_event_id``."""
+        with db_lock:
+            try:
+                with db.atomic():
+                    row = cls.get_or_none((cls.dedup_key == dedup_key) & (cls.status == "active"))
+                    if row is None:
+                        return False
+                    row.acknowledged_at = ts_utc
+                    AlertEpisode.archive(row, resolved_at=ts_utc)
+                    (cls.update(
+                        acknowledged_at=ts_utc,
+                        status="resolved", resolved_at=ts_utc, resolved_event_id=None,
+                        update_time=int(time.time()), update_date=datetime.now(),
+                    ).where(cls.dedup_key == dedup_key).execute())
+                    _bump_write_epoch(cls)
+                    _bump_write_epoch(AlertEpisode)
+                    return True
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error closing acknowledged alert: {e}")
+                return False
+
+    @classmethod
     def silence(cls, dedup_key, until, reason=None):
         with db_lock:
             try:
@@ -698,6 +730,9 @@ class AlertState(DataBaseModel):
                         "escalation_reason": reason,
                         "escalation_evidence_json": json.dumps(evidence, ensure_ascii=False, default=str) if evidence else None,
                         "escalated_at": ts_utc,
+                        # A higher severity is new information: drop the prior
+                        # acknowledgement so the alert needs attention again.
+                        "acknowledged_at": None,
                         "update_time": timestamp,
                         "update_date": now,
                     }
@@ -710,44 +745,71 @@ class AlertState(DataBaseModel):
 
     @classmethod
     def resolve(cls, *, event_type, scope, ts_utc, resolved_event_id=None):
-        """Resolve active alerts only when a matching recovery fact is recorded."""
+        """Resolve active alerts only when a matching recovery fact is recorded.
+        Each resolved occurrence is archived as an AlertEpisode first, because
+        this row is reused (and overwritten) if the alert fires again."""
         with db_lock:
             try:
                 with db.atomic():
+                    condition = ((cls.event_type == event_type)
+                                 & (cls.scope == scope)
+                                 & (cls.status == "active"))
+                    for row in cls.select().where(condition):
+                        AlertEpisode.archive(row, resolved_at=ts_utc, resolved_event_id=resolved_event_id)
                     changed = (cls.update(
                         status="resolved", resolved_at=ts_utc,
                         resolved_event_id=resolved_event_id,
                         update_time=int(time.time()), update_date=datetime.now(),
-                    ).where(
-                        (cls.event_type == event_type)
-                        & (cls.scope == scope)
-                        & (cls.status == "active")
-                    ).execute())
+                    ).where(condition).execute())
                     if changed:
                         _bump_write_epoch(cls)
+                        _bump_write_epoch(AlertEpisode)
                     return changed
             except (IntegrityError, OperationalError) as e:
                 logger.error(f"Error resolving alert state: {e}")
                 return 0
 
     @classmethod
-    def query_alerts(cls, *, active_only=False, notifyable_only=False, limit=200):
+    def query_alerts(cls, *, active_only=False, notifyable_only=False, limit=200,
+                     start_time=None, end_time=None):
+        """Active alerts come from this table; with ``active_only=False`` the
+        resolved history comes from AlertEpisode (one row per occurrence), since
+        a resolved row here only remembers the latest occurrence.
+
+        ``start_time``/``end_time`` (epoch seconds) keep only occurrences whose
+        span [first_fired_at, resolved_at or now] overlaps the window, so the row
+        limit applies after the range filter instead of before it."""
+        # Timestamps are stored as uniform UTC ISO strings, so string comparison
+        # orders them correctly.
+        start_iso = (datetime.fromtimestamp(start_time, tz=timezone.utc).isoformat(timespec="seconds")
+                     if start_time is not None else None)
+        end_iso = (datetime.fromtimestamp(end_time, tz=timezone.utc).isoformat(timespec="seconds")
+                   if end_time is not None else None)
+        limit = max(1, limit)
         with db_lock:
             try:
                 with db.atomic():
-                    query = cls.select()
-                    if active_only:
-                        query = query.where(cls.status == "active")
-                    else:
-                        query = query.where(cls.status != "pending")
+                    query = cls.select().where(cls.status == "active")
+                    if end_iso is not None:
+                        query = query.where(cls.first_fired_at <= end_iso)
                     if notifyable_only:
                         now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
                         query = query.where(
                             cls.acknowledged_at.is_null(True)
                             & (cls.silenced_until.is_null(True) | (cls.silenced_until <= now_utc))
                         )
-                    query = query.order_by(cls.last_fired_at.desc()).limit(max(1, limit))
-                    return list(query)
+                    rows = list(query.order_by(cls.last_fired_at.desc()).limit(limit))
+                    # Closed occurrences are never notifyable.
+                    if active_only or notifyable_only:
+                        return rows
+                    episodes = AlertEpisode.select()
+                    if end_iso is not None:
+                        episodes = episodes.where(AlertEpisode.first_fired_at <= end_iso)
+                    if start_iso is not None:
+                        episodes = episodes.where(AlertEpisode.resolved_at >= start_iso)
+                    rows += list(episodes.order_by(AlertEpisode.last_fired_at.desc()).limit(limit))
+                    rows.sort(key=lambda row: row.last_fired_at or "", reverse=True)
+                    return rows[:limit]
             except (IntegrityError, OperationalError) as e:
                 logger.error(f"Error querying alerts: {e}")
                 return []
@@ -766,6 +828,82 @@ class AlertState(DataBaseModel):
                 logger.error(f"Error deleting old resolved alerts: {e}")
                 return 0
 
+
+
+# AlertState columns that describe one occurrence and are copied on archive.
+_ALERT_EPISODE_FIELDS = (
+    "dedup_key", "first_fired_at", "last_fired_at", "fire_count", "last_event_id",
+    "acknowledged_at", "silenced_until", "silence_reason", "scope", "severity",
+    "severity_origin", "baseline_severity", "escalation_rule_id",
+    "escalation_rule_version", "escalation_reason", "escalation_evidence_json",
+    "escalated_at", "event_type", "summary",
+)
+
+
+class AlertEpisode(DataBaseModel):
+    """One closed occurrence (active -> resolved) of an alert.
+
+    AlertState keeps a single row per dedup_key and reuses it when the alert
+    fires again, which overwrites the previous occurrence. Archiving every
+    resolved occurrence here keeps alert history queryable for past ranges.
+    """
+
+    episode_id = CharField(max_length=32, primary_key=True)
+    dedup_key = CharField(max_length=128, index=True)
+    first_fired_at = CharField(max_length=40, index=True)
+    last_fired_at = CharField(max_length=40)
+    resolved_at = CharField(max_length=40, index=True)
+    resolved_event_id = CharField(max_length=32, null=True)
+    fire_count = IntegerField(default=0)
+    last_event_id = CharField(max_length=32, null=True)
+    acknowledged_at = CharField(max_length=40, null=True)
+    silenced_until = CharField(max_length=40, null=True)
+    silence_reason = CharField(max_length=256, null=True)
+    scope = CharField(max_length=96, null=True)
+    severity = CharField(max_length=16, null=True)
+    severity_origin = CharField(max_length=16, null=True)
+    baseline_severity = CharField(max_length=16, null=True)
+    escalation_rule_id = CharField(max_length=64, null=True)
+    escalation_rule_version = IntegerField(null=True)
+    escalation_reason = TextField(null=True)
+    escalation_evidence_json = TextField(null=True)
+    escalated_at = CharField(max_length=40, null=True)
+    event_type = CharField(max_length=64, null=True)
+    summary = TextField(null=True)
+
+    status = "resolved"
+
+    @staticmethod
+    def episode_id_for(dedup_key, first_fired_at):
+        """Deterministic id: an occurrence is identified by its key and start,
+        so archiving the same occurrence twice is a no-op."""
+        return uuid.uuid5(uuid.NAMESPACE_URL, f"{dedup_key}|{first_fired_at}").hex
+
+    @classmethod
+    def archive(cls, state, *, resolved_at, resolved_event_id=None):
+        """Copy an AlertState row as a closed occurrence. Caller holds
+        ``db_lock`` inside a transaction."""
+        now = int(time.time())
+        dt = datetime.now()
+        fields = {name: getattr(state, name) for name in _ALERT_EPISODE_FIELDS}
+        (cls.insert(
+            episode_id=cls.episode_id_for(state.dedup_key, state.first_fired_at),
+            resolved_at=resolved_at, resolved_event_id=resolved_event_id,
+            create_time=now, create_date=dt, update_time=now, update_date=dt,
+            **fields,
+        ).on_conflict_ignore().execute())
+
+    @classmethod
+    def delete_older_than(cls, days: int) -> int:
+        """Delete occurrences outside the diagnostics retention window."""
+        cutoff = int(time.time()) - max(1, int(days)) * 86400
+        with db_lock:
+            try:
+                with db.atomic():
+                    return cls.delete().where(cls.update_time < cutoff).execute()
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error deleting old alert episodes: {e}")
+                return 0
 
 class DetectorCursor(DataBaseModel):
     """Persistent scan position for a diagnostics event source."""
@@ -914,85 +1052,22 @@ class ConfigRevision(DataBaseModel):
                 return False
 
 
-def _apply_migrations():
-    """Apply incremental schema migrations for existing databases."""
-    migrations = [
-        "ALTER TABLE aiapppriority ADD COLUMN limit_overrides_json TEXT",
-        "ALTER TABLE aiapppriority ADD COLUMN network_priority VARCHAR(32)",
-        "ALTER TABLE aiapppriority ADD COLUMN config_meta_json TEXT",
-        "ALTER TABLE operationalevent ADD COLUMN create_time BIGINT",
-        "ALTER TABLE operationalevent ADD COLUMN category VARCHAR(32)",
-        "ALTER TABLE operationalevent ADD COLUMN impact VARCHAR(16)",
-        "ALTER TABLE operationalevent ADD COLUMN resource_type VARCHAR(24)",
-        "ALTER TABLE operationalevent ADD COLUMN protection_id VARCHAR(96)",
-        "ALTER TABLE operationalevent ADD COLUMN episode_id VARCHAR(32)",
-        "ALTER TABLE operationalevent ADD COLUMN boot_id VARCHAR(64)",
-        "ALTER TABLE operationalevent ADD COLUMN dedup_key VARCHAR(160)",
-        "ALTER TABLE operationalevent ADD COLUMN config_revision_id VARCHAR(32)",
-        "ALTER TABLE operationalevent ADD COLUMN severity_origin VARCHAR(16) DEFAULT 'producer'",
-        "ALTER TABLE alertstate ADD COLUMN severity_origin VARCHAR(16) DEFAULT 'producer'",
-        "ALTER TABLE alertstate ADD COLUMN baseline_severity VARCHAR(16)",
-        "ALTER TABLE alertstate ADD COLUMN escalation_rule_id VARCHAR(64)",
-        "ALTER TABLE alertstate ADD COLUMN escalation_rule_version INTEGER",
-        "ALTER TABLE alertstate ADD COLUMN escalation_reason TEXT",
-        "ALTER TABLE alertstate ADD COLUMN escalation_evidence_json TEXT",
-        "ALTER TABLE alertstate ADD COLUMN escalated_at VARCHAR(40)",
-        "ALTER TABLE alertstate ADD COLUMN status VARCHAR(16) DEFAULT 'active'",
-        "ALTER TABLE alertstate ADD COLUMN silenced_until VARCHAR(40)",
-        "ALTER TABLE alertstate ADD COLUMN silence_reason VARCHAR(256)",
-        "ALTER TABLE alertstate ADD COLUMN pending_since VARCHAR(40)",
-        "ALTER TABLE alertstate ADD COLUMN last_seen_at VARCHAR(40)",
-        "ALTER TABLE alertstate ADD COLUMN resolved_at VARCHAR(40)",
-        "ALTER TABLE alertstate ADD COLUMN resolved_event_id VARCHAR(32)",
-        "ALTER TABLE alertstate ADD COLUMN scope VARCHAR(96)",
-    ]
-    for sql in migrations:
-        try:
-            db.execute_sql(sql)
-        except OperationalError as e:
-            if "duplicate column" not in str(e).lower():
-                logger.warning(f"Migration warning ({sql!r}): {e}")
-
-    indexes = [
-        "CREATE INDEX IF NOT EXISTS operationalevent_impact ON operationalevent (impact)",
-        "CREATE INDEX IF NOT EXISTS operationalevent_resource_type ON operationalevent (resource_type)",
-        "CREATE INDEX IF NOT EXISTS operationalevent_protection_id ON operationalevent (protection_id)",
-        "CREATE INDEX IF NOT EXISTS operationalevent_episode_id ON operationalevent (episode_id)",
-        "CREATE INDEX IF NOT EXISTS operationalevent_boot_id ON operationalevent (boot_id)",
-        "CREATE INDEX IF NOT EXISTS operationalevent_config_revision_id ON operationalevent (config_revision_id)",
-        "CREATE INDEX IF NOT EXISTS operationalevent_severity_origin ON operationalevent (severity_origin)",
+def _create_extra_indexes():
+    """Indexes the model definitions cannot express: DESC ordering and the
+    partial UNIQUE index on dedup_key that write-level event idempotency relies
+    on. Run after create_tables()."""
+    for sql in (
         "CREATE INDEX IF NOT EXISTS operationalevent_create_time ON operationalevent (create_time DESC)",
         "CREATE INDEX IF NOT EXISTS operationalevent_category_create_time ON operationalevent (category, create_time DESC)",
-        "CREATE INDEX IF NOT EXISTS alertstate_status ON alertstate (status)",
-        "CREATE INDEX IF NOT EXISTS alertstate_scope ON alertstate (scope)",
-        # Partial unique index: SQLite treats every NULL as distinct, so legacy
-        # rows (dedup_key IS NULL) never collide with each other or with new
-        # rows -- only two rows that both set the same non-null key conflict.
+        # Partial: events without a dedup_key are never deduplicated.
         "CREATE UNIQUE INDEX IF NOT EXISTS operationalevent_dedup_key ON operationalevent (dedup_key) WHERE dedup_key IS NOT NULL",
-        "CREATE INDEX IF NOT EXISTS alertstate_severity_origin ON alertstate (severity_origin)",
-    ]
-    for sql in indexes:
-        try:
-            db.execute_sql(sql)
-        except OperationalError as e:
-            logger.warning(f"Migration warning ({sql!r}): {e}")
+    ):
+        db.execute_sql(sql)
 
 
 def init_database():
-    db.create_tables([AIAppPriority, MonitorSnapshot, AlertState, DetectorCursor, ConfigRevision])
-    # Peewee creates indexes while processing create_tables(). Upgrade an
-    # existing event table before that step so indexes never target a column
-    # that is absent from a legacy schema.
-    if "operationalevent" in db.get_tables():
-        _apply_migrations()
-    OperationalEvent.create_table(safe=True)
-    # Re-run now that the table definitely exists. On a *fresh* database the
-    # guarded call above was skipped (no table yet), so this pass is what
-    # creates the raw-SQL migrations that are not model-level indexes -- above
-    # all the partial UNIQUE index on dedup_key that write-level event
-    # idempotency relies on. Idempotent (CREATE INDEX IF NOT EXISTS /
-    # duplicate-column ALTERs) so the legacy path that already ran it is a no-op.
-    _apply_migrations()
+    db.create_tables([AIAppPriority, MonitorSnapshot, OperationalEvent, AlertState, AlertEpisode, DetectorCursor, ConfigRevision])
+    _create_extra_indexes()
 
 
 if __name__ == "__main__":

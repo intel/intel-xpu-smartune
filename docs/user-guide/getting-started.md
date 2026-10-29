@@ -64,7 +64,10 @@ will see some or all of these:
 Useful header controls, present on every tab:
 
 - **Theme toggle** — switch between light and dark.
-- **Alert / notification bell** — surfaces new diagnostic alerts.
+- **Alert bell** — opens the **Current alerts** panel, with a count of the
+  alerts that need attention. **Acknowledge** or **Silence** (30 minutes /
+  2 hours) an alert right there, select it to see it in
+  [System diagnostics](diagnostics.md#alerts), or use **View all alerts**.
 - **Collapse rail** — fold the navigation to widen the content area.
 - **User menu → Sign out**.
 

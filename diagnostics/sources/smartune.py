@@ -65,19 +65,21 @@ class SmartuneLogSource(LogSource):
 
     def query(self, flt: LogQueryFilter):
         records = []
-        # Files are newest-first and each holds only records >= its start stamp, so
-        # a narrow recent window need not read the whole history: skip files that
-        # start after the window, and stop once a file starts at/before the window's
-        # lower bound (every older file is then entirely before the window too).
+        # Each file covers [start stamp, mtime], so skip only files wholly outside
+        # the window. Files are written concurrently (the long-running service keeps
+        # appending to its file while one-off processes open newer ones), so file
+        # order says nothing about where an older file ends: every overlapping file
+        # is read, and the limit is applied after the merge.
         for path in self._log_files_newest_first():
-            if len(records) >= flt.limit:
-                break
             file_start = self._file_start_epoch(path)
-            past_window = False
-            if file_start is not None:
-                if flt.end_time is not None and file_start > flt.end_time:
+            if file_start is not None and flt.end_time is not None and file_start > flt.end_time:
+                continue
+            if flt.start_time is not None:
+                try:
+                    if os.path.getmtime(path) < flt.start_time:
+                        continue
+                except OSError:
                     continue
-                past_window = flt.start_time is not None and file_start <= flt.start_time
             try:
                 with open(path, "r", encoding="utf-8", errors="replace") as fh:
                     for line in fh:
@@ -93,8 +95,6 @@ class SmartuneLogSource(LogSource):
                             records.append(rec)
             except OSError as exc:
                 logger.warning("SmartTune log source skipped %s: %s", path, exc)
-            if past_window:
-                break  # this file straddled the lower bound; older files are before it
         # Newest first, capped.
         records.sort(key=lambda r: r.ts_epoch, reverse=True)
         return records[:flt.limit]

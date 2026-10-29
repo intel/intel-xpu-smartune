@@ -119,9 +119,11 @@ def events_for_protections(protection_ids, app_id=None):
     return [event_to_dict(r) for r in rows]
 
 
-def query_alerts(*, active_only=False, notifyable_only=False, limit=200):
+def query_alerts(*, active_only=False, notifyable_only=False, limit=200,
+                 start_time=None, end_time=None):
     return [alert_to_dict(r) for r in AlertState.query_alerts(
-        active_only=active_only, notifyable_only=notifyable_only, limit=limit)]
+        active_only=active_only, notifyable_only=notifyable_only, limit=limit,
+        start_time=start_time, end_time=end_time)]
 
 
 # --- serialization helpers -------------------------------------------------
@@ -154,6 +156,9 @@ def alert_to_dict(row):
         except (ValueError, TypeError):
             evidence = None
     return {
+        # Set only for a closed occurrence (AlertEpisode); one dedup_key can
+        # have many of those, so clients key history rows by this id.
+        "episode_id": getattr(row, "episode_id", None),
         "dedup_key": row.dedup_key, "first_fired_at": row.first_fired_at,
         "last_fired_at": row.last_fired_at, "fire_count": row.fire_count,
         "last_event_id": row.last_event_id,

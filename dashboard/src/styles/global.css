@@ -1,6 +1,6 @@
 /* Compact, opaque surface for the header's current-alert preview. */
 .app-alert-center {
-  width: 360px;
+  width: 400px;
   max-width: calc(100vw - 24px);
   padding: 12px 0;
   border: 1px solid var(--color-border);
@@ -28,22 +28,50 @@
 }
 
 .app-alert-center__item {
+  border-top: 1px solid var(--color-border);
+}
+
+.app-alert-center__item-main {
   display: block;
   width: 100%;
-  padding: 10px 16px;
+  padding: 10px 16px 6px;
   border: 0;
-  border-top: 1px solid var(--color-border);
   background: transparent;
   color: var(--color-text);
   cursor: pointer;
   text-align: left;
 }
 
-.app-alert-center__item:hover,
-.app-alert-center__item:focus-visible {
+.app-alert-center__item-main:hover,
+.app-alert-center__item-main:focus-visible {
   background: var(--color-row-alt);
   outline: 1px solid var(--color-accent);
   outline-offset: -1px;
+}
+
+.app-alert-center__item-actions {
+  display: flex;
+  gap: 8px;
+  padding: 0 16px 10px;
+}
+
+/* Marks the row as leaving for Diagnostics; brightens with the row hover. */
+.app-alert-center__nav-icon {
+  flex: 0 0 auto;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.app-alert-center__item-main:hover .app-alert-center__nav-icon,
+.app-alert-center__item-main:focus-visible .app-alert-center__nav-icon {
+  color: var(--color-accent);
+}
+
+/* Marks Silence as opening a duration menu. */
+.app-alert-center__caret {
+  margin-inline-start: 2px;
+  font-size: 10px;
+  opacity: 0.7;
 }
 
 .app-alert-center__item-title {
@@ -59,7 +87,30 @@
   overflow-wrap: anywhere;
 }
 
+.app-alert-center__more {
+  display: block;
+  width: 100%;
+  padding: 8px 16px;
+  border: 0;
+  border-top: 1px solid var(--color-border);
+  background: transparent;
+  color: var(--color-accent);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.app-alert-center__more:hover,
+.app-alert-center__more:focus-visible {
+  background: var(--color-row-alt);
+}
+
+/* Handled counts on the left, the way into Diagnostics on the right. */
 .app-alert-center__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin-top: 4px;
   padding: 8px 16px 0;
   border-top: 1px solid var(--color-border);

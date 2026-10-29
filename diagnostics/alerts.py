@@ -28,10 +28,12 @@ _COOLDOWN_SECONDS = 300
 # warning/error events remain evidence in the event ledger without paging users.
 # ``for_seconds`` filters transient observations; a TTL is only used for sampled
 # conditions that can safely resolve when their heartbeat stops.
+# ``close_on_ack`` marks one-off faults with no recovery event: acknowledging
+# them is what closes them, otherwise they would stay open forever.
 ALERT_POLICIES = {
-    "PLATFORM_KERNEL_PANIC": {"severity": "critical", "for_seconds": 0},
-    "RESOURCE_MEMORY_OOM_KILL": {"severity": "critical", "for_seconds": 0},
-    "DEVICE_GPU_HANG": {"severity": "critical", "for_seconds": 0},
+    "PLATFORM_KERNEL_PANIC": {"severity": "critical", "for_seconds": 0, "close_on_ack": True},
+    "RESOURCE_MEMORY_OOM_KILL": {"severity": "critical", "for_seconds": 0, "close_on_ack": True},
+    "DEVICE_GPU_HANG": {"severity": "critical", "for_seconds": 0, "close_on_ack": True},
     "PLATFORM_SERVICE_CRASHED": {"severity": "critical", "for_seconds": 0},
     "PLATFORM_SYSTEMD_RESTART_LOOP": {
         "severity": "error", "for_seconds": 0, "ttl_seconds": 120,
@@ -152,6 +154,23 @@ def evaluate(event, cooldown_seconds=_COOLDOWN_SECONDS):
     except Exception as exc:
         logger.warning("Alert evaluate failed: %s", exc)
         return False, 0
+
+
+def closes_on_ack(event_type):
+    """Whether acknowledging an alert of this type also closes it."""
+    return bool(ALERT_POLICIES.get(event_type or "", {}).get("close_on_ack"))
+
+
+def acknowledge(dedup_key):
+    """Acknowledge an active alert; one-off faults are closed at the same time.
+    Returns ``(found, closed)``."""
+    alert = AlertState.get_or_none((AlertState.dedup_key == dedup_key) & (AlertState.status == "active"))
+    if alert is None:
+        return False, False
+    if closes_on_ack(alert.event_type):
+        closed = AlertState.close_acknowledged(dedup_key, _now_iso())
+        return closed, closed
+    return AlertState.acknowledge(dedup_key, _now_iso()), False
 
 
 def resolve_expired(now_epoch=None):

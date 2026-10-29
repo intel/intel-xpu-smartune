@@ -36,13 +36,14 @@ def configured_days():
 
 def run_cleanup(days=None):
     """Remove expired history while preserving unresolved operational state."""
-    from db.DatabaseModel import AlertState, OperationalEvent
+    from db.DatabaseModel import AlertEpisode, AlertState, OperationalEvent
 
     days = configured_days() if days is None else days
     return {
         "retention_days": days,
         "events_deleted": OperationalEvent.delete_older_than(days),
         "resolved_alerts_deleted": AlertState.delete_resolved_older_than(days),
+        "alert_episodes_deleted": AlertEpisode.delete_older_than(days),
     }
 
 
@@ -72,7 +73,7 @@ def start_cleanup_loop():
         while True:
             try:
                 result = run_cleanup()
-                if result["events_deleted"] or result["resolved_alerts_deleted"]:
+                if result["events_deleted"] or result["resolved_alerts_deleted"] or result["alert_episodes_deleted"]:
                     logger.info("Diagnostics retention cleanup: %s", result)
                 else:
                     logger.debug("Diagnostics retention cleanup: %s", result)

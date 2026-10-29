@@ -13,6 +13,7 @@ import {
   Input,
   message,
   Modal,
+  Popover,
   Row,
   Segmented,
   Select,
@@ -67,6 +68,9 @@ import type {
   LimitSnapshotData,
 } from '../api/types'
 import { COLORS } from '../styles/theme'
+import { alertHandlingMark, alertLifecycleText, alertOccurrenceForEvent, isAlertableEvent, isAlertSilenced } from '../utils/alertPolicy'
+import type { AlertHandlingMark } from '../utils/alertPolicy'
+import AlertPolicyList from './AlertPolicyList'
 import '../styles/diagnostics.css'
 
 // Benchmark KPI results for the investigated job, rendered in the investigation
@@ -145,9 +149,27 @@ function BenchmarkResultsSection({
 
 const { Text } = Typography
 
+// Margin around an investigated alert's span so its lead-up and recovery show.
+const ALERT_RANGE_PADDING_SECONDS = 5 * 60
+
+// A request from the header alert center: open the current alerts (range reset
+// to end now), or locate one alert (time range centered on it, row highlighted).
+export type AlertsRequest =
+  | { requestId: number; kind: 'current' }
+  | { requestId: number; kind: 'locate'; alert: DiagAlert }
+
+type AlertMarkFilter = 'all' | AlertHandlingMark
+
+// One table row per occurrence: active rows have no episode_id yet.
+const alertRowKey = (alert: DiagAlert) => `${alert.dedup_key}::${alert.episode_id || alert.first_fired_at}`
+const ALERTS_PAGE_SIZE = 10
+
 interface Props {
   active: boolean
-  openAlertsSignal?: number
+  alertsRequest?: AlertsRequest | null
+  // Active alerts as the header sees them, used to tell when the selected range
+  // ends before some of them started.
+  currentAlerts?: DiagAlert[]
   rangeIntent?: { window: '1h'; requestId: number } | null
   onOpenHistory: (range: { from: number; to: number }) => void
 }
@@ -248,17 +270,6 @@ const FATAL_SIGNATURE_OPTIONS: { value: FatalSignature; label: string }[] = [
   { value: 'kernel-panic', label: 'Kernel panic' },
   { value: 'gpu-hang', label: 'GPU hang' },
 ]
-
-const ALERT_POLICY_SUMMARIES = [
-  { eventType: 'PLATFORM_KERNEL_PANIC', severity: 'critical', behavior: 'Kernel panic; requires manual investigation.' },
-  { eventType: 'RESOURCE_MEMORY_OOM_KILL', severity: 'critical', behavior: 'Kernel OOM kill; requires manual investigation.' },
-  { eventType: 'DEVICE_GPU_HANG', severity: 'critical', behavior: 'GPU hang; requires manual investigation.' },
-  { eventType: 'PLATFORM_SERVICE_CRASHED', severity: 'critical', behavior: 'Resolves when the service starts.' },
-  { eventType: 'PLATFORM_SYSTEMD_RESTART_LOOP', severity: 'error', behavior: 'Resolves after 120 seconds without a new observation; escalates after 3 fires in 5 minutes.' },
-  { eventType: 'CONTROL_CPU_LIMIT_FAILED', severity: 'error', behavior: 'Resolves when the CPU limit recovers.' },
-  { eventType: 'CONTROL_MEMORY_LIMIT_FAILED', severity: 'error', behavior: 'Resolves when the memory limit recovers.' },
-  { eventType: 'CONTROL_DISK_IO_LIMIT_FAILED', severity: 'error', behavior: 'Resolves when the disk I/O limit recovers.' },
-] as const
 
 // The two event filters answer DIFFERENT questions and must not be conflated:
 //   * category -> WHAT the event is about (the reason-code subject domain)
@@ -982,7 +993,7 @@ function contextTargetForEvent(event: DiagEvent): ContextTarget | null {
   return null
 }
 
-export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onOpenHistory }: Props) {
+export default function Diagnostics({ active, alertsRequest, currentAlerts, rangeIntent, onOpenHistory }: Props) {
   const [events, setEvents] = useState<DiagEvent[]>([])
   const [controlLifecycles, setControlLifecycles] = useState<DiagControlLifecycle[]>([])
   const [records, setRecords] = useState<DiagLogRecord[]>([])
@@ -1065,7 +1076,19 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
   const [reportResourceTrendLabels, setReportResourceTrendLabels] = useState<Set<string>>(
     () => new Set(),
   )
-  const [alerts, setAlerts] = useState<DiagAlert[]>([])
+  // Every alert occurrence active at some point in the selected range (filtered
+  // server-side so the row limit cannot hide them). Drives the overview count
+  // and the alert markers on event rows.
+  const [rangeAlerts, setRangeAlerts] = useState<DiagAlert[]>([])
+  // Alerts section: one row per alert occurrence in range. Ack / silence are
+  // marks on an active alert, not states of their own, so only two filters.
+  const [alertRecordsOpen, setAlertRecordsOpen] = useState(true)
+  const [alertStatusFilter, setAlertStatusFilter] = useState<'active' | 'resolved'>('active')
+  const [alertMarkFilter, setAlertMarkFilter] = useState<AlertMarkFilter>('all')
+  const [alertPage, setAlertPage] = useState(1)
+  // The alert being looked at: highlighted, and its page shown, so it can be
+  // found in the table after the range re-centers on it.
+  const [focusedAlertKey, setFocusedAlertKey] = useState<string | null>(null)
   const [alertsLoading, setAlertsLoading] = useState(false)
   const [insightsOpen, setInsightsOpen] = useState(false)
   const [reportOpen, setReportOpen] = useState(false)
@@ -1078,12 +1101,10 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
   const [reportLoading, setReportLoading] = useState(false)
   const [reportError, setReportError] = useState<string | null>(null)
   const [reportRange, setReportRange] = useState<{ from: number; to: number } | null>(null)
-  const [alertsOpen, setAlertsOpen] = useState(false)
-  const [alertFilter, setAlertFilter] = useState<'range' | 'all' | 'needs_attention' | 'acknowledged' | 'silenced' | 'resolved'>('all')
-  const [alertActionKey, setAlertActionKey] = useState<string | null>(null)
   const wasActive = useRef(false)
   const activeControlsRef = useRef<HTMLDivElement>(null)
   const eventsTableRef = useRef<HTMLDivElement>(null)
+  const alertsTableRef = useRef<HTMLDivElement>(null)
   const eventZoomDraggedRef = useRef(false)
   // Independent monotonic tokens prevent older event or lifecycle requests from
   // landing after a newer refresh without making the fast event list wait for
@@ -1097,6 +1118,8 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
   const logKeywordRef = useRef(logKeyword)
 
   const resetEventViewForTimeRange = () => {
+    setAlertPage(1)
+    setFocusedAlertKey(null)
     setEventKeyword('')
     setEventSeverity(undefined)
     setEventDomainFilter(undefined)
@@ -1429,6 +1452,8 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
     [activeControlRows, showAllActiveControls],
   )
 
+  // What the event list and its filters work on; the overview keeps `events`.
+
   const eventDomainOptions = useMemo(() => {
     const present = new Set(events.map(eventDomain))
     return [{ label: 'All domains', value: ALL }, ...EVENT_DOMAIN_OPTIONS.filter((option) => present.has(option.value))]
@@ -1682,6 +1707,21 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
 
   // Memoized so the render functions are not rebuilt on every parent re-render
   // (refresh tick, filter keystroke); only ``openContext`` changing rebuilds them.
+  // Marks events that fired an alert with that occurrence's state.
+  const alertTagForEvent = useCallback((event: DiagEvent) => {
+    if (!isAlertableEvent(event)) return null
+    const occurrence = alertOccurrenceForEvent(event, rangeAlerts)
+    if (!occurrence) return <Tag className='diagnostics-alert-tag'>ALERT</Tag>
+    if (occurrence.status === 'active') {
+      return <Tag className='diagnostics-alert-tag' color={COLORS.red}>ALERT · OPEN</Tag>
+    }
+    return (
+      <Tooltip title={`Closed ${formatActivityTime(occurrence.resolved_at)} · ${alertLifecycleText(occurrence)}`}>
+        <Tag className='diagnostics-alert-tag' color={COLORS.green}>ALERT · CLOSED</Tag>
+      </Tooltip>
+    )
+  }, [rangeAlerts])
+
   const eventColumns = useMemo(() => [
     { title: 'Time', width: 170, render: (_: unknown, item: DisplayEvent) => dayjs(item.event.ts_utc).format('MM-DD HH:mm:ss') },
     { title: 'Severity', width: 120, render: (_: unknown, item: DisplayEvent) => severityTag(item.event.severity) },
@@ -1697,8 +1737,10 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
       render: (_: unknown, item: DisplayEvent) => {
         const trigger = limitTrigger(item.event)
         const summary = displayEventSummary(item)
+        const alertTag = alertTagForEvent(item.event)
         return (
           <div className='diagnostics-summary-cell'>
+            {alertTag}
             <Text className='diagnostics-summary-text' ellipsis={{ tooltip: summary }}>{summary}</Text>
             {trigger ? <span className='diagnostics-trigger-note' style={{ color: trigger.color || COLORS.textMuted }}>({trigger.label})</span> : null}
           </div>
@@ -1743,7 +1785,7 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
         )
       },
     },
-  ], [openContext])
+  ], [openContext, alertTagForEvent])
 
   const sourceOptions = useMemo(() => {
     const merged = new Set<string>(availableSources)
@@ -1775,39 +1817,6 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
       color: resourceUtilizationColor(resource.label),
     })), [rangeResourceUtilization])
   const contextAlerts = contextData?.alerts ?? []
-  const rangeAlerts = useMemo(() => alerts.filter((alert) => {
-    const timestamp = dayjs(alert.last_fired_at).unix()
-    return Number.isFinite(timestamp) && timestamp >= timeRange.from && timestamp <= timeRange.to
-  }), [alerts, timeRange.from, timeRange.to])
-  const currentAlerts = useMemo(
-    () => alerts.filter((alert) => alert.status === 'active'),
-    [alerts],
-  )
-  const currentlySilenced = useCallback((alert: DiagAlert) =>
-    !!alert.silenced_until && dayjs(alert.silenced_until).isAfter(dayjs()), [])
-  const needsAttentionAlerts = useMemo(
-    () => currentAlerts.filter((alert) => !alert.acknowledged_at && !currentlySilenced(alert)),
-    [currentAlerts, currentlySilenced],
-  )
-  const displayedAlerts = useMemo(() => {
-    if (alertFilter === 'range') return rangeAlerts
-    if (alertFilter === 'needs_attention') return needsAttentionAlerts
-    if (alertFilter === 'acknowledged') {
-      return currentAlerts.filter((alert) => !!alert.acknowledged_at && !currentlySilenced(alert))
-    }
-    if (alertFilter === 'silenced') return currentAlerts.filter(currentlySilenced)
-    if (alertFilter === 'resolved') return rangeAlerts.filter((alert) => alert.status === 'resolved')
-    const resolvedInRange = rangeAlerts.filter((alert) => alert.status === 'resolved')
-    return [...currentAlerts, ...resolvedInRange]
-  }, [alertFilter, currentAlerts, currentlySilenced, needsAttentionAlerts, rangeAlerts])
-  const alertFilterLabel = {
-    range: 'Selected time range',
-    all: 'Current + resolved',
-    needs_attention: 'Needs attention',
-    acknowledged: 'Acknowledged',
-    silenced: 'Silenced',
-    resolved: 'Resolved',
-  }[alertFilter]
   const contextControlActions = useMemo(
     () => displayEvents(contextData?.control_actions ?? []),
     [contextData],
@@ -2075,18 +2084,18 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
     if (!active) return undefined
     let cancelled = false
     setAlertsLoading(true)
-    api.getDiagAlerts(false, 300)
+    api.getDiagAlerts(false, 500, false, { from: timeRange.from, to: timeRange.to })
       .then((data) => {
-        if (!cancelled) setAlerts(data.alerts || [])
+        if (!cancelled) setRangeAlerts(data.alerts || [])
       })
       .catch(() => {
-        if (!cancelled) setAlerts([])
+        if (!cancelled) setRangeAlerts([])
       })
       .finally(() => {
         if (!cancelled) setAlertsLoading(false)
       })
     return () => { cancelled = true }
-  }, [active, rangeEndEpoch])
+  }, [active, timeRange.from, timeRange.to])
 
   const investigateFinding = useCallback((finding: DiagFinding) => {
     const event = events.find((item) => finding.related_event_ids?.includes(item.event_id))
@@ -2103,36 +2112,6 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
     else setSelectedEvent(displayEvents([event])[0])
   }, [openContext])
 
-  const refreshAlerts = useCallback(async () => {
-    const data = await api.getDiagAlerts(false, 300)
-    setAlerts(data.alerts || [])
-  }, [])
-
-  const acknowledgeAlert = useCallback(async (alert: DiagAlert) => {
-    setAlertActionKey(alert.dedup_key)
-    try {
-      await api.acknowledgeDiagAlert(alert.dedup_key)
-      await refreshAlerts()
-      message.success('Alert acknowledged')
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : 'Unable to acknowledge alert')
-    } finally {
-      setAlertActionKey(null)
-    }
-  }, [refreshAlerts])
-
-  const silenceAlert = useCallback(async (alert: DiagAlert, minutes: 30 | 120) => {
-    setAlertActionKey(alert.dedup_key)
-    try {
-      await api.silenceDiagAlert(alert.dedup_key, minutes)
-      await refreshAlerts()
-      message.success(`Alert silenced for ${minutes === 30 ? '30 minutes' : '2 hours'}`)
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : 'Unable to silence alert')
-    } finally {
-      setAlertActionKey(null)
-    }
-  }, [refreshAlerts])
 
   // Keep the fetch-time keyword current without making it a loadLogs dependency.
   useEffect(() => { logKeywordRef.current = logKeyword }, [logKeyword])
@@ -2175,11 +2154,199 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
     if (!boots.length && !bootsLoading) loadBoots()
   }, [bootScopeEnabled, boots.length, bootsLoading, loadBoots])
 
+  // Scrolling right away lands short when a range change is reloading the
+  // sections above the alerts (their height changes as data arrives), so wait
+  // until those loads settle.
+  const [alertsScrollPending, setAlertsScrollPending] = useState(false)
+  const openAlerts = useCallback(() => {
+    setAlertRecordsOpen(true)
+    setAlertsScrollPending(true)
+  }, [])
+
   useEffect(() => {
-    if (!openAlertsSignal) return
-    setAlertFilter('needs_attention')
-    setAlertsOpen(true)
-  }, [openAlertsSignal])
+    if (!alertsScrollPending || !active) return undefined
+    if (alertsLoading || eventsLoading || controlLifecyclesLoading || rangeMonitorLoading) return undefined
+    const timer = window.setTimeout(() => {
+      alertsTableRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      setAlertsScrollPending(false)
+    }, 50)
+    return () => window.clearTimeout(timer)
+  }, [alertsScrollPending, active, alertsLoading, eventsLoading, controlLifecyclesLoading, rangeMonitorLoading])
+
+  // Ack / silence describe the present, so the alert center always lands on a
+  // range that ends now: the running boot, last 24h (or All of it if already
+  // chosen). A range ending now contains every active alert, whenever it first
+  // fired; the window length only decides how much resolved history shows.
+  const showRangeEndingNow = () => {
+    const runningBoot = boots.find((item) => item.running) ?? boots[0]
+    const keepEntireBoot = windowKey === 'entire' && !!selectedBoot?.running
+    if (runningBoot) setSelectedBootId(runningBoot.boot_id)
+    if (!keepEntireBoot) setWindowKey('24h')
+    setCustomRange(null)
+    setBootCustomRange(null)
+    setRangeEndEpoch(Math.floor(Date.now() / 1000))
+    resetEventViewForTimeRange()
+  }
+
+  const openCurrentAlerts = (mark: AlertMarkFilter = 'all') => {
+    showRangeEndingNow()
+    setAlertStatusFilter('active')
+    setAlertMarkFilter(mark)
+    openAlerts()
+  }
+
+  // Center the page on the alert -- from its first fire to its resolution
+  // (or now) -- in the boot it started in, and highlight its row. From the
+  // header this only scrolls to that row (the user picks Investigate there);
+  // a click in the table itself opens the investigation.
+  const focusAlert = (alert: DiagAlert, { fromHeader = false }: { fromHeader?: boolean } = {}) => {
+    const firstFired = dayjs(alert.first_fired_at).unix()
+    const end = alert.resolved_at ? dayjs(alert.resolved_at).unix() : Math.floor(Date.now() / 1000)
+    const boot = boots.find((item) => item.first_ts != null && item.first_ts <= firstFired
+      && (item.running || (item.last_ts ?? 0) >= firstFired)) ?? boots.find((item) => item.running)
+    if (boot) setSelectedBootId(boot.boot_id)
+    const range = { from: firstFired - ALERT_RANGE_PADDING_SECONDS, to: end + ALERT_RANGE_PADDING_SECONDS }
+    setWindowKey('custom')
+    setCustomRange(range)
+    setBootCustomRange(range)
+    resetEventViewForTimeRange()
+    setFocusedAlertKey(alertRowKey(alert))
+    setAlertStatusFilter(alert.status === 'active' ? 'active' : 'resolved')
+    setAlertMarkFilter('all')
+    if (fromHeader) openAlerts()
+    else void investigateAlert(alert)
+  }
+  const focusAlertRef = useRef(focusAlert)
+  focusAlertRef.current = focusAlert
+
+  useEffect(() => {
+    if (!alertsRequest) return
+    if (alertsRequest.kind === 'current') openCurrentAlerts()
+    else focusAlert(alertsRequest.alert, { fromHeader: true })
+    // Only a new request should act; boots/handlers changing must not replay it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [alertsRequest])
+
+  const activeRangeAlerts = useMemo(
+    () => rangeAlerts
+      .filter((alert) => alert.status === 'active')
+      .sort((a, b) => dayjs(b.last_fired_at).valueOf() - dayjs(a.last_fired_at).valueOf()),
+    [rangeAlerts],
+  )
+  const resolvedRangeAlerts = useMemo(
+    () => rangeAlerts
+      .filter((alert) => alert.status !== 'active')
+      .sort((a, b) => dayjs(b.resolved_at).valueOf() - dayjs(a.resolved_at).valueOf()),
+    [rangeAlerts],
+  )
+  // With nothing active, land on the history instead of an empty Active list.
+  useEffect(() => {
+    if (!activeRangeAlerts.length && resolvedRangeAlerts.length) setAlertStatusFilter('resolved')
+  }, [activeRangeAlerts, resolvedRangeAlerts])
+  const activeMarkCounts = useMemo(() => {
+    const counts: Record<AlertMarkFilter, number> = { all: activeRangeAlerts.length, needs_attention: 0, acknowledged: 0, silenced: 0 }
+    for (const alert of activeRangeAlerts) counts[alertHandlingMark(alert)] += 1
+    return counts
+  }, [activeRangeAlerts])
+  const displayedAlerts = alertStatusFilter === 'active'
+    ? (alertMarkFilter === 'all' ? activeRangeAlerts : activeRangeAlerts.filter((alert) => alertHandlingMark(alert) === alertMarkFilter))
+    : resolvedRangeAlerts
+  useEffect(() => {
+    if (!focusedAlertKey) return
+    const index = displayedAlerts.findIndex((alert) => alertRowKey(alert) === focusedAlertKey)
+    if (index >= 0) setAlertPage(Math.floor(index / ALERTS_PAGE_SIZE) + 1)
+  }, [focusedAlertKey, displayedAlerts])
+  // Active alerts that first fired after the selected range ends (a past boot or
+  // custom range), so they are missing here but counted in the header.
+  const activeAlertsAfterRange = useMemo(
+    () => (currentAlerts ?? []).filter((alert) => dayjs(alert.first_fired_at).unix() > timeRange.to).length,
+    [currentAlerts, timeRange.to],
+  )
+
+  const alertColumns = useMemo(() => [
+    {
+      title: 'Status',
+      width: 190,
+      render: (_: unknown, alert: DiagAlert) => {
+        if (alert.status !== 'active') {
+          return <span className='diagnostics-status-label' style={{ color: COLORS.green }}>Closed</span>
+        }
+        return (
+          <Space size={6}>
+            <span className='diagnostics-status-label' style={{ color: COLORS.red }}>Open</span>
+            {isAlertSilenced(alert) ? (
+              <Tooltip title={`Silenced until ${formatActivityTime(alert.silenced_until)}${alert.silence_reason ? ` · ${alert.silence_reason}` : ''}`}>
+                <Tag className='diagnostics-alert-tag'>SILENCED</Tag>
+              </Tooltip>
+            ) : alert.acknowledged_at ? (
+              <Tooltip title={`Acknowledged ${formatActivityTime(alert.acknowledged_at)}`}>
+                <Tag className='diagnostics-alert-tag'>ACK</Tag>
+              </Tooltip>
+            ) : null}
+          </Space>
+        )
+      },
+    },
+    { title: 'Severity', width: 120, render: (_: unknown, alert: DiagAlert) => severityTag(alert.severity) },
+    {
+      title: 'Alert',
+      width: 420,
+      render: (_: unknown, alert: DiagAlert) => (
+        <Tooltip title={alert.event_type}>
+          <Text ellipsis>{alert.summary || alert.event_type}</Text>
+        </Tooltip>
+      ),
+    },
+    {
+      title: (
+        <Tooltip title='For an open alert, what will close it; for a closed one, what closed it.'>
+          <span>Lifecycle</span>
+        </Tooltip>
+      ),
+      width: 250,
+      render: (_: unknown, alert: DiagAlert) => <Text type='secondary'>{alertLifecycleText(alert)}</Text>,
+    },
+    { title: 'Scope', width: 180, ellipsis: true, render: (_: unknown, alert: DiagAlert) => alert.scope || '-' },
+    { title: 'First detected', width: 140, render: (_: unknown, alert: DiagAlert) => formatActivityTime(alert.first_fired_at) },
+    { title: 'Closed', width: 140, render: (_: unknown, alert: DiagAlert) => formatActivityTime(alert.resolved_at) },
+    {
+      title: 'Duration',
+      width: 110,
+      render: (_: unknown, alert: DiagAlert) => {
+        const end = alert.resolved_at ? dayjs(alert.resolved_at) : dayjs()
+        const duration = formatDuration(end.diff(dayjs(alert.first_fired_at), 'second'))
+        return <Text type='secondary'>{duration ? (alert.resolved_at ? duration : `${duration}+`) : '-'}</Text>
+      },
+    },
+    {
+      title: (
+        <Tooltip title='How many times this fault was detected during the alert. Repeats are grouped into one row instead of raising new alerts.'>
+          <span>Times detected</span>
+        </Tooltip>
+      ),
+      width: 130,
+      render: (_: unknown, alert: DiagAlert) => alert.fire_count,
+    },
+    {
+      title: 'Action',
+      width: 130,
+      render: (_: unknown, alert: DiagAlert) => (
+        <Button
+          type='primary'
+          size='small'
+          icon={<SearchOutlined />}
+          disabled={!alert.last_event_id}
+          onClick={(event) => {
+            event.stopPropagation()
+            focusAlertRef.current(alert)
+          }}
+        >
+          Investigate
+        </Button>
+      ),
+    },
+  ], [])
+
 
   return (
     <Card className='diagnostics-page'>
@@ -2412,11 +2579,12 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
 
               <div className='diagnostics-overview-inline-divider' />
 
-              <Tooltip title='View alerts in the selected range'>
-                <button className='diagnostics-overview-inline-action diagnostics-overview-inline-alert' type='button' onClick={() => {
-                  setAlertFilter('range')
-                  setAlertsOpen(true)
-                }}>
+              <Tooltip title='View alerts active in the selected range'>
+                <button
+                  className='diagnostics-overview-inline-action diagnostics-overview-inline-alert'
+                  type='button'
+                  onClick={openAlerts}
+                >
                   <BellOutlined /> <strong>{alertsLoading ? '-' : rangeAlerts.length}</strong> alerts in range
                 </button>
               </Tooltip>
@@ -2835,6 +3003,96 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
         </section>
       ) : null}
 
+      <div ref={alertsTableRef}>
+      <Collapse
+        className='diagnostics-logs diagnostics-event-records'
+        activeKey={alertRecordsOpen ? ['alerts'] : []}
+        onChange={(keys) => setAlertRecordsOpen((Array.isArray(keys) ? keys : [keys]).includes('alerts'))}
+        items={[
+          {
+            key: 'alerts',
+            label: (
+              <Space size={4}>
+                <span>{`Alerts (${alertsLoading ? '-' : rangeAlerts.length})`}</span>
+                {/* The one place the alert policy is explained. */}
+                <Popover
+                  title='Alert policy'
+                  placement='bottomLeft'
+                  content={(
+                    <Space direction='vertical' size={8}>
+                      <Text type='secondary' style={{ display: 'block', width: 380 }}>Each row is one alert open at some point in the selected range; repeated detections are counted in Times detected. Open means it may still need action; Lifecycle says what closes it. ACK and SILENCED mark how an open alert is being handled.</Text>
+                      <AlertPolicyList />
+                    </Space>
+                  )}
+                >
+                  <InfoCircleOutlined style={{ color: COLORS.textMuted }} onClick={(event) => event.stopPropagation()} />
+                </Popover>
+              </Space>
+            ),
+            children: (
+              <>
+        <Space className='diagnostics-event-controls' wrap size={8}>
+          <Segmented
+            className='diagnostics-time-range-segmented'
+            size='small'
+            value={alertStatusFilter}
+            onChange={(value) => {
+              setAlertStatusFilter(value as 'active' | 'resolved')
+              setAlertPage(1)
+            }}
+            options={[
+              { label: `Open (${activeRangeAlerts.length})`, value: 'active' },
+              { label: `Closed (${resolvedRangeAlerts.length})`, value: 'resolved' },
+            ]}
+          />
+          {alertStatusFilter === 'active' ? (
+            <Select
+              aria-label='Alert handling'
+              size='small'
+              className='diagnostics-alert-mark-select'
+              value={alertMarkFilter}
+              onChange={(value) => {
+                setAlertMarkFilter(value)
+                setAlertPage(1)
+              }}
+              options={[
+                { label: `All handling (${activeMarkCounts.all})`, value: 'all' },
+                { label: `Needs attention (${activeMarkCounts.needs_attention})`, value: 'needs_attention' },
+                { label: `Acknowledged (${activeMarkCounts.acknowledged})`, value: 'acknowledged' },
+                { label: `Silenced (${activeMarkCounts.silenced})`, value: 'silenced' },
+              ]}
+            />
+          ) : null}
+        </Space>
+        {alertStatusFilter === 'active' && activeAlertsAfterRange > 0 ? (
+          <Alert
+            type='info'
+            showIcon
+            className='diagnostics-alert-range-hint'
+            message={`The selected range ends ${formatActivityTime(dayjs.unix(timeRange.to).toISOString())}; ${activeAlertsAfterRange} open ${activeAlertsAfterRange === 1 ? 'alert' : 'alerts'} started after it.`}
+            action={<Button size='small' type='link' onClick={() => openCurrentAlerts(alertMarkFilter)}>Jump to now</Button>}
+          />
+        ) : null}
+        <Table
+          rowKey={alertRowKey}
+          rowClassName={(alert: DiagAlert) => (alertRowKey(alert) === focusedAlertKey ? 'diagnostics-alert-row--focused' : '')}
+          loading={alertsLoading}
+          dataSource={displayedAlerts}
+          pagination={{ current: alertPage, onChange: setAlertPage, pageSize: ALERTS_PAGE_SIZE, showSizeChanger: false, hideOnSinglePage: true }}
+          size='small'
+          className='diagnostics-table diagnostics-alerts-table'
+          scroll={{ x: 1300 }}
+          onRow={(alert: DiagAlert) => ({ onClick: () => focusAlertRef.current(alert) })}
+          locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={alertStatusFilter === 'resolved' ? 'No closed alerts in the selected range' : alertMarkFilter === 'all' ? 'No open alerts in the selected range' : 'No open alerts with this handling in the selected range'} /> }}
+          columns={alertColumns}
+        />
+              </>
+            ),
+          },
+        ]}
+      />
+      </div>
+
       {eventsLoading || events.length > 0 || currentControlLifecycles.length > 0 ? (
       <div ref={eventsTableRef}>
       <Collapse
@@ -2915,8 +3173,8 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
           />
           <Text className='diagnostics-event-count' type='secondary'>
             {eventKeyword || eventSeverity || eventDomainFilter || eventKindFilter || eventFatalSignature || eventSource
-              ? `${displayedEvents.length} matching of ${displayEvents(events).length} ${displayEvents(events).length === 1 ? 'event record' : 'event records'}`
-              : `${displayedEvents.length} ${displayedEvents.length === 1 ? 'event record' : 'event records'}`}
+              ? `${displayedEvents.length} matching of ${displayEvents(events).length} event ${displayEvents(events).length === 1 ? 'record' : 'records'}`
+              : `${displayedEvents.length} event ${displayedEvents.length === 1 ? 'record' : 'records'}`}
           </Text>
           {timelineEventKeys ? (
             <Tag closable onClose={() => setTimelineEventKeys(null)} color='blue'>Timeline selection · oldest first</Tag>
@@ -3236,7 +3494,7 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
                           { title: 'Severity', width: 110, render: (_: unknown, alert: DiagAlert) => severityTag(alert.severity) },
                           { title: 'Alert', render: (_: unknown, alert: DiagAlert) => alert.summary || alert.event_type },
                           { title: 'Observed', width: 146, render: (_: unknown, alert: DiagAlert) => <span className='diagnostics-report-alert-time'>First {formatActivityTime(alert.first_fired_at)}<br />Latest {formatActivityTime(alert.last_fired_at)}</span> },
-                          { title: 'Count', dataIndex: 'fire_count', width: 76, align: 'right' as const },
+                          { title: 'Times detected', dataIndex: 'fire_count', width: 120, align: 'right' as const },
                         ]}
                       />
                     ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No alert activity in the selected range" />}
@@ -3363,104 +3621,6 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
             </>
           ) : null}
         </Space>
-      </Drawer>
-
-      <Drawer
-        title={`Alert history · ${alertFilterLabel}${displayedAlerts.length ? ` (${displayedAlerts.length})` : ''}`}
-        open={alertsOpen}
-        onClose={() => setAlertsOpen(false)}
-        width={560}
-      >
-        <Collapse
-          className='diagnostics-logs diagnostics-alert-policy'
-          items={[
-            {
-              key: 'alert-policy',
-              label: 'Alert policy (8 event types)',
-              children: (
-                <Space direction='vertical' size={8} style={{ width: '100%' }}>
-                  <Text type='secondary'>Only these event types create Alerts. Other events, including custom rules, remain diagnostic evidence even when their Severity is error or critical.</Text>
-                  {ALERT_POLICY_SUMMARIES.map((policy) => (
-                    <div key={policy.eventType}>
-                      <Space size={6} wrap>
-                        <Tag color={policy.severity === 'critical' ? COLORS.red : DIAGNOSTIC_ERROR_COLOR}>{policy.severity.toUpperCase()}</Tag>
-                        <Text code>{policy.eventType}</Text>
-                      </Space>
-                      <Text className='diagnostics-drawer-list-item' type='secondary'>{policy.behavior}</Text>
-                    </div>
-                  ))}
-                  <Text type='secondary'>Repeated observations with the same event type and scope are merged. Notifications for the same Alert are cooled down for 5 minutes.</Text>
-                </Space>
-              ),
-            },
-          ]}
-          style={{ marginBottom: 16 }}
-        />
-        <Segmented
-          className='diagnostics-alert-filter'
-          block
-          value={alertFilter}
-          onChange={(value) => setAlertFilter(value as typeof alertFilter)}
-          options={[
-            { label: 'In range', value: 'range' },
-            { label: 'Current + resolved', value: 'all' },
-            { label: 'Needs attention', value: 'needs_attention' },
-            { label: 'Acknowledged', value: 'acknowledged' },
-            { label: 'Silenced', value: 'silenced' },
-            { label: 'Resolved', value: 'resolved' },
-          ]}
-          style={{ marginBottom: 16 }}
-        />
-        {displayedAlerts.length ? (
-          <Space direction='vertical' size={16} style={{ width: '100%' }}>
-            {displayedAlerts.map((alert) => (
-              <section className='diagnostics-insight-drawer-item' key={alert.dedup_key}>
-                <Space size={6} wrap>
-                  {severityTag(alert.severity)}
-                  <Text strong>{alert.summary || alert.event_type}</Text>
-                </Space>
-                <Text type='secondary'>First observed {formatActivityTime(alert.first_fired_at)} · Latest {formatActivityTime(alert.last_fired_at)}</Text>
-                <Text type='secondary'>Observed {alert.fire_count} time{alert.fire_count === 1 ? '' : 's'} · Scope {alert.scope || '-'}</Text>
-                <Text type='secondary'>{alert.status === 'active' ? 'Current' : `Resolved ${formatActivityTime(alert.resolved_at)}`}</Text>
-                {alert.acknowledged_at ? <Tag color={COLORS.green}>Acknowledged</Tag> : null}
-                {alert.silenced_until ? <Tag color={COLORS.yellow}>Silenced until {formatActivityTime(alert.silenced_until)}</Tag> : null}
-                {alert.status === 'active' ? (
-                  <Space size={8} wrap>
-                    <Button
-                      size='small'
-                      disabled={!!alert.acknowledged_at}
-                      loading={alertActionKey === alert.dedup_key}
-                      onClick={() => void acknowledgeAlert(alert)}
-                    >
-                      {alert.acknowledged_at ? 'Acknowledged' : 'Acknowledge'}
-                    </Button>
-                    <Dropdown
-                      trigger={['click']}
-                      disabled={alertActionKey === alert.dedup_key}
-                      menu={{
-                        items: [
-                          { key: '30', label: '30 minutes' },
-                          { key: '120', label: '2 hours' },
-                        ],
-                        onClick: ({ key }) => void silenceAlert(alert, Number(key) as 30 | 120),
-                      }}
-                    >
-                      <Button size='small' loading={alertActionKey === alert.dedup_key}>Silence</Button>
-                    </Dropdown>
-                  </Space>
-                ) : null}
-                {alert.last_event_id ? (
-                  <Button type='primary' size='small' icon={<SearchOutlined />} onClick={() => {
-                    investigateAlert(alert)
-                    setAlertsOpen(false)
-                  }}>
-                    Investigate
-                  </Button>
-                ) : null}
-              </section>
-            ))}
-          </Space>
-        ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={alertFilter === 'range' || alertFilter === 'resolved' ? 'No alerts in the selected range' : alertFilter === 'needs_attention' ? 'No alerts need attention' : `No ${alertFilterLabel.toLowerCase()} alerts`} />}
       </Drawer>
 
       <Drawer title='Event Detail' open={!!selectedEvent} onClose={() => setSelectedEvent(null)} width={700}>
@@ -3709,24 +3869,28 @@ export default function Diagnostics({ active, openAlertsSignal, rangeIntent, onO
 
             <div className='diagnostics-investigation-section'>
               <div className='diagnostics-investigation-section-header'>
-                <Text className='diagnostics-investigation-heading' strong>System alerts</Text>
+                <Text className='diagnostics-investigation-heading' strong>Alerts in window</Text>
                 <Text type='secondary'>{contextAlerts.length}</Text>
               </div>
               {contextAlerts.length ? (
                 <div className='diagnostics-evidence-timeline'>
                   {contextAlerts.map((alert) => (
-                    <div className='diagnostics-evidence-item' key={alert.dedup_key}>
+                    <div className='diagnostics-evidence-item' key={`${alert.dedup_key}::${alert.episode_id || alert.first_fired_at}`}>
                       <Space size={8} wrap>
-                        <Text className='diagnostics-evidence-time' type='secondary'>{formatActivityTime(alert.last_fired_at)}</Text>
+                        <Text className='diagnostics-evidence-time' type='secondary'>{formatActivityTime(alert.first_fired_at)}</Text>
                         {severityTag(alert.severity)}
                         <Text>{alert.summary || alert.event_type}</Text>
-                        <Tag color={alert.acknowledged_at ? COLORS.green : COLORS.orange}>{alert.acknowledged_at ? 'Acknowledged' : 'Unacknowledged'}</Tag>
+                        {alert.status !== 'active' ? (
+                          <Tag color={COLORS.green}>Closed {formatActivityTime(alert.resolved_at)}</Tag>
+                        ) : (
+                          <Tag color={alert.acknowledged_at ? COLORS.green : COLORS.orange}>{alert.acknowledged_at ? 'Acknowledged' : 'Unacknowledged'}</Tag>
+                        )}
                       </Space>
                     </div>
                   ))}
                 </div>
               ) : (
-                <Text type='secondary'>No system alerts in window</Text>
+                <Text type='secondary'>No alerts in window</Text>
               )}
             </div>
 

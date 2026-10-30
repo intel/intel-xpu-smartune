@@ -839,7 +839,7 @@ export interface StaticInfoData {
       gt0?: { min_mhz: number | null; max_mhz: number | null }
       gt1?: { min_mhz: number | null; max_mhz: number | null }
     }>
-    vram: Record<string, { total_bytes: number | null; used_bytes: number | null; usage_percent: number | null }>
+    vram: Record<string, { total_bytes: number | null; used_bytes: number | null; usage_percent: number | null; pci_slot?: string | null }>
     pcie: Record<string, { current_speed: string | null; current_width: string | null; max_speed: string | null; max_width: string | null }>
     eu_count?: Record<string, number | null>
     pci_addresses?: Record<string, string>
@@ -952,7 +952,7 @@ export interface DynamicInfoData {
   }
   disk: DiskData
   gpu: {
-    vram: Record<string, { total_bytes: number | null; used_bytes: number | null; usage_percent: number | null }>
+    vram: Record<string, { total_bytes: number | null; used_bytes: number | null; usage_percent: number | null; pci_slot?: string | null }>
     gpu_usage: GpuUsageOutput
   }
   npu: {

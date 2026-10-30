@@ -423,6 +423,12 @@ function formatMetric(value?: number | null, unit?: string, decimals = 1): strin
   return `${value.toFixed(decimals)}${unit ? ` ${unit}` : ''}`
 }
 
+/** NPU memory bandwidth (PMT VPU_MEMORY_BW, read+write combined), MiB/s in. */
+function formatNpuMemoryBw(mibPerSec?: number | null): string {
+  if (!isNumber(mibPerSec)) return 'N/A'
+  return mibPerSec >= 1024 ? `${(mibPerSec / 1024).toFixed(2)} GiB/s` : `${mibPerSec.toFixed(1)} MiB/s`
+}
+
 function formatBytesRate(bytesPerSec?: number | null): string {
   if (!isNumber(bytesPerSec)) return 'N/A'
   const bitsPerSec = bytesPerSec * 8
@@ -2899,10 +2905,10 @@ function NpuDetailCard({
     freqMhz: padUf(freqSeries)[i] ?? null,
   })) : []
 
-  // Chart 2: Power W + DDR BW MiB/s + Temperature °C
+  // Chart 2: Power W + Memory BW MiB/s + Temperature °C
   const pbItems = [
     { key: 'npuPower', name: 'NPU Power W', color: '#4cc9f0' },
-    { key: 'ddrBw', name: 'DDR BW MiB/s', color: '#cbd5e1', dasharray: '5 3' },
+    { key: 'ddrBw', name: 'Memory BW MiB/s', color: '#cbd5e1', dasharray: '5 3' },
     { key: 'npuTemp', name: 'Temperature °C', color: '#fbbf24' },
   ]
   const pbMaxLen = Math.max(powerSeries.length, ddrBwSeries.length, tempSeries.length)
@@ -2966,12 +2972,11 @@ function NpuDetailCard({
           items.push({ key: 'util', label: 'Util', value: isNumber(util) ? `${util.toFixed(1)} %` : 'N/A', color: COLORS.accent })
           items.push({ key: 'freq', label: 'Freq', value: isNumber(freqMhz) ? `${freqMhz.toFixed(0)} MHz` : 'N/A', color: PERF_COLORS.npu })
           items.push({ key: 'mem', label: 'Memory Used', value: isNumber(memoryMb) ? `${memoryMb.toFixed(2)} MB` : 'N/A', color: COLORS.text })
-          if (pmtAvailable) {
-            items.push({ key: 'power', label: 'Power', value: isNumber(powerW) ? `${powerW.toFixed(2)} W` : 'N/A', color: '#4cc9f0' })
-            items.push({ key: 'bw', label: 'DDR BW', value: isNumber(bandwidthMib) ? `${(bandwidthMib / 1024).toFixed(2)} GB/s` : 'N/A', color: '#cbd5e1' })
-            items.push({ key: 'temp', label: 'Temp', value: isNumber(tempC) ? `${tempC.toFixed(0)} °C` : 'N/A', color: '#fbbf24' })
-            items.push({ key: 'tile', label: 'Tile Conf', value: tileConfig, color: COLORS.textMuted })
-          }
+          // PMT-backed fields: always listed, N/A when the platform has no usable PMT telemetry.
+          items.push({ key: 'power', label: 'Power', value: pmtAvailable && isNumber(powerW) ? `${powerW.toFixed(2)} W` : 'N/A', color: '#4cc9f0' })
+          items.push({ key: 'bw', label: 'Memory BW', value: pmtAvailable ? formatNpuMemoryBw(bandwidthMib) : 'N/A', color: '#cbd5e1' })
+          items.push({ key: 'temp', label: 'Temp', value: pmtAvailable && isNumber(tempC) ? `${tempC.toFixed(0)} °C` : 'N/A', color: '#fbbf24' })
+          items.push({ key: 'tile', label: 'Tile Used', value: pmtAvailable ? tileConfig : 'N/A', color: COLORS.textMuted })
           return items.map((it) => (
             <span key={it.key} style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
               <span style={{ width: 6, height: 6, borderRadius: '50%', background: it.color, flexShrink: 0, display: 'inline-block' }} />
@@ -3017,7 +3022,7 @@ function NpuDetailCard({
         </>
       )}
 
-      {/* Chart 2: Power W + Temperature °C (left Y) + DDR BW MiB/s (right Y) — matching History */}
+      {/* Chart 2: Power W + Temperature °C (left Y) + Memory BW MiB/s (right Y) — matching History */}
       {pmtAvailable && powerBwData.length > 0 && (
         <>
           <ChartLegend items={pbItems} hidden={hidden} onToggle={toggle} />
@@ -3051,7 +3056,7 @@ function NpuDetailCard({
                 <Line yAxisId="left" type="monotone" dataKey="npuPower" name="NPU Power W"
                   stroke={'#4cc9f0'} dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                   hide={hidden.has('npuPower')} />
-                <Line yAxisId="bw" type="monotone" dataKey="ddrBw" name="DDR BW MiB/s"
+                <Line yAxisId="bw" type="monotone" dataKey="ddrBw" name="Memory BW MiB/s"
                   stroke={'#cbd5e1'} strokeDasharray="5 3" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                   hide={hidden.has('ddrBw')} />
                 <Line yAxisId="left" type="monotone" dataKey="npuTemp" name="Temperature °C"
@@ -4715,6 +4720,8 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
               { label: 'Power', value: npuParsed?.pmt_available !== false && npuParsed?.power_w != null ? `${(npuParsed.power_w as number).toFixed(2)} W` : 'N/A' },
               { label: 'Frequency', value: npuParsed?.frequency_mhz != null ? `${Math.round(npuParsed.frequency_mhz as number)} MHz` : 'N/A' },
               { label: 'Memory Used', value: npuParsed?.memory_bytes != null ? `${((npuParsed.memory_bytes as number) / (1024 * 1024)).toFixed(2)} MB` : 'N/A' },
+              { label: 'Memory BW', value: npuParsed?.pmt_available !== false ? formatNpuMemoryBw(npuParsed?.noc_bandwidth_mib_per_s as number | null | undefined) : 'N/A' },
+              { label: 'Tile Used', value: npuParsed?.pmt_available !== false && npuParsed?.tile_config != null ? `${npuParsed.tile_config}` : 'N/A' },
             ]}
             series={getSeries('npu:util')}
             trendWindow={trendWindow}

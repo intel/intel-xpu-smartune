@@ -8,12 +8,7 @@
 #
 # The venv is created with --system-site-packages so system-provided packages
 # (bcc, OpenVINO bindings, ...) stay importable. Packages from requirements.txt
-# are installed INTO the venv only and shadow the system copies there; the
-# system site-packages are never upgraded or downgraded.
-#
-# Idempotent: requirements.txt is hashed, and pip only runs when it changed.
-# Must run as the same user that runs the service (root), so the venv is not
-# left owned by someone who cannot update it later.
+# are installed INTO the venv only and shadow the system copies there.
 
 set -e
 
@@ -30,13 +25,13 @@ fail() {
 
 [ -f "$REQ_FILE" ] || fail "requirements.txt not found at $REQ_FILE."
 command -v python3 >/dev/null 2>&1 || fail "python3 not found. Install it with: sudo apt install -y python3"
+if [ -e "$VENV_DIR" ] && [ ! -w "$VENV_DIR" ]; then
+    fail "$VENV_DIR is not writable by $(id -un) (probably created as root by an older version). Remove it with: sudo rm -rf $VENV_DIR"
+fi
 
 if [ ! -x "$VENV_DIR/bin/python" ]; then
-    if ! python3 -c "import venv, ensurepip" >/dev/null 2>&1; then
-        echo "[smartune] Installing python3-venv..."
-        apt-get install -y python3-venv \
-            || fail "could not install python3-venv. Run manually: sudo apt install -y python3-venv"
-    fi
+    python3 -c "import venv, ensurepip" >/dev/null 2>&1 \
+        || fail "python3-venv is not installed. Install it with: sudo apt install -y python3-venv"
     echo "[smartune] Creating virtual environment at $VENV_DIR ..."
     # Drop a half-created directory from an earlier failed attempt.
     rm -rf "$VENV_DIR"

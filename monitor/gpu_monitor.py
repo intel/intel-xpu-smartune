@@ -292,6 +292,15 @@ def _card_to_gpu_label(card_name):
     return card_name
 
 
+def is_integrated_pci_slot(pci_slot):
+    """Intel iGPU is always at bus 00, device 02 (e.g. 0000:00:02.0)."""
+    if not pci_slot:
+        return False
+    segments = pci_slot.split(":")
+    return (len(segments) >= 3 and segments[-2] == "00" and
+            segments[-1].startswith("02."))
+
+
 def detect_gpu_devices():
     """Detect Intel GPU devices and their drivers.
 
@@ -348,13 +357,7 @@ def detect_gpu_devices():
                 if driver != "xe":
                     continue
 
-        # Intel iGPU is always at bus 00, device 02 (e.g. 0000:00:02.0)
-        is_integrated = False
-        if pci_slot:
-            segments = pci_slot.split(":")
-            if len(segments) >= 3:
-                is_integrated = (segments[-2] == "00" and
-                                 segments[-1].startswith("02."))
+        is_integrated = is_integrated_pci_slot(pci_slot)
 
         devices.append({
             "card": card_name,                        # sysfs dir name, e.g. "card0"

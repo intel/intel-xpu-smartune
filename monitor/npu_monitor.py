@@ -16,6 +16,7 @@ PMT_GUID_ARL_H = "0x1306a0b2" # Arrow Lake-H telemetry GUID
 PMT_GUID_ARL_S = "0x1306a0b4" # Arrow Lake-S telemetry GUID
 PMT_GUID_LNL = "0x3072005"    # Lunar Lake telemetry GUID
 PMT_GUID_PTL = "0x3086000"    # Panther Lake telemetry GUID
+PMT_GUID_WCL = "0x308d000"    # Wildcat Lake telemetry GUID
 
 
 def get_mtl_regs():
@@ -45,11 +46,15 @@ def get_ptl_regs():
         'VPU_MEMORY_BW': 0xc18
     }
 
+def get_wcl_regs():
+    return get_ptl_regs()
+
 class CpuGen(enum.IntEnum):
     MTL = 0
     ARL = 1
     LNL = 2
     PTL = 3
+    WCL = 4
 
     def __str__(self):
         if self == CpuGen.MTL:
@@ -60,6 +65,8 @@ class CpuGen(enum.IntEnum):
             return "Lunar Lake"
         if self == CpuGen.PTL:
             return "Panther Lake"
+        if self == CpuGen.WCL:
+            return "Wildcat Lake"
         return ""
 
 def run_command(command, timeout=None):
@@ -135,9 +142,23 @@ class PmtTelemetry:
                 self.cpu_gen = CpuGen.PTL
                 self.regs = get_ptl_regs()
                 break
+            if guid == PMT_GUID_WCL:
+                self.cpu_gen = CpuGen.WCL
+                self.regs = get_wcl_regs()
+                break
 
         if self.cpu_gen is None:
             raise RuntimeError('No CPU telemetry devices found with known GUIDs')
+
+        needed = max(self.regs.values()) + 8
+        if telem_size < needed:
+            raise RuntimeError(f'Telemetry region too small for {self.cpu_gen}: '
+                               f'{telem_size} bytes, need {needed}')
+
+        # The telem node is root-only; fail here so callers fall back to sysfs
+        # instead of erroring out on the first update_buffer().
+        if not os.access(self.telemetry_path, os.R_OK):
+            raise RuntimeError(f'No read permission for {self.telemetry_path}')
 
         LOG.debug('CPU generation detected: %s', self.cpu_gen)
 
@@ -145,6 +166,8 @@ class PmtTelemetry:
         """Function get_telem_sample slices bits from buffer buf at the container offset
         and bit masking specified by sample_spec."""
         buf = self.buffer
+        if buf is None or len(buf) < offset + 8:
+            raise ValueError(f'Telemetry buffer too short to read offset {offset:#x}')
         # read 8 bytes from buffer from offset and convert it to 64 bit little endian integer
         data = int.from_bytes(buf[offset:offset + 8],
                               byteorder='little')
@@ -170,21 +193,31 @@ class PmtTelemetry:
         return self.read(self.regs['VPU_WORKPOINT'], 15, 8)
 
     def get_tile_config(self):
+        # Intel-PMT XML: TILE_CONFIG is 16 bits wide on MTL, 8 bits on LNL and later.
+        if self.cpu_gen in (CpuGen.MTL, CpuGen.ARL):
+            return self.read(self.regs['VPU_WORKPOINT'], 31, 16)
         return self.read(self.regs['VPU_WORKPOINT'], 23, 16)
 
     def get_npu_temperature(self):
+        # Per the Intel-PMT XML, VPU_TEMP moved down a byte on PTL/WCL;
+        # 47:40 there is Media_TEMP.
+        if self.cpu_gen in (CpuGen.PTL, CpuGen.WCL):
+            return self.read(self.regs['SOC_TEMPERATURES'], 39, 32)
         return self.read(self.regs['SOC_TEMPERATURES'], 47, 40)
 
     def get_npu_energy(self):
-        # Units: joules, Cast: U32.18.14
-        val = self.read(self.regs['VPU_ENERGY'], 63, 0)
+        # Units: joules, Cast: U32.18.14 -- the value is 32 bits wide inside a
+        # 64-bit container (upstream intel-npu-smi reads 31:0 too).
+        val = self.read(self.regs['VPU_ENERGY'], 31, 0)
         int_part = val >> 14
         float_part = (val & ((1 << 14) - 1)) / (1 << 14)
         return int_part + float_part
 
     def get_noc_bandwidth(self):
+        # Cumulative traffic counter in 1 KiB units (Intel-PMT tbw_1024B /
+        # tbw_KB); returned in MiB. Upstream divides by 1e3 instead.
         val = self.read(self.regs['VPU_MEMORY_BW'], 31, 0)
-        return val / 1e3
+        return val / 1024
 
 def check_fdinfo_for_intel_vpu(pid, fd_name):
     """Check if a file descriptor belongs to intel_vpu driver and extract memory info."""
@@ -206,14 +239,17 @@ def check_fdinfo_for_intel_vpu(pid, fd_name):
 
     LOG.debug('Found NPU process PID %d', pid)
 
-    # Extract drm-resident-memory from fdinfo (in KiB)
+    # Extract drm-resident-memory from fdinfo, normalised to KiB. The DRM core
+    # picks the unit per value: "4096", "12345 KiB" or "64 MiB".
+    unit_to_kib = {'': 1 / 1024, 'KiB': 1, 'MiB': 1024, 'GiB': 1024 * 1024}
     memory_kib = 0
     for line in fdinfo_content.split('\n'):
         if line.startswith('drm-resident-memory:'):
             try:
-                # Format: "drm-resident-memory:	12345 KiB"
-                memory_kib = int(line.split()[1])
-            except (ValueError, IndexError):
+                fields = line.split()
+                unit = fields[2] if len(fields) > 2 else ''
+                memory_kib = int(int(fields[1]) * unit_to_kib[unit])
+            except (ValueError, IndexError, KeyError):
                 memory_kib = 0
             break
 

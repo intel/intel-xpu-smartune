@@ -796,11 +796,14 @@ function buildGpuTrendSeries(items: HistorySnapshotItem[]): GpuTrendSeries[] {
         seriesMap.set(id, series)
       }
 
-      // iGPU uses system memory; dGPU uses dedicated VRAM (keyed by card index in vram map)
-      const vramEntry = dynamic.gpu?.vram?.[`card${index}`]
+      // iGPU uses system memory; dGPU uses dedicated VRAM, matched by PCI address.
+      // A dGPU without readable VRAM stays null instead of showing system memory.
+      const vramEntry = Object.values(dynamic.gpu?.vram || {}).find(
+        (entry) => Boolean(device.pci_dev) && entry?.pci_slot === device.pci_dev,
+      )
       const memUsage = integrated
         ? normalizePercent(dynamic.memory?.usage_percent)
-        : normalizePercent(vramEntry?.usage_percent ?? dynamic.memory?.usage_percent)
+        : normalizePercent(vramEntry?.usage_percent ?? null)
 
       const point: GpuTrendPoint = {
         timestamp: label,
@@ -2830,7 +2833,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
           />
           {hasNpuPmtData && (
             <ConfigurableChart
-              title="NPU — Power, DDR Bandwidth & Temperature"
+              title="NPU — Power, Memory Bandwidth & Temperature"
               storageKey="history-npu-power-bw-temp"
               data={npuTrendPoints}
               timeWindow={timeWindow}
@@ -2838,13 +2841,13 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
               showBrush
               allSeries={[
                 { key: 'npuPowerW', name: 'Power', color: '#4cc9f0', unit: 'W' },
-                { key: 'npuDdrBwMib', name: 'DDR BW', color: '#a78bfa', unit: 'MiB/s', dasharray: '5 3' },
+                { key: 'npuDdrBwMib', name: 'Memory BW', color: '#a78bfa', unit: 'MiB/s', dasharray: '5 3' },
                 { key: 'npuTemperatureC', name: 'Temperature', color: '#fbbf24', unit: '°C' },
               ]}
             />
           )}
           <ConfigurableChart
-            title={hasNpuPmtData ? 'NPU — Memory Used & Tiles' : 'NPU — Memory Used'}
+            title={hasNpuPmtData ? 'NPU — Memory Used & Tile Used' : 'NPU — Memory Used'}
             storageKey="history-npu-mem-tiles"
             data={npuTrendPoints}
             timeWindow={timeWindow}
@@ -2853,7 +2856,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
             allSeries={hasNpuPmtData
               ? [
                   { key: 'npuMemoryMb', name: 'Memory Used', color: '#56c8d8', unit: 'MB' },
-                  { key: 'npuTileCount', name: 'Tiles', color: '#b877db', unit: 'tiles', dasharray: '5 3', defaultOn: false },
+                  { key: 'npuTileCount', name: 'Tile', color: '#b877db', unit: 'Used', dasharray: '5 3', defaultOn: false },
                 ]
               : [
                   { key: 'npuMemoryMb', name: 'Memory Used', color: '#56c8d8', unit: 'MB' },

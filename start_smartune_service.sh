@@ -27,9 +27,23 @@ else
     echo "Certificate generated successfully"
 fi
 
-# Build/refresh the .smartune-venv virtual environment (no-op when up to date).
+# OS packages needed to build the venv.
+if ! python3 -c "import venv, ensurepip" >/dev/null 2>&1; then
+    echo "[smartune] Installing python3-venv..."
+    apt-get install -y python3-venv || {
+        echo "[smartune] ERROR: could not install python3-venv; service not started." >&2
+        exit 1
+    }
+fi
+
+# Build/refresh the .smartune-venv virtual environment (no-op when up to date)
+# as the owner of the source checkout, so the venv is not left owned by root
+# and start_smartune.sh can still update it. The environment (proxy settings)
+# is kept; only HOME is switched so pip uses that user's cache.
 # On failure, say so clearly; systemd then retries per Restart=on-failure.
-if ! bash "$SCRIPT_DIR/setup_venv.sh"; then
+VENV_OWNER="$(stat -c '%U' "$SCRIPT_DIR")"
+VENV_OWNER_HOME="$(getent passwd "$VENV_OWNER" | cut -d: -f6)"
+if ! runuser -u "$VENV_OWNER" -- env HOME="$VENV_OWNER_HOME" bash "$SCRIPT_DIR/setup_venv.sh"; then
     echo "[smartune] ERROR: Python environment setup failed; service not started." >&2
     exit 1
 fi

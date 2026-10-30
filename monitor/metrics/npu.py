@@ -16,7 +16,27 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-_pmt_init_warned = False
+# PMT support is a property of the platform and of our privileges, neither of
+# which changes at runtime: probe once, then reuse the instance or the reason.
+_pmt_telemetry: Optional[PmtTelemetry] = None
+_pmt_unavailable_reason: Optional[str] = None
+
+
+def _get_pmt_telemetry() -> Optional[PmtTelemetry]:
+    global _pmt_telemetry, _pmt_unavailable_reason
+    if _pmt_telemetry is None and _pmt_unavailable_reason is None:
+        try:
+            _pmt_telemetry = PmtTelemetry()
+        except Exception as exc:
+            _pmt_unavailable_reason = f"PmtTelemetry init failed: {exc}"
+            logger.info("%s; NPU power/temperature/bandwidth/tile config will be reported as N/A",
+                        _pmt_unavailable_reason)
+    return _pmt_telemetry
+
+# PMT energy and NoC bandwidth are free-running 32-bit counters. These are
+# their wrap sizes after PmtTelemetry's scaling (U32.18.14 joules, KiB -> MiB).
+_ENERGY_COUNTER_WRAP = float(1 << 18)
+_NOC_BW_COUNTER_WRAP = (1 << 32) / 1024
 
 
 def get_npu_names() -> List[str]:
@@ -120,18 +140,8 @@ def _collect_npu_smi_once(include_processes: bool = False) -> Dict[str, Any]:
     if dev_path is None:
         return {"available": False, "raw": None, "error": "No Intel NPU PCI device found"}
 
-    global _pmt_init_warned
-    telemetry: Optional[PmtTelemetry] = None
-    pmt_error: Optional[str] = None
-    try:
-        telemetry = PmtTelemetry()
-    except (SystemExit, RuntimeError) as exc:
-        pmt_error = f"PmtTelemetry init failed: {exc}"
-    except Exception as exc:
-        pmt_error = f"PmtTelemetry init failed: {exc}"
-    if pmt_error and not _pmt_init_warned:
-        logger.debug(pmt_error + " (this message will be suppressed on subsequent polls)")
-        _pmt_init_warned = True
+    telemetry = _get_pmt_telemetry()
+    pmt_error = _pmt_unavailable_reason
 
     npu_busy_path = os.path.join(dev_path, "npu_busy_time_us")
 
@@ -147,9 +157,13 @@ def _collect_npu_smi_once(include_processes: bool = False) -> Dict[str, Any]:
     energy_start: Optional[float] = None
     bandwidth_start: Optional[float] = None
     if telemetry is not None:
-        telemetry.update_buffer()
-        energy_start = telemetry.get_npu_energy()
-        bandwidth_start = telemetry.get_noc_bandwidth()
+        try:
+            telemetry.update_buffer()
+            energy_start = telemetry.get_npu_energy()
+            bandwidth_start = telemetry.get_noc_bandwidth()
+        except Exception as exc:
+            pmt_error = f"PMT read failed: {exc}"
+            telemetry = None
 
     time.sleep(interval_ms * 1e-3)
 
@@ -162,28 +176,39 @@ def _collect_npu_smi_once(include_processes: bool = False) -> Dict[str, Any]:
     tile_config: Optional[int] = None
     temperature_c: Optional[float] = None
     if telemetry is not None:
-        telemetry.update_buffer()
-        energy_end = telemetry.get_npu_energy()
-        bandwidth_end = telemetry.get_noc_bandwidth()
-        raw_freq = telemetry.get_freq()
-        freq_mhz = raw_freq * 1000 / 2 if raw_freq is not None else None
-        tile_config = telemetry.get_tile_config()
-        temperature_c = telemetry.get_npu_temperature()
+        try:
+            telemetry.update_buffer()
+            energy_end = telemetry.get_npu_energy()
+            bandwidth_end = telemetry.get_noc_bandwidth()
+            # PMT FREQ is the PLL ratio; the DPU (what sysfs reports) runs at half of it.
+            freq_mhz = telemetry.get_freq() * 1000 / 2
+            tile_config = telemetry.get_tile_config()
+            temperature_c = telemetry.get_npu_temperature()
+        except Exception as exc:
+            pmt_error = f"PMT read failed: {exc}"
+            telemetry = None
+            energy_end = bandwidth_end = freq_mhz = tile_config = temperature_c = None
+
+    elapsed_s = t_end - t_start
 
     utilization_percent: Optional[float] = None
-    if busy_start is not None and busy_end is not None:
+    if busy_start is not None and busy_end is not None and elapsed_s > 0:
         busy_delta = busy_end - busy_start
-        elapsed_us = (t_end - t_start) * 1e6
-        if elapsed_us > 0:
-            utilization_percent = max(0.0, min(100.0, 100.0 * busy_delta / elapsed_us))
+        utilization_percent = max(0.0, min(100.0, 100.0 * busy_delta / (elapsed_s * 1e6)))
 
     power_w: Optional[float] = None
-    if energy_start is not None and energy_end is not None:
-        power_w = (energy_end - energy_start) / (interval_ms * 1e-3)
+    if energy_start is not None and energy_end is not None and elapsed_s > 0:
+        energy_delta = energy_end - energy_start
+        if energy_delta < 0:  # 32-bit counter wrapped
+            energy_delta += _ENERGY_COUNTER_WRAP
+        power_w = energy_delta / elapsed_s
 
     noc_bandwidth: Optional[float] = None
-    if bandwidth_start is not None and bandwidth_end is not None:
-        noc_bandwidth = round(bandwidth_end - bandwidth_start, 6)
+    if bandwidth_start is not None and bandwidth_end is not None and elapsed_s > 0:
+        bandwidth_delta = bandwidth_end - bandwidth_start
+        if bandwidth_delta < 0:  # 32-bit counter wrapped
+            bandwidth_delta += _NOC_BW_COUNTER_WRAP
+        noc_bandwidth = round(bandwidth_delta / elapsed_s, 6)
 
     memory_bytes = _read_int_file(os.path.join(dev_path, "npu_memory_utilization"))
     current_freq_mhz = _read_int_file(os.path.join(dev_path, "npu_current_frequency_mhz"))
@@ -216,14 +241,13 @@ def _collect_npu_smi_once(include_processes: bool = False) -> Dict[str, Any]:
         "memory_bytes": memory_bytes,
         "pmt_available": telemetry is not None,
         "pmt_error": pmt_error,
+        # PMT-only fields stay in the payload as None (shown as N/A) when PMT is unavailable.
+        "power_w": round(power_w, 6) if power_w is not None else None,
+        "tile_config": tile_config,
+        "temperature_c": temperature_c,
+        "noc_bandwidth_mib_per_s": noc_bandwidth,
         "processes": processes,
     }
-
-    if telemetry is not None:
-        payload["power_w"] = round(power_w, 6) if power_w is not None else None
-        payload["tile_config"] = tile_config
-        payload["temperature_c"] = temperature_c
-        payload["noc_bandwidth_mib_per_s"] = noc_bandwidth
 
     return {
         "available": True,

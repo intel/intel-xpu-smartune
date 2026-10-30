@@ -10,14 +10,20 @@ from typing import Any, Dict, List, Optional
 
 import psutil
 
+from monitor.gpu_monitor import is_integrated_pci_slot
 from monitor.metrics.utils import safe_read, read_first_existing, parse_freq_val, run_cmd
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
+INTEL_GPU_DRIVERS = ("i915", "xe")
+
 
 def get_gpu_cards() -> List[str]:
     cards = sorted(glob.glob("/sys/class/drm/card[0-9]"))
-    return [c for c in cards if os.path.isdir(c)]
+    return [
+        c for c in cards
+        if os.path.isdir(c) and get_gpu_driver_name(c) in INTEL_GPU_DRIVERS
+    ]
 
 
 # Cached card_name -> 'GPU.N' mapping.  The DRM topology is static for the
@@ -71,7 +77,7 @@ def get_gpu_names() -> List[str]:
         return []
     matches = []
     for line in output.splitlines():
-        if re.search(r"VGA|3D|Display", line, re.IGNORECASE):
+        if re.search(r"VGA|3D|Display", line, re.IGNORECASE) and "[8086:" in line:
             matches.append(line.strip())
     return matches
 
@@ -258,31 +264,57 @@ def get_gpu_gt_freq_bounds_sysfs(
 
 
 
-def _parse_debugfs_vram_mm(card_index: int) -> Dict[str, Optional[float]]:
-    path = f"/sys/kernel/debug/dri/{card_index}/vram0_mm"
+_EMPTY_VRAM: Dict[str, Optional[float]] = {
+    "total_bytes": None,
+    "used_bytes": None,
+    "usage_percent": None,
+}
+
+# GPU labels already warned about missing VRAM, so periodic sampling logs once.
+_vram_warned: set = set()
+
+
+def _get_card_pci_slot(card: str) -> Optional[str]:
+    """Return the PCI address of a DRM card (e.g. 0000:03:00.0), or None."""
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-    except FileNotFoundError:
+        pci_addr = os.path.basename(os.path.realpath(os.path.join(card, "device")))
+    except Exception:
+        return None
+    if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", pci_addr):
+        return pci_addr
+    return None
+
+
+def _parse_xe_vram_mm(card_index: int) -> Dict[str, Optional[float]]:
+    """Parse size/usage from Xe debugfs tile*/vram_mm, summed over all tiles."""
+    paths = sorted(glob.glob(f"/sys/kernel/debug/dri/{card_index}/tile*/vram_mm"))
+    total_bytes = 0.0
+    used_bytes = 0.0
+    found = False
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as exc:
+            logger.debug("Read failed for %s: %s", path, exc)
+            continue
+
+        size_match = re.search(r"(?m)^\s*size:\s*(\d+)\s*$", content)
+        if not size_match:
+            size_match = re.search(r"(?m)^\s*man\s+size\s*:\s*(\d+)\s*$", content)
+        usage_match = re.search(r"(?m)^\s*usage:\s*(\d+)\s*$", content)
+        if not size_match or not usage_match:
+            logger.debug("No size/usage found in %s", path)
+            continue
+
+        total_bytes += float(size_match.group(1))
+        used_bytes += float(usage_match.group(1))
+        found = True
+
+    if not found:
         return {}
-    except Exception as exc:
-        logger.debug("Read failed for %s: %s", path, exc)
-        return {}
 
-    size_match = re.search(r"(?m)^\s*size:\s*(\d+)\s*$", content)
-    if not size_match:
-        size_match = re.search(r"(?m)^\s*man\s+size\s*:\s*(\d+)\s*$", content)
-    usage_match = re.search(r"(?m)^\s*usage:\s*(\d+)\s*$", content)
-
-    total_bytes = float(size_match.group(1)) if size_match else None
-    used_bytes = float(usage_match.group(1)) if usage_match else None
-    usage_percent = None
-    if total_bytes is not None and total_bytes > 0 and used_bytes is not None:
-        usage_percent = round((used_bytes / total_bytes) * 100, 2)
-
-    if total_bytes is None and used_bytes is None:
-        return {}
-
+    usage_percent = round((used_bytes / total_bytes) * 100, 2) if total_bytes > 0 else None
     return {
         "total_bytes": total_bytes,
         "used_bytes": used_bytes,
@@ -291,29 +323,37 @@ def _parse_debugfs_vram_mm(card_index: int) -> Dict[str, Optional[float]]:
 
 
 def _parse_i915_gem_objects_vram(card_index: int) -> Dict[str, Optional[float]]:
-    """Parse visible_size and visible_avail from i915_gem_objects debugfs (i915 dGPU only)."""
+    """Parse local memory from i915_gem_objects debugfs (i915 dGPU only).
+
+    Uses the buddy allocator line "chunk_size: ..., total: XMiB, free: YMiB",
+    summed over all local regions; it covers the whole LMEM regardless of BAR
+    size. The TTM "size:"/"usage:" lines are not used because i915 reports
+    size in pages but usage in bytes. Falls back to visible_size/visible_avail
+    (CPU-visible BAR window only) if no buddy line is present.
+    """
     path = f"/sys/kernel/debug/dri/{card_index}/i915_gem_objects"
     try:
         with open(path, "r", encoding="utf-8") as f:
             content = f.read().strip()
-    except FileNotFoundError:
-        return {}
     except Exception as exc:
         logger.debug("Read failed for %s: %s", path, exc)
         return {}
 
-    size_match = re.search(r"(?m)^\s*visible_size:\s*([0-9]+)\s*MiB", content)
-    avail_match = re.search(r"(?m)^\s*visible_avail:\s*([0-9]+)\s*MiB", content)
+    mib = 1024 * 1024
+    buddy = re.findall(r"(?m)^\s*chunk_size:.*?total:\s*(\d+)\s*MiB,\s*free:\s*(\d+)\s*MiB", content)
+    if buddy:
+        total_bytes = sum(float(t) for t, _ in buddy) * mib
+        free_bytes = sum(float(f) for _, f in buddy) * mib
+    else:
+        size_match = re.search(r"(?m)^\s*visible_size:\s*([0-9]+)\s*MiB", content)
+        avail_match = re.search(r"(?m)^\s*visible_avail:\s*([0-9]+)\s*MiB", content)
+        if not size_match or not avail_match:
+            return {}
+        total_bytes = float(size_match.group(1)) * mib
+        free_bytes = float(avail_match.group(1)) * mib
 
-    if not size_match:
-        return {}
-
-    total_bytes = float(size_match.group(1)) * 1024 * 1024
-    avail_bytes = float(avail_match.group(1)) * 1024 * 1024 if avail_match else None
-    used_bytes = max(0.0, total_bytes - avail_bytes) if avail_bytes is not None else None
-    usage_percent = None
-    if used_bytes is not None and total_bytes > 0:
-        usage_percent = round((used_bytes / total_bytes) * 100, 2)
+    used_bytes = max(0.0, total_bytes - free_bytes)
+    usage_percent = round((used_bytes / total_bytes) * 100, 2) if total_bytes > 0 else None
 
     return {
         "total_bytes": total_bytes,
@@ -337,30 +377,45 @@ def _get_system_memory_usage_bytes() -> Dict[str, Optional[float]]:
 
 
 def get_gpu_vram(cards: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
-    result: Dict[str, Dict[str, Optional[float]]] = {}
-    system_memory_stats = _get_system_memory_usage_bytes()
+    """Per-GPU memory: iGPU shares system memory; dGPU reads driver debugfs.
+
+    Each entry also carries "pci_slot" so consumers can match it to a device.
+    A dGPU whose debugfs cannot be read (e.g. not running as root) reports
+    all-None values rather than falling back to system memory.
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    system_memory_stats: Optional[Dict[str, Optional[float]]] = None
 
     for card in cards:
-        card_name = os.path.basename(card)
         gpu_label = card_to_gpu_label(card)
-        match = re.match(r"^card(\d+)$", card_name)
+        pci_slot = _get_card_pci_slot(card)
+        vram: Dict[str, Optional[float]] = {}
 
-        if match:
-            card_index = int(match.group(1))
-            xe_vram = _parse_debugfs_vram_mm(card_index)
-            if xe_vram:
-                result[gpu_label] = xe_vram
-                continue
-            i915_vram = _parse_i915_gem_objects_vram(card_index)
-            if i915_vram:
-                result[gpu_label] = i915_vram
-                continue
+        if is_integrated_pci_slot(pci_slot):
+            if system_memory_stats is None:
+                system_memory_stats = _get_system_memory_usage_bytes()
+            vram = dict(system_memory_stats)
+        else:
+            match = re.match(r"^card(\d+)$", os.path.basename(card))
+            driver = get_gpu_driver_name(card)
+            if match:
+                card_index = int(match.group(1))
+                if driver == "xe":
+                    vram = _parse_xe_vram_mm(card_index)
+                elif driver == "i915":
+                    vram = _parse_i915_gem_objects_vram(card_index)
 
-        result[gpu_label] = {
-            "total_bytes": system_memory_stats.get("total_bytes"),
-            "used_bytes": system_memory_stats.get("used_bytes"),
-            "usage_percent": system_memory_stats.get("usage_percent"),
-        }
+            if not vram:
+                if gpu_label not in _vram_warned:
+                    _vram_warned.add(gpu_label)
+                    logger.warning(
+                        "dGPU VRAM unavailable for %s (driver=%s): debugfs unreadable "
+                        "(need root / debugfs mounted?)",
+                        gpu_label, driver,
+                    )
+                vram = dict(_EMPTY_VRAM)
+
+        result[gpu_label] = {**vram, "pci_slot": pci_slot}
     return result
 
 
@@ -418,12 +473,7 @@ def get_gpu_pci_addresses(cards: List[str]) -> Dict[str, str]:
     """Return mapping of GPU label -> PCI address (e.g. GPU.0 -> 0000:00:02.0)."""
     result: Dict[str, str] = {}
     for card in cards:
-        device_path = os.path.join(card, "device")
-        try:
-            resolved = os.path.realpath(device_path)
-            pci_addr = os.path.basename(resolved)
-            if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", pci_addr):
-                result[card_to_gpu_label(card)] = pci_addr
-        except Exception:
-            pass
+        pci_addr = _get_card_pci_slot(card)
+        if pci_addr:
+            result[card_to_gpu_label(card)] = pci_addr
     return result

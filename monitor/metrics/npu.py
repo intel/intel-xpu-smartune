@@ -11,7 +11,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 from monitor.metrics.utils import safe_read, run_cmd
-from monitor.npu_monitor import PmtTelemetry, get_npu_processes
+from monitor.npu_monitor import get_npu_processes
+from monitor.pmt_telemetry import ENERGY_COUNTER_WRAP_J, PmtTelemetry
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
@@ -32,12 +33,6 @@ def _get_pmt_telemetry() -> Optional[PmtTelemetry]:
             logger.info("%s; NPU power/temperature/bandwidth/tile config will be reported as N/A",
                         _pmt_unavailable_reason)
     return _pmt_telemetry
-
-# PMT energy and NoC bandwidth are free-running 32-bit counters. These are
-# their wrap sizes after PmtTelemetry's scaling (U32.18.14 joules, KiB -> MiB).
-_ENERGY_COUNTER_WRAP = float(1 << 18)
-_NOC_BW_COUNTER_WRAP = (1 << 32) / 1024
-
 
 def get_npu_names() -> List[str]:
     output = run_cmd(["lspci", "-nn"])
@@ -200,14 +195,14 @@ def _collect_npu_smi_once(include_processes: bool = False) -> Dict[str, Any]:
     if energy_start is not None and energy_end is not None and elapsed_s > 0:
         energy_delta = energy_end - energy_start
         if energy_delta < 0:  # 32-bit counter wrapped
-            energy_delta += _ENERGY_COUNTER_WRAP
+            energy_delta += ENERGY_COUNTER_WRAP_J
         power_w = energy_delta / elapsed_s
 
     noc_bandwidth: Optional[float] = None
     if bandwidth_start is not None and bandwidth_end is not None and elapsed_s > 0:
         bandwidth_delta = bandwidth_end - bandwidth_start
         if bandwidth_delta < 0:  # 32-bit counter wrapped
-            bandwidth_delta += _NOC_BW_COUNTER_WRAP
+            bandwidth_delta += telemetry.noc_bandwidth_wrap_mib
         noc_bandwidth = round(bandwidth_delta / elapsed_s, 6)
 
     memory_bytes = _read_int_file(os.path.join(dev_path, "npu_memory_utilization"))

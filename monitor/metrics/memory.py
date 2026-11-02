@@ -11,7 +11,8 @@
   IMC free-running counters. Needs root or `perf_event_paranoid <= 0`; yields
   blanks when the PMU is unavailable. A reading is a counter delta, so each
   consumer owns its own `Sampler`; the shared one behind `get_memory_bandwidth()`
-  is lock-guarded.
+  is lock-guarded. The reading also carries a `devices` sub-dict (CPU/GPU
+  attributed bandwidth from PMT, see `pmt_telemetry`).
 """
 
 import ctypes
@@ -26,6 +27,7 @@ from typing import Any, Dict, List, Optional
 import psutil
 
 from monitor.metrics.utils import run_cmd
+from monitor.pmt_telemetry import get_device_bandwidth, last_pmt_sample
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
@@ -467,12 +469,17 @@ _shared_sampler_started = False
 _shared_lock = threading.Lock()
 
 
-def _blank_bandwidth() -> Dict[str, Any]:
+def _fmt(value: Optional[float]) -> str:
+    return "n/a" if value is None else f"{value:.2f}"
+
+
+def _blank_bandwidth(devices: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return {
         "total_gb_s": None,
         "read_gb_s": None,
         "write_gb_s": None,
         "usage_percent": None,
+        "devices": devices or {"cpu_gb_s": None, "gpu_gb_s": None},
     }
 
 
@@ -487,6 +494,9 @@ def get_memory_bandwidth() -> Dict[str, Any]:
     """
     global _shared_sampler, _shared_sampler_started
 
+    # Per-device attribution comes from PMT and is independent of the IMC PMU.
+    devices = get_device_bandwidth()
+
     with _shared_lock:
         if not _shared_sampler_started:
             _shared_sampler_started = True
@@ -497,22 +507,33 @@ def get_memory_bandwidth() -> Dict[str, Any]:
             # so every later call is a cheap no-op returning blanks.
 
         if _shared_sampler is None:
-            return _blank_bandwidth()
+            return _blank_bandwidth(devices)
 
         bw = _shared_sampler.sample()
         if bw is None:
-            return _blank_bandwidth()
+            return _blank_bandwidth(devices)
 
         max_gb_s = _shared_sampler.max_bandwidth_gb_s
         usage_percent = (
             round(100.0 * bw.total_gb_s / max_gb_s, 2)
             if max_gb_s else None
         )
+        pmt = last_pmt_sample()
+        if pmt is not None:
+            raw, dt = pmt
+            # Debug aid: IMC PMU total vs PMT attribution, to compare under load.
+            logger.info(
+                "MEMBW imc total=%.2f (r=%.2f w=%.2f) | pmt cpu=%s gpu=%s npu=%s sys=%s dt=%.2fs",
+                bw.total_gb_s, bw.read_gb_s, bw.write_gb_s,
+                _fmt(raw.cpu_gb_s), _fmt(raw.gpu_gb_s), _fmt(raw.npu_gb_s),
+                _fmt(raw.sys_gb_s), dt,
+            )
         return {
             "total_gb_s": round(bw.total_gb_s, 2),
             "read_gb_s": round(bw.read_gb_s, 2),
             "write_gb_s": round(bw.write_gb_s, 2),
             "usage_percent": usage_percent,
+            "devices": devices,
         }
 
 

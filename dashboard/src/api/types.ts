@@ -943,6 +943,12 @@ export interface DynamicInfoData {
       read_gb_s: number | null
       write_gb_s: number | null
       usage_percent: number | null
+      // CPU/GPU attributed bandwidth from SoC PMT telemetry (estimate, ~3% vs
+      // the system total). Null where the platform's PMT layout is unknown.
+      devices?: {
+        cpu_gb_s: number | null
+        gpu_gb_s: number | null
+      } | null
     } | null
   }
   pressure: PressureData

@@ -156,6 +156,10 @@ def _convert_monitor_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             busy_pct = eng_data.get("busy_pct")
             if busy_pct is not None:
                 engine_accum.setdefault(short_name, []).append(busy_pct)
+            else:
+                # Unknown for this interval (e.g. Xe runtime suspend); keep
+                # the engine listed so the UI shows N/A rather than dropping it.
+                engine_util.setdefault(short_name, None)
 
         for key, values in engine_accum.items():
             engine_util[key] = round(sum(values) / len(values), 2)

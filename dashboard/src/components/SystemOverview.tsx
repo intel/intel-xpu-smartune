@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import React, { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   Row,
   Col,
@@ -58,6 +58,7 @@ import { useDocumentVisible } from '../hooks/useDocumentVisible'
 import { useMonitoredSections } from '../hooks/useMonitoredSections'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 import { createLiveDiagnosticWindow, summarizeVisibleDiagnosticEvents } from '../utils/diagnosticEvents'
+import { getGpuComputeUnits, type GpuComputeUnits } from '../utils/gpuTopology'
 import '../styles/performance.css'
 
 const { Text, Title } = Typography
@@ -198,6 +199,17 @@ function takeUniqueApps(apps: AppResourceEntry[], limit: number): AppResourceEnt
     if (unique.length === limit) break
   }
   return unique
+}
+
+/** What a GPU's memory figure measures: VRAM for a dGPU, the GPU's own share
+ * of system memory for an Xe iGPU, whole-system memory for an i915 iGPU. */
+function gpuMemLabel(device: GpuDeviceView, form: 'long' | 'short' | 'chart'): string {
+  if (device.igpuMem) {
+    return { long: 'Mem Used', short: 'Mem % of RAM', chart: 'GPU Mem % of RAM' }[form]
+  }
+  const [long, short] = device.label === 'iGPU' ? ['System Memory', 'Sys Mem'] : ['VRAM Usage', 'VRAM']
+  if (form === 'long') return long
+  return form === 'chart' ? `${short} %` : short
 }
 
 function formatMemoryGb(memoryMb?: number | null): string {
@@ -343,10 +355,23 @@ interface GpuDeviceView {
   }
   powerGpu: number | null
   powerPkg: number | null
-  vramUsage: number | null
+  /** Memory % shown for this GPU: VRAM (dGPU), the GPU's own share of
+   * system memory (Xe iGPU), or whole-system memory (i915 iGPU). */
+  memUsage: number | null
   vramTotalGb: number | null
   vramAvailableGb: number | null
+  /** Xe iGPU only, null otherwise: the GPU's own share of system memory.
+   * i915 keeps no such counter, so an i915 iGPU shows system memory instead. */
+  igpuMem: {
+    totalGb: number | null
+    usedMb: number | null
+    usagePercent: number | null
+    /** System MemAvailable: what the GPU could still take, shared with every other user. */
+    availableGb: number | null
+  } | null
   euCount: number | null
+  /** Xe-cores on the xe driver, EUs on i915; see utils/gpuTopology. */
+  compute: GpuComputeUnits | null
   pciId: string | null
   pcieLink: {
     current_speed: string | null
@@ -666,6 +691,7 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
     const vramAvailableGb = vramTotalGb !== null && isNumber(vramUsedBytes)
       ? Math.max(vramTotalGb - vramUsedBytes / (1024 ** 3), 0)
       : null
+    const driverName = qdev?.drv_name || staticGpu?.driver_names?.[cardKey] || null
 
     // Determine iGPU vs dGPU. Authoritative source: Intel iGPU is always at
     // bus 00, device 02 (e.g. 0000:00:02.0). Fall back to qdev.dev_type when
@@ -689,6 +715,18 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
     }
     // displayLabel computed after loop via reassignment
 
+    const igpuMemTotalBytes = vramDyn?.gpu_total_bytes ?? vramStatic?.gpu_total_bytes ?? null
+    const igpuMemUsedBytes = vramDyn?.gpu_used_bytes ?? null
+    const igpuMem = label === 'iGPU' && driverName === 'xe'
+      ? {
+          totalGb: isNumber(igpuMemTotalBytes) && igpuMemTotalBytes > 0 ? igpuMemTotalBytes / (1024 ** 3) : null,
+          usedMb: isNumber(igpuMemUsedBytes) ? igpuMemUsedBytes / (1024 ** 2) : null,
+          usagePercent: normalizePercent(vramDyn?.gpu_usage_percent ?? null),
+          availableGb: dynamicInfo?.memory?.available_gb ?? null,
+        }
+      : null
+    const memUsage = igpuMem ? igpuMem.usagePercent : vramUsage
+
     const freqs = qdev?.freqs || []
     const gt0 = freqs.find((f) => f.name === 'gt0') || freqs[0]
     const gt1 = freqs.find((f) => f.name === 'gt1') || freqs[1]
@@ -711,7 +749,7 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
     }, {} as Record<EngineKey, number | null>)
 
     const engineValues = Object.values(engineUtil).filter(isNumber)
-    const utilization = engineValues.length ? Math.max(...engineValues) : vramUsage
+    const utilization = engineValues.length ? Math.max(...engineValues) : null
 
     const throttle = Boolean(gt0?.throttled || gt1?.throttled || freqs.some((f) => f.throttled))
     const available = Boolean(qdev) && gpuUsageAvailable
@@ -751,10 +789,16 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
       },
       powerGpu: qdev?.power_w?.gpu ?? null,
       powerPkg: qdev?.power_w?.pkg ?? qdev?.power_w?.card ?? null,
-      vramUsage,
+      memUsage,
       vramTotalGb,
       vramAvailableGb,
+      igpuMem,
       euCount: staticGpu?.eu_count?.[cardKey] ?? null,
+      compute: getGpuComputeUnits(
+        staticGpu?.driver_names?.[cardKey] ?? qdev?.drv_name,
+        staticGpu?.topology?.[cardKey],
+        staticGpu?.eu_count?.[cardKey],
+      ),
       pciId,
       pcieLink: {
         current_speed: staticGpu?.pcie?.[cardKey]?.current_speed ?? null,
@@ -2701,18 +2745,18 @@ function GpuSummaryCard({
   onOpen: () => void
 }) {
   const utilization = isNumber(device.utilization) ? device.utilization : null
-  const memoryUsage = isNumber(device.vramUsage) ? device.vramUsage : null
+  const memoryUsage = isNumber(device.memUsage) ? device.memUsage : null
   const frequencyValues = [device.frequencies.gt0?.act_mhz, device.frequencies.gt1?.act_mhz].filter(isNumber)
   const frequencyMhz = frequencyValues.length ? Math.max(...frequencyValues) : null
 
   return (
     <ResourceSummaryCard
       title={device.displayLabel}
-      subtitle={
-        device.label !== 'iGPU' && isNumber(device.vramTotalGb)
-          ? `${formatGpuSummaryName(device)} | ${device.vramTotalGb.toFixed(1)} GB VRAM`
-          : formatGpuSummaryName(device)
-      }
+      subtitle={[
+        formatGpuSummaryName(device),
+        device.compute ? device.compute.short : null,
+        device.label !== 'iGPU' && isNumber(device.vramTotalGb) ? `${device.vramTotalGb.toFixed(1)} GB VRAM` : null,
+      ].filter(Boolean).join(' | ')}
       accent={accent}
       status={device.status === 'Throttle' ? 'critical' : device.status === 'Busy' ? 'warning' : device.status.toLowerCase() as SummaryCardStatus}
       statusColor={device.statusColor}
@@ -2721,7 +2765,9 @@ function GpuSummaryCard({
       primaryUnit="%"
       metrics={[
         { label: 'Power', value: formatMetric(device.powerGpu, 'W', 2) },
-        { label: device.label === 'iGPU' ? 'System Memory' : 'VRAM Usage', value: memoryUsage === null ? 'N/A' : `${memoryUsage.toFixed(1)}%` },
+        device.igpuMem
+          ? { label: gpuMemLabel(device, 'long'), value: formatMemoryGb(device.igpuMem.usedMb) }
+          : { label: gpuMemLabel(device, 'long'), value: memoryUsage === null ? 'N/A' : `${memoryUsage.toFixed(1)}%` },
         { label: 'Frequency', value: formatMetric(frequencyMhz, 'MHz', 0) },
         { label: 'Mem BW', value: formatMetric(memBwGbS, 'GB/s', 1) },
       ]}
@@ -2824,6 +2870,44 @@ function CoreCell({
   )
 }
 
+/** One labelled column of current values in a device detail card. */
+function DetailStatGroup({
+  title,
+  items,
+}: {
+  title: string
+  items: Array<{ key: string; label: string; value: string }>
+}) {
+  if (items.length === 0) return null
+  return (
+    <div>
+      <Text style={{ color: COLORS.textMuted, fontSize: 10, display: 'block', marginBottom: 2 }}>{title}</Text>
+      <div style={{ display: 'grid', gridTemplateColumns: 'auto auto', columnGap: 12, lineHeight: '17px' }}>
+        {items.map((item) => (
+          <Fragment key={item.key}>
+            <Text style={{ color: COLORS.textMuted, fontSize: 10, whiteSpace: 'nowrap' }}>{item.label}</Text>
+            <Text style={{ color: COLORS.text, fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+              {item.value}
+            </Text>
+          </Fragment>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/** Heading that ties a chart to the legend right under it. */
+function ChartTitle({ title, subtitle, first = false }: { title: string; subtitle?: string; first?: boolean }) {
+  return (
+    <div style={{ marginTop: first ? 0 : 14, marginBottom: 4 }}>
+      <Text style={{ color: COLORS.text, fontSize: 11, fontWeight: 600 }}>{title}</Text>
+      {subtitle && (
+        <Text style={{ color: COLORS.textMuted, fontSize: 10, marginLeft: 8 }}>{subtitle}</Text>
+      )}
+    </div>
+  )
+}
+
 function ChartLegend({
   items,
   hidden,
@@ -2908,10 +2992,10 @@ function NpuDetailCard({
     freqMhz: padUf(freqSeries)[i] ?? null,
   })) : []
 
-  // Chart 2: Power W + Memory BW MiB/s + Temperature °C
+  // Chart 2: Power W + Mem BW MiB/s + Temperature °C
   const pbItems = [
     { key: 'npuPower', name: 'NPU Power W', color: '#4cc9f0' },
-    { key: 'ddrBw', name: 'Memory BW MiB/s', color: '#cbd5e1', dasharray: '5 3' },
+    { key: 'ddrBw', name: 'Mem BW MiB/s', color: '#cbd5e1', dasharray: '5 3' },
     { key: 'npuTemp', name: 'Temperature °C', color: '#fbbf24' },
   ]
   const pbMaxLen = Math.max(powerSeries.length, ddrBwSeries.length, tempSeries.length)
@@ -2974,10 +3058,10 @@ function NpuDetailCard({
           const items: Array<{ key: string; label: string; value: string; color: string }> = []
           items.push({ key: 'util', label: 'Util', value: isNumber(util) ? `${util.toFixed(1)} %` : 'N/A', color: COLORS.accent })
           items.push({ key: 'freq', label: 'Freq', value: isNumber(freqMhz) ? `${freqMhz.toFixed(0)} MHz` : 'N/A', color: PERF_COLORS.npu })
-          items.push({ key: 'mem', label: 'Memory Used', value: isNumber(memoryMb) ? `${memoryMb.toFixed(2)} MB` : 'N/A', color: COLORS.text })
+          items.push({ key: 'mem', label: 'Mem Used', value: isNumber(memoryMb) ? `${memoryMb.toFixed(2)} MB` : 'N/A', color: COLORS.text })
           // PMT-backed fields: always listed, N/A when the platform has no usable PMT telemetry.
           items.push({ key: 'power', label: 'Power', value: pmtAvailable && isNumber(powerW) ? `${powerW.toFixed(2)} W` : 'N/A', color: '#4cc9f0' })
-          items.push({ key: 'bw', label: 'Memory BW', value: pmtAvailable ? formatNpuMemoryBw(bandwidthMib) : 'N/A', color: '#cbd5e1' })
+          items.push({ key: 'bw', label: 'Mem BW', value: pmtAvailable ? formatNpuMemoryBw(bandwidthMib) : 'N/A', color: '#cbd5e1' })
           items.push({ key: 'temp', label: 'Temp', value: pmtAvailable && isNumber(tempC) ? `${tempC.toFixed(0)} °C` : 'N/A', color: '#fbbf24' })
           items.push({ key: 'tile', label: 'Tile Used', value: pmtAvailable ? tileConfig : 'N/A', color: COLORS.textMuted })
           return items.map((it) => (
@@ -3025,7 +3109,7 @@ function NpuDetailCard({
         </>
       )}
 
-      {/* Chart 2: Power W + Temperature °C (left Y) + Memory BW MiB/s (right Y) — matching History */}
+      {/* Chart 2: Power W + Temperature °C (left Y) + Mem BW MiB/s (right Y) — matching History */}
       {pmtAvailable && powerBwData.length > 0 && (
         <>
           <ChartLegend items={pbItems} hidden={hidden} onToggle={toggle} />
@@ -3059,7 +3143,7 @@ function NpuDetailCard({
                 <Line yAxisId="left" type="monotone" dataKey="npuPower" name="NPU Power W"
                   stroke={'#4cc9f0'} dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                   hide={hidden.has('npuPower')} />
-                <Line yAxisId="bw" type="monotone" dataKey="ddrBw" name="Memory BW MiB/s"
+                <Line yAxisId="bw" type="monotone" dataKey="ddrBw" name="Mem BW MiB/s"
                   stroke={'#cbd5e1'} strokeDasharray="5 3" dot={false} strokeWidth={2} isAnimationActive={false} connectNulls
                   hide={hidden.has('ddrBw')} />
                 <Line yAxisId="left" type="monotone" dataKey="npuTemp" name="Temperature °C"
@@ -3135,16 +3219,8 @@ function GpuDeviceCard({
     }
   })
 
-  const [hidden, setHidden] = useState<Set<string>>(() => {
-    const ranked = [...enginesToShow].sort(
-      (a, b) => (device.engineUtil[b] ?? -1) - (device.engineUtil[a] ?? -1),
-    )
-    const visible = new Set<EngineKey>(['ccs', 'bcs', 'rcs'])
-    ranked.slice(0, 2).forEach((engine) => visible.add(engine))
-    return new Set(enginesToShow
-      .filter((engine) => !visible.has(engine))
-      .map((engine) => `${device.id}-engine-${engine}`))
-  })
+  // Every series starts visible; the legend toggles them.
+  const [hidden, setHidden] = useState<Set<string>>(() => new Set())
   const toggle = useCallback((key: string) => setHidden((prev) => {
     const next = new Set(prev); next.has(key) ? next.delete(key) : next.add(key); return next
   }), [])
@@ -3190,8 +3266,9 @@ function GpuDeviceCard({
           !gt0RangeText && !gt1RangeText && (device.freqBounds.min_mhz || device.freqBounds.max_mhz)
             ? `Freq ${formatFreqRange(device.freqBounds.min_mhz, device.freqBounds.max_mhz)}`
             : null,
-          device.label === 'iGPU' && isNumber(device.euCount) ? `EU ${device.euCount}` : null,
+          device.compute ? device.compute.short : null,
           device.label !== 'iGPU' && isNumber(device.vramTotalGb) ? `VRAM ${device.vramTotalGb.toFixed(1)} GB` : null,
+          device.igpuMem && isNumber(device.igpuMem.totalGb) ? `Shared RAM ${device.igpuMem.totalGb.toFixed(1)} GB` : null,
         ].filter(Boolean).join(' | ') || 'No static info'}
       </Text>
 
@@ -3215,85 +3292,61 @@ function GpuDeviceCard({
 
       {/* Combined dynamic data: numbers + recharts trend charts */}
       <div style={{ marginTop: 10, paddingTop: 8, borderTop: '1px dashed rgba(120,176,255,0.16)' }}>
-        {/* Numbers row */}
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px 16px', alignItems: 'center', marginBottom: 8 }}>
-          {/* Freq */}
-          <Text style={{ color: COLORS.textMuted, fontSize: 10, flexShrink: 0 }}>Freq</Text>
-          {gtFreqItems.map((s) => (
-            <span key={s.key} style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
-              <span style={{ width: 6, height: 6, borderRadius: '50%', background: s.stroke, flexShrink: 0, display: 'inline-block' }} />
-              <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>{s.label}</Text>
-              <Text style={{ color: s.stroke, fontSize: 11, fontWeight: 600 }}>
-                {formatMetric(s.value, 'MHz', 0)}
-              </Text>
-            </span>
-          ))}
-          {/* RC6 */}
-          {(isNumber(device.frequencies.gt0?.rc6_pct) || isNumber(device.frequencies.gt1?.rc6_pct)) && (
-            <>
-              <Text style={{ color: COLORS.textMuted, fontSize: 10, flexShrink: 0, marginLeft: 4 }}>RC6</Text>
-              {isNumber(device.frequencies.gt0?.rc6_pct) && (
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
-                  <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>GT0</Text>
-                  <Text style={{ color: COLORS.text, fontSize: 11, fontWeight: 600 }}>
-                    {formatPercent(device.frequencies.gt0?.rc6_pct ?? null)}
-                  </Text>
-                </span>
-              )}
-              {isNumber(device.frequencies.gt1?.rc6_pct) && (
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
-                  <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>GT1</Text>
-                  <Text style={{ color: COLORS.text, fontSize: 11, fontWeight: 600 }}>
-                    {formatPercent(device.frequencies.gt1?.rc6_pct ?? null)}
-                  </Text>
-                </span>
-              )}
-            </>
-          )}
-          {/* Mem */}
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
-            <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>
-              {device.label === 'iGPU' ? 'Sys Mem' : 'VRAM'}
-            </Text>
-            <Text style={{ color: COLORS.text, fontSize: 11, fontWeight: 600 }}>
-              {formatPercent(device.vramUsage)}
-            </Text>
-            {device.label !== 'iGPU' && isNumber(device.vramAvailableGb) && (
-              <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>
-                ({formatMetric(device.vramAvailableGb, 'GB', 1)} available)
-              </Text>
-            )}
-          </span>
-          {/* Engine */}
-          <Text style={{ color: COLORS.textMuted, fontSize: 10, flexShrink: 0, marginLeft: 4 }}>Engine</Text>
-          {enginesToShow.length === 0 ? (
-            <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>—</Text>
-          ) : (
-            enginesToShow.map((engine) => {
-              const instanceCount = device.engineInstances.filter((n) => normalizeEngineName(n) === engine).length
-              return (
-                <span key={`${device.id}-${engine}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
-                  <Text style={{ color: COLORS.textMuted, fontSize: 10, textTransform: 'uppercase' }}>
-                    {engine}{instanceCount > 1 ? `\u00d7${instanceCount}` : ''}
-                  </Text>
-                  <Text style={{ color: engineColors[engine as EngineKey] ?? COLORS.accent, fontSize: 11, fontWeight: 600 }}>
-                    {formatPercent(device.engineUtil[engine])}
-                  </Text>
-                </span>
-              )
-            })
-          )}
-          {/* Power */}
-          <Text style={{ color: COLORS.textMuted, fontSize: 10, flexShrink: 0, marginLeft: 4 }}>Power</Text>
-          {powerSeries.map((s) => (
-            <span key={s.key} style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
-              <span style={{ width: 6, height: 6, borderRadius: '50%', background: s.stroke, flexShrink: 0, display: 'inline-block' }} />
-              <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>{s.label}</Text>
-              <Text style={{ color: s.stroke, fontSize: 11, fontWeight: 600 }}>
-                {formatMetric(s.label === 'GPU' ? device.powerGpu : device.powerPkg, 'W', 2)}
-              </Text>
-            </span>
-          ))}
+        {/* Current values, grouped. Values use text ink, not series colors, so
+            this block cannot be mistaken for the chart legend below. */}
+        <ChartTitle title="Now" first />
+        <div
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: '8px 36px',
+            padding: '8px 12px',
+            borderRadius: 6,
+            background: 'rgba(120,176,255,0.04)',
+            border: `1px solid ${COLORS.border}55`,
+          }}
+        >
+          <DetailStatGroup
+            title="Frequency"
+            items={gtFreqItems.map((s) => ({ key: s.key, label: s.label, value: formatMetric(s.value, 'MHz', 0) }))}
+          />
+          <DetailStatGroup
+            title="RC6"
+            items={[
+              { key: 'gt0', label: 'GT0', value: formatPercent(device.frequencies.gt0?.rc6_pct ?? null) },
+              { key: 'gt1', label: 'GT1', value: formatPercent(device.frequencies.gt1?.rc6_pct ?? null) },
+            ].filter((item) => item.value !== 'N/A')}
+          />
+          <DetailStatGroup
+            title="Memory"
+            items={device.igpuMem
+              ? [
+                  { key: 'used', label: gpuMemLabel(device, 'long'), value: formatMemoryGb(device.igpuMem.usedMb) },
+                  { key: 'pct', label: '% of RAM', value: formatPercent(device.igpuMem.usagePercent) },
+                ]
+              : [
+                  { key: 'pct', label: gpuMemLabel(device, 'short'), value: formatPercent(device.memUsage) },
+                  ...(device.label !== 'iGPU' && isNumber(device.vramAvailableGb)
+                    ? [{ key: 'avail', label: 'Available', value: formatMetric(device.vramAvailableGb, 'GB', 1) }]
+                    : []),
+                ]}
+          />
+          <DetailStatGroup
+            title="Power"
+            items={powerSeries.map((s) => ({
+              key: s.key,
+              label: s.label,
+              value: formatMetric(s.label === 'GPU' ? device.powerGpu : device.powerPkg, 'W', 2),
+            }))}
+          />
+          <DetailStatGroup
+            title="Engines"
+            items={enginesToShow.map((engine, i) => ({
+              key: engineSeries[i].key,
+              label: engineSeries[i].label,
+              value: formatPercent(device.engineUtil[engine]),
+            }))}
+          />
         </div>
 
         {/* Chart 1: Engine % + Mem % (left Y) + Freq MHz (right Y) */}
@@ -3319,7 +3372,7 @@ function GpuDeviceCard({
             pt['gt1Rc6'] = pad(gt1Rc6Series)[i] ?? null
             return pt
           })
-          const memLabel = device.label === 'iGPU' ? 'Sys Mem %' : 'VRAM %'
+          const memLabel = gpuMemLabel(device, 'chart')
 
           const chart1Items = [
             ...engineSeries.map((s) => ({ key: s.key, name: `${s.label} %`, color: s.stroke })),
@@ -3334,14 +3387,17 @@ function GpuDeviceCard({
 
           return (
             <>
+              <ChartTitle
+                title={`Trend (last ${trendWindow})`}
+                subtitle="Engines, memory, RC6 in % (left axis) · GT frequency in MHz (right axis)"
+              />
               <ChartLegend items={chart1Items} hidden={hidden} onToggle={toggle} />
               <div style={{ width: '100%', height: 160, marginBottom: 4 }}>
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={data} margin={{ top: 2, right: 4, left: 0, bottom: 16 }}>
                     <CartesianGrid stroke={`${COLORS.border}55`} strokeDasharray="3 3" />
                     <XAxis dataKey="i" ticks={[0, data.length - 1]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(val: number) => val === 0 ? `-${trendWindow}` : 'now'} />
-                    <YAxis yAxisId="pct" domain={[0, 100]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}%`} width={44}
-                      label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 10, offset: 14 }} />
+                    <YAxis yAxisId="pct" domain={[0, 100]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}%`} width={44} />
                     <YAxis yAxisId="mhz" orientation="right" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v: number) => `${Math.round(v)}`} width={56}
                       label={{ value: 'MHz', angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10, offset: 10 }} />
                     <Tooltip
@@ -3683,7 +3739,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
           updates[`gpu:${device.id}:freq:gt1:req_mhz`] = device.frequencies.gt1?.cur_mhz ?? null
           updates[`gpu:${device.id}:freq:gt0:rc6_pct`] = device.frequencies.gt0?.rc6_pct ?? null
           updates[`gpu:${device.id}:freq:gt1:rc6_pct`] = device.frequencies.gt1?.rc6_pct ?? null
-          updates[`gpu:${device.id}:vram_usage`] = device.vramUsage
+          updates[`gpu:${device.id}:vram_usage`] = device.memUsage
           if (isNumber(device.utilization)) gpuUtils.push(device.utilization)
           ENGINE_ORDER.forEach((engine) => {
             updates[`gpu:${device.id}:engine:${engine}`] = device.engineUtil[engine]
@@ -3998,10 +4054,27 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
         source: 'dynamic' as DataSourceKind,
       },
       {
-        label: device.label === 'iGPU' ? `${device.displayLabel} Sys Mem` : `${device.displayLabel} VRAM`,
-        value: formatPercent(device.vramUsage),
+        label: `${device.displayLabel} ${gpuMemLabel(device, 'short')}`,
+        value: formatPercent(device.memUsage),
         source: 'dynamic' as DataSourceKind,
       },
+      ...(device.igpuMem ? [
+        {
+          label: `${device.displayLabel} Mem Used`,
+          value: formatMemoryGb(device.igpuMem.usedMb),
+          source: 'dynamic' as DataSourceKind,
+        },
+        {
+          label: `${device.displayLabel} Shared RAM`,
+          value: formatMetric(device.igpuMem.totalGb, 'GB', 1),
+          source: 'dynamic' as DataSourceKind,
+        },
+        {
+          label: `${device.displayLabel} Available (shared)`,
+          value: formatMetric(device.igpuMem.availableGb, 'GB', 1),
+          source: 'dynamic' as DataSourceKind,
+        },
+      ] : []),
     ]),
     [gpuDevices],
   )
@@ -4126,7 +4199,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
   const gpuSnapshotMeta = gpuDevices.length
     ? gpuDevices.map((d) => {
         const parts: string[] = [`${d.displayLabel}(${d.driver !== 'N/A' ? d.driver : '?'})`]
-        if (d.label === 'iGPU' && isNumber(d.euCount)) parts.push(`EU ${d.euCount}`)
+        if (d.compute) parts.push(d.compute.short)
         if (d.pcieLink.current_speed) parts.push(`PCIe ${formatPcieLink(d.pcieLink.current_speed, d.pcieLink.current_width, d.pcieLink.max_speed, d.pcieLink.max_width)}`)
         return parts.join(' ')
       }).join(' | ')
@@ -4723,8 +4796,8 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
             metrics={[
               { label: 'Power', value: npuParsed?.pmt_available !== false && npuParsed?.power_w != null ? `${(npuParsed.power_w as number).toFixed(2)} W` : 'N/A' },
               { label: 'Frequency', value: npuParsed?.frequency_mhz != null ? `${Math.round(npuParsed.frequency_mhz as number)} MHz` : 'N/A' },
-              { label: 'Memory Used', value: npuParsed?.memory_bytes != null ? `${((npuParsed.memory_bytes as number) / (1024 * 1024)).toFixed(2)} MB` : 'N/A' },
-              { label: 'Memory BW', value: npuParsed?.pmt_available !== false ? formatNpuMemoryBw(npuParsed?.noc_bandwidth_mib_per_s as number | null | undefined) : 'N/A' },
+              { label: 'Mem Used', value: npuParsed?.memory_bytes != null ? `${((npuParsed.memory_bytes as number) / (1024 * 1024)).toFixed(2)} MB` : 'N/A' },
+              { label: 'Mem BW', value: npuParsed?.pmt_available !== false ? formatNpuMemoryBw(npuParsed?.noc_bandwidth_mib_per_s as number | null | undefined) : 'N/A' },
               { label: 'Tile Used', value: npuParsed?.pmt_available !== false && npuParsed?.tile_config != null ? `${npuParsed.tile_config}` : 'N/A' },
             ]}
             series={getSeries('npu:util')}

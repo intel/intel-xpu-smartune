@@ -113,6 +113,8 @@ interface GpuTrendSeries {
   id: string
   label: string
   isIntegrated: boolean
+  /** Xe iGPU: memUsage is the GPU's own share of system memory, not the whole system's. */
+  hasOwnMem: boolean
   points: GpuTrendPoint[]
 }
 
@@ -789,21 +791,25 @@ function buildGpuTrendSeries(items: HistorySnapshotItem[]): GpuTrendSeries[] {
       const id = device.pci_dev || `${device.dev_type || 'gpu'}-${index}`
       const seriesLabel = getGpuLabel(device, index)
       const integrated = isIntegratedGpu(device)
+      const hasOwnMem = integrated && device.drv_name === 'xe'
 
       let series = seriesMap.get(id)
       if (!series) {
-        series = { id, label: seriesLabel, isIntegrated: integrated, points: [] }
+        series = { id, label: seriesLabel, isIntegrated: integrated, hasOwnMem, points: [] }
         seriesMap.set(id, series)
       }
 
-      // iGPU uses system memory; dGPU uses dedicated VRAM, matched by PCI address.
-      // A dGPU without readable VRAM stays null instead of showing system memory.
+      // dGPU uses dedicated VRAM and an Xe iGPU its own share of system memory
+      // (gpu_usage_percent), both matched by PCI address and null when unread.
+      // i915 keeps no per-GPU counter, so its iGPU shows system memory.
       const vramEntry = Object.values(dynamic.gpu?.vram || {}).find(
         (entry) => Boolean(device.pci_dev) && entry?.pci_slot === device.pci_dev,
       )
-      const memUsage = integrated
-        ? normalizePercent(dynamic.memory?.usage_percent)
-        : normalizePercent(vramEntry?.usage_percent ?? null)
+      const memUsage = hasOwnMem
+        ? normalizePercent(vramEntry?.gpu_usage_percent ?? null)
+        : integrated
+          ? normalizePercent(dynamic.memory?.usage_percent)
+          : normalizePercent(vramEntry?.usage_percent ?? null)
 
       const point: GpuTrendPoint = {
         timestamp: label,
@@ -1208,7 +1214,7 @@ function GpuHistoryCard({
     [series.points, brushRange, timeWindow],
   )
 
-  const memLabel = series.isIntegrated ? 'Sys Mem %' : 'VRAM %'
+  const memLabel = series.hasOwnMem ? 'GPU Mem % of RAM' : series.isIntegrated ? 'Sys Mem %' : 'VRAM %'
   const gpuColors = getGpuChartColors()
 
   const engineLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string; strokeWidth?: number }> = [
@@ -2841,13 +2847,13 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
               showBrush
               allSeries={[
                 { key: 'npuPowerW', name: 'Power', color: '#4cc9f0', unit: 'W' },
-                { key: 'npuDdrBwMib', name: 'Memory BW', color: '#a78bfa', unit: 'MiB/s', dasharray: '5 3' },
+                { key: 'npuDdrBwMib', name: 'Mem BW', color: '#a78bfa', unit: 'MiB/s', dasharray: '5 3' },
                 { key: 'npuTemperatureC', name: 'Temperature', color: '#fbbf24', unit: '°C' },
               ]}
             />
           )}
           <ConfigurableChart
-            title={hasNpuPmtData ? 'NPU — Memory Used & Tile Used' : 'NPU — Memory Used'}
+            title={hasNpuPmtData ? 'NPU — Mem Used & Tile Used' : 'NPU — Mem Used'}
             storageKey="history-npu-mem-tiles"
             data={npuTrendPoints}
             timeWindow={timeWindow}
@@ -2855,11 +2861,11 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
             showBrush
             allSeries={hasNpuPmtData
               ? [
-                  { key: 'npuMemoryMb', name: 'Memory Used', color: '#56c8d8', unit: 'MB' },
+                  { key: 'npuMemoryMb', name: 'Mem Used', color: '#56c8d8', unit: 'MB' },
                   { key: 'npuTileCount', name: 'Tile', color: '#b877db', unit: 'Used', dasharray: '5 3', defaultOn: false },
                 ]
               : [
-                  { key: 'npuMemoryMb', name: 'Memory Used', color: '#56c8d8', unit: 'MB' },
+                  { key: 'npuMemoryMb', name: 'Mem Used', color: '#56c8d8', unit: 'MB' },
                 ]}
           />
         </div>

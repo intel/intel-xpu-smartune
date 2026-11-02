@@ -39,6 +39,7 @@ from monitor.metrics.gpu_info import (
     get_gpu_gt_freq_bounds_sysfs,
     get_gpu_vram,
     get_igpu_eu_count,
+    get_gpu_topology,
     get_gpu_pcie,
     get_gpu_pci_addresses,
     card_to_gpu_label,
@@ -454,6 +455,7 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
         network_static = _get_network_static_info()
         disk_static = _get_disk_static_info()
         gpu_pci_addresses = get_gpu_pci_addresses(cards)
+        gpu_topology = get_gpu_topology(cards)
         gpu_gt_freq_bounds = get_gpu_gt_freq_bounds_sysfs(cards)
         raw_gpu_engines = get_gpu_engines(cards)
         gpu_engine_instances: Dict[str, List[str]] = {
@@ -500,7 +502,8 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
                 "gt_freq_bounds_mhz": gpu_gt_freq_bounds,
                 "vram": get_gpu_vram(cards),
                 "pcie": get_gpu_pcie(cards),
-                "eu_count": get_igpu_eu_count(cards),
+                "eu_count": get_igpu_eu_count(cards, gpu_topology),
+                "topology": gpu_topology,
                 "pci_addresses": gpu_pci_addresses,
                 "driver_names": {card_to_gpu_label(c): get_gpu_driver_name(c) for c in cards},
             },

@@ -376,10 +376,44 @@ def _get_system_memory_usage_bytes() -> Dict[str, Optional[float]]:
     }
 
 
+_EMPTY_XE_IGPU_MEM: Dict[str, Any] = {
+    "gpu_total_bytes": None,
+    "gpu_used_bytes": None,
+    "gpu_usage_percent": None,
+}
+
+
+def _get_xe_igpu_memory(card_index: Optional[int]) -> Dict[str, Any]:
+    """The Xe iGPU's own share of system memory, from debugfs gtt_mm.
+
+    gtt_mm is the TTM TT manager: "size" is its limit in pages (= totalram)
+    and "usage" the bytes held by all GPU buffers in system memory. Reading it
+    needs root but never wakes the GPU. Unreadable values are None, never 0.
+    """
+    result = dict(_EMPTY_XE_IGPU_MEM)
+    if card_index is None:
+        return result
+    content = safe_read(f"/sys/kernel/debug/dri/{card_index}/gtt_mm")
+    size_match = re.search(r"(?m)^\s*size:\s*(\d+)\s*$", content or "")
+    usage_match = re.search(r"(?m)^\s*usage:\s*(\d+)\s*$", content or "")
+    if not size_match or not usage_match:
+        return result
+    total = float(int(size_match.group(1)) * os.sysconf("SC_PAGE_SIZE"))
+    used = float(usage_match.group(1))
+    result["gpu_total_bytes"] = total
+    result["gpu_used_bytes"] = used
+    if total > 0:
+        result["gpu_usage_percent"] = round((used / total) * 100, 2)
+    return result
+
+
 def get_gpu_vram(cards: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
     """Per-GPU memory: iGPU shares system memory; dGPU reads driver debugfs.
 
     Each entry also carries "pci_slot" so consumers can match it to a device.
+    For an iGPU, total/used/usage_percent describe the whole system; an Xe
+    iGPU also carries gpu_* fields (see _get_xe_igpu_memory) for the GPU's
+    own share of it. i915 keeps no such counter for system memory.
     A dGPU whose debugfs cannot be read (e.g. not running as root) reports
     all-None values rather than falling back to system memory.
     """
@@ -389,17 +423,19 @@ def get_gpu_vram(cards: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
     for card in cards:
         gpu_label = card_to_gpu_label(card)
         pci_slot = _get_card_pci_slot(card)
-        vram: Dict[str, Optional[float]] = {}
+        driver = get_gpu_driver_name(card)
+        match = re.match(r"^card(\d+)$", os.path.basename(card))
+        card_index = int(match.group(1)) if match else None
+        vram: Dict[str, Any] = {}
 
         if is_integrated_pci_slot(pci_slot):
             if system_memory_stats is None:
                 system_memory_stats = _get_system_memory_usage_bytes()
             vram = dict(system_memory_stats)
+            if driver == "xe":
+                vram.update(_get_xe_igpu_memory(card_index))
         else:
-            match = re.match(r"^card(\d+)$", os.path.basename(card))
-            driver = get_gpu_driver_name(card)
-            if match:
-                card_index = int(match.group(1))
+            if card_index is not None:
                 if driver == "xe":
                     vram = _parse_xe_vram_mm(card_index)
                 elif driver == "i915":
@@ -419,35 +455,86 @@ def get_gpu_vram(cards: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
     return result
 
 
-def get_igpu_eu_count(cards: List[str]) -> Dict[str, Optional[int]]:
-    """Read EU count per card."""
-    result: Dict[str, Optional[int]] = {}
+GpuTopology = Dict[str, Optional[int]]
+
+
+def _empty_topology() -> GpuTopology:
+    return {"eu_count": None, "xe_core_count": None, "eu_simd_width": None}
+
+
+def _get_xe_topology(card_index: int) -> Optional[GpuTopology]:
+    """EU / Xe-core counts from debugfs gt0/topology.
+    """
+    content = safe_read(f"/sys/kernel/debug/dri/{card_index}/gt0/topology")
+    if not content:
+        return None
+    geometry = re.search(r"(?m)^dss mask \(geometry\):\s*([0-9a-fA-F,]+)", content)
+    compute = re.search(r"(?m)^dss mask \(compute\):\s*([0-9a-fA-F,]+)", content)
+    eu_mask = re.search(r"(?m)^EU mask per DSS:\s*([0-9a-fA-F,]+)", content)
+    if not (geometry or compute) or not eu_mask:
+        return None
+    dss = 0
+    for m in (geometry, compute):
+        if m:
+            dss |= int(m.group(1).replace(",", ""), 16)
+    cores = bin(dss).count("1")
+    eus_per_core = bin(int(eu_mask.group(1).replace(",", ""), 16)).count("1")
+    eu_type = re.search(r"(?m)^EU type:\s*simd(\d+)", content)
+    return {
+        "eu_count": cores * eus_per_core,
+        "xe_core_count": cores,
+        "eu_simd_width": int(eu_type.group(1)) if eu_type else None,
+    }
+
+
+def _read_i915_sseu_eu_total(card_index: int) -> Optional[int]:
+    path = f"/sys/kernel/debug/dri/{card_index}/i915_sseu_status"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.debug("Read failed for %s: %s", path, exc)
+        return None
+    eu_match = re.search(r"(?m)^\s*Available EU Total:\s*(\d+)", content)
+    return int(eu_match.group(1)) if eu_match else None
+
+
+def get_gpu_topology(cards: List[str]) -> Dict[str, GpuTopology]:
+    """Per-card compute topology: eu_count, xe_core_count, eu_simd_width.
+
+    xe: debugfs gt*/topology. i915: debugfs i915_sseu_status (EU total only).
+    Both need root; unreadable values are None.
+    The dashboard presents eu_count for i915 and xe_core_count for every xe-driver GPU.
+    """
+    result: Dict[str, GpuTopology] = {}
     for card in cards:
-        card_name = os.path.basename(card)
-        gpu_label = card_to_gpu_label(card)
-        match = re.match(r"^card(\d+)$", card_name)
+        match = re.match(r"^card(\d+)$", os.path.basename(card))
         if not match:
             continue
         card_index = int(match.group(1))
         driver = get_gpu_driver_name(card)
-
-        if driver == "i915":
-            path = f"/sys/kernel/debug/dri/{card_index}/i915_sseu_status"
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                eu_match = re.search(r"(?m)^\s*Available EU Total:\s*(\d+)", content)
-                if eu_match:
-                    result[gpu_label] = int(eu_match.group(1))
-            except FileNotFoundError:
-                pass
-            except Exception as exc:
-                logger.debug("Read failed for %s: %s", path, exc)
-
-        elif driver == "xe":
-            result[gpu_label] = None
-
+        topo: Optional[GpuTopology] = None
+        if driver == "xe":
+            topo = _get_xe_topology(card_index)
+        elif driver == "i915":
+            eu_total = _read_i915_sseu_eu_total(card_index)
+            if eu_total is not None:
+                topo = {"eu_count": eu_total, "xe_core_count": None, "eu_simd_width": 8}
+        else:
+            continue
+        result[card_to_gpu_label(card)] = topo or _empty_topology()
     return result
+
+
+def get_igpu_eu_count(
+    cards: List[str], topology: Optional[Dict[str, GpuTopology]] = None
+) -> Dict[str, Optional[int]]:
+    """Enabled EU count per card (native EU width; see get_gpu_topology)."""
+    if topology is None:
+        topology = get_gpu_topology(cards)
+    return {label: topo.get("eu_count") for label, topo in topology.items()}
 
 
 def get_gpu_pcie(cards: List[str]) -> Dict[str, Dict[str, Optional[str]]]:

@@ -39,7 +39,8 @@ subsystem your server is monitoring:
 - **CPU** — overall and per-core style utilization, plus package power.
 - **Memory** — used / available, and (where available) memory bandwidth.
 - **GPU** — per-card (iGPU/dGPU) frequency, power, per-engine utilization and
-  VRAM.
+  memory. A dGPU shows its VRAM; an iGPU shares system memory, and on the `xe`
+  driver it also shows how much of that memory the GPU itself is using.
 - **NPU** — utilization, power, temperature, frequency, and memory.
 - **Disk** and **Network** — throughput and activity.
 

@@ -1235,7 +1235,17 @@ class XeMonitor:
             gt_name = idle_path.parent.parent.name
             self._idle_paths[gt_name] = str(idle_path)
 
-        # Hwmon energy paths (hwmon reads don't wake the GT)
+        # Device runtime PM state. In fdinfo/sysfs mode, fdinfo, freq, gtidle
+        # and hwmon reads each take a runtime PM reference, which resumes a
+        # suspended device; sample() skips them while it is suspended.
+        self._runtime_status_path = str(base / "device" / "power" / "runtime_status")
+        # Cumulative ms the device has been runtime-active (PM core, read
+        # without resuming it): unchanged between two samples proves the
+        # device stayed suspended for the whole interval.
+        self._runtime_active_path = str(base / "device" / "power" / "runtime_active_time")
+
+        # Hwmon energy paths (hwmon reads don't wake the GT, but do resume
+        # the device from runtime suspend)
         self._energy_paths = []
         hwmon_base = base / "device" / "hwmon"
         if hwmon_base.exists():
@@ -1396,6 +1406,15 @@ class XeMonitor:
             return {"gpu_uj": vals[0]}
         return {"gpu_uj": min(vals), "card_uj": max(vals)}
 
+    def _runtime_suspended(self):
+        """True if the device is runtime-suspended (fdinfo/sysfs mode only).
+
+        PMU mode keeps the device awake through its open counters, so the
+        check only applies when no PMU counters are held.
+        """
+        return (not self.use_pmu and
+                sysfs_read_str(self._runtime_status_path) == "suspended")
+
     def sample(self):
         """Take one sample."""
         result = {"ts": time.monotonic_ns(), "vals": []}
@@ -1404,6 +1423,19 @@ class XeMonitor:
             ts, vals = pmu_read_multi(self.group_fd, self.counter_idx)
             result["ts"] = ts
             result["vals"] = vals
+
+        if not self.use_pmu:
+            result["rpm_active_ms"] = sysfs_read_int(self._runtime_active_path)
+
+        if self._runtime_suspended():
+            # Reading fdinfo/sysfs/hwmon now would resume the device, so no
+            # counters are taken. Nothing is carried forward either: old
+            # counters with a new timestamp would stretch the next delta over
+            # several periods. compute() works from the PM state instead.
+            result["runtime_suspended"] = True
+            if self.igpu_power and self.igpu_power.available:
+                result.update(self.igpu_power.sample())
+            return result
 
         # fdinfo mode: fdinfo engines, sysfs frequency
         if not self.use_pmu:
@@ -1435,6 +1467,66 @@ class XeMonitor:
 
         return result
 
+    def _compute_without_counters(self, result, prev, cur, dt_s, busy_pct, rc6_pct, gt_freqs):
+        """Fill an interval whose engine/RC6/hwmon deltas cannot be taken.
+
+        busy_pct/rc6_pct are either known from the PM state (0/100 for an
+        interval spent entirely suspended) or None for unknown. gt_freqs maps
+        gt name -> (req_mhz, act_mhz) instantaneous values. dGPU power is left
+        out (hwmon has no baseline); iGPU RAPL power is unaffected.
+        """
+        result["engines"] = {
+            _fdinfo_display_name(eng): {
+                "busy_pct": busy_pct,
+                "num_instances": self._engine_instances.get(eng, 1),
+            }
+            for eng in self._known_engines
+        }
+        frequency = {}
+        for gt_name in self._freq_paths:
+            req, act = gt_freqs.get(gt_name, (None, None))
+            gt_freq = {"req_mhz": req, "act_mhz": act, "rc6_pct": rc6_pct}
+            sf = self._freq_range.get(gt_name, {})
+            if sf.get("min_mhz") is not None:
+                gt_freq["min_mhz"] = sf["min_mhz"]
+            if sf.get("max_mhz") is not None:
+                gt_freq["max_mhz"] = sf["max_mhz"]
+            frequency[gt_name] = gt_freq
+        if frequency:
+            result["frequency"] = frequency
+        if self.igpu_power and self.igpu_power.available:
+            power = self.igpu_power.compute_power(prev, cur, dt_s)
+            if power:
+                result["power"] = power
+        return result
+
+    def _compute_suspended(self, result, prev, cur, dt_s):
+        """Interval ending with the device runtime-suspended.
+
+        Suspended now does not mean idle throughout: work may have run and
+        finished before autosuspend. Only an unchanged runtime_active_time
+        proves the whole interval was spent suspended (engines 0%, RC6 100%);
+        otherwise utilization and RC6 are unknown. GT clocks are off now.
+        """
+        a0, a1 = prev.get("rpm_active_ms"), cur.get("rpm_active_ms")
+        idle_throughout = a0 is not None and a1 is not None and a0 == a1
+        result["runtime_suspended"] = True
+        return self._compute_without_counters(
+            result, prev, cur, dt_s,
+            busy_pct=0.0 if idle_throughout else None,
+            rc6_pct=100.0 if idle_throughout else None,
+            gt_freqs={gt: (None, 0) for gt in self._freq_paths},
+        )
+
+    def _compute_after_resume(self, result, prev, cur, dt_s):
+        """First interval after a suspended sample: cur re-establishes the
+        counter baseline, so no deltas are reported yet."""
+        sysfs_freq = cur.get("sysfs_freq", {})
+        return self._compute_without_counters(
+            result, prev, cur, dt_s, busy_pct=None, rc6_pct=None,
+            gt_freqs={gt: (f.get("cur_mhz"), f.get("act_mhz")) for gt, f in sysfs_freq.items()},
+        )
+
     def compute(self, prev, cur):
         dt_ns = cur["ts"] - prev["ts"]
         if dt_ns <= 0:
@@ -1448,6 +1540,11 @@ class XeMonitor:
             "period_ms": dt_ns / 1e6,
             "is_integrated": not self.is_discrete,
         }
+
+        if cur.get("runtime_suspended"):
+            return self._compute_suspended(result, prev, cur, dt_s)
+        if prev.get("runtime_suspended"):
+            return self._compute_after_resume(result, prev, cur, dt_s)
 
         # Engine utilization
         engines_result = {}

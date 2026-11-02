@@ -17,8 +17,8 @@ machines, or confirming firmware/driver versions.
 - **Memory** — total capacity, DDR speed, and channel/slot configuration.
 - **Disks** — device list and capacities.
 - **Network** — interfaces, the primary NIC, link speeds, and IP addresses.
-- **GPU** — per card: name, engine list, EU count, PCIe speed/width, PCI
-  address, and frequency ranges.
+- **GPU** — per card: name, engine list, compute units (EU count on `i915`,
+  Xe-core count on `xe`), PCIe speed/width, PCI address, and frequency ranges.
 - **NPU** — PCI ID, driver version, firmware version, and frequency ranges.
 
 **Software / firmware**

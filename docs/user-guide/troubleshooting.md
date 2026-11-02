@@ -57,6 +57,12 @@ The dashboard adapts automatically to what the server reports. See
   **[About](about.md)** for detected devices and driver versions).
 - Make sure the card is enabled under **[Settings → System Overview](settings.md#system-overview)**.
 - NPU telemetry requires a supported Intel platform (MTL / ARL / LNL / PTL).
+- Some GPU fields are read from kernel debugfs and need the monitor to run as
+  root; otherwise they show **N/A**: dGPU VRAM, the Xe iGPU's own memory usage,
+  and EU / Xe-core counts.
+- On an `xe`-driver GPU, engine utilization and RC6 may briefly show **N/A**
+  while the device is runtime-suspended or just resuming — SmarTune avoids
+  waking an idle GPU just to sample it.
 
 ## Resource limits aren't being applied
 

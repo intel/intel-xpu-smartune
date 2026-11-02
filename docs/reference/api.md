@@ -1711,12 +1711,37 @@ GET /monitor/process_detail?pid=12345
     "cpu": { "model": "...", "cores": 16, "threads": 32 },
     "memory": { "total_gb": 64, "type": "DDR5" },
     "io": { "disks": [...] },
-    "gpu": { "name": "...", "memory_mb": 16384 },
+    "gpu": {
+      "names": ["..."],
+      "count": 1,
+      "engines": { "GPU.0": ["rcs0", "bcs0", "vcs0", "vecs0", "ccs0"] },
+      "freq_bounds_mhz": { "GPU.0": { "min_mhz": 100, "max_mhz": 2350 } },
+      "gt_freq_bounds_mhz": { "GPU.0": { "gt0": { "min_mhz": 100, "max_mhz": 2350 } } },
+      "vram": {
+        "GPU.0": {
+          "total_bytes": 33554432000, "used_bytes": 12884901888, "usage_percent": 38.4, "pci_slot": "0000:00:02.0",
+          "gpu_total_bytes": 33554432000, "gpu_used_bytes": 1073741824, "gpu_usage_percent": 3.2
+        }
+      },
+      "pcie": { "GPU.0": { "current_speed": null, "current_width": null, "max_speed": null, "max_width": null } },
+      "eu_count": { "GPU.0": 64 },
+      "topology": { "GPU.0": { "eu_count": 64, "xe_core_count": 8, "eu_simd_width": 16 } },
+      "pci_addresses": { "GPU.0": "0000:00:02.0" },
+      "driver_names": { "GPU.0": "xe" }
+    },
     "npu": { "name": "...", "available": true },
     "collected_at": "2026-06-17T10:30:00"
   }
 }
 ```
+
+**GPU Field Notes:** (keys are GPU labels such as `GPU.0`)
+- `vram` — `total_bytes` / `used_bytes` / `usage_percent` are the dGPU's VRAM, or whole-system memory for an iGPU. An `xe` iGPU also has `gpu_total_bytes` / `gpu_used_bytes` / `gpu_usage_percent`: the GPU's own share of system memory (from debugfs `gtt_mm`). `i915` iGPUs do not have the `gpu_*` fields.
+- `topology` — per-card compute topology:
+  - `xe`: all three fields come from debugfs `gt0/topology`. `xe_core_count` = enabled DSS (geometry | compute masks), `eu_count` = `xe_core_count` × EUs per DSS, `eu_simd_width` from the `EU type` line. The dashboard shows Xe-cores for `xe`.
+  - `i915`: only `eu_count` is read (from `i915_sseu_status`); `xe_core_count` is `null`, `eu_simd_width` is fixed to `8`.
+- `eu_count` — kept for compatibility; equal to `topology[label].eu_count`.
+- The debugfs-backed values (dGPU VRAM, `gpu_*`, `topology`) need the monitor to run as root; when they can't be read they are `null`, never `0`.
 
 ---
 
@@ -1772,7 +1797,7 @@ GET /monitor/process_detail?pid=12345
     "pressure": { "level": "medium", "score": 45.2, "cpu": 12.5, "memory": 8.0, "io": 3.2, "network_busy_level": "medium", "..." },
     "network": { "per_nic": {"eth0": {"tx_mbps": 120.5, "rx_mbps": 85.3}} },
     "disk": { "is_stressed": false, "level": "low", "score": 0.12, "busy_level": "LOW", "busy_pct": 0.0, "pressure_pct": 12.0, "stressed_disks": [], "disk_io": {"sda": {"read_mbps": 50.0, "write_mbps": 30.0, "pressure": 0.12, "disk_type": "sata_ssd", "is_busy": false}}, "..." },
-    "gpu": { "vram": {"card0": {"used_mb": 1024, "total_mb": 8192, "free_mb": 7168}}, "gpu_usage": {"devices": [{"engines": ["rcs","bcs","vcs","vecs","ccs"], "engine_util": {"rcs": 45.2, "vcs": 80.5, "..."}, "freqs": [{"name": "gt0", "cur_mhz": 1200, "act_mhz": 1150, "max_mhz": 1500, "rc6_pct": 85.0}], "power_w": {"gpu": 15.2, "pkg": 28.0}}]} },
+    "gpu": { "vram": {"GPU.0": {"total_bytes": 33554432000, "used_bytes": 12884901888, "usage_percent": 38.4, "pci_slot": "0000:00:02.0", "gpu_total_bytes": 33554432000, "gpu_used_bytes": 1073741824, "gpu_usage_percent": 3.2}}, "gpu_usage": {"devices": [{"engines": ["rcs","bcs","vcs","vecs","ccs"], "engine_util": {"rcs": 45.2, "vcs": 80.5, "..."}, "freqs": [{"name": "gt0", "cur_mhz": 1200, "act_mhz": 1150, "max_mhz": 1500, "rc6_pct": 85.0}], "power_w": {"gpu": 15.2, "pkg": 28.0}}]} },
     "npu": { "npu_smi": {} },
     "monitored_sections_updated_at": 1718600000
   }
@@ -1782,6 +1807,8 @@ GET /monitor/process_detail?pid=12345
 **Field Notes:**
 - `monitored_sections_updated_at` — Unix timestamp that advances only when the effective monitored-sections set changes. Clients can watch it to detect a config change and re-sync (see `/monitor/config/monitored_sections`).
 - A section-filtered response contains only the requested section keys plus `collected_at` and `monitored_sections_updated_at`.
+- `gpu.vram` has the same per-card structure as in `/monitor/static_info` (see the GPU Field Notes there), including the `gpu_*` fields for an `xe` iGPU.
+- `gpu.gpu_usage.devices[].engine_util` values and `freqs[].rc6_pct` can be `null` when they are unknown for the interval — e.g. while an `xe` device is runtime-suspended (SmarTune does not wake it to sample), or on the first sample after it resumes. The engine is still listed; treat `null` as N/A, not 0.
 
 ---
 

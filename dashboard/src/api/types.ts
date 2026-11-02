@@ -751,6 +751,22 @@ export interface PackageInfo {
   raw: string | null
 }
 
+/**
+ * Per-card memory from monitor/metrics/gpu_info.py get_gpu_vram(). For a dGPU,
+ * total/used/usage_percent are its VRAM. For an iGPU they are whole-system
+ * memory; an Xe iGPU also carries gpu_* fields for the GPU's own share of it
+ * (null when the monitor lacks privilege). i915 iGPUs have no gpu_* fields.
+ */
+export interface GpuVramEntry {
+  total_bytes: number | null
+  used_bytes: number | null
+  usage_percent: number | null
+  pci_slot?: string | null
+  gpu_total_bytes?: number | null
+  gpu_used_bytes?: number | null
+  gpu_usage_percent?: number | null
+}
+
 export interface StaticInfoData {
   collected_at: string
   host?: {
@@ -839,9 +855,10 @@ export interface StaticInfoData {
       gt0?: { min_mhz: number | null; max_mhz: number | null }
       gt1?: { min_mhz: number | null; max_mhz: number | null }
     }>
-    vram: Record<string, { total_bytes: number | null; used_bytes: number | null; usage_percent: number | null; pci_slot?: string | null }>
+    vram: Record<string, GpuVramEntry>
     pcie: Record<string, { current_speed: string | null; current_width: string | null; max_speed: string | null; max_width: string | null }>
     eu_count?: Record<string, number | null>
+    topology?: Record<string, GpuTopology>
     pci_addresses?: Record<string, string>
     driver_names?: Record<string, string | null>
   }
@@ -851,6 +868,12 @@ export interface StaticInfoData {
     pciid?: string | null
     driver_version?: string | null
   }
+}
+
+export interface GpuTopology {
+  eu_count: number | null
+  xe_core_count: number | null
+  eu_simd_width: 8 | 16 | null
 }
 
 export interface ToolOutput {
@@ -958,7 +981,7 @@ export interface DynamicInfoData {
   }
   disk: DiskData
   gpu: {
-    vram: Record<string, { total_bytes: number | null; used_bytes: number | null; usage_percent: number | null; pci_slot?: string | null }>
+    vram: Record<string, GpuVramEntry>
     gpu_usage: GpuUsageOutput
   }
   npu: {

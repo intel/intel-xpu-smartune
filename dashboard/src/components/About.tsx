@@ -4,6 +4,7 @@ import { InfoCircleOutlined, ReloadOutlined, RobotOutlined } from '@ant-design/i
 import { api } from '../api/client'
 import type { PackageInfo, StaticInfoData } from '../api/types'
 import { COLORS } from '../styles/theme'
+import { getGpuComputeUnits, type GpuComputeUnits } from '../utils/gpuTopology'
 import '../styles/about.css'
 
 const { Text, Title, Paragraph } = Typography
@@ -96,7 +97,7 @@ function summarizeGpuPcie(
 
 function summarizeGpuPerDevice(
   staticInfo?: StaticInfoData | null,
-): Array<{ label: string; engines: string; gtFreqs: string; driverName: string | null; euCount: number | null; vramTotalGb: number | null }> {
+): Array<{ label: string; engines: string; gtFreqs: string; driverName: string | null; compute: GpuComputeUnits | null; vramTotalGb: number | null }> {
   if (!staticInfo) return []
 
   const cardKeySet = new Set<string>()
@@ -145,7 +146,7 @@ function summarizeGpuPerDevice(
     ].filter(Boolean).join(' | ')
 
     const driverName = staticInfo.gpu.driver_names?.[cardKey] ?? null
-    const euCount = staticInfo.gpu.eu_count?.[cardKey] ?? null
+    const compute = getGpuComputeUnits(driverName, staticInfo.gpu.topology?.[cardKey], staticInfo.gpu.eu_count?.[cardKey])
     const vramTotalBytes = staticInfo.gpu.vram?.[cardKey]?.total_bytes ?? null
     const vramTotalGb = typeof vramTotalBytes === 'number' && vramTotalBytes > 0 ? vramTotalBytes / (1024 ** 3) : null
 
@@ -154,7 +155,7 @@ function summarizeGpuPerDevice(
       engines: enginesSummary || 'N/A',
       gtFreqs: gtFreqs || 'N/A',
       driverName,
-      euCount,
+      compute,
       vramTotalGb,
     }
   })
@@ -350,7 +351,7 @@ export default function About({ active }: Props) {
         { label: 'Name', value: nameLine },
         { label: 'Driver', value: driverLabel },
         ...(pcieKeys.has(cardKey) ? [{ label: 'PCIe', value: pcieText }] : []),
-        ...(gpu.driverName === 'i915' && typeof gpu.euCount === 'number' ? [{ label: 'EU Count', value: `${gpu.euCount}` }] : []),
+        ...(gpu.compute ? [{ label: gpu.compute.label, value: `${gpu.compute.count}` }] : []),
         ...(pcieKeys.has(cardKey) && typeof gpu.vramTotalGb === 'number' ? [{ label: 'VRAM', value: `${gpu.vramTotalGb.toFixed(1)} GB` }] : []),
         { label: 'Engines', value: gpu.engines },
         { label: 'GT0/GT1 Freq', value: gpu.gtFreqs },

@@ -2689,12 +2689,14 @@ function GpuSummaryCard({
   device,
   accent,
   utilizationSeries,
+  memBwGbS,
   trendWindow,
   onOpen,
 }: {
   device: GpuDeviceView
   accent: string
   utilizationSeries: Array<number | null>
+  memBwGbS?: number | null
   trendWindow: '1m' | '5m'
   onOpen: () => void
 }) {
@@ -2721,6 +2723,7 @@ function GpuSummaryCard({
         { label: 'Power', value: formatMetric(device.powerGpu, 'W', 2) },
         { label: device.label === 'iGPU' ? 'System Memory' : 'VRAM Usage', value: memoryUsage === null ? 'N/A' : `${memoryUsage.toFixed(1)}%` },
         { label: 'Frequency', value: formatMetric(frequencyMhz, 'MHz', 0) },
+        { label: 'Mem BW', value: formatMetric(memBwGbS, 'GB/s', 1) },
       ]}
       series={utilizationSeries}
       trendWindow={trendWindow}
@@ -4575,6 +4578,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
               { label: 'Temperature', value: formatMetric(dynamicInfo?.cpu?.temperature_c, '°C', 1) },
               { label: 'Pkg Power', value: formatMetric(dynamicInfo?.cpu?.pkg_power_w, 'W', 2) },
               { label: 'IOWait', value: formatMetric(dynamicInfo?.cpu?.iowait_total, '%', 1) },
+              { label: 'Mem BW', value: formatMetric(dynamicInfo?.memory?.bandwidth?.devices?.cpu_gb_s, 'GB/s', 1) },
             ]}
             series={getSeries('util:cpu')}
             trendWindow={trendWindow}
@@ -4741,6 +4745,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
               device={device}
               accent={GPU_UTIL_COLORS[index % GPU_UTIL_COLORS.length]}
               utilizationSeries={getSeries(`gpu:${device.id}:util`)}
+              memBwGbS={device.label === 'iGPU' ? dynamicInfo?.memory?.bandwidth?.devices?.gpu_gb_s : null}
               trendWindow={trendWindow}
               onOpen={() => setDeviceDetail({ kind: 'gpu', deviceId: device.id })}
             />

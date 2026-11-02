@@ -346,6 +346,10 @@ def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
                 "read_gb_s": to_float(bandwidth.get("read_gb_s")),
                 "write_gb_s": to_float(bandwidth.get("write_gb_s")),
                 "usage_percent": to_float(bandwidth.get("usage_percent")),
+                "devices": {
+                    "cpu_gb_s": to_float((bandwidth.get("devices") or {}).get("cpu_gb_s")),
+                    "gpu_gb_s": to_float((bandwidth.get("devices") or {}).get("gpu_gb_s")),
+                },
             },
         }
 

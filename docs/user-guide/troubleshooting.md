@@ -64,6 +64,19 @@ The dashboard adapts automatically to what the server reports. See
   while the device is runtime-suspended or just resuming — SmarTune avoids
   waking an idle GPU just to sample it.
 
+## Memory bandwidth, CPU/GPU Mem BW or SoC cache shows N/A
+
+- **DRAM bandwidth** is read from Intel PMT telemetry where SmarTune knows the
+  platform's layout (Meteor/Arrow Lake, Lunar Lake, Panther Lake, Wildcat Lake),
+  and otherwise from the memory-controller counters. If neither is readable it
+  shows **N/A**.
+- **CPU / GPU Mem BW** and the **SoC cache** figures come from PMT only. PMT's
+  telemetry file is readable by root only, so run the monitor as root.
+- The first reading after the monitor starts is always blank — a rate needs two
+  samples.
+- CPU + GPU Mem BW can exceed the DRAM total: they are measured before the SoC
+  cache, and part of that traffic never reaches DRAM.
+
 ## Resource limits aren't being applied
 
 - Resource control requires the **full** install and its native dependencies

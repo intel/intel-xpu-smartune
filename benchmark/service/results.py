@@ -136,6 +136,11 @@ _METRIC_LABELS = {
     "memory_used_percent_median": "memory used, share",
     "memory_bandwidth_gb_s_median": "memory bandwidth",
     "memory_bandwidth_percent_median": "memory bandwidth, share",
+    "memory_bandwidth_read_gb_s_median": "memory bandwidth, read",
+    "memory_bandwidth_write_gb_s_median": "memory bandwidth, write",
+    "memory_bandwidth_cpu_gb_s_median": "CPU memory bandwidth",
+    "memory_bandwidth_gpu_gb_s_median": "GPU memory bandwidth",
+    "memory_soc_cache_hit_percent_median": "SoC cache hit rate",
     "gpu_power_w_median": "GPU power",
     "gpu_frequency_mhz_median": "GPU clock",
     "gpu_render_busy_percent_median": "GPU render busy",
@@ -269,6 +274,19 @@ _METRIC_NOTES = {
     "cpu_package_tjmax_c_median": "The junction temperature limit this CPU throttles at.",
     "memory_used_percent_median": "Share of total system memory in use.",
     "memory_bandwidth_percent_median": "Share of the memory controller's theoretical peak bandwidth.",
+    "memory_bandwidth_gb_s_median": "Actual DRAM read + write bandwidth, measured at the memory controller.",
+    "memory_bandwidth_cpu_gb_s_median": (
+        "Memory traffic the CPU sends out after its own caches. Some is served by "
+        "the shared SoC cache, so CPU + GPU can exceed the DRAM bandwidth."
+    ),
+    "memory_bandwidth_gpu_gb_s_median": (
+        "Memory traffic the GPU (incl. media) sends out after its own caches. Some "
+        "is served by the shared SoC cache, so CPU + GPU can exceed the DRAM bandwidth."
+    ),
+    "memory_soc_cache_hit_percent_median": (
+        "Share of CPU/GPU/NPU memory traffic served by the SoC cache in front of "
+        "DRAM instead of DRAM itself. Higher is better."
+    ),
     "npu_power_w_median": "Absent on drivers that do not expose an NPU power rail.",
     "npu_temperature_c_median": "Absent on drivers that do not expose an NPU temperature sensor.",
 }

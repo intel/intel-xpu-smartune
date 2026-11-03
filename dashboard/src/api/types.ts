@@ -962,20 +962,32 @@ export interface DynamicInfoData {
     swap_total_gb: number | null
     swap_used_gb: number | null
     swap_usage_percent: number | null
-    // Live system memory bandwidth (uncore IMC counters). All null when the PMU
-    // is unavailable or on the first sample (needs a delta). usage_percent is the
+    // Live DRAM bandwidth (SoC PMT telemetry, else uncore IMC counters; see
+    // `source`). All null when neither is available or on the first sample
+    // (needs a delta). usage_percent is the
     // live total as a fraction of the DMI ceiling (static max_bandwidth_gb_s).
     bandwidth?: {
       total_gb_s: number | null
       read_gb_s: number | null
       write_gb_s: number | null
       usage_percent: number | null
-      // CPU/GPU attributed bandwidth from SoC PMT telemetry (estimate, ~3% vs
-      // the system total). Null where the platform's PMT layout is unknown.
+      // Where total/read/write came from: SoC PMT telemetry or the uncore IMC
+      // PMU. Both count at the memory controller. Null when neither is available.
+      source?: 'pmt' | 'imc' | null
+      // CPU/GPU egress bandwidth from SoC PMT telemetry: traffic leaving each
+      // device toward memory, before the SoC memory-side cache. Part of it hits
+      // that cache, so cpu + gpu can exceed total_gb_s (DRAM). Null where the
+      // platform's PMT layout is unknown.
       devices?: {
         cpu_gb_s: number | null
         gpu_gb_s: number | null
       } | null
+      // Hit ratio (%) of the SoC memory-side cache, shared by CPU/GPU/NPU.
+      // Null where the platform has no such counters.
+      soc_cache_hit_percent?: number | null
+      // Same cache in absolute terms: traffic it served (hit) / fetched from DRAM (miss).
+      soc_cache_hit_gb_s?: number | null
+      soc_cache_miss_gb_s?: number | null
     } | null
   }
   pressure: PressureData

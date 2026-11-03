@@ -97,6 +97,18 @@ const PERF_COLORS = {
 
 const GPU_UTIL_COLORS = [PERF_COLORS.gpu, PERF_COLORS.memory, PERF_COLORS.cpu, PERF_COLORS.network, PERF_COLORS.npu] as const
 
+// Hover help for the memory-bandwidth figures; device values are measured before
+// the shared SoC cache, so they can add up to more than the DRAM bandwidth.
+const MEM_BW_TIPS = {
+  cpu: 'Memory traffic the CPU sends out after its own caches. Some is served by the shared SoC cache, so CPU + GPU can exceed the Memory bandwidth.',
+  gpu: 'Memory traffic the GPU (incl. media) sends out after its own caches. Some is served by the shared SoC cache, so CPU + GPU can exceed the Memory bandwidth.',
+  npu: 'Memory traffic the NPU sends out. Some is served by the shared SoC cache, so it can exceed what actually reaches DRAM.',
+  dram: 'Actual DRAM read + write bandwidth, measured at the memory controller.',
+  socCacheHit: 'SoC System-Level Cache (SLC) Hit Rate: Measures the percentage of memory traffic processed directly within the on-chip SLC (shared by CPU, GPU, and NPU) without accessing off-chip DRAM.',
+  socCacheHitBw: 'Memory traffic served by the shared SoC cache: DRAM bandwidth saved.',
+  socCacheMissBw: 'Memory traffic the shared SoC cache passed on to DRAM. DRAM bandwidth can be higher, since data evicted from the cache is also written back.',
+} as const
+
 // Distinct purple family for GPU lines in the utilization trend, so multiple GPUs
 // read as one group yet stay separable from CPU/Memory/Disk/Network.
 const GPU_TREND_COLORS = ['#a78bfa', '#c084fc', '#e879f9', '#8b5cf6', '#d8b4fe'] as const
@@ -2351,28 +2363,52 @@ function SystemHealthTrend({
   )
 }
 
+/** Metric label with an optional "?" icon that shows `tip` on hover. */
+function HelpLabel({ label, tip, style, className }: {
+  label: string
+  tip?: string
+  style?: React.CSSProperties
+  className?: string
+}) {
+  return (
+    <Text className={className} style={style}>
+      {label}
+      {tip && (
+        <AntTooltip title={tip}>
+          <QuestionCircleOutlined
+            aria-label={`About ${label}`}
+            style={{ marginLeft: 4, fontSize: '0.9em', color: COLORS.textMuted, cursor: 'help' }}
+          />
+        </AntTooltip>
+      )}
+    </Text>
+  )
+}
+
 function DetailItem({
   label,
   value,
   source,
+  tip,
 }: {
   label: string
   value: string
   source?: DataSourceKind
+  tip?: string
 }) {
   return (
     <div className="perf-detail-item">
       <div className="perf-detail-label-row">
-        <Text className="perf-detail-label">{label}</Text>
+        <HelpLabel className="perf-detail-label" label={label} tip={tip} />
       </div>
-      <Text className="perf-detail-value" title={value}>
-        {value}
-      </Text>
+      {/* No native title: values wrap (never truncate), so it only repeated the
+          visible text in a browser tooltip that covered the next group. */}
+      <Text className="perf-detail-value">{value}</Text>
     </div>
   )
 }
 
-type DetailRow = { label: string; value: string; source?: DataSourceKind; divider?: boolean }
+type DetailRow = { label: string; value: string; source?: DataSourceKind; divider?: boolean; tip?: string }
 
 function TrendPanel({
   title,
@@ -2400,6 +2436,8 @@ function TrendPanel({
   detailTopMargin = 12,
   primaryChartLabel,
   alert,
+  badges,
+  detailContent,
 }: {
   title: string
   accent: string
@@ -2407,7 +2445,7 @@ function TrendPanel({
   unit?: string
   statusColor?: string
   series: Array<number | null>
-  details: Array<{ label: string; value: string; source?: DataSourceKind; divider?: boolean }>
+  details: DetailRow[]
   subtitle?: string
   sparkMode?: SparkMode
   trendWindow?: '1m' | '5m'
@@ -2426,6 +2464,10 @@ function TrendPanel({
   detailTopMargin?: number
   primaryChartLabel?: string
   alert?: { text: string; color: string }
+  /** Spec chips shown instead of the plain subtitle line. */
+  badges?: string[]
+  /** Replaces the label/value detail grid (e.g. the Memory detail cards). */
+  detailContent?: React.ReactNode
 }) {
   const gaugeValue = isNumber(value) ? Math.max(0, Math.min(value, 100)) : 0
   const hasValue = isNumber(value)
@@ -2519,7 +2561,13 @@ function TrendPanel({
               </div>
             )}
           </div>
-          {subtitle && (
+          {badges && badges.length > 0 ? (
+            <div className="perf-spec-badges">
+              {badges.map((badge, index) => (
+                <span className="perf-metrics-chip perf-spec-badge" key={`${title}-badge-${index}`}>{badge}</span>
+              ))}
+            </div>
+          ) : subtitle && (
             <Text className="perf-trend-subtitle" title={subtitle}>
               {subtitle}
             </Text>
@@ -2577,11 +2625,20 @@ function TrendPanel({
           )}
         </div>
       </div>
-      <div className={`perf-detail-grid ${compactDetails ? 'perf-detail-grid--compact' : ''}`} style={{ marginTop: detailTopMargin }}>
-        {details.map((item) =>
+      {detailContent ? (
+        <div style={{ marginTop: detailTopMargin }}>{detailContent}</div>
+      ) : (
+      <div
+        className={[
+          'perf-detail-grid',
+          compactDetails ? 'perf-detail-grid--compact' : '',
+        ].filter(Boolean).join(' ')}
+        style={{ marginTop: detailTopMargin }}
+      >
+        {details.map((item, index) =>
           item.divider ? (
             <div
-              key={`${title}-divider-${item.label}`}
+              key={`${title}-divider-${index}`}
               style={{
                 gridColumn: '1 / -1',
                 borderTop: `1px solid ${COLORS.border}`,
@@ -2597,11 +2654,234 @@ function TrendPanel({
               </Text>
             </div>
           ) : (
-            <DetailItem key={`${title}-${item.label}`} label={item.label} value={item.value} source={item.source} />
+            // Labels repeat across groups ("Total", "Used"), so key by position.
+            <DetailItem key={`${title}-${index}`} label={item.label} value={item.value} source={item.source} tip={item.tip} />
           )
         )}
       </div>
+      )}
     </Card>
+  )
+}
+
+const RW_READ_COLOR = PERF_COLORS.cpu
+const RW_WRITE_COLOR = PERF_COLORS.npu
+const CRITICAL_UTIL_THRESHOLD = 90
+
+/** Capacity-style colour: `normal` below 80%, orange from 80%, red from 90%. */
+function usageColor(percent: number | null | undefined, normal?: string): string | undefined {
+  if (isNumber(percent) && percent >= CRITICAL_UTIL_THRESHOLD) return COLORS.red
+  if (isNumber(percent) && percent >= BUSY_UTIL_THRESHOLD) return COLORS.orange
+  return normal
+}
+
+function clampPercent(value: number | null | undefined): number {
+  return isNumber(value) ? Math.max(0, Math.min(value, 100)) : 0
+}
+
+function DetailCardStat({ label, value, tip, color }: { label: string; value: string; tip?: string; color?: string }) {
+  return (
+    <div className="perf-dcard-stat">
+      <HelpLabel className="perf-dcard-stat-label" label={label} tip={tip} />
+      <span className="perf-dcard-stat-value" style={color ? { color } : undefined}>{value}</span>
+    </div>
+  )
+}
+
+/** Thin bar; several segments stack left to right (DRAM read + write). */
+function DetailCardBar({ segments }: { segments: Array<{ percent: number; color: string }> }) {
+  let remaining = 100
+  return (
+    <div className="perf-dcard-bar">
+      {segments.map((seg, index) => {
+        const width = Math.min(seg.percent, remaining)
+        remaining -= width
+        return <span key={index} style={{ width: `${width}%`, background: seg.color }} />
+      })}
+    </div>
+  )
+}
+
+function DetailCard({ title, tip, headline, children }: { title: string; tip?: string; headline?: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <div className="perf-dcard-card">
+      <div className="perf-dcard-card-head">
+        <HelpLabel className="perf-dcard-card-title" label={title} tip={tip} />
+        {headline}
+      </div>
+      {children}
+    </div>
+  )
+}
+
+/**
+ * Memory detail body: RAM | Swap on top, DRAM bandwidth | SoC cache below.
+ * The RAM card has no bar of its own: the panel's main gauge already shows RAM usage.
+ */
+function MemoryDetailCards({ memory, totalGb, usedGb, maxBandwidthGbS, readSeries, writeSeries, sparkMode, trendWindow }: {
+  memory: DynamicInfoData['memory'] | null | undefined
+  totalGb: number | null | undefined
+  usedGb: number | null
+  maxBandwidthGbS: number | null | undefined
+  readSeries: Array<number | null>
+  writeSeries: Array<number | null>
+  sparkMode?: SparkMode
+  trendWindow?: '1m' | '5m'
+}) {
+  const bw = memory?.bandwidth
+  const swapPercent = memory?.swap_usage_percent
+  // Bar full scale = theoretical DRAM bandwidth; derive it from usage_percent when the static ceiling is missing.
+  const ceiling = isNumber(maxBandwidthGbS) && maxBandwidthGbS > 0
+    ? maxBandwidthGbS
+    : isNumber(bw?.total_gb_s) && isNumber(bw?.usage_percent) && bw.usage_percent > 0
+      ? (bw.total_gb_s * 100) / bw.usage_percent
+      : null
+  const share = (gbS: number | null | undefined) => (isNumber(gbS) && ceiling ? (gbS / ceiling) * 100 : 0)
+  const bwUsage = isNumber(bw?.usage_percent) ? bw.usage_percent : isNumber(bw?.total_gb_s) && ceiling ? share(bw.total_gb_s) : null
+  const hitPercent = bw?.soc_cache_hit_percent
+  // Round the axis up to a tidy number just above the window's peak (at least 2 GB/s).
+  const bwPeak = Math.max(0, ...[...readSeries, ...writeSeries].filter(isNumber))
+  const bwAxisMax = Math.max(2, Math.ceil(bwPeak * 1.15))
+
+  return (
+    <div className="perf-dcard-grid">
+      <DetailCard title="RAM">
+        <div className="perf-dcard-stats">
+          <DetailCardStat label="Total" value={formatMetric(totalGb, 'GB', 1)} />
+          <DetailCardStat label="Used" value={formatMetric(usedGb, 'GB', 1)} />
+          <DetailCardStat label="Available" value={formatMetric(memory?.available_gb, 'GB', 1)} />
+        </div>
+      </DetailCard>
+
+      <DetailCard
+        title="Swap"
+        headline={<span className="perf-dcard-card-headline" style={{ color: usageColor(swapPercent, PERF_COLORS.memory) }}>{formatPercent(swapPercent)}</span>}
+      >
+        <DetailCardBar segments={[{ percent: clampPercent(swapPercent), color: usageColor(swapPercent) ?? PERF_COLORS.memory }]} />
+        <div className="perf-dcard-stats">
+          <DetailCardStat label="Total" value={formatMetric(memory?.swap_total_gb, 'GB', 1)} />
+          <DetailCardStat label="Used" value={formatMetric(memory?.swap_used_gb, 'GB', 1)} />
+        </div>
+      </DetailCard>
+
+      <DetailCard
+        title="DRAM Bandwidth"
+        tip={MEM_BW_TIPS.dram}
+        headline={
+          <span className="perf-dcard-card-headline" style={{ color: usageColor(bwUsage) }}>
+            {formatMetric(bw?.total_gb_s, 'GB/s', 1)}
+            {ceiling && (
+              <span className="perf-dcard-card-headline-sub">
+                {isNumber(bwUsage) ? `${bwUsage.toFixed(0)}% of ` : 'of '}{ceiling.toFixed(0)} GB/s
+              </span>
+            )}
+          </span>
+        }
+      >
+        <DetailCardBar
+          segments={[
+            { percent: share(bw?.read_gb_s), color: RW_READ_COLOR },
+            { percent: share(bw?.write_gb_s), color: RW_WRITE_COLOR },
+          ]}
+        />
+        {/* Auto-scaled: at the 45 GB/s ceiling everyday traffic would sit on the floor.
+            The bar above is the one that shows headroom. */}
+        <MultiLineSparkline
+          series={[
+            { key: 'read', label: 'Read', data: readSeries, stroke: RW_READ_COLOR },
+            { key: 'write', label: 'Write', data: writeSeries, stroke: RW_WRITE_COLOR },
+          ]}
+          width={320}
+          height={64}
+          responsive
+          mode={sparkMode || 'axis'}
+          xStartLabel={trendWindow ? `-${trendWindow}` : ''}
+          xEndLabel="now"
+          yMin={0}
+          yMax={bwAxisMax}
+          yTickCount={3}
+        />
+        <div className="perf-dcard-stats">
+          <DetailCardStat label="Read" value={formatMetric(bw?.read_gb_s, 'GB/s', 1)} color={RW_READ_COLOR} />
+          <DetailCardStat label="Write" value={formatMetric(bw?.write_gb_s, 'GB/s', 1)} color={RW_WRITE_COLOR} />
+        </div>
+      </DetailCard>
+
+      <DetailCard
+        title="SoC Cache"
+        tip={MEM_BW_TIPS.socCacheHit}
+        headline={<span className="perf-dcard-card-headline">{formatPercent(hitPercent)}<span className="perf-dcard-card-headline-sub">hit</span></span>}
+      >
+        {/* Neutral colour: a low hit rate is workload-dependent, not a fault. */}
+        <DetailCardBar segments={[{ percent: clampPercent(hitPercent), color: PERF_COLORS.memory }]} />
+        <div className="perf-dcard-stats">
+          <DetailCardStat label="Hit BW" value={formatMetric(bw?.soc_cache_hit_gb_s, 'GB/s', 1)} tip={MEM_BW_TIPS.socCacheHitBw} />
+          <DetailCardStat label="Miss BW" value={formatMetric(bw?.soc_cache_miss_gb_s, 'GB/s', 1)} tip={MEM_BW_TIPS.socCacheMissBw} />
+        </div>
+      </DetailCard>
+    </div>
+  )
+}
+
+type DiskIoData = NonNullable<NonNullable<DynamicInfoData['disk']>['disk_io']>[string]
+
+/**
+ * Disk detail body: Capacity | I/O. The panel's main gauge is I/O utilization,
+ * so the capacity bar here is a different metric, not a repeat.
+ */
+function DiskDetailCards({ disk, sizeGb }: { disk: DiskIoData; sizeGb: number | null | undefined }) {
+  const usage = disk.usage_percent
+  return (
+    <div className="perf-dcard-grid">
+      <DetailCard
+        title="Capacity"
+        headline={<span className="perf-dcard-card-headline" style={{ color: usageColor(usage, PERF_COLORS.disk) }}>{formatPercent(usage)}</span>}
+      >
+        <DetailCardBar segments={[{ percent: clampPercent(usage), color: usageColor(usage) ?? PERF_COLORS.disk }]} />
+        <div className="perf-dcard-stats perf-dcard-stats--2">
+          <DetailCardStat label="Size" value={formatMetric(sizeGb, 'GB', 2)} />
+          <DetailCardStat label="Used" value={formatMetric(disk.used_size_gb, 'GB', 2)} />
+        </div>
+      </DetailCard>
+
+      <DetailCard title="I/O">
+        <div className="perf-dcard-stats perf-dcard-stats--2">
+          <DetailCardStat label="Read" value={formatMetric(disk.read_kb_per_sec, 'KB/s', 1)} color={RW_READ_COLOR} />
+          <DetailCardStat label="Write" value={formatMetric(disk.write_kb_per_sec, 'KB/s', 1)} color={RW_WRITE_COLOR} />
+          <DetailCardStat label="Read IOPS" value={formatMetric(disk.read_iops, 'IOPS', 1)} color={RW_READ_COLOR} />
+          <DetailCardStat label="Write IOPS" value={formatMetric(disk.write_iops, 'IOPS', 1)} color={RW_WRITE_COLOR} />
+        </div>
+      </DetailCard>
+    </div>
+  )
+}
+
+/** Network detail body: one card per direction (Receive | Send). */
+function NetworkDirectionCard({ title, rate, util, lossPct, overflowPct, color }: {
+  title: string
+  rate: number | null | undefined
+  util: number | null | undefined
+  lossPct: number | null | undefined
+  overflowPct: number | null | undefined
+  color: string
+}) {
+  const barColor = usageColor(util) ?? color
+  return (
+    <DetailCard
+      title={title}
+      headline={
+        <span className="perf-dcard-card-headline" style={{ color: usageColor(util) }}>
+          {formatBytesRate(rate)}
+          <span className="perf-dcard-card-headline-sub">{isNumber(util) ? `${util.toFixed(1)}% of link` : 'of link N/A'}</span>
+        </span>
+      }
+    >
+      <DetailCardBar segments={[{ percent: clampPercent(util), color: barColor }]} />
+      <div className="perf-dcard-stats perf-dcard-stats--2">
+        <DetailCardStat label="Packet Loss" value={formatPercent(lossPct ?? null)} />
+        <DetailCardStat label="Buffer Overflow" value={formatPercent(overflowPct ?? null)} />
+      </div>
+    </DetailCard>
   )
 }
 
@@ -2666,7 +2946,7 @@ function ResourceSummaryCard({
   primaryLabel: string
   primaryValue: number | null
   primaryUnit: string
-  metrics: Array<{ label: string; value: string }>
+  metrics: Array<{ label: string; value: string; tip?: string }>
   series: Array<number | null>
   trendWindow: '1m' | '5m'
   statusReason?: string
@@ -2722,7 +3002,10 @@ function ResourceSummaryCard({
 
       <div className="perf-gpu-summary-meta">
         {metrics.map((metric) => (
-          <span key={metric.label}><Text>{metric.label}</Text><strong title={metric.value}>{metric.value}</strong></span>
+          <span key={metric.label}>
+            <HelpLabel label={metric.label} tip={metric.tip} />
+            <strong title={metric.value}>{metric.value}</strong>
+          </span>
         ))}
       </div>
     </Card>
@@ -2769,7 +3052,7 @@ function GpuSummaryCard({
           ? { label: gpuMemLabel(device, 'long'), value: formatMemoryGb(device.igpuMem.usedMb) }
           : { label: gpuMemLabel(device, 'long'), value: memoryUsage === null ? 'N/A' : `${memoryUsage.toFixed(1)}%` },
         { label: 'Frequency', value: formatMetric(frequencyMhz, 'MHz', 0) },
-        { label: 'Mem BW', value: formatMetric(memBwGbS, 'GB/s', 1) },
+        { label: 'Mem BW', value: formatMetric(memBwGbS, 'GB/s', 1), tip: MEM_BW_TIPS.gpu },
       ]}
       series={utilizationSeries}
       trendWindow={trendWindow}
@@ -2876,7 +3159,7 @@ function DetailStatGroup({
   items,
 }: {
   title: string
-  items: Array<{ key: string; label: string; value: string }>
+  items: Array<{ key: string; label: string; value: string; tip?: string }>
 }) {
   if (items.length === 0) return null
   return (
@@ -2885,7 +3168,7 @@ function DetailStatGroup({
       <div style={{ display: 'grid', gridTemplateColumns: 'auto auto', columnGap: 12, lineHeight: '17px' }}>
         {items.map((item) => (
           <Fragment key={item.key}>
-            <Text style={{ color: COLORS.textMuted, fontSize: 10, whiteSpace: 'nowrap' }}>{item.label}</Text>
+            <HelpLabel label={item.label} tip={item.tip} style={{ color: COLORS.textMuted, fontSize: 10, whiteSpace: 'nowrap' }} />
             <Text style={{ color: COLORS.text, fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
               {item.value}
             </Text>
@@ -3167,11 +3450,13 @@ function GpuDeviceCard({
   trendWindow,
   getSeries,
   sparkMode,
+  memBwGbS,
 }: {
   device: GpuDeviceView
   trendWindow: '1m' | '5m'
   getSeries: (key: string) => Array<number | null>
   sparkMode: SparkMode
+  memBwGbS?: number | null
 }) {
   const utilSeries = getSeries(`gpu:${device.id}:util`)
   const gt0FreqSeries = getSeries(`gpu:${device.id}:freq:gt0:cur_mhz`)
@@ -3319,17 +3604,23 @@ function GpuDeviceCard({
           />
           <DetailStatGroup
             title="Memory"
-            items={device.igpuMem
-              ? [
-                  { key: 'used', label: gpuMemLabel(device, 'long'), value: formatMemoryGb(device.igpuMem.usedMb) },
-                  { key: 'pct', label: '% of RAM', value: formatPercent(device.igpuMem.usagePercent) },
-                ]
-              : [
-                  { key: 'pct', label: gpuMemLabel(device, 'short'), value: formatPercent(device.memUsage) },
-                  ...(device.label !== 'iGPU' && isNumber(device.vramAvailableGb)
-                    ? [{ key: 'avail', label: 'Available', value: formatMetric(device.vramAvailableGb, 'GB', 1) }]
-                    : []),
-                ]}
+            items={[
+              ...(device.igpuMem
+                ? [
+                    { key: 'used', label: gpuMemLabel(device, 'long'), value: formatMemoryGb(device.igpuMem.usedMb) },
+                    { key: 'pct', label: '% of RAM', value: formatPercent(device.igpuMem.usagePercent) },
+                  ]
+                : [
+                    { key: 'pct', label: gpuMemLabel(device, 'short'), value: formatPercent(device.memUsage) },
+                    ...(device.label !== 'iGPU' && isNumber(device.vramAvailableGb)
+                      ? [{ key: 'avail', label: 'Available', value: formatMetric(device.vramAvailableGb, 'GB', 1) }]
+                      : []),
+                  ]),
+              // Mem BW comes from SoC telemetry, so only the iGPU has it.
+              ...(device.label === 'iGPU'
+                ? [{ key: 'bw', label: 'Mem BW', value: formatMetric(memBwGbS, 'GB/s', 1), tip: MEM_BW_TIPS.gpu }]
+                : []),
+            ]}
           />
           <DetailStatGroup
             title="Power"
@@ -3639,6 +3930,10 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
       }
       if (showMemorySection) {
         updates['util:memory'] = normalizePercent(data.memory?.usage_percent)
+        // Raw GB/s, not a percentage: the DRAM card scales its own axis.
+        const memBw = data.memory?.bandwidth
+        updates['mem:bw_read'] = isNumber(memBw?.read_gb_s) ? memBw.read_gb_s : null
+        updates['mem:bw_write'] = isNumber(memBw?.write_gb_s) ? memBw.write_gb_s : null
       }
       if (showPressureSection) {
         updates['pressure:score'] = isNumber(data.pressure?.score) ? data.pressure.score! * 100 : null
@@ -4104,7 +4399,8 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
     ? Math.max(dynamicTotalGb - dynamicInfo.memory.available_gb, 0)
     : null
   const dynamicSwapTotalGb = dynamicInfo?.memory?.swap_total_gb
-  const memorySnapshotMeta = useMemo(() => {
+  // Spec pieces: joined into one line on the summary card, shown as badges in the detail.
+  const memorySpecParts = useMemo((): string[] => {
     if (staticMemory) {
       const parts: string[] = []
       const totalGb = staticMemory.total_gb
@@ -4129,13 +4425,14 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
       // Theoretical DRAM bandwidth ceiling (MT/s x bus width), not a measured peak.
       const peak = staticMemory.max_bandwidth_gb_s
       if (isNumber(peak)) parts.push(`Theoretical BW ${peak.toFixed(0)} GB/s`)
-      return parts.join(' | ')
+      return parts
     }
     const parts: string[] = []
     if (isNumber(dynamicTotalGb)) parts.push(`${dynamicTotalGb.toFixed(1)} GB total`)
     if (isNumber(dynamicSwapTotalGb)) parts.push(`Swap ${dynamicSwapTotalGb.toFixed(1)} GB`)
-    return parts.length ? parts.join(' | ') : 'No data'
+    return parts
   }, [staticMemory, dynamicTotalGb, dynamicSwapTotalGb])
+  const memorySnapshotMeta = memorySpecParts.length ? memorySpecParts.join(' | ') : 'No data'
 
   // Build per-NIC render data
   const networkNicCards = useMemo(() => {
@@ -4327,6 +4624,16 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
     : isNumber(dynamicInfo?.cpu?.lpe_core_freq_mhz)
       ? { label: 'LPE-Core Freq', value: formatMetric(dynamicInfo.cpu.lpe_core_freq_mhz, 'MHz', 0) }
       : { label: 'Logical Cores', value: formatPlain(staticInfo?.cpu?.core_count?.logical) }
+
+  // Shared by the CPU summary card and the top of the CPU detail view.
+  const cpuSummaryMetrics: Array<{ label: string; value: string; tip?: string }> = [
+    { label: 'P-Core Freq', value: formatMetric(dynamicInfo?.cpu?.p_core_freq_mhz, 'MHz', 0) },
+    cpuSecondaryFrequency,
+    { label: 'Temperature', value: formatMetric(dynamicInfo?.cpu?.temperature_c, '°C', 1) },
+    { label: 'Pkg Power', value: formatMetric(dynamicInfo?.cpu?.pkg_power_w, 'W', 2) },
+    { label: 'IOWait', value: formatMetric(dynamicInfo?.cpu?.iowait_total, '%', 1) },
+    { label: 'Mem BW', value: formatMetric(dynamicInfo?.memory?.bandwidth?.devices?.cpu_gb_s, 'GB/s', 1), tip: MEM_BW_TIPS.cpu },
+  ]
 
   const coreGroups = useMemo<Array<{ label: string; type: 'P' | 'E' | 'LPE' | 'Core'; indices: number[] }>>(() => {
     const usage = dynamicInfo?.cpu?.per_core_usage || []
@@ -4645,14 +4952,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
             primaryLabel="Util"
             primaryValue={cpuTrendValue}
             primaryUnit="%"
-            metrics={[
-              { label: 'P-Core Freq', value: formatMetric(dynamicInfo?.cpu?.p_core_freq_mhz, 'MHz', 0) },
-              cpuSecondaryFrequency,
-              { label: 'Temperature', value: formatMetric(dynamicInfo?.cpu?.temperature_c, '°C', 1) },
-              { label: 'Pkg Power', value: formatMetric(dynamicInfo?.cpu?.pkg_power_w, 'W', 2) },
-              { label: 'IOWait', value: formatMetric(dynamicInfo?.cpu?.iowait_total, '%', 1) },
-              { label: 'Mem BW', value: formatMetric(dynamicInfo?.memory?.bandwidth?.devices?.cpu_gb_s, 'GB/s', 1) },
-            ]}
+            metrics={cpuSummaryMetrics}
             series={getSeries('util:cpu')}
             trendWindow={trendWindow}
             statusReason={cpuBusy && isNumber(cpuTrendValue) ? `High load: ${cpuTrendValue.toFixed(1)}%` : undefined}
@@ -4674,7 +4974,8 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
             primaryUnit="%"
             metrics={[
               { label: 'Available', value: formatMetric(dynamicInfo?.memory?.available_gb, 'GB', 1) },
-              { label: 'Bandwidth', value: formatMetric(dynamicInfo?.memory?.bandwidth?.total_gb_s, 'GB/s', 1) },
+              { label: 'Bandwidth', value: formatMetric(dynamicInfo?.memory?.bandwidth?.total_gb_s, 'GB/s', 1), tip: MEM_BW_TIPS.dram },
+              { label: 'SoC Cache Hit', value: formatPercent(dynamicInfo?.memory?.bandwidth?.soc_cache_hit_percent), tip: MEM_BW_TIPS.socCacheHit },
               { label: 'Swap Used', value: formatSwapUsed(dynamicInfo?.memory?.swap_used_gb, dynamicInfo?.memory?.swap_total_gb) },
             ]}
             series={getSeries('util:memory')}
@@ -4797,7 +5098,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
               { label: 'Power', value: npuParsed?.pmt_available !== false && npuParsed?.power_w != null ? `${(npuParsed.power_w as number).toFixed(2)} W` : 'N/A' },
               { label: 'Frequency', value: npuParsed?.frequency_mhz != null ? `${Math.round(npuParsed.frequency_mhz as number)} MHz` : 'N/A' },
               { label: 'Mem Used', value: npuParsed?.memory_bytes != null ? `${((npuParsed.memory_bytes as number) / (1024 * 1024)).toFixed(2)} MB` : 'N/A' },
-              { label: 'Mem BW', value: npuParsed?.pmt_available !== false ? formatNpuMemoryBw(npuParsed?.noc_bandwidth_mib_per_s as number | null | undefined) : 'N/A' },
+              { label: 'Mem BW', value: npuParsed?.pmt_available !== false ? formatNpuMemoryBw(npuParsed?.noc_bandwidth_mib_per_s as number | null | undefined) : 'N/A', tip: MEM_BW_TIPS.npu },
               { label: 'Tile Used', value: npuParsed?.pmt_available !== false && npuParsed?.tile_config != null ? `${npuParsed.tile_config}` : 'N/A' },
             ]}
             series={getSeries('npu:util')}
@@ -4890,6 +5191,21 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
       >
         {deviceDetail?.kind === 'cpu' && (
           <div className="perf-device-detail-stack">
+            <Card className="perf-card perf-rise" bodyStyle={{ padding: 16 }}>
+              <div className="perf-device-detail-heading">
+                <Space size={8}>
+                  <ThunderboltOutlined style={{ color: PERF_COLORS.cpu }} />
+                  <Text style={{ color: COLORS.text, fontWeight: 600 }}>Summary</Text>
+                  {cpuSnapshotMeta && <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>{cpuSnapshotMeta}</Text>}
+                </Space>
+                <Tag style={{ fontSize: 10 }}>Util {formatMetric(cpuTrendValue, '%', 1)}</Tag>
+              </div>
+              <div className="perf-detail-grid">
+                {cpuSummaryMetrics.map((metric) => (
+                  <DetailItem key={metric.label} label={metric.label} value={metric.value} source="dynamic" tip={metric.tip} />
+                ))}
+              </div>
+            </Card>
             {coreGroups.length === 0 ? (
               <Card className="perf-card" bodyStyle={{ padding: 16 }}>
                 <Text style={{ color: COLORS.textMuted }}>No per-core CPU data</Text>
@@ -4963,17 +5279,20 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
             statusColor={memoryTrendStatusColor}
             series={getSeries('util:memory')}
             subtitle={memorySnapshotMeta}
-            details={[
-              { label: 'RAM Available', value: formatMetric(dynamicInfo?.memory?.available_gb, 'GB', 1), source: 'dynamic' },
-              { label: 'RAM Total', value: formatMetric(dynamicInfo?.memory?.total_gb ?? staticInfo?.memory?.total_gb, 'GB', 1), source: 'dynamic' },
-              { label: 'RAM Used', value: formatMetric(memoryUsedGb, 'GB', 1), source: 'dynamic' },
-              { label: 'Swap Total', value: formatMetric(dynamicInfo?.memory?.swap_total_gb ?? staticInfo?.memory?.swap_total_gb, 'GB', 1), source: 'dynamic' },
-              { label: 'Swap Used', value: formatMetric(dynamicInfo?.memory?.swap_used_gb, 'GB', 1), source: 'dynamic' },
-              { label: 'Swap Usage', value: formatPercent(dynamicInfo?.memory?.swap_usage_percent), source: 'dynamic' },
-              { label: 'BW Total', value: formatMetric(dynamicInfo?.memory?.bandwidth?.total_gb_s, 'GB/s', 1), source: 'dynamic' },
-              { label: 'BW Read', value: formatMetric(dynamicInfo?.memory?.bandwidth?.read_gb_s, 'GB/s', 1), source: 'dynamic' },
-              { label: 'BW Write', value: formatMetric(dynamicInfo?.memory?.bandwidth?.write_gb_s, 'GB/s', 1), source: 'dynamic' },
-            ]}
+            badges={memorySpecParts}
+            details={[]}
+            detailContent={
+              <MemoryDetailCards
+                memory={dynamicInfo?.memory}
+                totalGb={dynamicInfo?.memory?.total_gb ?? staticInfo?.memory?.total_gb}
+                usedGb={memoryUsedGb}
+                maxBandwidthGbS={staticInfo?.memory?.max_bandwidth_gb_s}
+                readSeries={getSeries('mem:bw_read')}
+                writeSeries={getSeries('mem:bw_write')}
+                sparkMode={sparkMode}
+                trendWindow={trendWindow}
+              />
+            }
             sparkMode={sparkMode}
             trendWindow={trendWindow}
           />
@@ -4990,15 +5309,9 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
               statusColor={diskData.is_busy ? COLORS.red : COLORS.green}
               series={getSeries(`disk:${deviceDetail.name}:util`)}
               subtitle={diskSizeLookup[deviceDetail.name] != null ? `${formatMetric(diskSizeLookup[deviceDetail.name], 'GB', 1)} total capacity` : undefined}
-              details={[
-                { label: 'Size', value: formatMetric(diskSizeLookup[deviceDetail.name], 'GB', 2), source: 'static' },
-                { label: 'Used', value: formatMetric(diskData.used_size_gb, 'GB', 2), source: 'dynamic' },
-                { label: 'Capacity Usage', value: formatPercent(diskData.usage_percent), source: 'dynamic' },
-                { label: 'Read', value: formatMetric(diskData.read_kb_per_sec, 'KB/s', 1), source: 'dynamic' },
-                { label: 'Write', value: formatMetric(diskData.write_kb_per_sec, 'KB/s', 1), source: 'dynamic' },
-                { label: 'Read IOPS', value: formatMetric(diskData.read_iops, 'IOPS', 1), source: 'dynamic' },
-                { label: 'Write IOPS', value: formatMetric(diskData.write_iops, 'IOPS', 1), source: 'dynamic' },
-              ]}
+              badges={diskSizeLookup[deviceDetail.name] != null ? [`${formatMetric(diskSizeLookup[deviceDetail.name], 'GB', 1)} total`] : undefined}
+              details={[]}
+              detailContent={<DiskDetailCards disk={diskData} sizeGb={diskSizeLookup[deviceDetail.name]} />}
               sparkMode={sparkMode}
               trendWindow={trendWindow}
             />
@@ -5021,16 +5334,28 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
               statusColor={isNumber(utilization) && utilization >= BUSY_UTIL_THRESHOLD ? COLORS.red : PERF_COLORS.network}
               series={getSeries(deviceDetail.name ? `util:network:${deviceDetail.name}` : 'util:network')}
               subtitle={`Link speed ${formatNetworkSpeed(nic?.bandwidth ?? fbStaticPeakMbps)}`}
-              details={[
-                { label: 'Receive Bandwidth', value: formatBytesRate(rxRate), source: 'dynamic' },
-                { label: 'Receive Utilization', value: formatPercent(nic?.rxUtil ?? fallbackRxUtil), source: 'dynamic' },
-                { label: 'Receive Packet Loss', value: formatPercent(pressure?.rx?.drop_ratio_pct ?? null), source: 'dynamic' },
-                { label: 'Receive Buffer Overflow', value: formatPercent(pressure?.rx?.hw_overflow_ratio_pct ?? null), source: 'dynamic' },
-                { label: 'Send Bandwidth', value: formatBytesRate(txRate), source: 'dynamic' },
-                { label: 'Send Utilization', value: formatPercent(nic?.txUtil ?? fallbackTxUtil), source: 'dynamic' },
-                { label: 'Send Packet Loss', value: formatPercent(pressure?.tx?.drop_ratio_pct ?? null), source: 'dynamic' },
-                { label: 'Send Buffer Overflow', value: formatPercent(pressure?.tx?.fifo_ratio_pct ?? null), source: 'dynamic' },
-              ]}
+              badges={[`Link speed ${formatNetworkSpeed(nic?.bandwidth ?? fbStaticPeakMbps)}`]}
+              details={[]}
+              detailContent={
+                <div className="perf-dcard-grid">
+                  <NetworkDirectionCard
+                    title="Receive"
+                    rate={rxRate}
+                    util={nic?.rxUtil ?? fallbackRxUtil}
+                    lossPct={pressure?.rx?.drop_ratio_pct}
+                    overflowPct={pressure?.rx?.hw_overflow_ratio_pct}
+                    color={RW_READ_COLOR}
+                  />
+                  <NetworkDirectionCard
+                    title="Send"
+                    rate={txRate}
+                    util={nic?.txUtil ?? fallbackTxUtil}
+                    lossPct={pressure?.tx?.drop_ratio_pct}
+                    overflowPct={pressure?.tx?.fifo_ratio_pct}
+                    color={RW_WRITE_COLOR}
+                  />
+                </div>
+              }
               sparkMode={sparkMode}
               trendWindow={trendWindow}
             />
@@ -5052,6 +5377,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
             trendWindow={trendWindow}
             getSeries={getSeries}
             sparkMode={sparkMode}
+            memBwGbS={dynamicInfo?.memory?.bandwidth?.devices?.gpu_gb_s}
           />
         )}
       </Modal>

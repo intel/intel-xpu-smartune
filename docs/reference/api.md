@@ -1711,7 +1711,7 @@ GET /monitor/process_detail?pid=12345
     "os": { "name": "...", "version": "...", "kernel": "..." },
     "driver": { "gpu": "...", "version": "..." },
     "cpu": { "model": "...", "cores": 16, "threads": 32 },
-    "memory": { "total_gb": 64, "type": "DDR5" },
+    "memory": { "total_gb": 64, "type": "DDR5", "max_bandwidth_gb_s": 89.6 },
     "io": { "disks": [...] },
     "gpu": {
       "names": ["..."],
@@ -1744,6 +1744,9 @@ GET /monitor/process_detail?pid=12345
   - `i915`: only `eu_count` is read (from `i915_sseu_status`); `xe_core_count` is `null`, `eu_simd_width` is fixed to `8`.
 - `eu_count` — kept for compatibility; equal to `topology[label].eu_count`.
 - The debugfs-backed values (dGPU VRAM, `gpu_*`, `topology`) need the monitor to run as root; when they can't be read they are `null`, never `0`.
+
+**Memory Field Notes:**
+- `memory.max_bandwidth_gb_s` — theoretical DRAM peak (MT/s × data width), read from DMI. `null` without root. It is the ceiling behind `usage_percent` in `memory.bandwidth` of `/monitor/dynamic_info`.
 
 ---
 
@@ -1795,7 +1798,7 @@ GET /monitor/process_detail?pid=12345
   "data": {
     "collected_at": "2026-06-17 10:30:00",
     "cpu": { "usage_total": 35.2, "per_core_usage": [...], "per_core_freq_mhz": [...], "p_core_usage": 45.0, "e_core_usage": 20.0, "lpe_core_usage": 10.0, "temperature_c": 65.0, "per_core_temperature_c": [...], "..." },
-    "memory": { "usage_percent": 50.0, "total_gb": 64.0, "available_gb": 32.0, "swap_total_gb": 8.0, "swap_used_gb": 1.2 },
+    "memory": { "usage_percent": 50.0, "total_gb": 64.0, "available_gb": 32.0, "swap_total_gb": 8.0, "swap_used_gb": 1.2, "swap_usage_percent": 15.0, "bandwidth": { "total_gb_s": 35.5, "read_gb_s": 21.4, "write_gb_s": 14.1, "usage_percent": 39.6, "source": "pmt", "devices": { "cpu_gb_s": 37.0, "gpu_gb_s": 0.0 }, "soc_cache_hit_percent": 25.0, "soc_cache_hit_gb_s": 10.0, "soc_cache_miss_gb_s": 30.0 } },
     "pressure": { "level": "medium", "score": 45.2, "cpu": 12.5, "memory": 8.0, "io": 3.2, "network_busy_level": "medium", "..." },
     "network": { "per_nic": {"eth0": {"tx_mbps": 120.5, "rx_mbps": 85.3}} },
     "disk": { "is_stressed": false, "level": "low", "score": 0.12, "busy_level": "LOW", "busy_pct": 0.0, "pressure_pct": 12.0, "stressed_disks": [], "disk_io": {"sda": {"read_mbps": 50.0, "write_mbps": 30.0, "pressure": 0.12, "disk_type": "sata_ssd", "is_busy": false}}, "..." },
@@ -1810,6 +1813,9 @@ GET /monitor/process_detail?pid=12345
 - `monitored_sections_updated_at` — Unix timestamp that advances only when the effective monitored-sections set changes. Clients can watch it to detect a config change and re-sync (see `/monitor/config/monitored_sections`).
 - A section-filtered response contains only the requested section keys plus `collected_at` and `monitored_sections_updated_at`.
 - `gpu.vram` has the same per-card structure as in `/monitor/static_info` (see the GPU Field Notes there), including the `gpu_*` fields for an `xe` iGPU.
+- `memory.bandwidth` — live DRAM bandwidth in GB/s. `total_gb_s` is `read_gb_s` + `write_gb_s`; `usage_percent` is that total as a share of the theoretical peak (`max_bandwidth_gb_s` in static info) and is `null` when the peak is unknown. `source` says where the figures came from: `"pmt"` (Intel PMT telemetry, preferred where SmarTune knows the platform's layout) or `"imc"` (uncore memory-controller counters, the fallback). Where both exist they agree to within about 1%. Every field is `null` on the first sample (a rate needs two readings) and when neither source is readable; PMT telemetry needs the monitor to run as root.
+- `memory.bandwidth.devices` — `cpu_gb_s` / `gpu_gb_s` are the traffic each device sends toward memory, measured *before* the SoC memory-side cache. Part of that traffic is served from the cache, so the two can add up to more than `total_gb_s`. `null` where the platform has no PMT layout.
+- `memory.bandwidth.soc_cache_*` — the memory-side cache shared by CPU, GPU and NPU: `soc_cache_hit_percent` is the hit share (%), `soc_cache_hit_gb_s` / `soc_cache_miss_gb_s` are the traffic it served / fetched from DRAM. `null` without PMT cache counters.
 - `gpu.gpu_usage.devices[].engine_util` values and `freqs[].rc6_pct` can be `null` when they are unknown for the interval — e.g. while an `xe` device is runtime-suspended (SmarTune does not wake it to sample), or on the first sample after it resumes. The engine is still listed; treat `null` as N/A, not 0.
 
 ---
@@ -1849,6 +1855,7 @@ GET /monitor/process_detail?pid=12345
 - `range_seconds` is only used when both `start_time` and `end_time` are omitted
 - Server anchors the window to its own clock to avoid client clock-skew issues
 - `sections` only trims serialization/transfer; rows are still read from the DB in full. Omitting it (or `null`) returns every stored field. Invalid section names return `101 ARGUMENT_ERROR`
+- Dynamic rows keep `memory.bandwidth` (including `source`, `devices` and `soc_cache_*`, see `/monitor/dynamic_info`), which is what History charts. Rows stored before these fields existed simply lack them.
 
 **Response:**
 ```json

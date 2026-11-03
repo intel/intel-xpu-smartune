@@ -140,7 +140,8 @@ runner.py  start_run()
        monitor/metrics/gpu_perf.create_independent_sampler()  GPU power/freq/engines
        monitor/metrics/cpu.py       P/E core usage+freq, package power/temp, memory
        monitor/metrics/npu.py       NPU utilisation/power/freq/bandwidth/temp
-       monitor/metrics/membw.py     system memory bandwidth (uncore IMC, perf_event)
+       monitor/metrics/memory.py    capacity (get_memory_capacity) + DRAM bandwidth
+                                    (MemoryBandwidthSampler: Intel PMT first, uncore IMC fallback)
   └─ BENCH_METRICS_CSV -> the run script
         run_with_metrics() in templates/benchmark_*_common.sh
           tees the case output to <case_dir>/detail.log and marks [begin, end]
@@ -156,6 +157,27 @@ pollers; a second caller at 2 Hz would consume the baseline the dashboard is abo
 to read. Utilisation would merely get noisy, but GPU power is an energy counter
 differenced over `dt`, so a microsecond gap turns one counter tick into thousands
 of watts.
+
+Memory bandwidth follows the same rule. A bandwidth reading is a counter delta, so
+the sampler owns a private `MemoryBandwidthSampler` and reads capacity through
+`get_memory_capacity()`, which touches no bandwidth state. The dashboard's
+`get_memory_bandwidth()` uses its own shared instance; calling it from here would
+advance that instance's baseline and shrink the dashboard's next sampling window.
+DRAM read/write come from Intel PMT where the platform has it (else the uncore IMC
+counters), and the run records which one in `memory_bandwidth_source`. Columns:
+
+| Column | Meaning |
+|---|---|
+| `memory_bandwidth_gb_s` | DRAM total |
+| `memory_bandwidth_read_gb_s` / `_write_gb_s` | DRAM read / write |
+| `memory_bandwidth_source` | `pmt` or `imc` (text, so it has no median) |
+| `memory_bandwidth_cpu_gb_s` / `_gpu_gb_s` | CPU / GPU traffic toward memory, before the SoC cache (PMT only) |
+| `memory_soc_cache_hit_pct` | SoC memory-side cache hit rate (PMT only) |
+
+The PMT-only columns are blank where PMT is unavailable (no root, or an unknown
+platform layout), and a CSV from before they existed lacks them entirely:
+`export_windowed_metric_medians.py` treats a missing column as empty, so older runs
+still export.
 
 Two column families upstream had are gone, because their sources are not portable:
 `xe_*` (EU-level counters, needs a patched IGT built from Intel-internal sources)

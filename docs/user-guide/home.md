@@ -36,16 +36,33 @@ lax.
 Below the pressure panel, **Resource Details** cards show live utilization for each
 subsystem your server is monitoring:
 
-- **CPU** — overall and per-core style utilization, plus package power.
-- **Memory** — used / available, and (where available) memory bandwidth.
+- **CPU** — overall and per-core style utilization, plus package power and, where
+  available, how much memory bandwidth the CPU is driving (**Mem BW**).
+- **Memory** — used / available, and (where available) DRAM bandwidth and the
+  **SoC cache hit rate**.
 - **GPU** — per-card (iGPU/dGPU) frequency, power, per-engine utilization and
   memory. A dGPU shows its VRAM; an iGPU shares system memory, and on the `xe`
-  driver it also shows how much of that memory the GPU itself is using.
+  driver it also shows how much of that memory the GPU itself is using and, where
+  available, its memory bandwidth.
 - **NPU** — utilization, power, temperature, frequency, and memory.
 - **Disk** and **Network** — throughput and activity.
 
 Use **Configure monitored resources** to choose which of these cards are shown —
 handy on a platform without a dGPU or NPU, for example.
+
+Select a card to open its detail view. Memory, Disk and Network lay theirs out as
+small cards:
+
+- **Memory** — *RAM* and *Swap* capacity; *DRAM Bandwidth* with a read/write trend
+  and a bar scaled to the platform's theoretical peak; and *SoC Cache* (hit rate,
+  hit and miss bandwidth).
+- **Disk** — *Capacity* and *I/O* (read/write throughput and IOPS).
+- **Network** — one card each for *Receive* and *Send*: rate, share of the link,
+  packet loss and buffer overflow.
+
+Capacity and link bars turn orange at 80% and red at 90%. Hover the **?** next to a
+label for a short explanation — the memory-bandwidth figures in particular count
+traffic at different points, so CPU + GPU can add up to more than the DRAM total.
 
 ## Top resource consumers
 

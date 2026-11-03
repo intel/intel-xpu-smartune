@@ -658,6 +658,108 @@
   border-top: 1px solid rgba(120, 176, 255, 0.08);
 }
 
+/* Card-style device detail (Memory, Disk, Network): label/value groups in a 2-column grid. */
+.perf-dcard-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.perf-dcard-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(120, 176, 255, 0.04);
+  border: 1px solid rgba(120, 176, 255, 0.1);
+}
+
+.perf-dcard-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.perf-dcard-card-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #d9e3ff !important;
+}
+
+.perf-dcard-card-headline {
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+  color: #f1f5ff;
+  white-space: nowrap;
+}
+
+.perf-dcard-card-headline-sub {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 400;
+  color: rgba(195, 209, 245, 0.6);
+}
+
+.perf-dcard-bar {
+  display: flex;
+  height: 6px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(120, 176, 255, 0.12);
+}
+
+.perf-dcard-bar > span {
+  height: 100%;
+  transition: width 0.4s ease;
+}
+
+.perf-dcard-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.perf-dcard-stats--2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.perf-dcard-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.perf-dcard-stat-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: rgba(195, 209, 245, 0.6) !important;
+}
+
+.perf-dcard-stat-value {
+  font-size: 15px;
+  font-weight: 600;
+  color: #f1f5ff;
+  white-space: nowrap;
+}
+
+.perf-spec-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.perf-spec-badge {
+  font-size: 11px;
+  color: #b6c7ea;
+  white-space: nowrap;
+}
+
 .perf-detail-grid--compact {
   gap: 6px 10px;
 }
@@ -1457,6 +1559,12 @@
     flex-direction: column;
     gap: 12px;
     min-width: 0;
+  }
+}
+
+@media (max-width: 900px) {
+  .perf-dcard-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -2489,4 +2597,29 @@
 :root[data-theme='light'] .perf-device-drawer .perf-metrics-chip {
   background: var(--color-panel-bg);
   border-color: var(--color-border);
+}
+
+:root[data-theme='light'] .perf-device-drawer .perf-dcard-card {
+  background: var(--color-panel-bg);
+  border-color: var(--color-border);
+}
+
+:root[data-theme='light'] .perf-device-drawer .perf-dcard-card-title {
+  color: var(--color-text) !important;
+}
+
+/* No !important: inline threshold / read-write colours must still win. */
+:root[data-theme='light'] .perf-device-drawer .perf-dcard-card-headline,
+:root[data-theme='light'] .perf-device-drawer .perf-dcard-stat-value {
+  color: var(--color-text);
+}
+
+:root[data-theme='light'] .perf-device-drawer .perf-dcard-stat-label,
+:root[data-theme='light'] .perf-device-drawer .perf-dcard-card-headline-sub,
+:root[data-theme='light'] .perf-device-drawer .perf-spec-badge {
+  color: var(--color-text-muted) !important;
+}
+
+:root[data-theme='light'] .perf-device-drawer .perf-dcard-bar {
+  background: var(--color-border);
 }

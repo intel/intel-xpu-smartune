@@ -47,13 +47,15 @@ interface CpuMemTrendPoint {
   eCoreFreqMhz: number | null
   lpeCoreFreqMhz: number | null
   cpuTemperatureC: number | null
+  // CPU -> memory traffic (PMT), measured before the SoC cache; null without PMT.
+  cpuMemBwGbS: number | null
 }
 
 interface MemoryTrendPoint {
   timestamp: string
   ts: number
-  // Left axis: capacity utilization (%). Right axis: the three IMC bandwidth
-  // reads (GB/s). Bandwidth is null when the PMU is unavailable or on the
+  // Left axis: capacity utilization (%). Right axis: the three DRAM bandwidth
+  // reads (GB/s). Bandwidth is null when neither PMT nor the PMU is available or on the
   // first sample (it is a counter delta).
   memoryUtilization: number | null
   bandwidthTotal: number | null
@@ -61,6 +63,10 @@ interface MemoryTrendPoint {
   bandwidthWrite: number | null
   swapUsedGb: number | null
   swapUsagePercent: number | null
+  // SoC memory-side cache (PMT); null where the platform has no such counters.
+  socCacheHitPercent: number | null
+  socCacheHitGbS: number | null
+  socCacheMissGbS: number | null
 }
 
 interface DiskTrendPoint {
@@ -586,6 +592,7 @@ function buildCpuMemTrendPoints(items: HistorySnapshotItem[]): CpuMemTrendPoint[
       eCoreFreqMhz: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.e_core_freq_mhz as number | null),
       lpeCoreFreqMhz: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.lpe_core_freq_mhz as number | null),
       cpuTemperatureC: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.temperature_c as number | null),
+      cpuMemBwGbS: toNumber(dynamic?.memory?.bandwidth?.devices?.cpu_gb_s),
     }
   })
 }
@@ -604,6 +611,9 @@ function buildMemoryTrendPoints(items: HistorySnapshotItem[]): MemoryTrendPoint[
       bandwidthWrite: toNumber(bandwidth?.write_gb_s),
       swapUsedGb: toNumber(dynamic?.memory?.swap_used_gb),
       swapUsagePercent: toNumber(dynamic?.memory?.swap_usage_percent),
+      socCacheHitPercent: toNumber(bandwidth?.soc_cache_hit_percent),
+      socCacheHitGbS: toNumber(bandwidth?.soc_cache_hit_gb_s),
+      socCacheMissGbS: toNumber(bandwidth?.soc_cache_miss_gb_s),
     }
   })
 }
@@ -2091,6 +2101,10 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
         { header: 'mem_bw_total_gbs', key: 'bwTotal', width: 16 },
         { header: 'mem_bw_read_gbs', key: 'bwRead', width: 16 },
         { header: 'mem_bw_write_gbs', key: 'bwWrite', width: 16 },
+        { header: 'cpu_mem_bw_gbs', key: 'cpuMemBw', width: 16 },
+        { header: 'soc_cache_hit_pct', key: 'socHitPct', width: 18 },
+        { header: 'soc_cache_hit_gbs', key: 'socHitBw', width: 18 },
+        { header: 'soc_cache_miss_gbs', key: 'socMissBw', width: 18 },
         { header: 'swap_used_gb', key: 'swap_used', width: 14 },
         { header: 'swap_util_pct', key: 'swap', width: 14 },
         { header: 'swap_total_gb', key: 'swap_total', width: 14 },
@@ -2102,6 +2116,10 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
         bwTotal: d?.memory?.bandwidth?.total_gb_s ?? null,
         bwRead: d?.memory?.bandwidth?.read_gb_s ?? null,
         bwWrite: d?.memory?.bandwidth?.write_gb_s ?? null,
+        cpuMemBw: d?.memory?.bandwidth?.devices?.cpu_gb_s ?? null,
+        socHitPct: d?.memory?.bandwidth?.soc_cache_hit_percent ?? null,
+        socHitBw: d?.memory?.bandwidth?.soc_cache_hit_gb_s ?? null,
+        socMissBw: d?.memory?.bandwidth?.soc_cache_miss_gb_s ?? null,
         swap_used: d?.memory?.swap_used_gb ?? null,
         swap: d?.memory?.swap_usage_percent ?? null,
         swap_total: d?.memory?.swap_total_gb ?? null,
@@ -2578,12 +2596,15 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
               ? [{ key: 'lpeCoreFreqMhz', name: 'LPE-Core Freq', color: '#c7a8ff', unit: 'MHz', dasharray: '6 3', defaultOn: false }]
               : []),
             { key: 'cpuTemperatureC', name: 'CPU Temp', color: '#fbbf24', unit: '°C', dasharray: '4 2', defaultOn: false },
+            // A fourth unit (%, MHz, °C, GB/s) on a two-axis chart: only the first two
+            // selected units get an axis, so enable it without the frequency lines.
+            { key: 'cpuMemBwGbS', name: 'CPU Mem BW', color: '#22d3ee', unit: 'GB/s', dasharray: '6 3', defaultOn: false },
           ]}
           order={2}
         />
       )}
 
-      {/* System Memory — capacity utilization (left %) + IMC bandwidth (right GB/s) */}
+      {/* System Memory — capacity utilization (left %) + DRAM bandwidth (right GB/s) */}
       {visibleSections.includes('memory') && !loading && memoryTrendPoints.length > 0 && (
         <ConfigurableChart
           title="System Memory"
@@ -2598,6 +2619,10 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
             { key: 'bandwidthRead', name: 'BW Read', color: '#22d3ee', unit: 'GB/s' },
             { key: 'bandwidthWrite', name: 'BW Write', color: METRIC_COLORS.write, unit: 'GB/s' },
             { key: 'swapUsagePercent', name: 'Swap Usage', color: '#f472b6', unit: '%', dasharray: '5 3' },
+            // Hit rate is noisy when DRAM is nearly idle, so these start hidden.
+            { key: 'socCacheHitPercent', name: 'SoC Cache Hit', color: '#facc15', unit: '%', dasharray: '2 2', defaultOn: false },
+            { key: 'socCacheHitGbS', name: 'Cache Hit BW', color: '#34d399', unit: 'GB/s', dasharray: '6 3', defaultOn: false },
+            { key: 'socCacheMissGbS', name: 'Cache Miss BW', color: '#fb923c', unit: 'GB/s', dasharray: '6 3', defaultOn: false },
             // A third unit: a chart has only two Y axes, so with % and GB/s both on this
             // would be drawn against the % axis. Off by default for that reason.
             { key: 'swapUsedGb', name: 'Swap Used', color: '#a78bfa', unit: 'GB', defaultOn: false },

@@ -22,8 +22,13 @@ spot patterns, recurring spikes, and slow regressions.
 
 Depending on your hardware and selected sections, History shows trends such as:
 
-- **CPU** — utilization and **CPU temperature (°C)**.
-- **System Memory** — usage over time.
+- **CPU** — utilization and **CPU temperature (°C)**. **CPU Mem BW** (GB/s) can be
+  switched on from the legend; leave the frequency lines off while it is shown,
+  because a chart has only two Y axes.
+- **System Memory** — usage, swap, and DRAM bandwidth (total / read / write) over
+  time. The SoC cache series (**SoC Cache Hit**, **Cache Hit BW**, **Cache Miss BW**)
+  start hidden; switch them on from the legend. Bandwidth series are blank on
+  platforms where neither Intel PMT nor the memory-controller counters can be read.
 - **GPU** — frequency, power, and engine utilization trends.
 - **NPU** — two charts: *Utilization & Frequency*, and *Power, DDR Bandwidth &
   Temperature*.

@@ -5,14 +5,15 @@
 
 * `get_memory_static()`  - DMI inventory: DDR speeds, per-slot devices, total
   capacity, and the theoretical peak-bandwidth ceiling.
-* `get_memory_dynamic()` - live capacity (used / available / percent plus swap),
-  with the live bandwidth reading folded in.
-* `get_memory_bandwidth()` / `Sampler` - live memory bandwidth from the uncore
-  IMC free-running counters. Needs root or `perf_event_paranoid <= 0`; yields
-  blanks when the PMU is unavailable. A reading is a counter delta, so each
-  consumer owns its own `Sampler`; the shared one behind `get_memory_bandwidth()`
-  is lock-guarded. The reading also carries a `devices` sub-dict (CPU/GPU
-  attributed bandwidth from PMT, see `pmt_telemetry`).
+* `get_memory_capacity()` - live capacity (used / available / percent plus swap).
+* `get_memory_dynamic()` - capacity plus the dashboard's live bandwidth reading.
+* `MemoryBandwidthSampler` - live DRAM bandwidth: from SoC PMT telemetry where the
+  platform has it (see `pmt_telemetry`), else from the IMC `Sampler`. Also carries
+  CPU/GPU egress bandwidth and SoC cache hit/miss (PMT). A reading is a counter
+  delta, so each consumer owns an instance (the benchmark sampler has its own);
+  the dashboard's shared one behind `get_memory_bandwidth()` is lock-guarded.
+* `Sampler` - DRAM bandwidth from the uncore IMC free-running counters. Needs
+  root or `perf_event_paranoid <= 0`.
 """
 
 import ctypes
@@ -27,7 +28,7 @@ from typing import Any, Dict, List, Optional
 import psutil
 
 from monitor.metrics.utils import run_cmd
-from monitor.pmt_telemetry import get_device_bandwidth, last_pmt_sample
+from monitor.pmt_telemetry import DeviceBandwidth, PmtBandwidthSampler, bandwidth_fields
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
@@ -464,80 +465,148 @@ class Sampler:
         self._last_counts = []
         self._last_ts = None
 
-_shared_sampler: Optional["Sampler"] = None
-_shared_sampler_started = False
-_shared_lock = threading.Lock()
-
-
 def _fmt(value: Optional[float]) -> str:
     return "n/a" if value is None else f"{value:.2f}"
 
 
-def _blank_bandwidth(devices: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+_dmi_ceiling_done = False
+_dmi_ceiling_gb_s: Optional[float] = None
+
+
+def _dmi_ceiling() -> Optional[float]:
+    """Theoretical peak from DMI, looked up once per process (dmidecode is a
+    subprocess). Not a sampler: the value is a constant of the installed DIMMs."""
+    global _dmi_ceiling_done, _dmi_ceiling_gb_s
+    if not _dmi_ceiling_done:
+        _dmi_ceiling_done = True
+        _dmi_ceiling_gb_s = _max_bandwidth_gbs(_dmi_slots())
+    return _dmi_ceiling_gb_s
+
+
+def _bandwidth_payload(
+    pmt: Dict[str, Any], imc: Optional[BandwidthSample], max_gb_s: Optional[float],
+) -> Dict[str, Any]:
+    """Pick the DRAM source (PMT first, IMC fallback) and build the payload."""
+    read = pmt.get("dram_read_gb_s")
+    write = pmt.get("dram_write_gb_s")
+    source: Optional[str] = None
+    if read is not None and write is not None:
+        source = "pmt"
+    elif imc is not None:
+        source = "imc"
+        read, write = imc.read_gb_s, imc.write_gb_s
+    total = None if source is None else read + write
     return {
-        "total_gb_s": None,
-        "read_gb_s": None,
-        "write_gb_s": None,
-        "usage_percent": None,
-        "devices": devices or {"cpu_gb_s": None, "gpu_gb_s": None},
+        "total_gb_s": None if total is None else round(total, 2),
+        "read_gb_s": None if read is None else round(read, 2),
+        "write_gb_s": None if write is None else round(write, 2),
+        "usage_percent": (round(100.0 * total / max_gb_s, 2)
+                          if total is not None and max_gb_s else None),
+        "source": source,
+        "devices": {"cpu_gb_s": pmt.get("cpu_gb_s"), "gpu_gb_s": pmt.get("gpu_gb_s")},
+        "soc_cache_hit_percent": pmt.get("soc_cache_hit_percent"),
+        "soc_cache_hit_gb_s": pmt.get("soc_cache_hit_gb_s"),
+        "soc_cache_miss_gb_s": pmt.get("soc_cache_miss_gb_s"),
     }
 
 
-def get_memory_bandwidth() -> Dict[str, Any]:
-    """System memory bandwidth for the dashboard, as a plain dict.
+class MemoryBandwidthSampler:
+    """Live memory bandwidth as a dashboard-shaped dict.
 
-    Always returns the same shape; every field is None when the PMU is
-    unavailable (non-Intel, no permission) or when this is the first read (a
-    bandwidth reading is a delta, so the first call has no baseline to subtract).
-    `usage_percent` is the live total as a fraction of the DMI ceiling, or None
-    when that ceiling is unknown.
+    DRAM total/read/write come from PMT (TOTAL_READ/WRITE_BANDWIDTH) when the
+    platform has it, so they share one snapshot with the CPU/GPU/cache figures;
+    otherwise from the uncore IMC PMU.
+
+    The IMC is sampled even while PMT is used (~10 us per call): that keeps its
+    delta baseline current, so a fallback mid-run (e.g. PMT attribution disabled
+    by its guard) yields a correct first reading.
+
+    A reading is a counter delta, so each consumer owns an instance; sharing one
+    would cut the other's sampling window. Not thread-safe on its own.
+    """
+
+    def __init__(self, log_sources: bool = False) -> None:
+        self._pmt: Optional[PmtBandwidthSampler] = None
+        self._imc: Optional[Sampler] = None
+        self._log_sources = log_sources
+        self.max_bandwidth_gb_s: Optional[float] = None
+
+    def start(self) -> bool:
+        """Open whatever sources the platform has. False if neither is usable."""
+        pmt = PmtBandwidthSampler()
+        self._pmt = pmt if pmt.start() else None
+        imc = Sampler()
+        self._imc = imc if imc.start() else None
+        self.max_bandwidth_gb_s = (self._imc.max_bandwidth_gb_s
+                                   if self._imc is not None else _dmi_ceiling())
+        return self._pmt is not None or self._imc is not None
+
+    def sample(self) -> Dict[str, Any]:
+        """Same shape every call; fields are None on the first call (no baseline)
+        or when no source is available."""
+        pmt_bw = self._pmt.sample() if self._pmt is not None else None
+        imc = self._imc.sample() if self._imc is not None else None
+        payload = _bandwidth_payload(bandwidth_fields(pmt_bw), imc, self.max_bandwidth_gb_s)
+        if self._log_sources:
+            self._log(imc, pmt_bw, payload["source"])
+        return payload
+
+    def close(self) -> None:
+        if self._imc is not None:
+            self._imc.close()
+            self._imc = None
+        self._pmt = None
+
+    def _log(self, imc: Optional[BandwidthSample], raw: Optional[DeviceBandwidth],
+             source: Optional[str]) -> None:
+        """Debug aid: IMC PMU vs PMT readings side by side, to compare under load."""
+        if imc is None and raw is None:
+            return
+        dt = self._pmt.last[1] if raw is not None and self._pmt.last else 0.0
+        logger.debug(
+            "MEMBW source=%s | imc total=%s (r=%s w=%s) | pmt dram=%s (r=%s w=%s) "
+            "cpu=%s gpu=%s npu=%s io=%s cache hit=%s miss=%s gpu_idle=%s dt=%.2fs",
+            source,
+            _fmt(imc.total_gb_s if imc else None),
+            _fmt(imc.read_gb_s if imc else None),
+            _fmt(imc.write_gb_s if imc else None),
+            _fmt(raw.sys_gb_s if raw else None),
+            _fmt(raw.sys_read_gb_s if raw else None),
+            _fmt(raw.sys_write_gb_s if raw else None),
+            _fmt(raw.cpu_gb_s if raw else None), _fmt(raw.gpu_gb_s if raw else None),
+            _fmt(raw.npu_gb_s if raw else None), _fmt(raw.io_gb_s if raw else None),
+            _fmt(raw.cache_hit_gb_s if raw else None),
+            _fmt(raw.cache_miss_gb_s if raw else None),
+            raw.gpu_idle if raw else None, dt,
+        )
+
+
+_shared_sampler: Optional[MemoryBandwidthSampler] = None
+_shared_sampler_started = False
+_shared_lock = threading.Lock()
+
+
+def get_memory_bandwidth() -> Dict[str, Any]:
+    """The dashboard's live memory bandwidth, from one process-wide
+    `MemoryBandwidthSampler` (lock-guarded). Other consumers that sample on their
+    own schedule (the benchmark sampler) must own their instance instead.
     """
     global _shared_sampler, _shared_sampler_started
-
-    # Per-device attribution comes from PMT and is independent of the IMC PMU.
-    devices = get_device_bandwidth()
-
     with _shared_lock:
         if not _shared_sampler_started:
             _shared_sampler_started = True
-            sampler = Sampler()
+            sampler = MemoryBandwidthSampler(log_sources=True)
             if sampler.start():
                 _shared_sampler = sampler
-            # start() already warns once on failure; leave _shared_sampler None
-            # so every later call is a cheap no-op returning blanks.
-
+            # Leave _shared_sampler None when no source is usable, so every later
+            # call is a cheap no-op returning blanks.
         if _shared_sampler is None:
-            return _blank_bandwidth(devices)
-
-        bw = _shared_sampler.sample()
-        if bw is None:
-            return _blank_bandwidth(devices)
-
-        max_gb_s = _shared_sampler.max_bandwidth_gb_s
-        usage_percent = (
-            round(100.0 * bw.total_gb_s / max_gb_s, 2)
-            if max_gb_s else None
-        )
-        pmt = last_pmt_sample()
-        if pmt is not None:
-            raw, dt = pmt
-            # Debug aid: IMC PMU total vs PMT attribution, to compare under load.
-            logger.debug(
-                "MEMBW imc total=%.2f (r=%.2f w=%.2f) | pmt cpu=%s gpu=%s npu=%s sys=%s dt=%.2fs",
-                bw.total_gb_s, bw.read_gb_s, bw.write_gb_s,
-                _fmt(raw.cpu_gb_s), _fmt(raw.gpu_gb_s), _fmt(raw.npu_gb_s),
-                _fmt(raw.sys_gb_s), dt,
-            )
-        return {
-            "total_gb_s": round(bw.total_gb_s, 2),
-            "read_gb_s": round(bw.read_gb_s, 2),
-            "write_gb_s": round(bw.write_gb_s, 2),
-            "usage_percent": usage_percent,
-            "devices": devices,
-        }
+            return _bandwidth_payload(bandwidth_fields(None), None, _dmi_ceiling())
+        return _shared_sampler.sample()
 
 
-def get_memory_dynamic() -> Dict[str, Any]:
+def get_memory_capacity() -> Dict[str, Any]:
+    """RAM and swap capacity only; touches no bandwidth sampler."""
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
     return {
@@ -547,5 +616,11 @@ def get_memory_dynamic() -> Dict[str, Any]:
         "swap_total_gb": round(swap.total / (1024 ** 3), 2),
         "swap_used_gb": round(swap.used / (1024 ** 3), 2),
         "swap_usage_percent": round(swap.percent, 2),
-        "bandwidth": get_memory_bandwidth(),
     }
+
+
+def get_memory_dynamic() -> Dict[str, Any]:
+    """Capacity plus the dashboard's live bandwidth. Advances the shared bandwidth
+    sampler, so only the dashboard's collector should call it; anyone else wants
+    `get_memory_capacity()`."""
+    return {**get_memory_capacity(), "bandwidth": get_memory_bandwidth()}

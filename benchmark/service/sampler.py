@@ -45,6 +45,15 @@ COLUMNS = (
     "memory_used_pct",
     "memory_bandwidth_gb_s",
     "memory_bandwidth_pct",
+    "memory_bandwidth_read_gb_s",
+    "memory_bandwidth_write_gb_s",
+    # "pmt" / "imc": which counters the DRAM columns above came from.
+    "memory_bandwidth_source",
+    # Device egress toward memory (before the SoC cache), from PMT; empty on
+    # platforms without it. cpu + gpu can exceed memory_bandwidth_gb_s.
+    "memory_bandwidth_cpu_gb_s",
+    "memory_bandwidth_gpu_gb_s",
+    "memory_soc_cache_hit_pct",
     "gpu_power_w",
     "gpu_freq_mhz",
     "gpu_render_busy_pct",
@@ -93,8 +102,7 @@ class RunSampler:
         self._fh = None
         self._writer: Optional[csv.DictWriter] = None
         self._gpu = None
-        self._membw: Optional[mem_metrics.Sampler] = None
-        self._membw_max_gb_s: Optional[float] = None
+        self._membw: Optional[mem_metrics.MemoryBandwidthSampler] = None
         self._cpu: Optional[cpu_metrics.CpuUsageSampler] = None
 
     # --- lifecycle --------------------------------------------------------
@@ -122,13 +130,10 @@ class RunSampler:
         gpu = gpu_perf.create_independent_sampler()
         self._gpu = gpu if gpu.start() else None
 
-        bandwidth = mem_metrics.Sampler()
-        if bandwidth.start():
-            self._membw = bandwidth
-            self._membw_max_gb_s = bandwidth.max_bandwidth_gb_s
-        else:
-            # start() already warned once with the reason.
-            self._membw = None
+        # Its own instance, not the dashboard's shared one: a reading is a
+        # counter delta, so sharing would cut both sampling windows.
+        bandwidth = mem_metrics.MemoryBandwidthSampler()
+        self._membw = bandwidth if bandwidth.start() else None
 
         # Constructing it takes the baseline, so the first row is a real interval
         # and not "usage since boot".
@@ -259,7 +264,9 @@ class RunSampler:
     def _sample_memory(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         try:
-            mem = mem_metrics.get_memory_dynamic()
+            # Capacity only: get_memory_dynamic() would also advance the
+            # dashboard's shared bandwidth sampler.
+            mem = mem_metrics.get_memory_capacity()
             total = mem.get("total_gb")
             available = mem.get("available_gb")
             out["memory_used_gb"] = (
@@ -272,13 +279,16 @@ class RunSampler:
             out.update({"memory_used_gb": None, "memory_available_gb": None,
                         "memory_used_pct": None})
 
-        bw = self._membw.sample() if self._membw is not None else None
-        gb_s = bw.total_gb_s if bw is not None else None
-        out["memory_bandwidth_gb_s"] = _round(gb_s)
-        out["memory_bandwidth_pct"] = (
-            _round(100.0 * gb_s / self._membw_max_gb_s)
-            if gb_s is not None and self._membw_max_gb_s else None
-        )
+        bw = self._membw.sample() if self._membw is not None else {}
+        devices = bw.get("devices") or {}
+        out["memory_bandwidth_gb_s"] = bw.get("total_gb_s")
+        out["memory_bandwidth_pct"] = bw.get("usage_percent")
+        out["memory_bandwidth_read_gb_s"] = bw.get("read_gb_s")
+        out["memory_bandwidth_write_gb_s"] = bw.get("write_gb_s")
+        out["memory_bandwidth_source"] = bw.get("source")
+        out["memory_bandwidth_cpu_gb_s"] = devices.get("cpu_gb_s")
+        out["memory_bandwidth_gpu_gb_s"] = devices.get("gpu_gb_s")
+        out["memory_soc_cache_hit_pct"] = bw.get("soc_cache_hit_percent")
         return out
 
     def _sample_gpu(self) -> Dict[str, Any]:

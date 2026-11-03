@@ -117,6 +117,12 @@ METRICS_COLUMNS = {
     'memory_used_pct': 'memory_used_percent_median',
     'memory_bandwidth_gb_s': 'memory_bandwidth_gb_s_median',
     'memory_bandwidth_pct': 'memory_bandwidth_percent_median',
+    'memory_bandwidth_read_gb_s': 'memory_bandwidth_read_gb_s_median',
+    'memory_bandwidth_write_gb_s': 'memory_bandwidth_write_gb_s_median',
+    # memory_bandwidth_source is a label ("pmt"/"imc"), not a metric: no median.
+    'memory_bandwidth_cpu_gb_s': 'memory_bandwidth_cpu_gb_s_median',
+    'memory_bandwidth_gpu_gb_s': 'memory_bandwidth_gpu_gb_s_median',
+    'memory_soc_cache_hit_pct': 'memory_soc_cache_hit_percent_median',
     'gpu_power_w': 'gpu_power_w_median',
     'gpu_freq_mhz': 'gpu_frequency_mhz_median',
     'gpu_render_busy_pct': 'gpu_render_busy_percent_median',

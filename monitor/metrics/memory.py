@@ -522,7 +522,7 @@ def get_memory_bandwidth() -> Dict[str, Any]:
         if pmt is not None:
             raw, dt = pmt
             # Debug aid: IMC PMU total vs PMT attribution, to compare under load.
-            logger.info(
+            logger.debug(
                 "MEMBW imc total=%.2f (r=%.2f w=%.2f) | pmt cpu=%s gpu=%s npu=%s sys=%s dt=%.2fs",
                 bw.total_gb_s, bw.read_gb_s, bw.write_gb_s,
                 _fmt(raw.cpu_gb_s), _fmt(raw.gpu_gb_s), _fmt(raw.npu_gb_s),

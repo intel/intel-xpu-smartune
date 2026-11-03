@@ -58,6 +58,7 @@ interface AppRow extends AppControl {
   score: number
   gpu_util: number
   gpu_mem_mb: number
+  npu_mem_mb: number
 }
 
 interface DiskIoRow extends AppControl {
@@ -361,7 +362,7 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
       const [resourceData, diskData, procData, dynData] = await Promise.all([
         api.getAppResourceStats(topCount),
         api.getAppDiskIoStats(topCount),
-        api.getProcesses(true, true).catch(() => null),
+        api.getProcesses(true, true, true).catch(() => null),
         api.getDynamicInfo(['gpu']).catch(() => null),
       ])
 
@@ -382,6 +383,7 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
         score: entry.score,
         gpu_util: entry.gpu_util ?? 0,
         gpu_mem_mb: entry.gpu_mem_mb ?? 0,
+        npu_mem_mb: entry.npu_mem_mb ?? 0,
       }))
       setRows(appRows)
 
@@ -512,7 +514,7 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
       title: 'Name',
       dataIndex: 'name',
       key: 'name',
-      width: '21%',
+      width: showGpu ? '14%' : '21%',
       ellipsis: true,
       render: (v: string, p: ProcessEntry) => (
         <Space size={4}>
@@ -566,7 +568,7 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
     {
       title: 'Disk I/O',
       key: 'disk_io',
-      width: showGpu ? '11%' : '12%',
+      width: showGpu ? '10%' : '12%',
       render: (_: unknown, p: ProcessEntry) => {
         if (p.io_read_rate == null && p.io_write_rate == null)
           return <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>—</Text>
@@ -621,6 +623,21 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
                 </Space>
               )
             },
+          },
+          {
+            title: (
+              <Tooltip title="NPU buffers this process holds (drm-resident-memory, system memory). It reflects held memory, not that the process is running on the NPU, and may partly overlap RSS.">
+                NPU Mem
+              </Tooltip>
+            ),
+            key: 'npu_mem',
+            width: '8%',
+            render: (_: unknown, p: ProcessEntry) =>
+              p.npu_mem_mb === undefined ? (
+                <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>—</Text>
+              ) : (
+                <Text style={{ color: COLORS.text, fontSize: 11 }}>{formatMemory(p.npu_mem_mb * 1024)}</Text>
+              ),
           },
         ]
       : []),
@@ -753,6 +770,19 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
       dataIndex: 'gpu_mem_mb',
       key: 'gpu_mem_mb',
       sorter: (a, b) => a.gpu_mem_mb - b.gpu_mem_mb,
+      render: (v: number) => (
+        <Text style={{ color: v > 0 ? COLORS.text : COLORS.textMuted }}>{v.toFixed(1)}</Text>
+      ),
+    },
+    {
+      title: (
+        <Tooltip title="NPU buffers this process holds (drm-resident-memory, system memory). It reflects held memory, not that the process is running on the NPU, and may partly overlap RSS.">
+          NPU Mem (MB)
+        </Tooltip>
+      ),
+      dataIndex: 'npu_mem_mb',
+      key: 'npu_mem_mb',
+      sorter: (a, b) => a.npu_mem_mb - b.npu_mem_mb,
       render: (v: number) => (
         <Text style={{ color: v > 0 ? COLORS.text : COLORS.textMuted }}>{v.toFixed(1)}</Text>
       ),

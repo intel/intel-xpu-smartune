@@ -870,7 +870,7 @@ class SystemPressureMonitor:
 
 @monitor_bp.route('/app_resource_stats', methods=['GET'])
 def get_app_resource_stats():
-    """Return per-application CPU/memory/GPU resource usage (top N by score)."""
+    """Return per-application CPU/memory/GPU resource usage (top N by score) plus held NPU memory."""
     try:
         _start_app_stats_auto_refresh()
         n = int(request.args.get('n', 10))
@@ -1001,6 +1001,14 @@ def get_processes():
                 devs = gpu_stats.get(p['pid'])
                 if devs:
                     p['gpu_devices'] = devs
+
+        # Optional per-PID NPU memory held (single fdinfo pass, no sampling window).
+        if request.args.get('npu') in ('1', 'true', 'yes'):
+            npu_mem = _get_resource_monitor().get_per_pid_npu_stats()
+            for p in procs:
+                mb = npu_mem.get(p['pid'])
+                if mb is not None:
+                    p['npu_mem_mb'] = mb
 
         # Optional per-PID disk IO rates (delta since the previous call, no sleep).
         if request.args.get('io') in ('1', 'true', 'yes'):

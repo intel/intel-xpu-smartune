@@ -27,6 +27,7 @@ from monitor import PSIMonitor
 from monitor.app_discovery import is_noise_process
 from monitor.cgroup import IO_STAT_FIELDS, as_io_rates, io_stat_deltas, snapshot_cgroup_io
 from monitor.disk_pressure import DiskIOMonitor, disk_name_for_devno
+from monitor.npu_monitor import parse_npu_fdinfo
 from utils.self_ident import is_own_process
 
 _GPU_DRM_DRIVERS = frozenset({'i915', 'xe'})
@@ -253,6 +254,44 @@ def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
         return None
 
     return {'engines': all_engines, 'mem_bytes': total_mem_bytes, 'per_pdev': per_pdev}
+
+
+def _read_pid_fdinfo_npu(pid, seen_client_ids=None):
+    """Read the NPU memory a process holds from /proc/<pid>/fdinfo, in bytes.
+
+    Returns ``None`` when the process holds no intel_vpu fd. Memory is the DRM
+    ``drm-resident-memory`` (buffers with backing pages, system memory): what
+    the process holds, not whether it is running on the NPU. As for the GPU,
+    ``seen_client_ids`` dedupes a DRM client shared across pids by fd inheritance.
+    """
+    fd_dir = f'/proc/{pid}/fd'
+    try:
+        fd_entries = os.listdir(fd_dir)
+    except (OSError, PermissionError):
+        return None
+
+    seen = seen_client_ids if seen_client_ids is not None else set()
+    found = False
+    total_kib = 0
+    for fd_name in fd_entries:
+        try:
+            if '/dev/accel/' not in os.readlink(os.path.join(fd_dir, fd_name)):
+                continue
+            with open(f'/proc/{pid}/fdinfo/{fd_name}', 'r') as fh:
+                parsed = parse_npu_fdinfo(fh.read())
+        except (OSError, PermissionError):
+            continue
+        if parsed is None:
+            continue
+        found = True
+        client_id, resident_kib = parsed
+        if client_id is not None:
+            if client_id in seen:
+                continue
+            seen.add(client_id)
+        total_kib += resident_kib
+
+    return total_kib * 1024 if found else None
 
 
 def _accumulate_engine_delta(out, t0_engines, t1_engines):
@@ -1398,6 +1437,18 @@ class ResourceMonitor:
 
         return result
 
+    def get_per_pid_npu_stats(self):
+        """Per-PID NPU memory (MB) held via fdinfo, for PIDs holding an NPU fd."""
+        result = {}
+        for pid in psutil.pids():
+            try:
+                npu_bytes = _read_pid_fdinfo_npu(pid)
+            except Exception:
+                continue
+            if npu_bytes is not None:
+                result[pid] = round(npu_bytes / (1024 * 1024), 1)
+        return result
+
     def get_per_pid_io_rates(self):
         """Per-PID disk read/write rates (bytes/s) from io_counters deltas since last call."""
         now = time.time()
@@ -1487,6 +1538,16 @@ class ResourceMonitor:
                 'gpu_mem_mb': round(mem_bytes / (1024 * 1024), 1),
             }
 
+        # NPU memory is a plain snapshot (no rate), so one pass per cgroup; the
+        # shared seen set dedupes a DRM client inherited across the app's pids.
+        npu_mem_by_cgroup = {}
+        for cgroup, pids in cgroup_pids.items():
+            seen_npu = set()
+            npu_bytes = 0
+            for pid in pids:
+                npu_bytes += _read_pid_fdinfo_npu(pid, seen_npu) or 0
+            npu_mem_by_cgroup[cgroup] = round(npu_bytes / (1024 * 1024), 1)
+
         for process in processes:
             process_name = process.get('dominant_name') or next(iter(process['names']), 'unknown')
             process_cmdline = process.get('dominant_cmdline') or next(iter(process['cmdlines']), 'unknown')
@@ -1521,6 +1582,8 @@ class ResourceMonitor:
                 'score': round(process['score'], 3),
                 'gpu_util': gpu_stats['gpu_util'],                      # % (0-100)
                 'gpu_mem_mb': gpu_stats['gpu_mem_mb'],                  # MB
+                # Held NPU buffers (resident, system memory); display only, not in the ranking.
+                'npu_mem_mb': npu_mem_by_cgroup.get(process['cgroup'], 0.0),  # MB
             })
 
         # Re-sort results to surface GPU-heavy apps that might have low CPU/mem scores.

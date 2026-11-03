@@ -483,6 +483,7 @@ export interface AppResourceEntry {
   score: number
   gpu_util: number        // peak GPU engine utilisation % (0-100); 0 when GPU not in use
   gpu_mem_mb: number      // GPU memory used in MB (drm-memory-* from /proc fdinfo)
+  npu_mem_mb?: number     // NPU buffers the app holds, MB (drm-resident-memory, system memory); not part of the score
 }
 
 export interface AppResourceStatsData {
@@ -533,6 +534,9 @@ export interface ProcessEntry {
   // Present only when fetched with gpu=1 and the PID holds a GPU fd.
   // Keyed by PCI address (drm-pdev); mapped to igpu/dgpu labels client-side.
   gpu_devices?: Record<string, { gpu_util: number; gpu_mem_mb: number }>
+  // Present only when fetched with npu=1 and the PID holds an NPU fd: MB of NPU
+  // buffers held (drm-resident-memory), not whether it is running on the NPU.
+  npu_mem_mb?: number
   // Present only when fetched with io=1; bytes/s over the polling interval.
   io_read_rate?: number
   io_write_rate?: number

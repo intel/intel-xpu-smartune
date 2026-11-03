@@ -1534,7 +1534,8 @@ data: {"app_id": "", "app_name": "", "status": "pressure_level_changed", "sys_le
         "io_write_rate": 5.6,
         "score": 85.2,
         "gpu_util": 45.0,
-        "gpu_mem_mb": 2048.0
+        "gpu_mem_mb": 2048.0,
+        "npu_mem_mb": 4351.5
       }
     ]
   }
@@ -1551,6 +1552,7 @@ data: {"app_id": "", "app_name": "", "status": "pressure_level_changed", "sys_le
 | score | float | Combined ranking score |
 | gpu_util | float | Peak GPU engine utilization % (0-100) |
 | gpu_mem_mb | float | GPU memory used in MB |
+| npu_mem_mb | float | NPU buffers the app holds, in MB (`drm-resident-memory` of the intel_vpu fds; system memory). Shows memory held, not that the app is running on the NPU; may partly overlap RSS. 0 when the app has no NPU fd. Display only: not part of `score` or the ranking |
 
 ---
 

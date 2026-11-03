@@ -176,6 +176,9 @@ function buildGroups(rows: ProcessEntry[]): Row[] {
       io_read_rate: sum((p) => p.io_read_rate || 0),
       io_write_rate: sum((p) => p.io_write_rate || 0),
       gpu_devices: aggregateGpuDevices(members),
+      npu_mem_mb: members.some((p) => p.npu_mem_mb !== undefined)
+        ? Math.round(sum((p) => p.npu_mem_mb || 0) * 10) / 10
+        : undefined,
       isGroup: true,
       groupName: friendlyName,
       groupRawName: cgroupLeaf(groupKey),
@@ -205,7 +208,7 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
       // the summary bar stays in sync with the table.  A failure of the summary
       // snapshot must not blank out the table, so it is tolerated separately.
       const [data, dynData] = await Promise.all([
-        api.getProcesses(true, true),
+        api.getProcesses(true, true, true),
         api.getDynamicInfo().catch(() => null),
       ])
       setAllRows(data.processes)
@@ -254,6 +257,7 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
     : rows.map((p) => ({ ...p, key: String(p.pid) }))
 
   const hasGpu = allRows.some((p) => p.gpu_devices !== undefined)
+  const hasNpu = allRows.some((p) => p.npu_mem_mb !== undefined)
   const hasIo = allRows.some((p) => p.io_read_rate !== undefined || p.io_write_rate !== undefined)
 
   const ioColumns: ColumnsType<Row> = [
@@ -333,6 +337,25 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
           </Space>
         )
       },
+    },
+  ]
+
+  const npuColumns: ColumnsType<Row> = [
+    {
+      title: (
+        <Tooltip title="NPU buffers this process holds (drm-resident-memory, system memory). It reflects held memory, not that the process is running on the NPU, and may partly overlap RSS.">
+          NPU Mem
+        </Tooltip>
+      ),
+      key: 'npu_mem_mb',
+      width: 100,
+      sorter: (a, b) => (a.npu_mem_mb ?? 0) - (b.npu_mem_mb ?? 0),
+      render: (_: unknown, p: ProcessEntry) =>
+        p.npu_mem_mb === undefined ? (
+          <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>—</Text>
+        ) : (
+          <Text style={{ color: COLORS.text, fontSize: 11 }}>{formatMemory(p.npu_mem_mb * 1024)}</Text>
+        ),
     },
   ]
 
@@ -450,6 +473,7 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
     },
     ...(hasIo ? ioColumns : []),
     ...(hasGpu ? gpuColumns : []),
+    ...(hasNpu ? npuColumns : []),
     {
       title: 'Started',
       dataIndex: 'create_time',

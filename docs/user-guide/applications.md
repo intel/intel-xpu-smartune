@@ -22,6 +22,11 @@ This view lists the apps SmarTune is managing and scores them by resource usage
 so the heaviest rise to the top. For each app you see its CPU, memory, GPU and
 I/O usage and its current priority/limit status.
 
+The **NPU Mem** column shows the NPU buffers an app holds (system memory). It
+means the app has loaded something onto the NPU, not that the NPU is busy with
+it right now, and it can partly overlap the app's regular memory. It is shown
+for information only and does not affect the ranking.
+
 <!-- Screenshot: the Resource consumers list with a few controlled apps. -->
 ![Resource consumers](images/applications-resource-consumers.png)
 

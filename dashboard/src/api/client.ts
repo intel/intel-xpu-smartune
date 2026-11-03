@@ -363,8 +363,8 @@ export const api = {
     get<DiagDigest>(`/diag/digest?from=${from}&to=${to}`),
   getAppResourceStats: (n = 10) => get<AppResourceStatsData>(`/monitor/app_resource_stats?n=${n}`),
   getAppDiskIoStats: (n = 10) => get<AppDiskIoStatsData>(`/monitor/app_disk_io_stats?n=${n}`),
-  getProcesses: (gpu = false, io = false) => {
-    const params = [gpu && 'gpu=1', io && 'io=1'].filter(Boolean)
+  getProcesses: (gpu = false, io = false, npu = false) => {
+    const params = [gpu && 'gpu=1', io && 'io=1', npu && 'npu=1'].filter(Boolean)
     return get<ProcessListData>(`/monitor/processes${params.length ? `?${params.join('&')}` : ''}`)
   },
   getProcessDetail: (pid: number) =>

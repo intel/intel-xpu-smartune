@@ -391,6 +391,23 @@ export interface EffectiveControl {
   }
 }
 
+export type CpuAffinityClass = 'p' | 'e' | 'lpe' | 'custom' | 'restore' | 'status'
+
+export interface CpuAffinityPayload {
+  app_id: string
+  class: CpuAffinityClass
+  cpus?: string
+  target_cgroups?: string[]
+}
+
+// classes: core classes present on this machine -> cpu list, e.g. { p: '0-1', lpe: '2-5' }.
+export interface CpuAffinityStatus {
+  classes: Record<string, string>
+  cgroups: { cgroup: string; cpus: string | null; bound: boolean }[]
+  // Last successfully applied selection for this app (kept by the server, shared by all clients).
+  last: { class: string; cpus: string } | null
+}
+
 export interface LimitSnapshotData {
   limited: boolean
   source: 'auto' | 'manual' | null
@@ -445,6 +462,8 @@ export interface AppInfo {
   // Manual Freeze (cgroup.freeze) is active; frozen_at is epoch seconds.
   frozen?: boolean
   frozen_at?: number | null
+  // cpuset.cpus.effective lists the app's cgroups are pinned to by CPU Affinity; empty = not pinned.
+  cpu_affinity?: string[]
 }
 
 export interface ProcessStatusRow {

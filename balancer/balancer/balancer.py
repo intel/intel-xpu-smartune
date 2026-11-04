@@ -830,6 +830,10 @@ class DynamicBalancer:
         self.control_manager = self.bpf_monitor.control_manager
         self.resource_monitor = self.control_manager.res
         self.io_ctl = IOController()
+        # app_id -> {app_name, pids, dirs}: apps bound to cores, so the reaper can unpin them on exit.
+        self._affinity_apps: Dict[str, dict] = {}
+        self._affinity_lock = threading.Lock()
+        self._affinity_op_lock = threading.RLock()   # serialises bind/restore across clients and the reaper
 
         self.known_pids = set()
 
@@ -1178,6 +1182,7 @@ class DynamicBalancer:
                 if state.current_time - state.last_reap_time >= reap_interval:
                     state.last_reap_time = state.current_time
                     self._reap_closed_apps()
+                    self._reap_closed_affinity()
 
                 time.sleep(1)
             except Exception as e:
@@ -3284,6 +3289,67 @@ class DynamicBalancer:
 
         self._notify_long_frozen()
 
+    def cpu_affinity_summary(self, app_id: str) -> "list[str]":
+        """Distinct ``cpuset.cpus.effective`` lists of the app's pinned cgroups; [] when not pinned.
+
+        Cheap enough for the app-list poll: the registry is in memory, so only the
+        pinned cgroups' effective files are read.
+        """
+        with self._affinity_lock:
+            tracked = self._affinity_apps.get(app_id)
+            dirs = sorted(tracked["dirs"]) if tracked else []
+        seen = []
+        for d in dirs:
+            cpus = self.control_manager.cpu.read_cpus(d)
+            if cpus and cpus not in seen:
+                seen.append(cpus)
+        return seen
+
+    def _forget_affinity(self, app_id: str, dirs: "list[str]") -> None:
+        with self._affinity_lock:
+            tracked = self._affinity_apps.get(app_id)
+            if tracked is None:
+                return
+            tracked["dirs"].difference_update(dirs)
+            if not tracked["dirs"]:
+                self._affinity_apps.pop(app_id, None)
+
+    def _reap_closed_affinity(self) -> None:
+        """Unpin apps that have exited.
+
+        The cgroup can outlive the app (a shell or terminal scope is shared), so
+        a leftover ``cpuset.cpus`` would pin whatever runs there next.  Same
+        PID-based detection as the limit reaper; with no PID snapshot, fall
+        back to the app's running status.
+        """
+        with self._affinity_lock:
+            snapshot = list(self._affinity_apps.items())
+        closed = []
+        for app_id, tracked in snapshot:
+            pids = tracked["pids"]
+            if pids:
+                gone = all(self._pid_gone_or_dying(pid) for pid in pids)
+            else:
+                try:
+                    gone = app_utils.check_app_running_status(app_id, tracked["app_name"], "") == "stopped"
+                except Exception as e:
+                    logger.warning(f"Affinity reaper: status check failed for {app_id}: {e}")
+                    gone = False
+            if gone:
+                closed.append((app_id, tracked))
+        for app_id, tracked in closed:
+            with self._affinity_lock:
+                if self._affinity_apps.get(app_id) is not tracked:
+                    continue
+                self._affinity_apps.pop(app_id, None)
+            logger.info(f"Affinity reaper: app '{tracked['app_name']}' ({app_id}) closed; unpinning cores")
+            with self._affinity_op_lock:
+                for d in tracked["dirs"]:
+                    ok, msg = self.control_manager.cpu.restore(d)
+                    if not ok:
+                        logger.error(f"Affinity reaper: restore failed for {d}: {msg}")
+            self._notify_ui_refresh(app_id, tracked["app_name"], 'cpu_affinity_changed')
+
     def _notify_long_frozen(self) -> None:
         """Remind the UI, once per freeze, that an app has stayed frozen too long.
 
@@ -4065,6 +4131,8 @@ class DynamicBalancer:
             if not ok:
                 logger.error(f"Failed to thaw cgroup {cg}: {msg}")
                 all_ok = False
+            else:
+                logger.info(f"Thawed cgroup {cg}")
         return all_ok
 
     def set_freeze(self, app_id: str, freeze: bool) -> "tuple[bool, str]":
@@ -4104,7 +4172,101 @@ class DynamicBalancer:
             found[1].frozen_at = time.time() if freeze else 0.0
             found[1].freeze_notified = False
         logger.info(f"{'Froze' if freeze else 'Thawed'} app {app_id} ({len(done)} cgroup(s))")
+        self._notify_ui_refresh(app_id, entry.app_name, 'app_frozen_changed')
         return True, "Frozen" if freeze else "Unfrozen"
+
+    def _app_cgroup_targets(self, app_id: str, app_name: str) -> "tuple[list[str], list[int]]":
+        """Absolute cgroup directories the app currently occupies, and its live PIDs."""
+        usage = app_utils.get_app_resource_usage(app_id, app_name) or {}
+        paths = usage.get("cgroup_paths") or (
+            [usage["cgroup_path"]] if usage.get("cgroup_path") else [])
+        mount = self.config.cgroup_mount
+        dirs = [os.path.join(mount, p.lstrip('/')) for p in paths if p]
+        return dirs, [int(pid) for pid in (usage.get("pids") or [])]
+
+    def get_cpu_affinity(self, app_id: str, app_name: str) -> dict:
+        """Core classes available here and what each of the app's cgroups is bound to."""
+        from controller.cpu import core_class_options, format_cpu_list
+        from monitor.metrics.cpu import detect_core_groups
+        options = core_class_options(detect_core_groups())
+        cgroups = [
+            {"cgroup": os.path.basename(d),
+             "cpus": self.control_manager.cpu.read_cpus(d),
+             "bound": self.control_manager.cpu.is_bound(d)}
+            for d in self._app_cgroup_targets(app_id, app_name)[0]
+        ]
+        return {"classes": {k: format_cpu_list(v) for k, v in options.items()},
+                "cgroups": cgroups,
+                "last": self.control_manager.cpu.last_choice(app_id)}
+
+    def set_cpu_affinity(self, app_id: str, app_name: str, cpu_class: str,
+                         cpus: Optional[str] = None,
+                         target_cgroups: Optional[list] = None) -> "tuple[bool, str]":
+        """Serialised: two clients binding the same app must not interleave their cgroup writes."""
+        with self._affinity_op_lock:
+            ok, msg = self._set_cpu_affinity(app_id, app_name, cpu_class, cpus, target_cgroups)
+        if ok:
+            self._notify_ui_refresh(app_id, app_name, 'cpu_affinity_changed')
+        return ok, msg
+
+    def _notify_ui_refresh(self, app_id: str, app_name: str, status: str) -> None:
+        """Tell every open UI to refresh this app: the Balance tab does not poll, it only
+        updates on pushed events, so a change one client makes is invisible to the others
+        unless it is announced."""
+        app_utils.callback_manager.send_callback_notification({
+            'app_id': app_id,
+            'app_name': app_name,
+            'status': status,
+            'purpose': 'notify',
+        }, False)
+
+    def _set_cpu_affinity(self, app_id: str, app_name: str, cpu_class: str,
+                         cpus: Optional[str] = None,
+                         target_cgroups: Optional[list] = None) -> "tuple[bool, str]":
+        """Bind the app's cgroups to a core class (p / e / lpe / custom) or restore.
+
+        Independent of the resource-limit registry: affinity is a manual,
+        separately restorable step.  ``restore`` puts back each cgroup's
+        original ``cpuset.cpus``.
+        """
+        from controller.cpu import resolve_cpus
+        from monitor.metrics.cpu import detect_core_groups
+        dirs, pids = self._app_cgroup_targets(app_id, app_name)
+        if target_cgroups:
+            wanted = {os.path.basename(str(c)) for c in target_cgroups if str(c).strip()}
+            dirs = [d for d in dirs if os.path.basename(d) in wanted]
+        if (cpu_class or "").lower() == "restore":
+            # Restore also covers bound cgroups the app no longer reports, if any.
+            dirs = dirs or [d for d in self.control_manager.cpu.bound_cgroups()
+                            if os.path.basename(d) in {os.path.basename(str(c)) for c in (target_cgroups or [])}]
+            failures = [msg for ok, msg in (self.control_manager.cpu.restore(d) for d in dirs) if not ok]
+            if failures:
+                return False, "; ".join(failures)
+            self._forget_affinity(app_id, dirs)
+            return True, "Affinity restored"
+        if not dirs:
+            return False, f"No running cgroup found for {app_name}"
+        online = set(range(os.cpu_count() or 1))
+        value, msg = resolve_cpus(cpu_class, cpus, detect_core_groups(), online)
+        if value is None:
+            return False, msg
+        done = []
+        for d in dirs:
+            ok, detail = self.control_manager.cpu.set_cpus(d, value)
+            if not ok:
+                logger.error(f"Set affinity failed for {app_id} ({os.path.basename(d)}): {detail}")
+                for prev in done:       # don't leave a half-bound app
+                    self.control_manager.cpu.restore(prev)
+                return False, detail
+            done.append(d)
+        with self._affinity_lock:
+            tracked = self._affinity_apps.setdefault(
+                app_id, {"app_name": app_name, "pids": set(), "dirs": set()})
+            tracked["pids"].update(pids)
+            tracked["dirs"].update(done)
+        self.control_manager.cpu.remember_choice(app_id, cpu_class.lower(), value)
+        logger.info(f"Bound app {app_id} ({len(done)} cgroup(s)) to cpus {value}")
+        return True, f"Bound to cpus {value}"
 
     def set_restore_resource(self, app_id: str) -> bool:
         """Restore resource limits for the given app_id (manual/UI path).
@@ -4647,6 +4809,7 @@ class DynamicBalancer:
         self.is_running = False
 
         self.restore_all_limited_apps_resources()
+        self.control_manager.cpu.restore_all()
         self.network_controller.clear_network_rules_on_exit()
         self._release_swap_on_exit()
         if hasattr(self, "monitor_thread"):

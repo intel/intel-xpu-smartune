@@ -215,6 +215,7 @@ Everything here comes from the dashboard's Balance page, or from calling the RES
 | Restore | `/app/resource_restore` | Only returns manual limits (and thaws a frozen app); auto limits are left alone |
 | Query the snapshot | `/app/limit_snapshot` | The values actually written out right now |
 | Freeze | `/app/freeze` | Manual limits only. Writes `cgroup.freeze` on every cgroup of the limit, as an escalation for GPU/NPU-bound apps the ordinary limit cannot slow down. Restore lifts the limits first and thaws last |
+| CPU affinity | `/app/cpu_affinity` | Pins an app to P / E / LPE cores or a custom list through cgroup v2 `cpuset.cpus`. Independent of the limits: needs none, and Restore does not undo it |
 
 What the manual limit dialog lets you set:
 
@@ -236,8 +237,21 @@ A GPU/NPU-bound app needs little CPU, memory or disk per unit of time, so the li
 - The reaper sends a one-off `app_frozen_long` notification once an app has been frozen for `freeze_notify_after`; there is no automatic thaw.
 - Restore lifts the limits first, then thaws, so the app does not resume straight into a `memory.high` / `io.max` stall. A failed limit restore still thaws.
 - Takes effect on the cgroup in milliseconds, but an NPU only frees up once its in-flight jobs drain (about 20 s measured), so a short on/off duty cycle does not work, and `cpu.max` has no effect on such an app.
+- A successful freeze or thaw is pushed to every client (`app_frozen_changed`). The Balance tab does not poll, so without the event a second dashboard would keep showing the old state.
 
-<sub>Code: `balancer.py#get_resource_limit_profile`, `balancer.py#_get_limit_rate_bounds`, `balancer.py#_install_resource_limit`, `balancer.py#set_freeze`, `controller/freeze.py`</sub>
+#### CPU affinity
+
+Limits decide *how much* an app may use; CPU affinity decides *where* it runs, e.g. one app on the P cores and another on the LPE cores. It is a separate step with its own lifecycle, not part of the limit registry and not driven by pressure.
+
+- Mechanism: `cpuset.cpus` on every cgroup of the app. A write moves the running threads at once, so it can change while the app runs. The cpuset controller is missing from `cgroup.subtree_control` below the root on most systemd hosts, so it is enabled on every ancestor of the target on demand (levels that already have it are skipped; it is not switched off again).
+- Core classes come from the core topology detection used by the monitor. On hybrid parts, cores with no L3 cache are LPE cores (the monitor's `detect_core_groups`); the kernel still lists them under `cpu_atom`, so sysfs alone would call them E cores. A class the machine does not have is refused rather than silently ignored.
+- Every cgroup's original `cpuset.cpus` is recorded before the first write and written back on restore (empty = inherit). A write is confirmed through `cpuset.cpus.effective`, never through systemd properties, which do not see direct cgroupfs writes.
+- Release is paired with every way a binding can end: the user's restore, the app exiting, and service shutdown. The app-exit case needs its own reaper because the cgroup can outlive the app (a terminal tab is one shared scope), so a leftover `cpuset.cpus` would pin whatever starts there next. The reaper uses the same PID-based "is the app gone" test as the limit reaper. After `kill -9` or a crash nothing runs this path and the pin stays until the cgroup disappears; unlike freeze there is no startup sweep yet.
+- It combines with `cpu.max` as the smaller of the two caps: the quota limits CPU time, the cpuset limits the cores. A CPU limit that works out to more than the pinned cores has no effect. It also does not change how many threads an app creates: an app with two busy threads is still capped at two cores.
+- Several clients share one server: set, restore and the automatic unpin run under one lock, and each change is pushed as `cpu_affinity_changed`. The last successful selection per app is kept in memory only, because stopping the service restores every binding.
+- Shutdown restores bindings after the limits and logs each restored cgroup.
+
+<sub>Code: `balancer.py#get_resource_limit_profile`, `balancer.py#_get_limit_rate_bounds`, `balancer.py#_install_resource_limit`, `balancer.py#set_freeze`, `controller/freeze.py`, `balancer.py#set_cpu_affinity`, `balancer.py#_reap_closed_affinity`, `controller/cpu.py`</sub>
 
 ### Taking over from Auto
 

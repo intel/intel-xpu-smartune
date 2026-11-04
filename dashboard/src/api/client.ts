@@ -25,6 +25,8 @@ import type {
   ResourceLimitPayload,
   ResourceLimitProfileData,
   LimitSnapshotData,
+  CpuAffinityPayload,
+  CpuAffinityStatus,
   WeightsTopData,
   PassiveControlData,
   MonitoredSectionsData,
@@ -473,6 +475,14 @@ export const api = {
   freezeApp: async (payload: Pick<AppIdPayload, 'app_id'> & { freeze: boolean }) => {
     const res = await client.post<ApiResponse<void>>(
       '/app/freeze', payload, { timeout: 30_000 },
+    )
+    if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
+    return res.data.data
+  },
+  // Bind an app to a core class / restore it / read the classes available here.
+  cpuAffinity: async (payload: CpuAffinityPayload) => {
+    const res = await client.post<ApiResponse<CpuAffinityStatus>>(
+      '/app/cpu_affinity', payload, { timeout: 30_000 },
     )
     if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
     return res.data.data

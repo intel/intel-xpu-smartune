@@ -640,13 +640,3 @@ class Controller:
             return True
         except (FileNotFoundError, PermissionError):
             return False
-
-    def set_affinity(self, cgroup: str, cpus: str) -> bool:
-        """Set CPU affinity for a cgroup"""
-        path = os.path.join(self.cgroup_mount, cgroup, "cpuset.cpus")
-        try:
-            with open(path, 'w') as f:
-                f.write(cpus)
-            return True
-        except (FileNotFoundError, PermissionError):
-            return False

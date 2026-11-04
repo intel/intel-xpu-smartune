@@ -25,6 +25,7 @@ from config.config import b_config
 from monitor.metrics.utils import safe_read, run_cmd
 from monitor.metrics.cpu import (
     get_cpu_freq_summary,
+    get_platform_name,
     get_cpu_dynamic,
     get_cpu_temperatures,
     detect_core_groups,
@@ -42,6 +43,7 @@ from monitor.metrics.gpu_info import (
     get_gpu_topology,
     get_gpu_pcie,
     get_gpu_pci_addresses,
+    get_gpu_pci_ids,
     card_to_gpu_label,
 )
 from monitor.metrics.memory import get_memory_dynamic, get_memory_static
@@ -485,6 +487,7 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
             },
             "cpu": {
                 "model_name": _parse_cpu_model(),
+                "platform_name": get_platform_name(),
                 "core_count": {
                     "logical": psutil.cpu_count(logical=True),
                     "physical": psutil.cpu_count(logical=False),
@@ -505,6 +508,7 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
                 "eu_count": get_igpu_eu_count(cards, gpu_topology),
                 "topology": gpu_topology,
                 "pci_addresses": gpu_pci_addresses,
+                "pci_ids": get_gpu_pci_ids(cards),
                 "driver_names": {card_to_gpu_label(c): get_gpu_driver_name(c) for c in cards},
             },
             "npu": {

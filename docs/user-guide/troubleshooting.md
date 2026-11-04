@@ -96,6 +96,20 @@ The dashboard adapts automatically to what the server reports. See
 - CPU + GPU Mem BW can exceed the DRAM total: they are measured before the SoC
   cache, and part of that traffic never reaches DRAM.
 
+## GPU Mem BW shows 0 or an estimate
+
+On platforms that have no GPU-only bandwidth counter,
+the iGPU's **Mem BW** is derived from a shared counter that also carries NPU, disk
+and display traffic.
+
+- **0.0 GB/s** — the GPU (graphics and media) is idle, so it is not using memory
+  bandwidth, even if disk activity or swapping is heavy at the same time.
+- **≈ value** — heavy disk traffic that bypasses the SoC cache (typically
+  swapping) is running while the GPU is busy. The figure is then estimated from
+  the SoC cache total and is coarse, roughly ±1–2 GB/s. It returns to the normal
+  measurement on its own once that traffic stops. CPU Mem BW, DRAM bandwidth and
+  the SoC cache figures are unaffected.
+
 ## Resource limits aren't being applied
 
 - Resource control requires the **full** install and its native dependencies

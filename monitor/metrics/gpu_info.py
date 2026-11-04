@@ -556,6 +556,16 @@ def get_gpu_pcie(cards: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
     return result
 
 
+def get_gpu_pci_ids(cards: List[str]) -> Dict[str, str]:
+    """Map each GPU label (GPU.0, ...) to its PCI device ID as lowercase hex from sysfs."""
+    result: Dict[str, str] = {}
+    for card in cards:
+        device_id = safe_read(os.path.join(card, "device", "device"))
+        if device_id:
+            result[card_to_gpu_label(card)] = device_id.lower()
+    return result
+
+
 def get_gpu_pci_addresses(cards: List[str]) -> Dict[str, str]:
     """Return mapping of GPU label -> PCI address (e.g. GPU.0 -> 0000:00:02.0)."""
     result: Dict[str, str] = {}

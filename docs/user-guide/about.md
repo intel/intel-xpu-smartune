@@ -13,11 +13,12 @@ machines, or confirming firmware/driver versions.
 
 **Hardware**
 
-- **CPU** — model, P-core / E-core topology, and frequency ranges.
-- **Memory** — total capacity, DDR speed, and channel/slot configuration.
+- **CPU** — platform, model, P-core / E-core topology, and frequency ranges.
+- **Memory** — total capacity, DDR speed, channel/slot configuration, and peak
+  (theoretical) bandwidth.
 - **Disks** — device list and capacities.
 - **Network** — interfaces, the primary NIC, link speeds, and IP addresses.
-- **GPU** — per card: name, engine list, compute units (EU count on `i915`,
+- **GPU** — per card: name, PCI ID, engine list, compute units (EU count on `i915`,
   Xe-core count on `xe`), PCIe speed/width, PCI address, and frequency ranges.
 - **NPU** — PCI ID, driver version, firmware version, and frequency ranges.
 

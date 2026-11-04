@@ -504,6 +504,8 @@ def _bandwidth_payload(
                           if total is not None and max_gb_s else None),
         "source": source,
         "devices": {"cpu_gb_s": pmt.get("cpu_gb_s"), "gpu_gb_s": pmt.get("gpu_gb_s")},
+        # gpu_gb_s is a coarse SoC-cache-based estimate (non-cached IO such as swap).
+        "gpu_estimated": bool(pmt.get("gpu_estimated")),
         "soc_cache_hit_percent": pmt.get("soc_cache_hit_percent"),
         "soc_cache_hit_gb_s": pmt.get("soc_cache_hit_gb_s"),
         "soc_cache_miss_gb_s": pmt.get("soc_cache_miss_gb_s"),

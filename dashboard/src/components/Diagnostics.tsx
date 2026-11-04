@@ -63,6 +63,7 @@ import type {
   DiagFinding,
   DiagLogRecord,
   DiagResourceUtilization,
+  DiagPressureLevel,
   DiagResourceTrendPoint,
   DiagSeverity,
   LimitSnapshotData,
@@ -953,6 +954,94 @@ function monitorPressurePoints(samples: DiagContextData['metrics']['monitor']['s
     out.push({ ts: sample.ts_epoch, system, disk, network })
   }
   return out.sort((a, b) => a.ts - b.ts)
+}
+
+const PRESSURE_LANES = [
+  { key: 'System', label: 'System' },
+  { key: 'Disk', label: 'Disk I/O' },
+  { key: 'Network', label: 'Network' },
+] as const
+
+const PRESSURE_LEVEL_LABELS: Record<DiagPressureLevel, string> = {
+  low: 'Low', medium: 'Medium', high: 'High', critical: 'Critical',
+}
+
+// Every level is coloured, so the bare track only ever means "no samples". Low is
+// a translucent green: it is the common case and should not draw the eye. High
+// uses its own orange because the dark theme's `orange` is a red that cannot be
+// told apart from `red` in a 6px lane.
+const PRESSURE_HIGH_COLOR = '#ff9830'
+
+function pressureLevelColor(level: DiagPressureLevel): string {
+  if (level === 'critical') return COLORS.red
+  if (level === 'high') return PRESSURE_HIGH_COLOR
+  if (level === 'medium') return COLORS.yellow
+  return `${COLORS.green}59`
+}
+
+interface PressureRun { level: DiagPressureLevel; from: number; to: number }
+
+// Merge consecutive buckets of one channel that share a level. A bucket spans to
+// the next sample but at most `step` seconds, so a stretch with no samples stays
+// blank rather than being painted with the last known level.
+function pressureRuns(points: DiagResourceTrendPoint[], channel: string, step: number): PressureRun[] {
+  const samples = points.filter((point) => point.pressure?.[channel])
+  const runs: PressureRun[] = []
+  samples.forEach((point, index) => {
+    const level = point.pressure![channel]
+    const next = samples[index + 1]?.ts_epoch
+    const from = point.ts_epoch
+    const to = next !== undefined ? Math.min(next, from + step) : from + step
+    const last = runs[runs.length - 1]
+    if (last && last.level === level && last.to >= from) last.to = to
+    else runs.push({ level, from, to })
+  })
+  return runs
+}
+
+// Pressure levels as thin state lanes under the utilization chart, sharing its
+// time axis and plot insets. Kept off the chart itself: pressure (stall) and
+// utilization (busy) are different measures on the same 0-100 scale.
+function PressureLanes({ points, from, to }: { points: DiagResourceTrendPoint[]; from: number; to: number }) {
+  const span = to - from
+  const lanes = PRESSURE_LANES.filter((lane) => points.some((point) => point.pressure?.[lane.key]))
+  if (!lanes.length || span <= 0) return null
+
+  // Bucket width: the median spacing of the samples.
+  const gaps = points.slice(1).map((point, index) => point.ts_epoch - points[index].ts_epoch).filter((gap) => gap > 0).sort((a, b) => a - b)
+  const step = gaps.length ? gaps[Math.floor(gaps.length / 2)] : span / 120
+  const position = (ts: number) => Math.max(0, Math.min(100, ((ts - from) / span) * 100))
+  const timeLabel = (ts: number) => dayjs.unix(ts).format('HH:mm:ss')
+
+  return (
+    <div className='diagnostics-pressure-lanes'>
+      <div className='diagnostics-pressure-lane'>
+        <Text className='diagnostics-pressure-lane-label' type='secondary' style={{ width: EVENT_TIMELINE_PLOT_LEFT }}>Pressure</Text>
+        <div className='diagnostics-pressure-legend'>
+          {(['low', 'medium', 'high', 'critical'] as const).map((level) => (
+            <span key={level}><i style={{ background: pressureLevelColor(level) }} />{PRESSURE_LEVEL_LABELS[level]}</span>
+          ))}
+          <span><i style={{ background: `${COLORS.border}99` }} />No data</span>
+        </div>
+      </div>
+      {lanes.map((lane) => (
+        <div className='diagnostics-pressure-lane' key={lane.key}>
+          <Text className='diagnostics-pressure-lane-label' type='secondary' style={{ width: EVENT_TIMELINE_PLOT_LEFT }}>{lane.label}</Text>
+          <div className='diagnostics-pressure-lane-track' style={{ background: `${COLORS.border}99` }}>
+            {pressureRuns(points, lane.key, step).map((run) => {
+              if (run.to <= from || run.from >= to) return null
+              const left = position(run.from)
+              return (
+                <Tooltip key={run.from} title={`${lane.label} pressure: ${PRESSURE_LEVEL_LABELS[run.level]} · ${timeLabel(run.from)} – ${timeLabel(run.to)}`}>
+                  <span className='diagnostics-pressure-lane-run' style={{ left: `${left}%`, width: `${Math.max(0.3, position(run.to) - left)}%`, background: pressureLevelColor(run.level) }} />
+                </Tooltip>
+              )
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
 }
 
 function resourceUtilizationColor(label: string): string {
@@ -2934,6 +3023,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                         </ResponsiveContainer>
                       </div>
                     ) : <Text className='diagnostics-resource-lanes-empty' type='secondary'>Select a resource to display its trend</Text>}
+                    <PressureLanes points={visibleResourceTrend} from={eventViewRange.from} to={eventViewRange.to} />
                       </>
                     ),
                   },

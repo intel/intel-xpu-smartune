@@ -1142,6 +1142,59 @@
   height: 112px;
 }
 
+.diagnostics-pressure-lanes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.diagnostics-pressure-lane {
+  display: flex;
+  align-items: center;
+  /* Matches the utilization chart's right margin so both share one time axis. */
+  padding-right: 16px;
+}
+
+.diagnostics-pressure-lane-label {
+  flex: none;
+  padding-right: 8px;
+  font-size: 11px;
+  line-height: 12px;
+  text-align: right;
+}
+
+.diagnostics-pressure-lane-track {
+  position: relative;
+  flex: 1;
+  height: 6px;
+  border-radius: 2px;
+}
+
+.diagnostics-pressure-lane-run {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 2px;
+}
+
+.diagnostics-pressure-legend {
+  display: flex;
+  flex: 1;
+  justify-content: flex-end;
+  gap: 10px;
+  color: var(--diagnostics-text-muted, #8e9ab3);
+  font-size: 11px;
+}
+
+.diagnostics-pressure-legend i {
+  display: inline-block;
+  width: 10px;
+  height: 6px;
+  margin-right: 4px;
+  border-radius: 2px;
+}
+
 .diagnostics-resource-lanes-empty {
   display: block;
   height: 112px;

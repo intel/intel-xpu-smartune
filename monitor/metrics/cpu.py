@@ -12,12 +12,22 @@ import psutil
 
 from monitor.metrics.utils import safe_read, run_cmd
 from monitor.metrics.rapl import RaplPackagePowerSampler
+from monitor.pmt_telemetry import find_telem_nodes
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
 _CORE_CLASS_CACHE: Dict[str, Any] = {"cpu_count": None, "result": None}
 _CORE_TOPOLOGY: Optional[List[Optional[int]]] = None
 _PACKAGE_POWER_SAMPLER = RaplPackagePowerSampler()
+
+
+def get_platform_name() -> Optional[str]:
+    """SoC family from the PMT telemetry GUID."""
+    try:
+        nodes = find_telem_nodes()
+    except Exception:
+        return None
+    return str(nodes[0].platform.cpu_gen) if nodes else None
 
 
 def _expand_cpu_ranges(spec: Optional[str]) -> Set[int]:

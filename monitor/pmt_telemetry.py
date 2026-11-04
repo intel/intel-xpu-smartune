@@ -29,11 +29,18 @@ Where the counters sit (one memory access walks down this path):
 Bandwidth attribution:
 * cpu = SANTA (CCF) + IDIBR (IDI) read+write traffic.
 * npu = VPU_MEMORY_BW, a 32-bit cumulative counter.
-* gpu = MemSWITCH - npu - idle IO floor. MemSWITCH carries GPU *and* NPU (and a
-  little other IO) traffic, so the NPU share is subtracted. The GT NOC counter
-  only sees about half of the GPU traffic and is not used.
-* The idle IO floor is learned at runtime from samples where the GPU is idle
-  (GT RC6 and media C6 residency both high); the per-platform value only seeds it.
+* gpu, on platforms without per-GPU egress counters, first match wins:
+  1. GPU idle (GT RC6 and media C6 residency both >= 95%): 0. MemSWITCH may still
+     carry disk/swap DMA or display traffic, none of which is the GPU's.
+  2. Normal: MemSWITCH - npu - idle IO floor. MemSWITCH carries GPU *and* NPU (and
+     other IO) traffic, so the NPU share is subtracted. The GT NOC counter only
+     sees about half of the GPU traffic and is not used.
+  3. Divergence episode on a verified platform (see the guard below):
+     MUFASA hit + miss - cpu - npu - floor, flagged `gpu_estimated`. Heavy
+     non-cached IO such as swap/NVMe DMA inflates MemSWITCH but bypasses MUFASA,
+     so the cache total excludes it. Coarse (the two totals agree only within
+     ~20%, and subtracting the usually larger cpu share amplifies that), so it is
+     only meaningful while the GPU is busy.
 """
 
 import dataclasses
@@ -389,6 +396,8 @@ class DeviceBandwidth:
     cache_miss_gb_s: Optional[float] = None
     # True/False when GT RC6 and media C6 residency are readable and sane.
     gpu_idle: Optional[bool] = None
+    # gpu_gb_s was estimated from the SoC cache total instead of MemSWITCH.
+    gpu_estimated: bool = False
 
     @property
     def sys_gb_s(self) -> Optional[float]:
@@ -447,6 +456,7 @@ def compute_bandwidth(
     counts = (read_bits(cur, noc, 31, 0) - read_bits(prev, noc, 31, 0)) & _MASK32
     npu = counts * platform.noc_bw_unit_bytes / dt / 1e9
 
+    gpu_idle = _gpu_idle(platform, prev, cur, dt)
     io: Optional[float] = None
     gpu: Optional[float] = None
     if platform.gpu_offsets:
@@ -454,7 +464,9 @@ def compute_bandwidth(
     elif platform.io_offsets:
         floor = platform.io_floor_gb_s if io_floor_gb_s is None else io_floor_gb_s
         io = counted(platform.io_offsets, egress)
-        gpu = max(0.0, io - npu - floor)
+        # GT and media both parked: the GPU is not touching memory, whatever else
+        # (disk/swap DMA, display) MemSWITCH is carrying.
+        gpu = 0.0 if gpu_idle else max(0.0, io - npu - floor)
 
     hit = miss = None
     if platform.cache_hit_offset is not None and platform.cache_miss_offset is not None:
@@ -465,8 +477,22 @@ def compute_bandwidth(
         cpu_gb_s=cpu, gpu_gb_s=gpu, npu_gb_s=npu,
         sys_read_gb_s=sys_read, sys_write_gb_s=sys_write, io_gb_s=io,
         cache_hit_gb_s=hit, cache_miss_gb_s=miss,
-        gpu_idle=_gpu_idle(platform, prev, cur, dt),
+        gpu_idle=gpu_idle,
     )
+
+
+def gpu_from_cache(bw: DeviceBandwidth, io_floor_gb_s: float) -> Optional[float]:
+    """GPU share estimated as SoC cache total - CPU - NPU - floor.
+
+    Used when MemSWITCH carries IO the cache never sees (swap/NVMe DMA), which the
+    usual MemSWITCH - NPU - floor would count as GPU. Coarse: the cache and egress
+    totals agree only within ~20%, and subtracting the (usually larger) CPU share
+    amplifies that, so it is only meaningful when the GPU itself is busy.
+    """
+    cache = bw.cache_total_gb_s
+    if cache is None or bw.cpu_gb_s is None:
+        return None
+    return max(0.0, cache - bw.cpu_gb_s - (bw.npu_gb_s or 0.0) - io_floor_gb_s)
 
 
 def _implausible(bw: DeviceBandwidth) -> bool:
@@ -499,6 +525,8 @@ class PmtBandwidthSampler:
         self._prev_ts: Optional[float] = None
         self._bad_samples = 0
         self._disabled = False
+        # Verified platform in a divergence episode: GPU share withheld until it ends.
+        self._diverging = False
         # Idle IO-path floor; seeded from the platform, learned from GPU-idle samples.
         self.io_floor_gb_s = 0.0
         # Last good reading and its window, for the debug log only.
@@ -554,16 +582,38 @@ class PmtBandwidthSampler:
         dt = now - prev_ts
         bw = compute_bandwidth(self._node.platform, prev, buf, dt, self.io_floor_gb_s)
 
+        platform = self._node.platform
         self._bad_samples = self._bad_samples + 1 if _implausible(bw) else 0
-        if self._bad_samples >= _GUARD_BAD_SAMPLES:
+        diverging = self._bad_samples >= _GUARD_BAD_SAMPLES
+        if diverging and not platform.verified:
+            # Unverified layout: a lasting gap most likely means wrong offsets/units.
             self._disabled = True
             logger.warning(
-                "PMT bandwidth attribution disabled: %s (verified=%s) egress traffic "
+                "PMT bandwidth attribution disabled: %s (verified=False) egress traffic "
                 "keeps diverging from the MUFASA hit+miss total; its offsets/units are "
                 "probably wrong for this platform",
-                self._node.platform.name, self._node.platform.verified,
+                platform.name,
             )
             return None
+        if diverging:
+            # Verified layout: the gap is the workload, typically swap/NVMe DMA that
+            # MemSWITCH counts but the SoC cache never sees. Only the GPU share is
+            # derived from MemSWITCH; CPU, cache and DRAM are direct counters and
+            # stay valid. An idle GPU already reads 0; a busy one is re-estimated
+            # from the cache total. Recovers on the first good sample.
+            if not self._diverging:
+                logger.warning(
+                    "PMT bandwidth: %s egress traffic diverges from the MUFASA hit+miss "
+                    "total (likely non-cached IO such as swap); GPU bandwidth estimated "
+                    "from the SoC cache until it recovers", platform.name,
+                )
+            if not bw.gpu_idle:
+                bw = dataclasses.replace(
+                    bw, gpu_gb_s=gpu_from_cache(bw, self.io_floor_gb_s), gpu_estimated=True)
+        elif self._diverging:
+            logger.info("PMT bandwidth: %s egress traffic consistent again; GPU bandwidth "
+                        "back to MemSWITCH", platform.name)
+        self._diverging = diverging
         if not self._bad_samples:
             # Don't learn the floor from a suspect sample.
             bw = self._learn_io_floor(bw)
@@ -571,13 +621,12 @@ class PmtBandwidthSampler:
         return bw
 
     def _learn_io_floor(self, bw: DeviceBandwidth) -> DeviceBandwidth:
-        """On a GPU-idle sample, fold its IO traffic into the floor and re-derive gpu."""
+        """On a GPU-idle sample, fold its IO traffic into the floor (gpu is already 0)."""
         if not bw.gpu_idle or bw.io_gb_s is None:
             return bw
         observed = max(0.0, bw.io_gb_s - (bw.npu_gb_s or 0.0))
         self.io_floor_gb_s += _FLOOR_EMA_ALPHA * (observed - self.io_floor_gb_s)
-        gpu = max(0.0, bw.io_gb_s - (bw.npu_gb_s or 0.0) - self.io_floor_gb_s)
-        return dataclasses.replace(bw, gpu_gb_s=gpu)
+        return bw
 
 
 def _round(value: Optional[float]) -> Optional[float]:
@@ -594,7 +643,7 @@ def bandwidth_fields(bw: Optional[DeviceBandwidth]) -> Dict[str, Optional[float]
     """
     if bw is None:
         return {
-            "cpu_gb_s": None, "gpu_gb_s": None, "soc_cache_hit_percent": None,
+            "cpu_gb_s": None, "gpu_gb_s": None, "gpu_estimated": False, "soc_cache_hit_percent": None,
             "soc_cache_hit_gb_s": None, "soc_cache_miss_gb_s": None,
             "dram_read_gb_s": None, "dram_write_gb_s": None,
         }
@@ -602,6 +651,7 @@ def bandwidth_fields(bw: Optional[DeviceBandwidth]) -> Dict[str, Optional[float]
     return {
         "cpu_gb_s": _round(bw.cpu_gb_s),
         "gpu_gb_s": _round(bw.gpu_gb_s),
+        "gpu_estimated": bw.gpu_estimated,
         "soc_cache_hit_percent": None if hit is None else round(hit, 1),
         "soc_cache_hit_gb_s": _round(bw.cache_hit_gb_s),
         "soc_cache_miss_gb_s": _round(bw.cache_miss_gb_s),

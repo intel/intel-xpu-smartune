@@ -102,12 +102,19 @@ const GPU_UTIL_COLORS = [PERF_COLORS.gpu, PERF_COLORS.memory, PERF_COLORS.cpu, P
 const MEM_BW_TIPS = {
   cpu: 'Memory traffic the CPU sends out after its own caches. Some is served by the shared SoC cache, so CPU + GPU can exceed the Memory bandwidth.',
   gpu: 'Memory traffic the GPU (incl. media) sends out after its own caches. Some is served by the shared SoC cache, so CPU + GPU can exceed the Memory bandwidth.',
+  gpuEstimated: 'Estimate: heavy non-cached IO (e.g. swap or disk DMA) is flowing, so the GPU share is derived from the SoC cache total minus CPU and NPU traffic. Coarse, roughly ±1-2 GB/s.',
   npu: 'Memory traffic the NPU sends out. Some is served by the shared SoC cache, so it can exceed what actually reaches DRAM.',
   dram: 'Actual DRAM read + write bandwidth, measured at the memory controller.',
   socCacheHit: 'SoC System-Level Cache (SLC) Hit Rate: Measures the percentage of memory traffic processed directly within the on-chip SLC (shared by CPU, GPU, and NPU) without accessing off-chip DRAM.',
   socCacheHitBw: 'Memory traffic served by the shared SoC cache: DRAM bandwidth saved.',
   socCacheMissBw: 'Memory traffic the shared SoC cache passed on to DRAM. DRAM bandwidth can be higher, since data evicted from the cache is also written back.',
 } as const
+
+// GPU memory bandwidth, prefixed with "≈" when the backend estimated it from the SoC cache.
+const gpuMemBw = (gbS: number | null | undefined, estimated?: boolean) => ({
+  value: `${estimated && isNumber(gbS) ? '≈ ' : ''}${formatMetric(gbS, 'GB/s', 1)}`,
+  tip: estimated ? MEM_BW_TIPS.gpuEstimated : MEM_BW_TIPS.gpu,
+})
 
 // Distinct purple family for GPU lines in the utilization trend, so multiple GPUs
 // read as one group yet stay separable from CPU/Memory/Disk/Network.
@@ -772,9 +779,8 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
     const cardPciAddr = staticGpu?.pci_addresses?.[cardKey]  // e.g. "0000:03:00.0"
     const shortBdf = cardPciAddr ? cardPciAddr.replace(/^[0-9a-f]{4}:/i, '').toLowerCase() : null
     const staticName = (shortBdf && nameByBdf[shortBdf]) || staticGpu?.names?.[index]
-    // Extract PCIe vendor:device ID e.g. "8086:7d55" from lspci name
-    const pciIdMatch = staticName?.match(/\[([0-9a-f]{4}:[0-9a-f]{4})\]\s*(?:\(rev|$)/i)
-    const pciId = pciIdMatch ? pciIdMatch[1] : null
+    const lspciDeviceId = staticName?.match(/\[[0-9a-f]{4}:([0-9a-f]{4})\]\s*(?:\(rev|$)/i)?.[1]
+    const pciId = staticGpu?.pci_ids?.[cardKey] ?? (lspciDeviceId ? `0x${lspciDeviceId.toLowerCase()}` : null)
 
     devices.push({
       id,
@@ -2214,15 +2220,14 @@ function TrendEndLabels(props: {
   const plotBottom = offset.top + offset.height
   const plotRight = (offset.left ?? 0) + (offset.width ?? 0)
 
-  // The newest sample of each series; a series with nothing in the window is
-  // simply not labelled rather than being pinned to zero.
+  // Only series with a sample in the newest slot reach "now" and get a label.
+  // A series that stopped (section unmonitored) still draws its old curve as it
+  // scrolls out, but labelling it at the right edge would claim a current value.
+  const newest = data[data.length - 1]
   const anchors = series
     .map((item) => {
-      for (let index = data.length - 1; index >= 0; index -= 1) {
-        const value = data[index]?.[item.key]
-        if (isNumber(value)) return { ...item, y: scale(value) }
-      }
-      return null
+      const value = newest?.[item.key]
+      return isNumber(value) ? { ...item, y: scale(value) } : null
     })
     .filter((item): item is { key: string; label: string; color: string; y: number } => (
       item !== null && Number.isFinite(item.y)
@@ -2271,20 +2276,59 @@ function TrendEndLabels(props: {
   )
 }
 
+// Split each series into segments at null runs longer than `maxBridgeSlots`.
+// `connectNulls` must keep bridging short gaps (missed polls in a background
+// tab), but not the long gap left while a section was unmonitored: without the
+// split, re-enabling it drew a straight line from the old curve to the new one.
+// Segment values go under `<key>__seg<n>`; rows without one read as missing.
+const segmentTrendData = (
+  data: Array<Record<string, number | null>>,
+  keys: string[],
+  maxBridgeSlots: number,
+) => {
+  const rows: Array<Record<string, number | null>> = data.map((row) => ({ ...row }))
+  const segmentKeys: Record<string, string[]> = {}
+  keys.forEach((key) => {
+    const used: string[] = []
+    let segment = 0
+    let nullRun = 0
+    let seen = false
+    data.forEach((row, index) => {
+      const value = row[key]
+      if (!isNumber(value)) {
+        nullRun += 1
+        return
+      }
+      if (seen && nullRun > maxBridgeSlots) segment += 1
+      seen = true
+      nullRun = 0
+      const segmentKey = `${key}__seg${segment}`
+      rows[index][segmentKey] = value
+      if (used[used.length - 1] !== segmentKey) used.push(segmentKey)
+    })
+    segmentKeys[key] = used
+  })
+  return { rows, segmentKeys }
+}
+
 function SystemHealthTrend({
   data,
   trendWindow,
   series,
+  maxBridgeSlots,
   onOpenHistory,
 }: {
   data: Array<Record<string, number | null>>
   trendWindow: '1m' | '5m'
   series: Array<{ key: string; label: string; color: string }>
+  /** Longest null run, in slots, still drawn as a continuous line. */
+  maxBridgeSlots: number
   onOpenHistory?: () => void
 }) {
   const [hiddenSeries, setHiddenSeries] = useState<Set<string>>(() => new Set())
   const xTicks = data.length > 1 ? [0, data.length - 1] : [0]
   const visibleSeries = series.filter((item) => !hiddenSeries.has(item.key))
+  const { rows: chartData, segmentKeys } = segmentTrendData(data, series.map((item) => item.key), maxBridgeSlots)
   const toggleSeries = (key: string) => {
     setHiddenSeries((current) => {
       const next = new Set(current)
@@ -2327,7 +2371,7 @@ function SystemHealthTrend({
       <div className="perf-system-health-chart">
         <ResponsiveContainer width="100%" height="100%">
           {/* The right margin is the gutter TrendEndLabels draws its names into. */}
-          <LineChart data={data} margin={{ top: 4, right: TREND_LABEL_GUTTER, bottom: 8, left: 8 }}>
+          <LineChart data={chartData} margin={{ top: 4, right: TREND_LABEL_GUTTER, bottom: 8, left: 8 }}>
             <CartesianGrid vertical={false} stroke={`${COLORS.border}88`} strokeDasharray="3 3" />
             <YAxis
               domain={[0, 100]}
@@ -2351,9 +2395,9 @@ function SystemHealthTrend({
               labelFormatter={(value) => Number(value) === data.length - 1 ? 'Now' : `${trendWindow} ago`}
               formatter={(value: number, name: string) => [`${value.toFixed(1)}%`, name]}
             />
-            {visibleSeries.map((item) => (
-              <Line key={item.key} type="monotone" dataKey={item.key} name={item.label} stroke={item.color} strokeWidth={2} dot={false} connectNulls />
-            ))}
+            {visibleSeries.flatMap((item) => (segmentKeys[item.key] || []).map((segmentKey) => (
+              <Line key={segmentKey} type="monotone" dataKey={segmentKey} name={item.label} stroke={item.color} strokeWidth={2} dot={false} connectNulls />
+            )))}
             {/* Last, so the labels paint above the lines. */}
             <Customized component={TrendEndLabels} trendSeries={visibleSeries} trendData={data} />
           </LineChart>
@@ -3017,6 +3061,7 @@ function GpuSummaryCard({
   accent,
   utilizationSeries,
   memBwGbS,
+  memBwEstimated,
   trendWindow,
   onOpen,
 }: {
@@ -3024,6 +3069,7 @@ function GpuSummaryCard({
   accent: string
   utilizationSeries: Array<number | null>
   memBwGbS?: number | null
+  memBwEstimated?: boolean
   trendWindow: '1m' | '5m'
   onOpen: () => void
 }) {
@@ -3036,6 +3082,7 @@ function GpuSummaryCard({
     <ResourceSummaryCard
       title={device.displayLabel}
       subtitle={[
+        device.pciId ? `[${device.pciId}]` : null,
         formatGpuSummaryName(device),
         device.compute ? device.compute.short : null,
         device.label !== 'iGPU' && isNumber(device.vramTotalGb) ? `${device.vramTotalGb.toFixed(1)} GB VRAM` : null,
@@ -3052,7 +3099,7 @@ function GpuSummaryCard({
           ? { label: gpuMemLabel(device, 'long'), value: formatMemoryGb(device.igpuMem.usedMb) }
           : { label: gpuMemLabel(device, 'long'), value: memoryUsage === null ? 'N/A' : `${memoryUsage.toFixed(1)}%` },
         { label: 'Frequency', value: formatMetric(frequencyMhz, 'MHz', 0) },
-        { label: 'Mem BW', value: formatMetric(memBwGbS, 'GB/s', 1), tip: MEM_BW_TIPS.gpu },
+        { label: 'Mem BW', ...gpuMemBw(memBwGbS, memBwEstimated) },
       ]}
       series={utilizationSeries}
       trendWindow={trendWindow}
@@ -3451,12 +3498,14 @@ function GpuDeviceCard({
   getSeries,
   sparkMode,
   memBwGbS,
+  memBwEstimated,
 }: {
   device: GpuDeviceView
   trendWindow: '1m' | '5m'
   getSeries: (key: string) => Array<number | null>
   sparkMode: SparkMode
   memBwGbS?: number | null
+  memBwEstimated?: boolean
 }) {
   const utilSeries = getSeries(`gpu:${device.id}:util`)
   const gt0FreqSeries = getSeries(`gpu:${device.id}:freq:gt0:cur_mhz`)
@@ -3618,7 +3667,7 @@ function GpuDeviceCard({
                   ]),
               // Mem BW comes from SoC telemetry, so only the iGPU has it.
               ...(device.label === 'iGPU'
-                ? [{ key: 'bw', label: 'Mem BW', value: formatMetric(memBwGbS, 'GB/s', 1), tip: MEM_BW_TIPS.gpu }]
+                ? [{ key: 'bw', label: 'Mem BW', ...gpuMemBw(memBwGbS, memBwEstimated) }]
                 : []),
             ]}
           />
@@ -3859,9 +3908,15 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
       : Math.max(1, Math.min(TREND_STORAGE_MAX_POINTS, Math.round((now - last) / refreshIntervalMs)))
 
     setTrends((prev) => {
-      const next: TrendSeries = { ...prev }
-      Object.entries(updates).forEach(([key, value]) => {
+      const next: TrendSeries = {}
+      // Every series advances on every tick, including ones absent from
+      // `updates` (section unmonitored, device gone): they get a null, so their
+      // old curve scrolls left out of the window instead of its last value
+      // staying pinned at "now" while everything else moves on.
+      const keys = new Set([...Object.keys(prev), ...Object.keys(updates)])
+      keys.forEach((key) => {
         const current = prev[key] || []
+        const value = updates[key] ?? null
         // Pad the (slots - 1) skipped intervals with null, then the sample.
         const updated = slots > 1
           ? [...current, ...Array(slots - 1).fill(null), value]
@@ -3869,6 +3924,8 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
         if (updated.length > TREND_STORAGE_MAX_POINTS) {
           updated.splice(0, updated.length - TREND_STORAGE_MAX_POINTS)
         }
+        // A stale series that has scrolled out entirely is dropped.
+        if (!(key in updates) && !updated.some(isNumber)) return
         next[key] = updated
       })
       return next
@@ -4388,7 +4445,12 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
   }, [staticInfo?.cpu?.freq_mhz])
 
   const cpuSnapshotMeta = staticInfo?.cpu?.model_name
-    ? `${staticInfo?.cpu?.core_count?.logical ?? 0} cores | ${cpuFreqRangeMeta} | ${staticInfo?.cpu?.model_name}`
+    ? [
+        `${staticInfo?.cpu?.core_count?.logical ?? 0} cores`,
+        cpuFreqRangeMeta,
+        staticInfo?.cpu?.platform_name,
+        staticInfo?.cpu?.model_name,
+      ].filter(Boolean).join(' | ')
     : ((dynamicInfo?.cpu?.per_core_usage?.length ?? 0) > 0)
       ? `${dynamicInfo?.cpu?.per_core_usage?.length ?? 0} cores`
       : 'No data'
@@ -4424,7 +4486,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
       else if (!memTypes.length) parts.push('DDR N/A')
       // Theoretical DRAM bandwidth ceiling (MT/s x bus width), not a measured peak.
       const peak = staticMemory.max_bandwidth_gb_s
-      if (isNumber(peak)) parts.push(`Theoretical BW ${peak.toFixed(0)} GB/s`)
+      if (isNumber(peak)) parts.push(`Peak BW ${peak.toFixed(0)} GB/s`)
       return parts
     }
     const parts: string[] = []
@@ -4863,6 +4925,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
           data={systemHealthTrendData}
           trendWindow={trendWindow}
           series={trendSeriesMeta}
+          maxBridgeSlots={Math.ceil((INACTIVE_REFRESH_INTERVAL_MS * 1.5) / refreshIntervalMs)}
           onOpenHistory={() => onNavigate?.('history')}
         />
         {showPressureSection && (
@@ -5120,6 +5183,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
               accent={GPU_UTIL_COLORS[index % GPU_UTIL_COLORS.length]}
               utilizationSeries={getSeries(`gpu:${device.id}:util`)}
               memBwGbS={device.label === 'iGPU' ? dynamicInfo?.memory?.bandwidth?.devices?.gpu_gb_s : null}
+              memBwEstimated={device.label === 'iGPU' && Boolean(dynamicInfo?.memory?.bandwidth?.gpu_estimated)}
               trendWindow={trendWindow}
               onOpen={() => setDeviceDetail({ kind: 'gpu', deviceId: device.id })}
             />
@@ -5378,6 +5442,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
             getSeries={getSeries}
             sparkMode={sparkMode}
             memBwGbS={dynamicInfo?.memory?.bandwidth?.devices?.gpu_gb_s}
+            memBwEstimated={Boolean(dynamicInfo?.memory?.bandwidth?.gpu_estimated)}
           />
         )}
       </Modal>

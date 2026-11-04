@@ -89,6 +89,30 @@ def _resource_utilization_values(data):
     return values
 
 
+_PRESSURE_LEVEL_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+_PRESSURE_LEVELS = tuple(_PRESSURE_LEVEL_RANK)
+
+
+def _pressure_levels(data):
+    """Per-channel pressure level of one snapshot as a rank (0=low..3=critical).
+
+    The snapshot already carries the levels the controller acted on, so no
+    thresholds are re-applied here. Channels without a known level are omitted.
+    """
+    pressure = data.get("pressure") if isinstance(data.get("pressure"), dict) else {}
+    disk = data.get("disk") if isinstance(data.get("disk"), dict) else {}
+    raw = {
+        "System": pressure.get("level"),
+        "Disk": disk.get("busy_level"),
+        "Network": pressure.get("network_pressure_level"),
+    }
+    return {
+        label: _PRESSURE_LEVEL_RANK[level.lower()]
+        for label, level in raw.items()
+        if isinstance(level, str) and level.lower() in _PRESSURE_LEVEL_RANK
+    }
+
+
 def read_resource_utilization(start_time, end_time, limit=2000, max_points=120):
     """Return resource averages, peaks, and a compact trend for diagnostics."""
     try:
@@ -118,7 +142,14 @@ def read_resource_utilization(start_time, end_time, limit=2000, max_points=120):
         sample_values = _resource_utilization_values(data)
         timestamp = int(row.create_time or range_start)
         bucket_index = max(0, min(max_points - 1, int((timestamp - range_start) / bucket_width)))
-        bucket = buckets.setdefault(bucket_index, {"ts_epoch": int(range_start + bucket_index * bucket_width), "values": {}})
+        bucket = buckets.setdefault(
+            bucket_index,
+            {"ts_epoch": int(range_start + bucket_index * bucket_width), "values": {}, "pressure": {}},
+        )
+        # Worst level in the bucket, not the mean: a short critical spike is
+        # exactly what diagnostics needs to see.
+        for label, rank in _pressure_levels(data).items():
+            bucket["pressure"][label] = max(rank, bucket["pressure"].get(label, rank))
         for label, value in sample_values.items():
             total, count, peak = values.get(label, (0, 0, value))
             values[label] = (total + value, count + 1, max(peak, value))
@@ -138,6 +169,7 @@ def read_resource_utilization(start_time, end_time, limit=2000, max_points=120):
                 for label, (total, count) in bucket["values"].items()
                 if count
             },
+            "pressure": {label: _PRESSURE_LEVELS[rank] for label, rank in bucket["pressure"].items()},
         }
         for _, bucket in sorted(buckets.items())
     ]

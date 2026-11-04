@@ -349,6 +349,7 @@ export default function About({ active }: Props) {
 
       const items: Array<{ label: string; value: React.ReactNode }> = [
         { label: 'Name', value: nameLine },
+        { label: 'Device', value: formatPlain(staticInfo.gpu.pci_ids?.[cardKey]) },
         { label: 'Driver', value: driverLabel },
         ...(pcieKeys.has(cardKey) ? [{ label: 'PCIe', value: pcieText }] : []),
         ...(gpu.compute ? [{ label: gpu.compute.label, value: `${gpu.compute.count}` }] : []),
@@ -363,6 +364,7 @@ export default function About({ active }: Props) {
       {
         title: 'CPU',
         items: [
+          { label: 'Platform', value: formatPlain(staticInfo.cpu.platform_name) },
           { label: 'Model', value: formatPlain(staticInfo.cpu.model_name) },
           { label: 'Logical cores', value: formatPlain(staticInfo.cpu.core_count.logical) },
           { label: 'Physical cores', value: formatPlain(staticInfo.cpu.core_count.physical) },
@@ -407,7 +409,7 @@ export default function About({ active }: Props) {
             { label: 'Swap', value: typeof staticInfo.memory.swap_total_gb === 'number' && staticInfo.memory.swap_total_gb > 0
               ? `${staticInfo.memory.swap_total_gb.toFixed(1)} GB`
               : 'Not configured' },
-            { label: 'Theoretical BW', value: typeof staticInfo.memory.max_bandwidth_gb_s === 'number'
+            { label: 'Peak BW', value: typeof staticInfo.memory.max_bandwidth_gb_s === 'number'
               ? `${staticInfo.memory.max_bandwidth_gb_s.toFixed(1)} GB/s`
               : 'N/A' },
           ]

@@ -3,6 +3,8 @@
 
 """Run from the repo root: python -m pytest monitor/test/test_pmt_telemetry.py"""
 
+import dataclasses
+
 import monitor.pmt_telemetry as pmt
 from monitor.pmt_telemetry import (
     _GUARD_BAD_SAMPLES,
@@ -214,13 +216,78 @@ def test_guard_accepts_cache_hits_that_old_sys_guard_rejected():
     assert all(r is not None for r in results[1:])
 
 
-def test_guard_disables_layout_diverging_from_cache():
-    # Egress counters claim 2x the MUFASA total: wrong offsets/units.
+def test_guard_disables_unverified_layout_diverging_from_cache():
+    # Egress counters claim 2x the MUFASA total on an unverified layout: wrong offsets/units.
+    unverified = dataclasses.replace(PTL, verified=False)
     step = {**_CPU_INFERENCE, 0x6c0: _counts(15.0, 32)}
-    sampler = _sampler(PTL, PMT_GUID_PTL, step)
+    sampler = _sampler(unverified, PMT_GUID_PTL, step)
     results = _run(sampler, _GUARD_BAD_SAMPLES + 2)
     assert sampler._disabled
     assert results[-1] is None
+
+
+def _phased_sampler(platform, guid, phases):
+    """Sampler whose per-read count step follows `phases`: [(step, reads), ...]."""
+    steps = [step for step, reads in phases for _ in range(reads)]
+    sampler = PmtBandwidthSampler()
+    sampler._node = TelemNode("unused", "unused", guid, platform, None)
+    sampler.io_floor_gb_s = platform.io_floor_gb_s
+    totals = {}
+    state = {"n": 0}
+
+    def fake_read():
+        step = steps[min(state["n"], len(steps) - 1)]
+        state["n"] += 1
+        for off, counts in step.items():
+            totals[off] = totals.get(off, 0) + counts
+        return _buf(totals)
+
+    sampler._read = fake_read
+    return sampler, len(steps)
+
+
+# Swap storm: 6 GB/s of NVMe DMA on MemSWITCH that the SoC cache never sees.
+_SWAP_IO = _counts(6.0, 32)
+_GT_IDLE = {0x4d0: _residency(0.99), 0x4d8: _residency(1.0)}
+_GT_BUSY = {0x4d0: 0, 0x4d8: _residency(1.0)}
+
+
+def _swap_storm(normal, swap):
+    """Normal / swap / normal phases, long enough for the guard to engage."""
+    sampler, reads = _phased_sampler(PTL, PMT_GUID_PTL, [
+        (normal, 3), (swap, _GUARD_BAD_SAMPLES + 3), (normal, 3),
+    ])
+    results = _run(sampler, reads)
+    during = results[3 + _GUARD_BAD_SAMPLES:3 + _GUARD_BAD_SAMPLES + 3]
+    return sampler, results, during
+
+
+def test_idle_gpu_reads_zero_through_a_swap_storm():
+    normal = {**_CPU_INFERENCE, **_GT_IDLE}
+    swap = {**normal, 0x6e0: _SWAP_IO}
+    sampler, results, during = _swap_storm(normal, swap)
+
+    assert not sampler._disabled
+    assert all(r is not None for r in results[1:])          # never goes dark
+    assert all(r.gpu_gb_s == 0.0 and not r.gpu_estimated for r in during)
+    assert all(r.cpu_gb_s is not None and r.cache_hit_percent is not None for r in during)
+
+
+def test_busy_gpu_estimated_from_cache_during_swap_storm_and_recovers():
+    # GPU at 3 GB/s, all of it through the SoC cache (hit and miss +1.5 each).
+    normal = {
+        **_CPU_INFERENCE, **_GT_BUSY,
+        0x6e0: _counts(3.06, 32), 0x6a0: _counts(6.3, 64), 0x6a8: _counts(4.2, 64),
+    }
+    swap = {**normal, 0x6e0: _counts(3.06, 32) + _SWAP_IO}
+    sampler, results, during = _swap_storm(normal, swap)
+
+    assert not sampler._disabled
+    # cache 10.5 - cpu 7.4 - npu 0 - floor 0 = 3.1, instead of MemSWITCH's 9.06.
+    assert all(r.gpu_estimated and abs(r.gpu_gb_s - 3.1) < 0.05 for r in during)
+    assert not results[-1].gpu_estimated                     # back to MemSWITCH
+    assert abs(results[-1].gpu_gb_s - 3.06) < 0.05
+    assert not sampler._diverging
 
 
 def test_guard_skipped_without_cache_counters():

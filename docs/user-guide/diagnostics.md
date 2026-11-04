@@ -45,6 +45,16 @@ the **severity legend**). This is the fastest way to spot a burst of activity.
 ![Event timeline](images/diagnostics-timeline.png)
 
 - **Zoom** into a span to narrow the range, and **Reset zoom** to go back.
+- **Resource trends**, below the timeline, plots CPU, GPU, NPU, memory, disk and
+  network utilization on the same time axis, with each event marked as a dashed
+  line. Click a resource in its legend to show or hide it.
+- **Pressure** lanes under the chart show the **System**, **Disk I/O** and
+  **Network** pressure level over the same span — green *low*, yellow *medium*,
+  orange *high*, red *critical*; grey means no samples. Each span shows the worst
+  level reached in it, so a short spike is not averaged away. Hover a span for its
+  level and time range. Use the lanes to see whether a burst of events or a
+  utilization peak came with real contention: pressure, not utilization, is what
+  triggers automatic control.
 
 ## Alerts
 

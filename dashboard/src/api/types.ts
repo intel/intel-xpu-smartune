@@ -155,9 +155,13 @@ export interface DiagResourceUtilization {
   count: number
 }
 
+export type DiagPressureLevel = 'low' | 'medium' | 'high' | 'critical'
+
 export interface DiagResourceTrendPoint {
   ts_epoch: number
   values: Record<string, number>
+  /** Worst pressure level in the bucket, keyed by System / Disk / Network. */
+  pressure?: Record<string, DiagPressureLevel>
 }
 
 export interface DiagResourceUtilizationData {
@@ -815,6 +819,7 @@ export interface StaticInfoData {
   }
   cpu: {
     model_name: string | null
+    platform_name?: string | null
     core_count: {
       logical: number | null
       physical: number | null
@@ -883,6 +888,7 @@ export interface StaticInfoData {
     eu_count?: Record<string, number | null>
     topology?: Record<string, GpuTopology>
     pci_addresses?: Record<string, string>
+    pci_ids?: Record<string, string>
     driver_names?: Record<string, string | null>
   }
   npu: {
@@ -1001,6 +1007,9 @@ export interface DynamicInfoData {
         cpu_gb_s: number | null
         gpu_gb_s: number | null
       } | null
+      // True when devices.gpu_gb_s is a coarse SoC-cache-based estimate
+      // (heavy non-cached IO such as swap made the usual derivation unreliable).
+      gpu_estimated?: boolean
       // Hit ratio (%) of the SoC memory-side cache, shared by CPU/GPU/NPU.
       // Null where the platform has no such counters.
       soc_cache_hit_percent?: number | null

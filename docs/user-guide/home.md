@@ -37,14 +37,18 @@ Below the pressure panel, **Resource Details** cards show live utilization for e
 subsystem your server is monitoring:
 
 - **CPU** — overall and per-core style utilization, plus package power and, where
-  available, how much memory bandwidth the CPU is driving (**Mem BW**).
+  available, how much memory bandwidth the CPU is driving (**Mem BW**). The card's
+  subtitle names the platform when SmarTune recognizes it.
 - **Memory** — used / available, and (where available) DRAM bandwidth and the
-  **SoC cache hit rate**.
+  **SoC cache hit rate**. The subtitle shows the platform's **Peak BW**.
 - **GPU** — per-card (iGPU/dGPU) frequency, power, per-engine utilization and
-  memory. A dGPU shows its VRAM; an iGPU shares system memory, and on the `xe`
-  driver it also shows how much of that memory the GPU itself is using and, where
-  available, its memory bandwidth.
-- **NPU** — utilization, power, temperature, frequency, and memory.
+  memory. The subtitle starts with the card's PCI ID. A dGPU 
+  shows its VRAM; an iGPU shares system memory, and on the `xe` driver it also
+  shows how much of that memory the GPU itself is using and, where available, its
+  memory bandwidth (see
+  [why it can read 0 or "≈"](troubleshooting.md#gpu-mem-bw-shows-0-or-an-estimate)).
+- **NPU** — utilization, power, temperature, frequency, and memory. The subtitle
+  starts with its PCI ID.
 - **Disk** and **Network** — throughput and activity.
 
 Use **Configure monitored resources** to choose which of these cards are shown —

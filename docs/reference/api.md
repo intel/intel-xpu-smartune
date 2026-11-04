@@ -94,6 +94,7 @@ All endpoints return a standardized JSON structure:
 | App | `/app/resource_limit_profile` | POST | Get limit profile | Defaults + bounds for UI |
 | App | `/app/resource_restore` | POST | Restore resources | Remove limits by app_id |
 | App | `/app/freeze` | POST | Freeze/unfreeze a limited app | cgroup.freeze; manual limits only |
+| App | `/app/cpu_affinity` | POST | Bind an app to CPU cores, query, or restore | cgroup v2 cpuset; P/E/LPE class or specific cores |
 | App | `/app/limit_snapshot` | POST | Live limit snapshot | Ownership + effective caps + pids |
 | App | `/app/interrupted_limit_status` | POST | Probe kernel caps by cgroup | Recovers interrupted lifecycles; one or many |
 | App | `/app/auto_limited_apps` | POST | List pressure-driven limits | Rows + live pressure levels |
@@ -729,13 +730,16 @@ Or query by name:
       "remark": "Critical service",
       "status": "running",
       "frozen": false,
-      "frozen_at": null
+      "frozen_at": null,
+      "cpu_affinity": []
     }
   ]
 }
 ```
 
 `frozen` / `frozen_at` (epoch seconds, `null` when not frozen) report the manual Freeze state set through `/app/freeze`.
+
+`cpu_affinity` lists the distinct `cpuset.cpus.effective` values of the app's cgroups that were pinned through `/app/cpu_affinity` (e.g. `["2-5"]`); an empty list means the app is not pinned. It is independent of the limit state.
 
 ---
 
@@ -1070,6 +1074,70 @@ Or query by name:
 - A freeze takes effect on the cgroup in milliseconds, but an NPU keeps running work it already has: usage fell only after about 20 s in a measurement with an 8B model.
 - Every freeze is recorded in `/run/smartune/frozen_cgroups.json` (override with the `SMARTUNE_FREEZE_STATE` environment variable) before it is written. On startup the balancer thaws exactly the recorded cgroups, never other frozen cgroups on the host (e.g. `docker pause`).
 - The state is reported as `frozen` / `frozen_at` in `/app/limit_snapshot` and `/app/get_controlled_app`. `/app/resource_restore` undoes both the limits and the freeze.
+- A successful freeze or thaw is pushed to every connected client as the `app_frozen_changed` SSE event, so a second dashboard refreshes without polling. A call that changes nothing (`Already frozen`) and a failed one send nothing.
+
+---
+
+#### POST /app/cpu_affinity
+
+**Purpose:** Choose which CPU cores a controlled app may run on, using the cgroup v2 cpuset controller (`cpuset.cpus`) on every cgroup the app occupies. It can be changed while the app runs: its running threads move at once. It is independent of the resource limits: it needs no limit, and `/app/resource_restore` does not undo it.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | app_id | Yes | string | Public application identifier; must be registered and under control |
+| Body | class | Yes | string | `p`, `e`, `lpe` (core class), `custom` (needs `cpus`), `restore` (back to all cores) or `status` (read only) |
+| Body | cpus | When `class` is `custom` | string | CPU list such as `1,3-4`; every CPU must be online |
+| Body | target_cgroups | No | string[] | Restrict to these running instances (cgroup basenames); default is every cgroup of the app |
+
+**Request Example:**
+```json
+{
+  "app_id": "com.example.app",
+  "class": "lpe"
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Bound to cpus 2-5",
+  "data": {}
+}
+```
+
+**`class: "status"` response** (`data` carries the answer; nothing is changed):
+```json
+{
+  "retcode": 0,
+  "retmsg": "ok",
+  "data": {
+    "classes": { "p": "0-1", "lpe": "2-5" },
+    "cgroups": [
+      { "cgroup": "app-demo.scope", "cpus": "2-5", "bound": true }
+    ],
+    "last": { "class": "lpe", "cpus": "2-5" }
+  }
+}
+```
+
+- `classes` holds only the core classes this machine has (no `e` key on a CPU without E cores), each with its CPU list. Clients should build their choices from it instead of hardcoding P/E/LPE.
+- `cpus` is the live `cpuset.cpus.effective`; `bound` tells whether SmarTune pinned that cgroup.
+- `last` is the last selection applied successfully for this app (`null` if none). It is kept in the service's memory, shared by every client, and lost when the service stops.
+
+**Notes:**
+- A missing `app_id` or `class` returns `RetCode.ARGUMENT_ERROR`. An unknown or non-controlled `app_id` returns `RetCode.NOT_EXISTING`.
+- Refusals return `RetCode.OPERATING_ERROR` with a message: a class the machine does not have (`this machine has no E cores (available: p, lpe)`), an unknown class, a malformed or offline CPU list, or no running cgroup found for the app.
+- `p` / `e` / `lpe` come from the detected core topology. On hybrid parts the LPE cores (no L3, on the SoC tile) are reported separately from the E cores, even when the kernel lists both under `cpu_atom`.
+- The cpuset controller is absent from `cgroup.subtree_control` below the root on most systemd hosts. It is enabled on every ancestor of the target on demand; ancestors that already pass it down are left alone, and it is not switched off afterwards.
+- A write is confirmed by reading `cpuset.cpus.effective` back; a mismatch returns `RetCode.OPERATING_ERROR` (the original value is still recorded, so Restore works). If one cgroup of a multi-cgroup app fails, those already bound in the same call are restored.
+- The original `cpuset.cpus` of each cgroup is recorded before the first write and written back by `restore` (an empty original means "inherit the parent"). Repeated calls keep the first original.
+- The binding is removed automatically when every tracked PID of the app has exited (the cgroup can outlive the app, e.g. a terminal scope), and for every bound app when the service stops.
+- It only limits where threads run, not how many the app creates: a program with two busy threads uses at most two cores however many it is allowed.
+- It combines with a CPU limit as the smaller of the two: `cpu.max` caps CPU time, the cpuset caps the cores. A CPU limit that works out to more than the pinned cores has no effect.
+- Setting, restoring, and the automatic unpin are serialised, and each change is pushed to every connected client as the `cpu_affinity_changed` SSE event.
 
 ---
 
@@ -1498,6 +1566,8 @@ data: {"app_id": "", "app_name": "", "status": "pressure_level_changed", "sys_le
 | `auto_limit_changed` | `detail` | The auto-limited list changed in a way no app event covers (a staged restore step, or a failed one). `detail` names the step |
 | `auto_limit_restored_by_user` | — | A limit was lifted through `/app/auto_limit_restore` |
 | `app_closed_limit_restored` | — | The app exited and its limit was dropped with it |
+| `app_frozen_changed` | — | A client froze or thawed the app (`/app/freeze`); refresh that app |
+| `cpu_affinity_changed` | — | CPU affinity was set, restored, or removed because the app exited (`/app/cpu_affinity`); refresh that app |
 
 ---
 

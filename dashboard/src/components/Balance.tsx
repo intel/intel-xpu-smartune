@@ -21,6 +21,9 @@ import {
   Tabs,
   Drawer,
   Descriptions,
+  Radio,
+  Spin,
+  Divider,
 } from 'antd'
 import {
   PlusOutlined,
@@ -41,11 +44,71 @@ import {
   EditOutlined,
   ControlOutlined,
   PauseCircleOutlined,
+  ClusterOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
 import { MEMORY_RECOVERY_HINT, FREEZE_WHY, FREEZE_RISKS } from '../utils/messages'
 import { api } from '../api/client'
+
+// '0-1,4' -> [0, 1, 4]
+function expandCpuList(spec: string): number[] {
+  return spec.split(',').flatMap((part) => {
+    const [a, b] = part.split('-').map(Number)
+    if (!Number.isFinite(a)) return []
+    return Array.from({ length: (Number.isFinite(b) ? b : a) - a + 1 }, (_, i) => a + i)
+  })
+}
+
+type AffinityChoice = AffinityDialogState['choice']
+
+// What to preselect when the dialog opens: the app's actual current pinning when it has one,
+// otherwise the last selection applied successfully (remembered by the server, so every open UI
+// agrees), and only if it is still valid on this machine.
+function initialAffinityChoice(
+  classes: Record<string, string>, pinned: string[], last: { class: string; cpus: string } | null,
+): { choice: AffinityChoice; selected: number[] } {
+  const key = (cores: number[]) => [...new Set(cores)].sort((a, b) => a - b).join(',')
+  if (pinned.length > 0) {
+    const cores = pinned.flatMap(expandCpuList)
+    const match = (['p', 'e', 'lpe'] as const).find(
+      (c) => c in classes && pinned.length === 1 && key(expandCpuList(classes[c])) === key(cores))
+    return match
+      ? { choice: match, selected: [] }
+      : { choice: 'custom', selected: [...new Set(cores)].sort((a, b) => a - b) }
+  }
+  if (!last) return { choice: '', selected: [] }
+  const valid = new Set(Object.values(classes).flatMap(expandCpuList))
+  if (last.class === 'custom') {
+    const selected = expandCpuList(last.cpus).filter((c) => valid.has(c))
+    return selected.length ? { choice: 'custom', selected } : { choice: '', selected: [] }
+  }
+  return last.class in classes ? { choice: last.class as AffinityChoice, selected: [] } : { choice: '', selected: [] }
+}
+
+// Distinct cores across the cpu lists an app is pinned to.
+function pinnedCoreCount(lists: string[] | undefined): number {
+  return new Set((lists ?? []).flatMap(expandCpuList)).size
+}
+
+interface AffinityDialogState {
+  app: AppInfo | null
+  status: 'loading' | 'ready' | 'error'
+  classes: Record<string, string>   // core classes present on this machine -> cpu list
+  current: string[]                 // cpu lists the app's cgroups are currently pinned to
+  choice: '' | 'p' | 'e' | 'lpe' | 'custom' | 'restore'
+  selected: number[]
+}
+
+const AFFINITY_DIALOG_CLOSED: AffinityDialogState = {
+  app: null, status: 'loading', classes: {}, current: [], choice: '', selected: [],
+}
+
+const AFFINITY_CLASS_INFO = {
+  p: { title: 'P cores', hint: 'Performance cores: fastest per core, highest power. Best for heavy or latency-sensitive work.' },
+  e: { title: 'E cores', hint: 'Efficient cores: slower but power-efficient. Good for background work.' },
+  lpe: { title: 'LPE cores', hint: 'Low-power efficient cores on the SoC tile (no L3 cache): lowest power and speed. Keeps P cores free for other apps.' },
+} as const
 import type {
   AppInfo,
   AutoLimitedApp,
@@ -815,6 +878,9 @@ export default function Balance({
     DEFAULT_NETWORK_BW_RANGES
   )
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({})
+  // CPU affinity dialog. Nothing is offered until the machine's core layout has been read, so a
+  // wrong placeholder list is never shown.
+  const [affinityDialog, setAffinityDialog] = useState<AffinityDialogState>(AFFINITY_DIALOG_CLOSED)
   const [limitDialog, setLimitDialog] = useState<LimitDialogState>({
     app: null,
     open: false,
@@ -1111,6 +1177,13 @@ export default function Balance({
           refreshAutoLimited()
           return
         }
+        // Another client changed Freeze or CPU Affinity (or the reaper unpinned an exited app):
+        // the Frozen / CPU tags and the Freeze button are the only things that move, and no
+        // other event announces it.
+        if (event.status === 'cpu_affinity_changed' || event.status === 'app_frozen_changed') {
+          refreshControlled()
+          return
+        }
         // System-level notifications (no specific app_id)
         if (event.status === 'manual_app_limit_by_user') {
           messageApi.warning(
@@ -1229,6 +1302,44 @@ export default function Balance({
       await api.freezeApp({ app_id: app.app_id, freeze: false })
       messageApi.success(`${app.app_name} is running again (limits kept)`)
     })()
+
+  // CPU affinity is its own step, independent of Limit/Restore.  The dialog always opens first and
+  // reads the core layout from the server; the restriction is removed by choosing "All cores",
+  // or automatically when the app exits.
+  const openAffinityDialog = async (app: AppInfo) => {
+    setAffinityDialog({ ...AFFINITY_DIALOG_CLOSED, app, status: 'loading' })
+    const isCurrent = (prev: AffinityDialogState) => prev.app?.app_id === app.app_id
+    try {
+      const st = await api.cpuAffinity({ app_id: app.app_id, class: 'status' })
+      if (!st || Object.keys(st.classes).length === 0) throw new Error('core layout unavailable')
+      const pinned = Array.from(new Set(
+        st.cgroups.filter((c) => c.bound && c.cpus).map((c) => c.cpus as string)))
+      const initial = initialAffinityChoice(st.classes, pinned, st.last ?? null)
+      setAffinityDialog((prev) => (isCurrent(prev)
+        ? { ...prev, status: 'ready', classes: st.classes, current: pinned, ...initial } : prev))
+    } catch {
+      setAffinityDialog((prev) => (isCurrent(prev) ? { ...prev, status: 'error' } : prev))
+    }
+  }
+
+  const submitAffinity = () => {
+    const { app, choice, selected } = affinityDialog
+    if (!app || !choice) return
+    setAffinityDialog(AFFINITY_DIALOG_CLOSED)
+    const cores = [...selected].sort((a, b) => a - b)
+    withLoading(`affinity-${app.app_id}`, async () => {
+      await api.cpuAffinity({
+        app_id: app.app_id,
+        class: choice,
+        cpus: choice === 'custom' ? cores.join(',') : undefined,
+        target_cgroups: selectedTargetCgroups[app.app_id],
+      })
+      messageApi.success(
+        choice === 'restore' ? `${app.app_name} may use all CPU cores again`
+          : choice === 'custom' ? `${app.app_name} is restricted to CPU ${cores.join(', ')}`
+            : `${app.app_name} is restricted to ${choice.toUpperCase()} cores`)
+    })()
+  }
 
   const handleResourceLimit = async (app: AppInfo) => {
     setLimitDialog({ app, open: true, loadingProfile: true, submitting: false })
@@ -1497,7 +1608,7 @@ export default function Balance({
       title: 'App Name',
       dataIndex: 'app_name',
       key: 'app_name',
-      width: 240,
+      width: 210,
       render: (name: string, record) => {
         const displayName = name || record.app_id
         const tooltipContent = record.remark ? `${displayName} — ${record.remark}` : displayName
@@ -1526,13 +1637,13 @@ export default function Balance({
     {
       title: 'Priority',
       key: 'priority',
-      width: 150,
+      width: 120,
       render: (_: unknown, record: ControlRow) => <PriorityTag priority={record.priority} />,
     },
     {
       title: 'Status',
       key: 'status',
-      width: 230,
+      width: 290,
       render: (_: unknown, record: AppInfo) => {
         const combined = deriveCombinedStatus(record)
 
@@ -1540,6 +1651,13 @@ export default function Balance({
           <Space size={6} wrap>
             {runtimeHintTag(combined.runtime)}
             {limitSummaryTag(combined.limitSummary)}
+            {(record.cpu_affinity?.length ?? 0) > 0 && (
+              <Tooltip title={`Restricted by CPU Affinity to CPU ${record.cpu_affinity?.join(' ; ')}. Restore does not undo this; use CPU Affinity > All cores.`}>
+                <Tag color="geekblue" icon={<ClusterOutlined />} style={{ marginInlineEnd: 0 }}>
+                  CPU {record.cpu_affinity?.join(' ; ')}
+                </Tag>
+              </Tooltip>
+            )}
             {record.frozen && record.control_status === 'MANUAL_LIMITED' && (
               <Tag color="blue" icon={<PauseCircleOutlined />} style={{ marginInlineEnd: 0 }}>
                 Frozen
@@ -1685,9 +1803,11 @@ export default function Balance({
         return (
           <Space size={4} wrap={false}>
             {detailsButton}
+            <Divider type="vertical" />
+            {/* Group 1: how much the app may use (resource limits, freeze) */}
             {isLimited ? (
               <>
-              <Tooltip title={record.frozen ? 'Unfreeze first, then restore the limits' : 'Restore Resources'}>
+              <Tooltip title={record.frozen ? 'Unfreeze first, then restore the limits' : 'Restore resource limits (does not undo CPU Affinity)'}>
                 <Button
                   size="small"
                   icon={<ReloadOutlined />}
@@ -1728,6 +1848,24 @@ export default function Balance({
               </Tooltip>
             )}
 
+            {/* Group 2: where the app runs (separate from, and not undone by, Restore) */}
+            {isRunning && <Divider type="vertical" />}
+            {isRunning && (
+              <Tooltip title="Choose which CPU cores (P / E / LPE, or specific cores) this app may run on">
+                <Button
+                  size="small"
+                  icon={<ClusterOutlined />}
+                  loading={actionLoading[`affinity-${record.app_id}`]}
+                  onClick={() => openAffinityDialog(record)}
+                  style={{ borderColor: COLORS.accent, color: COLORS.accent }}
+                >
+                  CPU Affinity
+                </Button>
+              </Tooltip>
+            )}
+
+            {/* Group 3: app management */}
+            <Divider type="vertical" />
             <Tooltip title="Edit application priority and process identities. Add or remove the program names that decide which processes and cgroups this app controls (currently-limited names are locked).">
               <Button
                 size="small"
@@ -1799,20 +1937,20 @@ export default function Balance({
       title: 'App Name',
       dataIndex: 'app_name',
       key: 'app_name',
-      width: 240,
+      width: 210,
       render: (name: string) => <Text style={{ color: COLORS.text }}>{name}</Text>,
     },
     {
       title: 'Priority',
       dataIndex: 'priority',
       key: 'priority',
-      width: 150,
+      width: 120,
       render: (p: string) => <PriorityTag priority={p} />,
     },
     {
       title: 'Status',
       key: 'status',
-      width: 230,
+      width: 290,
       render: () => <Tag color="processing">Pending</Tag>,
     },
     {
@@ -2029,6 +2167,18 @@ export default function Balance({
             onChange={(v) => updateForm((prev) => ({ ...prev, cpuPercent: Number(v ?? prev.cpuPercent) }))}
           />
         </div>
+        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
+          The percentage is applied to this app's current CPU usage (a share of the whole machine), not to a single core.
+        </Text>
+        {pinnedCoreCount(limitDialog.app?.cpu_affinity) > 0 && (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginTop: 8 }}
+            message={`This app is pinned to ${pinnedCoreCount(limitDialog.app?.cpu_affinity)} core(s) (CPU ${limitDialog.app?.cpu_affinity?.join(' ; ')}) by CPU Affinity.`}
+            description="Its CPU use cannot exceed those cores, so a CPU limit that works out to more than that has no effect; the smaller of the two applies."
+          />
+        )}
       </div>}
 
       {resourceSectionExpanded && <div style={{ marginLeft: 14, paddingLeft: 12, borderLeft: `2px solid ${COLORS.border}` }}>
@@ -2709,6 +2859,101 @@ export default function Balance({
         />
       </Card>
       )}
+
+      <Modal
+        title={`CPU affinity - ${affinityDialog.app?.app_name ?? ''}`}
+        open={affinityDialog.app !== null}
+        width={560}
+        okText={affinityDialog.choice === 'restore' ? 'Restore' : 'Apply'}
+        okButtonProps={{
+          disabled: affinityDialog.status !== 'ready' || !affinityDialog.choice
+            || (affinityDialog.choice === 'custom' && affinityDialog.selected.length === 0),
+        }}
+        onCancel={() => setAffinityDialog(AFFINITY_DIALOG_CLOSED)}
+        onOk={submitAffinity}
+      >
+        {affinityDialog.status === 'loading' && (
+          <div style={{ textAlign: 'center', padding: 24 }}><Spin /></div>
+        )}
+        {affinityDialog.status === 'error' && (
+          <Alert
+            type="warning"
+            showIcon
+            message="Cannot read this machine's CPU core layout"
+            description="CPU affinity cannot be set right now. Check that the balancer service is running and try again."
+          />
+        )}
+        {affinityDialog.status === 'ready' && (
+          <>
+            <Typography.Paragraph type="secondary" style={{ fontSize: 13 }}>
+              Choose which CPU cores this app may run on. It takes effect immediately on the running
+              app, and is removed automatically when the app exits. It limits <i>where</i> threads run,
+              not how many the app creates: an app with 2 busy threads uses at most 2 cores even if
+              more are allowed.
+            </Typography.Paragraph>
+            {affinityDialog.app?.effective?.cpu_mem?.limited && (
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 12 }}
+                message="This app also has a CPU limit."
+                description="CPU Affinity decides where it runs, the limit decides how much CPU time it gets. The effective cap is the smaller of the two."
+              />
+            )}
+            <Typography.Paragraph style={{ fontSize: 13 }}>
+              Currently: {affinityDialog.current.length
+                ? <Tag color="blue">restricted to CPU {affinityDialog.current.join(' ; ')}</Tag>
+                : <Tag>not restricted (all cores)</Tag>}
+            </Typography.Paragraph>
+            <Radio.Group
+              value={affinityDialog.choice}
+              onChange={(e) => setAffinityDialog((prev) => ({ ...prev, choice: e.target.value }))}
+              style={{ display: 'block' }}
+            >
+              <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                {(['p', 'e', 'lpe'] as const)
+                  .filter((c) => c in affinityDialog.classes)
+                  .map((c) => (
+                    <Radio key={c} value={c}>
+                      <b>{AFFINITY_CLASS_INFO[c].title}</b> (CPU {affinityDialog.classes[c]})
+                      <div style={{ fontSize: 12, color: COLORS.textMuted }}>{AFFINITY_CLASS_INFO[c].hint}</div>
+                    </Radio>
+                  ))}
+                <Radio value="custom">
+                  <b>Specific cores</b>
+                  <div style={{ fontSize: 12, color: COLORS.textMuted }}>
+                    Tick individual cores below, e.g. one P core for one app and another for a second app.
+                  </div>
+                </Radio>
+                <Radio value="restore">
+                  <b>All cores (default)</b>
+                  <div style={{ fontSize: 12, color: COLORS.textMuted }}>
+                    Remove the restriction; the OS scheduler decides where the app runs.
+                  </div>
+                </Radio>
+              </Space>
+            </Radio.Group>
+            {affinityDialog.choice === 'custom' && (
+              <Checkbox.Group
+                value={affinityDialog.selected}
+                onChange={(vals) => setAffinityDialog((prev) => ({ ...prev, selected: vals as number[] }))}
+                style={{ display: 'block', marginTop: 12 }}
+              >
+                {(['p', 'e', 'lpe'] as const)
+                  .filter((c) => c in affinityDialog.classes)
+                  .map((c) => (
+                    <div key={c} style={{ marginBottom: 6 }}>
+                      <Typography.Text strong>{AFFINITY_CLASS_INFO[c].title}: </Typography.Text>
+                      {expandCpuList(affinityDialog.classes[c]).map((core) => (
+                        <Checkbox key={core} value={core}>CPU {core}</Checkbox>
+                      ))}
+                    </div>
+                  ))}
+              </Checkbox.Group>
+            )}
+          </>
+        )}
+      </Modal>
 
       <Modal
         title={(

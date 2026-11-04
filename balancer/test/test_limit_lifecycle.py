@@ -1804,6 +1804,85 @@ class PurgeControlledAppTests(unittest.TestCase):
         service.restore_resource.assert_called_once_with('existing.scope')
 
 
+class AffinityReaperTests(unittest.TestCase):
+    """A closed app is unpinned: its cgroup can outlive it (shared scope), and the
+    leftover cpuset.cpus would pin whatever runs there next."""
+
+    def _balancer(self, pids, alive):
+        b = _balancer()
+        b.control_manager.cpu = mock.Mock()
+        b.control_manager.cpu.restore.return_value = (True, "ok")
+        b._affinity_apps = {"app1": {"app_name": "demo", "pids": set(pids), "dirs": {"/cg/a.scope"}}}
+        b._affinity_lock = threading.Lock()
+        b._affinity_op_lock = threading.RLock()
+        b._pid_gone_or_dying = lambda pid: pid not in alive
+        return b
+
+    def test_closed_app_is_unpinned_and_forgotten(self):
+        b = self._balancer({10, 11}, alive=set())
+        b._reap_closed_affinity()
+        b.control_manager.cpu.restore.assert_called_once_with("/cg/a.scope")
+        self.assertEqual(b._affinity_apps, {})
+
+    def test_running_app_keeps_its_binding(self):
+        b = self._balancer({10, 11}, alive={11})      # one tracked pid still alive
+        b._reap_closed_affinity()
+        b.control_manager.cpu.restore.assert_not_called()
+        self.assertIn("app1", b._affinity_apps)
+
+    def test_no_pid_snapshot_falls_back_to_running_status(self):
+        b = self._balancer(set(), alive=set())
+        with mock.patch.object(balancer_mod.app_utils, "check_app_running_status",
+                               return_value="stopped"):
+            b._reap_closed_affinity()
+        b.control_manager.cpu.restore.assert_called_once_with("/cg/a.scope")
+
+    def test_summary_lists_distinct_effective_cpus_of_pinned_cgroups(self):
+        b = self._balancer({10}, alive={10})
+        b._affinity_apps["app1"]["dirs"] = {"/cg/a.scope", "/cg/b.scope", "/cg/c.scope"}
+        reads = {"/cg/a.scope": "2-5", "/cg/b.scope": "2-5", "/cg/c.scope": "0-1"}
+        b.control_manager.cpu.read_cpus.side_effect = reads.get
+        self.assertEqual(b.cpu_affinity_summary("app1"), ["2-5", "0-1"])   # cgroup-path order, deduplicated
+
+    def test_summary_is_empty_for_an_unpinned_app(self):
+        b = self._balancer({10}, alive={10})
+        self.assertEqual(b.cpu_affinity_summary("other"), [])
+        b.control_manager.cpu.read_cpus.assert_not_called()
+
+    def test_successful_bind_is_remembered_and_failure_is_not(self):
+        b = self._balancer({10}, alive={10})
+        b._app_cgroup_targets = lambda *a: (["/cg/a.scope"], [10])
+        b.control_manager.cpu.set_cpus.return_value = (True, "ok")
+        with mock.patch("monitor.metrics.cpu.detect_core_groups",
+                        return_value={"p_cores": [0, 1], "lpe_cores": [2, 3, 4, 5]}):
+            self.assertTrue(b.set_cpu_affinity("app1", "demo", "lpe")[0])
+            b.control_manager.cpu.remember_choice.assert_called_once_with("app1", "lpe", "2-5")
+            b.control_manager.cpu.remember_choice.reset_mock()
+            b.control_manager.cpu.set_cpus.return_value = (False, "boom")
+            self.assertFalse(b.set_cpu_affinity("app1", "demo", "p")[0])
+            b.control_manager.cpu.remember_choice.assert_not_called()
+
+    def test_bind_and_unpin_tell_every_ui_to_refresh(self):
+        """The Balance tab does not poll; without a pushed event other clients show stale state."""
+        b = self._balancer({10}, alive=set())
+        sent = []
+        with mock.patch.object(balancer_mod.app_utils.callback_manager, "send_callback_notification",
+                               side_effect=lambda data, store=False: sent.append(data)):
+            b._reap_closed_affinity()                       # app exited -> unpinned
+            b._app_cgroup_targets = lambda *a: (["/cg/a.scope"], [10])
+            b.control_manager.cpu.set_cpus.return_value = (True, "ok")
+            with mock.patch("monitor.metrics.cpu.detect_core_groups",
+                            return_value={"p_cores": [0, 1], "lpe_cores": [2, 3, 4, 5]}):
+                b.set_cpu_affinity("app1", "demo", "p")
+        self.assertEqual([(d["app_id"], d["status"], d["purpose"]) for d in sent],
+                         [("app1", "cpu_affinity_changed", "notify")] * 2)
+
+    def test_manual_restore_stops_tracking(self):
+        b = self._balancer({10}, alive={10})
+        b._forget_affinity("app1", ["/cg/a.scope"])
+        self.assertEqual(b._affinity_apps, {})
+
+
 class SwapHandbackTests(unittest.TestCase):
     """Stopping smartune undoes what smartune did -- swap included.
 
@@ -1816,9 +1895,15 @@ class SwapHandbackTests(unittest.TestCase):
     def _balancer(self):
         b = _balancer()
         b.control_manager.release_swap = mock.Mock(return_value=[])
+        b.control_manager.cpu = mock.Mock()
         b.restore_all_limited_apps_resources = mock.Mock()
         b.network_controller = mock.Mock()
         return b
+
+    def test_shutdown_unpins_cpu_affinity(self):
+        b = self._balancer()
+        b.shutdown()
+        b.control_manager.cpu.restore_all.assert_called_once_with()
 
     def test_shutdown_hands_back_only_the_files_holding_nothing(self):
         b = self._balancer()

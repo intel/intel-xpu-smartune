@@ -192,6 +192,26 @@ class SetFreezeTests(unittest.TestCase):
         self.assertNotIn(("restore_limit", "a.scope"), calls)
         self.assertIn("a.scope", b.all_limits.apps)
 
+    def test_freeze_and_unfreeze_tell_every_ui_to_refresh(self):
+        """The Balance tab does not poll: a freeze made by one client must be pushed to the rest."""
+        calls = []
+        b = _balancer(calls, _entry())
+        sent = []
+        with mock.patch.object(balancer_mod.app_utils.callback_manager, "send_callback_notification",
+                               side_effect=lambda data, store=False: sent.append(data)):
+            b.set_freeze("app-1", True)
+            b.set_freeze("app-1", True)     # already frozen: nothing changed, nothing to announce
+            b.set_freeze("app-1", False)
+        self.assertEqual([(d["app_id"], d["status"], d["purpose"]) for d in sent],
+                         [("app-1", "app_frozen_changed", "notify")] * 2)
+
+    def test_failed_freeze_announces_nothing(self):
+        calls = []
+        b = _balancer(calls, _entry(cgroups=("a.scope", "b.scope")), fail_freeze_on="b.scope")
+        with mock.patch.object(balancer_mod.app_utils.callback_manager, "send_callback_notification") as send:
+            b.set_freeze("app-1", True)
+        send.assert_not_called()
+
     def test_half_frozen_app_is_rolled_back(self):
         calls = []
         entry = _entry(cgroups=("a.scope", "b.scope"))

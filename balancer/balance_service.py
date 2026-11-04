@@ -135,6 +135,15 @@ class DynamicService:
     def restore_resource(self, app_id):
         return self.balancer.set_restore_resource(app_id)
 
+    def cpu_affinity_summary(self, app_id):
+        return self.balancer.cpu_affinity_summary(app_id)
+
+    def cpu_affinity(self, app_id, app_name, cpu_class, cpus=None, target_cgroups=None):
+        if cpu_class == "status":
+            return True, self.balancer.get_cpu_affinity(app_id, app_name)
+        return self.balancer.set_cpu_affinity(
+            app_id, app_name, cpu_class, cpus=cpus, target_cgroups=target_cgroups)
+
     def freeze_resource(self, app_id, freeze):
         return self.balancer.set_freeze(app_id, freeze)
 
@@ -1348,6 +1357,14 @@ def get_controlled_app():
                 except Exception as e:
                     logger.debug(f"get_limit_snapshot failed for {app.app_id}: {e}")
 
+            cpu_affinity = []
+            get_affinity = getattr(_service, "cpu_affinity_summary", None)
+            if callable(get_affinity):
+                try:
+                    cpu_affinity = get_affinity(app.app_id) or []
+                except Exception as e:
+                    logger.debug(f"cpu_affinity_summary failed for {app.app_id}: {e}")
+
             process_rows, app_summary_status, runtime_hint = _build_process_scope_snapshot(
                 app_id=app.app_id,
                 app_name=app_name,
@@ -1387,6 +1404,8 @@ def get_controlled_app():
                 "limited_scopes": limit_snapshot.get("cgroups", []),
                 "frozen": bool(limit_snapshot.get("frozen", False)),
                 "frozen_at": limit_snapshot.get("frozen_at"),
+                # Cores the app is pinned to by CPU Affinity ([] = not pinned); independent of limits.
+                "cpu_affinity": cpu_affinity,
             })
 
         return construct_response(
@@ -1784,6 +1803,44 @@ def app_freeze():
             retcode=RetCode.EXCEPTION_ERROR,
             retmsg=str(e)
         )
+
+
+@app.route('/app/cpu_affinity', methods=['POST'])
+def app_cpu_affinity():
+    """Bind a controlled app to P / E / LPE cores (or a custom list), query it, or restore it.
+
+    ``class`` is one of ``p``, ``e``, ``lpe``, ``custom`` (with ``cpus``),
+    ``restore`` or ``status``.  Independent of the resource limits.
+    """
+    try:
+        data = request.get_json() or {}
+        app_id = data.get('app_id', "")
+        cpu_class = str(data.get('class', "")).lower()
+        if not app_id or not cpu_class:
+            return construct_response(
+                data={}, retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="app_id and class must be provided")
+
+        app_record = AIAppPriority.query().filter(AIAppPriority.app_id == app_id).first()
+        if not app_record or not app_record.controlled:
+            return construct_response(
+                data={}, retcode=RetCode.NOT_EXISTING,
+                retmsg="Unknown or non-controlled app_id; register and enable control before binding cores.")
+
+        ok, result = _service.cpu_affinity(
+            app_id, app_record.name, cpu_class,
+            cpus=data.get('cpus'),
+            target_cgroups=data.get('target_cgroups') or None)
+        if cpu_class == "status":
+            return construct_response(data=result, retmsg="ok")
+        return construct_response(
+            data={},
+            retcode=RetCode.SUCCESS if ok else RetCode.OPERATING_ERROR,
+            retmsg=result)
+    except Exception as e:
+        logger.error(f"CPU affinity failed: {e}")
+        return construct_response(
+            data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
 
 
 @app.route('/app/auto_limited_apps', methods=['POST'])

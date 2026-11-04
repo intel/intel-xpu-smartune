@@ -117,6 +117,50 @@ Before you freeze, be aware that:
 If SmarTune stops while an app is frozen, it unfreezes that app the next time it
 starts.
 
+## Choosing which CPU cores an app runs on
+
+Use **CPU Affinity** to decide *where* an app runs, for example one app on the
+P cores and another on the LPE cores. Limits decide how much an app may use;
+affinity decides which cores it may use, and the two are independent. The
+button is on running apps under manual control and needs no limit first. Apps
+that automatic control is currently limiting do not show it; use **Take Control**
+first.
+
+- Click **CPU Affinity**. A dialog shows this machine's core groups, such as
+  **P cores (CPU 0-1)** and **LPE cores (CPU 2-5)**. Groups the machine does
+  not have are not listed. If the core layout cannot be read, the dialog says
+  so and offers nothing.
+- Pick a group, or **Specific cores** to tick individual cores (for example a
+  single P core), or **All cores (default)** to remove the restriction. Then
+  click **Apply**.
+- It takes effect immediately on the running app and can be changed again at any
+  time.
+- The row shows a **CPU 2-5** tag while the app is restricted. Other open
+  dashboards update too.
+- The dialog opens with the app's current restriction selected. If it has none,
+  it opens with your last successful choice for that app; that memory is shared
+  by every dashboard and is cleared when SmarTune restarts.
+- The restriction is removed automatically when the app exits, and for all apps
+  when SmarTune stops.
+
+Things to know:
+
+- It decides where the app runs, not how many threads it starts. An app that
+  runs two busy threads uses at most two cores, however many it is allowed.
+- Everything in the same scope is restricted together (a terminal tab is one
+  scope).
+- With a CPU limit as well, the smaller of the two applies. The CPU limit is a
+  share of the app's current usage, not of one core, so a limit that works out
+  to more than the pinned cores has no effect.
+- **Restore** only lifts limits. It does not undo CPU Affinity; choose
+  **All cores (default)** for that.
+- LPE cores have no L3 cache and are the slowest group; the P cores are the
+  fastest.
+
+![The CPU Affinity dialog](images/control-center-cpu-affinity.png)
+
+The CPU Affinity dialog, opened from the **CPU Affinity** button on the app's row. Box 1: the app's current restriction (here it runs on the two P cores, CPU 0-1). Box 2: with **Specific cores** selected, tick any other cores and click **Apply** to move the running app.
+
 ## Restoring limits
 
 You are always in control of releasing limits:
@@ -124,7 +168,8 @@ You are always in control of releasing limits:
 - **Restore now** — release a specific active limit immediately instead of
   waiting for staged recovery.
 - **Restore Resources** — lift the app's limits back to normal. Unfreeze a
-  frozen app first; Restore is disabled until then.
+  frozen app first; Restore is disabled until then. This does not undo
+  [CPU Affinity](#choosing-which-cpu-cores-an-app-runs-on).
 
 <!-- Screenshot: Restore Resources on a manually limited app (Manual Control tab). -->
 ![Restore Resources on a manual limit](images/control-center-restore-manual.png)

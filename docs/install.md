@@ -71,6 +71,10 @@ bash start_dashboard.sh    # dev server on port 39527, binds 0.0.0.0
 Open `http://<host-ip>:39527/` (or `http://localhost:39527/` on the host
 itself). The dev server proxies API calls to the backend on port 9001.
 
+**Sign in.** The dashboard asks for an access token. The backend creates it on first
+start; read it with `sudo cat key/api_token` and paste it into the sign-in screen
+(see [Getting started → Log in](user-guide/getting-started.md#3-log-in)).
+
 ---
 
 ## Run as a systemd service

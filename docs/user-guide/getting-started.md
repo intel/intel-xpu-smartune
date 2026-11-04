@@ -36,11 +36,60 @@ address and continue.
 
 ## 3. Log in
 
-The dashboard is gated by an access token. On first open you are shown the
-sign-in screen; enter the credentials for your SmarTune instance to continue.
+SmarTune has no user name or password. The dashboard (and every API endpoint) is
+protected by a single **access token** that the server creates for your instance.
+You need that token to sign in.
 
 <!-- Screenshot: the login / sign-in screen (LoginGate). -->
 ![Sign in](images/login.png)
+
+### Debian package: automatic sign-in
+
+When you start SmarTune from the application menu, the launcher reads the token
+for you (after the administrator Polkit prompt) and passes it to the browser, so
+you normally land straight on the dashboard **without seeing the sign-in screen**.
+
+You only see the sign-in screen if you open `https://localhost:9001` yourself, from
+another browser or machine, or after the browser's saved token was cleared.
+In that case, get the token as described below.
+
+### From source or systemd service: sign in manually
+
+Open the dashboard and paste the token into the sign-in screen.
+
+1. Get the token. It is stored in a root-only file, so read it with `sudo`:
+
+   ```bash
+   sudo cat key/api_token                          # source install (repository root)
+   sudo cat /opt/intel/smartune/key/api_token      # Debian package
+   ```
+
+   The file is created automatically the first time the service starts
+   (random value, mode `0600`) and reused on every later start, so the token does
+   not change between restarts.
+
+2. Enter the token in the **Access token** field and select **Sign in** (or press
+   Enter). The main dashboard opens.
+
+The browser remembers the token, so you do not have to sign in again on that
+browser. If the token is changed on the server, the saved one stops working and
+the sign-in screen appears again.
+
+| Message on the sign-in screen | Meaning |
+| --- | --- |
+| *Please enter your access token.* | The field was empty. |
+| *Invalid access token. Please check with your administrator.* | The token is wrong or out of date. Re-read it from `key/api_token`. |
+| *Could not reach the server. Please try again.* | The service is not running or not reachable; see [Troubleshooting](troubleshooting.md#the-dashboard-wont-open). |
+
+### Sharing, setting, or resetting the token
+
+- **Share access:** give the token to the people who should use the dashboard.
+  Anyone with it has full access, so share it only over a trusted channel.
+- **Choose your own token:** set the `BALANCER_API_TOKEN` environment variable
+  before starting the service. It takes priority over the file.
+- **Reset the token:** stop the service, delete `key/api_token`, and start it
+  again; a new random token is generated. Everyone must then sign in with the new
+  token.
 
 ## 4. A tour of the dashboard
 

@@ -71,6 +71,13 @@ bash start_dashboard.sh       # dev server on port 39527
 http://<host-ip>:39527/
 ```
 
+**4. Sign in** with the access token the backend generated on first start. Read it
+on the host and paste it into the sign-in screen:
+
+```bash
+sudo cat key/api_token
+```
+
 Next: the **[User guide → Getting started](docs/user-guide/getting-started.md)**, or the
 [Install guide](docs/install.md) for the systemd service, the Debian package, and
 building native dependencies.

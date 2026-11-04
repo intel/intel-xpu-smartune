@@ -23,6 +23,25 @@
 Expected — the local dashboard uses a **self-signed TLS certificate**. Confirm
 the address is `localhost:9001` and proceed.
 
+## I can't sign in / "Invalid access token"
+
+The dashboard signs in with an **access token**, not a user name and password.
+
+1. Read the current token on the server:
+   ```bash
+   sudo cat key/api_token                          # source install
+   sudo cat /opt/intel/smartune/key/api_token      # Debian package
+   ```
+   If the service was started with `BALANCER_API_TOKEN` set, that value is the
+   token instead, and it overrides the file.
+2. Paste it into the **Access token** field with no extra spaces or line breaks.
+3. If the dashboard suddenly returns to the sign-in screen, the token was changed
+   on the server. Sign in again with the new one.
+4. Forgot or need a new token: stop the service, delete `key/api_token`, start the
+   service, and read the newly generated token.
+
+See [Getting started → Log in](getting-started.md#3-log-in) for details.
+
 ## The admin/authentication dialog never appears
 
 Log out of the desktop session and log back in. Locking the screen or closing the

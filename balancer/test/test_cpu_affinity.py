@@ -140,8 +140,48 @@ class ControllerTest(unittest.TestCase):
         self.assertFalse(self.ctl.is_bound(self.scope))
 
     def test_restore_when_never_bound_is_a_noop(self):
-        self.assertEqual(self.ctl.restore(self.scope), (True, "not bound"))
+        self.assertEqual(self.ctl.restore(self.scope),
+                         (True, "no restriction"))
         self.assertEqual(WRITES, [])
+
+    def test_restore_leaves_a_value_set_outside_smartune_alone(self):
+        _w(os.path.join(self.scope, "cpuset.cpus"), "2-3\n")       # e.g. an admin's echo
+        self.assertEqual(self.ctl.restore(self.scope),
+                         (True, "CPU 2-3 (set outside SmarTune, unchanged)"))
+        self.assertEqual(WRITES, [])
+
+    def test_restore_puts_back_a_non_empty_original(self):
+        _w(os.path.join(self.scope, "cpuset.cpus"), "2-3\n")
+        self.ctl.set_cpus(self.scope, "0-1")
+        self.assertEqual(self.ctl.restore(self.scope), (True, "CPU 2-3"))
+        self.assertEqual(self._cpus(), "2-3")
+
+    def test_restore_keeps_a_change_made_outside_smartune_meanwhile(self):
+        self.ctl.set_cpus(self.scope, "0-1")
+        _w(os.path.join(self.scope, "cpuset.cpus"), "4-5\n")        # changed after our write
+        WRITES.clear()
+        self.assertEqual(self.ctl.restore(self.scope),
+                         (True, "CPU 4-5 (changed outside SmarTune, kept)"))
+        self.assertEqual(WRITES, [])
+        self.assertEqual(self._cpus(), "4-5")
+        self.assertFalse(self.ctl.is_bound(self.scope))
+
+    def test_same_cpus_in_another_spelling_is_not_an_outside_change(self):
+        self.ctl.set_cpus(self.scope, "0,1")                       # kernel shows it as 0-1
+        _w(os.path.join(self.scope, "cpuset.cpus"), "0-1\n")
+        self.assertEqual(self.ctl.restore(self.scope), (True, "no restriction"))
+        self.assertEqual(self._cpus(), "")
+
+    def test_cgroup_state_reports_what_restore_will_do(self):
+        _w(os.path.join(self.scope, "cpuset.cpus"), "2-3\n")
+        _w(os.path.join(self.scope, "cpuset.cpus.effective"), "2-3\n")
+        self.assertEqual(self.ctl.cgroup_state(self.scope), {
+            "cgroup": "app-demo.scope", "cpus": "2-3", "configured": "2-3",
+            "bound": False, "original": None})
+        self.ctl.set_cpus(self.scope, "0-1")
+        self.assertEqual(self.ctl.cgroup_state(self.scope), {
+            "cgroup": "app-demo.scope", "cpus": "0-1", "configured": "0-1",
+            "bound": True, "original": "2-3"})
 
     def test_missing_cpuset_file_is_refused(self):
         os.remove(os.path.join(self.scope, "cpuset.cpus"))
@@ -185,6 +225,86 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(self.ctl.last_choice("app2"), {"class": "custom", "cpus": "0,3"})
         self.ctl.last_choice("app1")["class"] = "x"            # callers get a copy
         self.assertEqual(self.ctl.last_choice("app1")["class"], "p")
+
+    def _with_populated_kernel(self, errno_code=28):
+        """Make writing "" to cpuset.cpus fail like a pre-7.0 kernel on a populated cgroup."""
+        import controller.cpu as mod
+        original = mod.write_cgroup_file
+        def refuse_empty(content, target):
+            if target.endswith("cpuset.cpus") and not content:
+                raise OSError(errno_code, os.strerror(errno_code))
+            original(content, target)
+        mod.write_cgroup_file = refuse_empty
+        self.addCleanup(setattr, mod, "write_cgroup_file", original)
+
+    def test_restore_falls_back_to_parent_effective_on_enospc(self):
+        _w(os.path.join(self.app_slice, "cpuset.cpus.effective"), "0-3\n")
+        self.ctl.set_cpus(self.scope, "0-1")
+        self._with_populated_kernel()
+        ok, msg = self.ctl.restore(self.scope)
+        self.assertTrue(ok, msg)
+        self.assertEqual(self._cpus(), "0-3")
+        self.assertFalse(self.ctl.is_bound(self.scope))
+
+    def test_restore_reports_enospc_when_parent_effective_unreadable(self):
+        self.ctl.set_cpus(self.scope, "0-1")
+        self._with_populated_kernel()
+        ok, msg = self.ctl.restore(self.scope)
+        self.assertFalse(ok)
+        self.assertIn("No space left", msg)
+        self.assertTrue(self.ctl.is_bound(self.scope))      # kept for a later retry
+
+    def test_fallback_leftover_is_not_mistaken_for_an_outside_restriction(self):
+        """On pre-7.0 kernels the fallback leaves the parent's full list behind; it restricts nothing."""
+        _w(os.path.join(self.app_slice, "cpuset.cpus.effective"), ALL + "\n")
+        self._with_populated_kernel()
+        self.ctl.set_cpus(self.scope, "0-1")
+        self.assertEqual(self.ctl.restore(self.scope), (True, "no restriction"))
+        self.assertEqual(self._cpus(), ALL)                   # what the fallback wrote
+        state = self.ctl.cgroup_state(self.scope)
+        self.assertEqual((state["configured"], state["bound"]), ("", False))
+        self.assertEqual(self.ctl.restore(self.scope), (True, "no restriction"))
+        # Pinning again records "" as the original, not the leftover list ...
+        self.ctl.set_cpus(self.scope, "2-5")
+        self.assertEqual(self.ctl.cgroup_state(self.scope)["original"], "")
+        # ... so restore tries real inheritance first, and falls back again if refused.
+        self.assertEqual(self.ctl.restore(self.scope), (True, "no restriction"))
+
+    def test_leftover_full_list_is_restored_as_inherit_where_the_kernel_allows(self):
+        _w(os.path.join(self.app_slice, "cpuset.cpus.effective"), ALL + "\n")
+        _w(os.path.join(self.scope, "cpuset.cpus"), ALL + "\n")   # e.g. left by an older kernel
+        self.ctl.set_cpus(self.scope, "0-1")
+        self.assertEqual(self.ctl.restore(self.scope), (True, "no restriction"))
+        self.assertEqual(self._cpus(), "")
+
+    def test_partial_list_is_still_a_restriction(self):
+        _w(os.path.join(self.app_slice, "cpuset.cpus.effective"), ALL + "\n")
+        _w(os.path.join(self.scope, "cpuset.cpus"), "2-3\n")
+        self.assertEqual(self.ctl.cgroup_state(self.scope)["configured"], "2-3")
+
+    def test_restore_after_cpuset_was_disabled_above_succeeds(self):
+        """Disabling cpuset removes cpuset.cpus and the pin with it; retrying the write would fail forever."""
+        self.ctl.set_cpus(self.scope, "0-1")
+        os.remove(os.path.join(self.scope, "cpuset.cpus"))
+        WRITES.clear()
+        self.assertEqual(self.ctl.restore(self.scope),
+                         (True, "no restriction (cpuset controller disabled)"))
+        self.assertEqual(WRITES, [])
+        self.assertFalse(self.ctl.is_bound(self.scope))
+
+    def test_restore_does_not_fall_back_on_other_errors(self):
+        _w(os.path.join(self.app_slice, "cpuset.cpus.effective"), "0-3\n")
+        self.ctl.set_cpus(self.scope, "0-1")
+        self._with_populated_kernel(errno_code=13)
+        self.assertFalse(self.ctl.restore(self.scope)[0])
+        self.assertEqual(self._cpus(), "0-1")
+
+    def test_restore_all_survives_enospc(self):
+        _w(os.path.join(self.app_slice, "cpuset.cpus.effective"), ALL + "\n")
+        self.ctl.set_cpus(self.scope, "2-5")
+        self._with_populated_kernel()
+        self.assertEqual(self.ctl.restore_all(), 0)
+        self.assertEqual(self.ctl.bound_cgroups(), [])
 
     def test_restore_all(self):
         self.ctl.set_cpus(self.scope, "2-5")

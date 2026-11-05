@@ -404,10 +404,21 @@ export interface CpuAffinityPayload {
   target_cgroups?: string[]
 }
 
+// One cgroup of the app.  cpus: effective list; configured: raw cpuset.cpus ('' = inherit);
+// original: what Restore puts back, null when SmarTune has not pinned it (bound=false), in
+// which case a non-empty `configured` was set outside SmarTune and Restore leaves it alone.
+export interface CpuAffinityCgroup {
+  cgroup: string
+  cpus: string | null
+  configured: string | null
+  bound: boolean
+  original: string | null
+}
+
 // classes: core classes present on this machine -> cpu list, e.g. { p: '0-1', lpe: '2-5' }.
 export interface CpuAffinityStatus {
   classes: Record<string, string>
-  cgroups: { cgroup: string; cpus: string | null; bound: boolean }[]
+  cgroups: CpuAffinityCgroup[]
   // Last successfully applied selection for this app (kept by the server, shared by all clients).
   last: { class: string; cpus: string } | null
 }

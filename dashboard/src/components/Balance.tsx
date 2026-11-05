@@ -91,17 +91,80 @@ function pinnedCoreCount(lists: string[] | undefined): number {
   return new Set((lists ?? []).flatMap(expandCpuList)).size
 }
 
+// Same wording as the server's restore messages (controller/cpu.py NO_RESTRICTION).  Not "all
+// cores": an unrestricted cgroup inherits its parent's cpus, and the parent may be confined.
+const NO_RESTRICTION = 'no restriction'
+
+// How one cgroup is confined right now.  A restriction SmarTune did not write came from outside
+// (an admin, systemd AllowedCPUs), so it is labelled as such.
+function affinityNow(c: CpuAffinityCgroup): string {
+  if (c.bound) return `CPU ${c.cpus ?? c.configured}`
+  return c.configured ? `CPU ${c.configured} (set outside SmarTune)` : NO_RESTRICTION
+}
+
+// What Restore leaves the cgroup with: Restore undoes SmarTune's pinning only, so it goes back
+// to the value seen before SmarTune pinned it, and a cgroup SmarTune never pinned is untouched.
+function affinityAfterRestore(c: CpuAffinityCgroup): string {
+  if (c.bound) return c.original ? `CPU ${c.original} (its value before SmarTune)` : NO_RESTRICTION
+  return c.configured ? `CPU ${c.configured} (set outside SmarTune, unchanged)` : NO_RESTRICTION
+}
+
+// One text when every cgroup agrees (an app without cgroups counts as unrestricted),
+// otherwise one row per cgroup -- an app's cgroups can have different original values.
+function describeCgroups(
+  cgroups: CpuAffinityCgroup[], describe: (c: CpuAffinityCgroup) => string,
+): { uniform: string | null; rows: { cgroup: string; text: string }[] } {
+  const rows = cgroups.map((c) => ({ cgroup: c.cgroup, text: describe(c) }))
+  const distinct = new Set(rows.map((r) => r.text))
+  if (distinct.size === 0) return { uniform: NO_RESTRICTION, rows }
+  return { uniform: distinct.size === 1 ? rows[0].text : null, rows }
+}
+
+function AffinityCurrent({ cgroups }: { cgroups: CpuAffinityCgroup[] }) {
+  const { uniform, rows } = describeCgroups(cgroups, affinityNow)
+  const tag = (text: string) => (text === NO_RESTRICTION
+    ? <Tag>not restricted</Tag>
+    : <Tag color="blue">restricted to {text}</Tag>)
+  if (uniform !== null) {
+    return <Typography.Paragraph style={{ fontSize: 13 }}>Currently: {tag(uniform)}</Typography.Paragraph>
+  }
+  return (
+    <Typography.Paragraph style={{ fontSize: 13 }}>
+      Currently (per cgroup):
+      {rows.map((r) => (
+        <div key={r.cgroup} style={{ marginTop: 4 }}>
+          <Typography.Text code>{r.cgroup}</Typography.Text> {tag(r.text)}
+        </div>
+      ))}
+    </Typography.Paragraph>
+  )
+}
+
+function RestorePreview({ cgroups }: { cgroups: CpuAffinityCgroup[] }) {
+  const { uniform, rows } = describeCgroups(cgroups, affinityAfterRestore)
+  const pinned = cgroups.some((c) => c.bound)
+  const lead = pinned ? "Undo SmarTune's restriction" : 'Not pinned by SmarTune, nothing to undo'
+  if (uniform === NO_RESTRICTION) return <>{lead}; the OS scheduler decides where the app runs.</>
+  if (uniform !== null) return <>{lead}{pinned ? `: back to ${uniform}.` : ` (${uniform}).`}</>
+  return (
+    <>
+      {lead}; each cgroup ends up with:
+      {rows.map((r) => <div key={r.cgroup}>• {r.cgroup}: {r.text}</div>)}
+    </>
+  )
+}
+
 interface AffinityDialogState {
   app: AppInfo | null
   status: 'loading' | 'ready' | 'error'
   classes: Record<string, string>   // core classes present on this machine -> cpu list
-  current: string[]                 // cpu lists the app's cgroups are currently pinned to
+  cgroups: CpuAffinityCgroup[]      // the app's cgroups this dialog acts on
   choice: '' | 'p' | 'e' | 'lpe' | 'custom' | 'restore'
   selected: number[]
 }
 
 const AFFINITY_DIALOG_CLOSED: AffinityDialogState = {
-  app: null, status: 'loading', classes: {}, current: [], choice: '', selected: [],
+  app: null, status: 'loading', classes: {}, cgroups: [], choice: '', selected: [],
 }
 
 const AFFINITY_CLASS_INFO = {
@@ -115,6 +178,7 @@ import type {
   AutoLimitedAppsData,
   AutoLimitExclusion,
   ControlStatus,
+  CpuAffinityCgroup,
   ResourceLimitProfileData,
   PassiveControlData,
   ProcessStatusRow,
@@ -1370,19 +1434,22 @@ export default function Balance({
     })()
 
   // CPU affinity is its own step, independent of Limit/Restore.  The dialog always opens first and
-  // reads the core layout from the server; the restriction is removed by choosing "All cores",
-  // or automatically when the app exits.
+  // reads the core layout from the server; SmarTune's pinning is undone by choosing "Restore
+  // original", or automatically when the app exits.
   const openAffinityDialog = async (app: AppInfo) => {
     setAffinityDialog({ ...AFFINITY_DIALOG_CLOSED, app, status: 'loading' })
     const isCurrent = (prev: AffinityDialogState) => prev.app?.app_id === app.app_id
     try {
       const st = await api.cpuAffinity({ app_id: app.app_id, class: 'status' })
       if (!st || Object.keys(st.classes).length === 0) throw new Error('core layout unavailable')
+      // Same scope as the request submitAffinity sends: only the cgroups picked in the table, if any.
+      const targets = new Set((selectedTargetCgroups[app.app_id] ?? []).map((c) => c.split('/').pop()))
+      const cgroups = targets.size ? st.cgroups.filter((c) => targets.has(c.cgroup)) : st.cgroups
       const pinned = Array.from(new Set(
-        st.cgroups.filter((c) => c.bound && c.cpus).map((c) => c.cpus as string)))
+        cgroups.filter((c) => c.bound && c.cpus).map((c) => c.cpus as string)))
       const initial = initialAffinityChoice(st.classes, pinned, st.last ?? null)
       setAffinityDialog((prev) => (isCurrent(prev)
-        ? { ...prev, status: 'ready', classes: st.classes, current: pinned, ...initial } : prev))
+        ? { ...prev, status: 'ready', classes: st.classes, cgroups, ...initial } : prev))
     } catch {
       setAffinityDialog((prev) => (isCurrent(prev) ? { ...prev, status: 'error' } : prev))
     }
@@ -1394,14 +1461,15 @@ export default function Balance({
     setAffinityDialog(AFFINITY_DIALOG_CLOSED)
     const cores = [...selected].sort((a, b) => a - b)
     withLoading(`affinity-${app.app_id}`, async () => {
-      await api.cpuAffinity({
+      const result = await api.applyCpuAffinity({
         app_id: app.app_id,
         class: choice,
         cpus: choice === 'custom' ? cores.join(',') : undefined,
         target_cgroups: selectedTargetCgroups[app.app_id],
       })
+      // Restore reports per cgroup what it put back, which need not be "all cores".
       messageApi.success(
-        choice === 'restore' ? `${app.app_name} may use all CPU cores again`
+        choice === 'restore' ? result
           : choice === 'custom' ? `${app.app_name} is restricted to CPU ${cores.join(', ')}`
             : `${app.app_name} is restricted to ${choice.toUpperCase()} cores`)
     })()
@@ -2965,11 +3033,7 @@ export default function Balance({
                 description="CPU Affinity decides where it runs, the limit decides how much CPU time it gets. The effective cap is the smaller of the two."
               />
             )}
-            <Typography.Paragraph style={{ fontSize: 13 }}>
-              Currently: {affinityDialog.current.length
-                ? <Tag color="blue">restricted to CPU {affinityDialog.current.join(' ; ')}</Tag>
-                : <Tag>not restricted (all cores)</Tag>}
-            </Typography.Paragraph>
+            <AffinityCurrent cgroups={affinityDialog.cgroups} />
             <Radio.Group
               value={affinityDialog.choice}
               onChange={(e) => setAffinityDialog((prev) => ({ ...prev, choice: e.target.value }))}
@@ -2991,9 +3055,9 @@ export default function Balance({
                   </div>
                 </Radio>
                 <Radio value="restore">
-                  <b>All cores (default)</b>
+                  <b>Restore original (default)</b>
                   <div style={{ fontSize: 12, color: COLORS.textMuted }}>
-                    Remove the restriction; the OS scheduler decides where the app runs.
+                    <RestorePreview cgroups={affinityDialog.cgroups} />
                   </div>
                 </Radio>
               </Space>

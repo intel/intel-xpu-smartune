@@ -138,6 +138,9 @@ class DynamicService:
     def cpu_affinity_summary(self, app_id):
         return self.balancer.cpu_affinity_summary(app_id)
 
+    def release_cpu_affinity(self, app_id):
+        return self.balancer.release_cpu_affinity(app_id)
+
     def cpu_affinity(self, app_id, app_name, cpu_class, cpus=None, target_cgroups=None):
         if cpu_class == "status":
             return True, self.balancer.get_cpu_affinity(app_id, app_name)
@@ -716,6 +719,12 @@ def set_to_control():
             # limiting. Explicitly taking it under control supersedes that choice,
             # so it must not remain in both Manual Control and Excluded.
             _service.remove_auto_limit_exclusion(app_id)
+        elif app_id:
+            # /app/cpu_affinity refuses non-controlled apps, so unpin now or the
+            # binding is unreachable from the UI until the app exits.
+            affinity_ok, affinity_msg = _service.release_cpu_affinity(app_id)
+            if not affinity_ok:
+                logger.warning(f"set_to_control: CPU affinity restore failed for {app_id}: {affinity_msg}")
 
         update_fields = dict(
             controlled=controlled,
@@ -1278,6 +1287,14 @@ def purge_controlled_app():
                     data={}, retcode=RetCode.OPERATING_ERROR,
                     retmsg="Could not restore active resource limits; the app was not deleted"
                 )
+
+        # Same rule for core pinning: once the app is gone from the UI nobody can unpin it.
+        affinity_ok, affinity_msg = _service.release_cpu_affinity(app_id)
+        if not affinity_ok:
+            return construct_response(
+                data={}, retcode=RetCode.OPERATING_ERROR,
+                retmsg=f"Could not restore CPU affinity ({affinity_msg}); the app was not deleted"
+            )
 
         # The helper preserves existing config comments.
         removed_count = b_config.remove_from_list_section(

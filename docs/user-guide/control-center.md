@@ -131,8 +131,8 @@ first.
   not have are not listed. If the core layout cannot be read, the dialog says
   so and offers nothing.
 - Pick a group, or **Specific cores** to tick individual cores (for example a
-  single P core), or **All cores (default)** to remove the restriction. Then
-  click **Apply**.
+  single P core), then click **Apply**. To undo it, choose
+  **Restore original (default)** and click **Restore**.
 - It takes effect immediately on the running app and can be changed again at any
   time.
 - The row shows a **CPU 2-5** tag while the app is restricted. Other open
@@ -140,8 +140,23 @@ first.
 - The dialog opens with the app's current restriction selected. If it has none,
   it opens with your last successful choice for that app; that memory is shared
   by every dashboard and is cleared when SmarTune restarts.
-- The restriction is removed automatically when the app exits, and for all apps
-  when SmarTune stops.
+- SmarTune undoes its restriction automatically when the app exits, when you
+  delete the app or turn off its control, and for all apps when SmarTune stops.
+
+**What Restore original does:** it undoes only what SmarTune did, and puts each
+of the app's cgroups back to the setting it had before SmarTune pinned it.
+
+- Usually that means no restriction: the OS scheduler decides where the app
+  runs.
+- If the cgroup was already restricted outside SmarTune (for example by an
+  administrator, or by systemd `AllowedCPUs`), that restriction comes back.
+  The dialog shows it as **set outside SmarTune**, and the Restore option says
+  which cores the app goes back to.
+- If someone changes the cores outside SmarTune while it is pinned, that
+  change is kept and is not overwritten.
+- An app with several cgroups can have a different original setting in each.
+  The dialog then lists every cgroup on its own line, both under
+  **Currently** and under **Restore original**.
 
 Things to know:
 
@@ -152,14 +167,14 @@ Things to know:
 - With a CPU limit as well, the smaller of the two applies. The CPU limit is a
   share of the app's current usage, not of one core, so a limit that works out
   to more than the pinned cores has no effect.
-- **Restore** only lifts limits. It does not undo CPU Affinity; choose
-  **All cores (default)** for that.
+- **Restore Resources** only lifts limits. It does not undo CPU Affinity;
+  choose **Restore original (default)** in the CPU Affinity dialog for that.
 - LPE cores have no L3 cache and are the slowest group; the P cores are the
   fastest.
 
 ![The CPU Affinity dialog](images/control-center-cpu-affinity.png)
 
-The CPU Affinity dialog, opened from the **CPU Affinity** button on the app's row. Box 1: the app's current restriction (here it runs on the two P cores, CPU 0-1). Box 2: with **Specific cores** selected, tick any other cores and click **Apply** to move the running app.
+The CPU Affinity dialog, opened from the **CPU Affinity** button on the app's row. Box 1: the app's current restriction (here it runs on the two P cores, CPU 0-1). Box 2: with **Specific cores** selected, tick any other cores and click **Apply** to move the running app. **Restore original (default)** undoes SmarTune's restriction; here the app had none before, so the OS scheduler decides where it runs again.
 
 ## Restoring limits
 

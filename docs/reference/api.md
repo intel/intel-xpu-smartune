@@ -405,7 +405,7 @@ Or query by name:
 
 #### POST /app/set_to_control
 
-**Purpose:** Enable or disable control for an application and register it with the BPF monitor.
+**Purpose:** Enable or disable control for an application and register it with the BPF monitor. Disabling control first undoes the app's CPU affinity, because `/app/cpu_affinity` refuses apps that are not under control (see [`/app/cpu_affinity`](#post-appcpu_affinity)). If that fails, a warning is logged and control is still disabled.
 
 **Request:**
 
@@ -672,7 +672,7 @@ Or query by name:
 
 #### POST /app/purge_controlled_app
 
-**Purpose:** Hard-delete an application from BOTH config.yaml and the DB: this completely wipes the entry — an active manual resource limit is restored first, then config is removed, the DB row is deleted, the OOM score is restored, and the BPF cache is refreshed. If the active manual limit cannot be restored, the purge fails and leaves the application intact. Auto-limited apps must be restored or taken under manual control before deletion. Used when the user wants to re-add an app whose process_names overlap with an existing entry.
+**Purpose:** Hard-delete an application from BOTH config.yaml and the DB: this completely wipes the entry — an active manual resource limit is restored first, then the app's CPU affinity is undone, then config is removed, the DB row is deleted, the OOM score is restored, and the BPF cache is refreshed. If the active manual limit or the CPU affinity cannot be restored, the purge fails with `RetCode.OPERATING_ERROR` and leaves the application intact: once deleted, nothing in the UI could undo them. Auto-limited apps must be restored or taken under manual control before deletion. Used when the user wants to re-add an app whose process_names overlap with an existing entry.
 
 **Request:**
 
@@ -1087,7 +1087,7 @@ Or query by name:
 | Type | Parameter | Required | Format | Description |
 |------|-----------|----------|--------|-------------|
 | Body | app_id | Yes | string | Public application identifier; must be registered and under control |
-| Body | class | Yes | string | `p`, `e`, `lpe` (core class), `custom` (needs `cpus`), `restore` (back to all cores) or `status` (read only) |
+| Body | class | Yes | string | `p`, `e`, `lpe` (core class), `custom` (needs `cpus`), `restore` (undo SmarTune's pinning: back to each cgroup's original value) or `status` (read only) |
 | Body | cpus | When `class` is `custom` | string | CPU list such as `1,3-4`; every CPU must be online |
 | Body | target_cgroups | No | string[] | Restrict to these running instances (cgroup basenames); default is every cgroup of the app |
 
@@ -1116,15 +1116,28 @@ Or query by name:
   "data": {
     "classes": { "p": "0-1", "lpe": "2-5" },
     "cgroups": [
-      { "cgroup": "app-demo.scope", "cpus": "2-5", "bound": true }
+      { "cgroup": "app-demo.scope", "cpus": "2-5", "configured": "2-5", "bound": true, "original": "" },
+      { "cgroup": "app-worker.scope", "cpus": "3", "configured": "3", "bound": false, "original": null }
     ],
     "last": { "class": "lpe", "cpus": "2-5" }
   }
 }
 ```
 
+**`class: "restore"` response** (`retmsg` says what each cgroup now has):
+```json
+{
+  "retcode": 0,
+  "retmsg": "demo restored: app-demo.scope -> no restriction; app-worker.scope -> CPU 3 (set outside SmarTune, unchanged)",
+  "data": {}
+}
+```
+
 - `classes` holds only the core classes this machine has (no `e` key on a CPU without E cores), each with its CPU list. Clients should build their choices from it instead of hardcoding P/E/LPE.
 - `cpus` is the live `cpuset.cpus.effective`; `bound` tells whether SmarTune pinned that cgroup.
+- `configured` is the restriction `cpuset.cpus` imposes: `""` means none (empty, or a list that covers every CPU the parent allows). A non-empty value on a cgroup with `bound: false` was set outside SmarTune.
+- `original` is what `restore` writes back (`""` = no restriction); `null` when SmarTune has not pinned the cgroup, in which case `restore` leaves it unchanged.
+- The `restore` message is one line when every cgroup ends up the same (`demo restored: no restriction`), and one entry per cgroup otherwise.
 - `last` is the last selection applied successfully for this app (`null` if none). It is kept in the service's memory, shared by every client, and lost when the service stops.
 
 **Notes:**
@@ -1132,9 +1145,15 @@ Or query by name:
 - Refusals return `RetCode.OPERATING_ERROR` with a message: a class the machine does not have (`this machine has no E cores (available: p, lpe)`), an unknown class, a malformed or offline CPU list, or no running cgroup found for the app.
 - `p` / `e` / `lpe` come from the detected core topology. On hybrid parts the LPE cores (no L3, on the SoC tile) are reported separately from the E cores, even when the kernel lists both under `cpu_atom`.
 - The cpuset controller is absent from `cgroup.subtree_control` below the root on most systemd hosts. It is enabled on every ancestor of the target on demand; ancestors that already pass it down are left alone, and it is not switched off afterwards.
-- A write is confirmed by reading `cpuset.cpus.effective` back; a mismatch returns `RetCode.OPERATING_ERROR` (the original value is still recorded, so Restore works). If one cgroup of a multi-cgroup app fails, those already bound in the same call are restored.
-- The original `cpuset.cpus` of each cgroup is recorded before the first write and written back by `restore` (an empty original means "inherit the parent"). Repeated calls keep the first original.
-- The binding is removed automatically when every tracked PID of the app has exited (the cgroup can outlive the app, e.g. a terminal scope), and for every bound app when the service stops.
+- A write is confirmed by reading `cpuset.cpus.effective` back; a mismatch returns `RetCode.OPERATING_ERROR`. If one cgroup of a multi-cgroup app fails, the call is rolled back: the cgroups already bound in the same call are restored, and so is the failed one if it was already written.
+- The original `cpuset.cpus` of each cgroup is recorded before the first write and written back by `restore` (an empty original means "inherit the parent"). Repeated calls keep the first original. A list that covers every CPU the parent allows restricts nothing and is recorded as `""`.
+- `restore` undoes only SmarTune's own pinning:
+  - A cgroup SmarTune never pinned is left unchanged.
+  - If `cpuset.cpus` no longer holds the value SmarTune last wrote, it was changed outside SmarTune. That change is kept.
+  - If the cpuset controller has been disabled above the cgroup, its `cpuset.cpus` is gone and so is the pin. Restore succeeds without writing.
+  - Kernels before 7.0 refuse to clear a non-empty `cpuset.cpus` while the cgroup has tasks (`ENOSPC`). When an empty original is refused this way, restore writes the parent's `cpuset.cpus.effective` instead, which also restricts nothing.
+  - When the app reports no running cgroup any more, restore uses the cgroups recorded when it was pinned.
+- SmarTune undoes the pinning automatically when every tracked PID of the app has exited (the cgroup can outlive the app, e.g. a terminal scope), when the app is purged or its control is disabled, and for every bound app when the service stops. These are the same steps as `restore`.
 - It only limits where threads run, not how many the app creates: a program with two busy threads uses at most two cores however many it is allowed.
 - It combines with a CPU limit as the smaller of the two: `cpu.max` caps CPU time, the cpuset caps the cores. A CPU limit that works out to more than the pinned cores has no effect.
 - Setting, restoring, and the automatic unpin are serialised, and each change is pushed to every connected client as the `cpu_affinity_changed` SSE event.

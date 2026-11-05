@@ -136,6 +136,15 @@ const APP_STATUS = {
   NA: 'NA',
 } as const
 
+// Lists a background refresh can target; see queueRefresh in Balance.
+type RefreshKey = 'controlled' | 'autoLimited' | 'pending'
+// Long enough to fold the burst of events one action emits into one request.
+const REFRESH_COALESCE_MS = 300
+// While the tab is open the controlled list is re-fetched once it is this old (see
+// the effect using it); checked every CONTROLLED_POLL_CHECK_MS, without a request.
+const CONTROLLED_POLL_MS = 3000
+const CONTROLLED_POLL_CHECK_MS = 500
+
 interface Props {
   active: boolean
   // false = monitor-only server: the balancer is not available, so this tab
@@ -943,9 +952,19 @@ export default function Balance({
     setControlledApps(ctrl)
   }, [])
 
-  // Narrow refreshes used by the SSE handler. This tab has no polling fallback, so an
-  // event pulls exactly the slice it can have changed and nothing else.
+  // Background refreshes (SSE events, the controlled-list poll, expanding a row) are
+  // queued rather than sent: one action often emits several events, each wanting the
+  // same list, and the action's own fetchData() follows with everything. Queued keys
+  // wait REFRESH_COALESCE_MS, are held while an action is in flight, and are dropped
+  // when a direct fetch of the same list starts first.
+  const queuedRefresh = useRef(new Set<RefreshKey>())
+  const refreshTimer = useRef<number | null>(null)
+  const actionsInFlight = useRef(0)
+  const lastControlledFetch = useRef(0)
+
+  // Narrow refreshes: each pulls exactly the slice an event can have changed.
   const refreshAutoLimited = useCallback(async () => {
+    queuedRefresh.current.delete('autoLimited')
     try {
       applyAutoLimited(await api.getAutoLimitedApps())
     } catch (e: unknown) {
@@ -954,6 +973,8 @@ export default function Balance({
   }, [applyAutoLimited])
 
   const refreshControlled = useCallback(async () => {
+    queuedRefresh.current.delete('controlled')
+    lastControlledFetch.current = Date.now()
     try {
       applyControlled((await api.getControlledApps()) ?? [])
     } catch (e: unknown) {
@@ -962,12 +983,47 @@ export default function Balance({
   }, [applyControlled])
 
   const refreshPending = useCallback(async () => {
+    queuedRefresh.current.delete('pending')
     try {
       setPendingApps((await api.getPendingApps()) ?? [])
     } catch (e: unknown) {
       console.error('[Balance] pending refresh failed:', e)
     }
   }, [])
+
+  const refreshRunners = useRef({ controlled: refreshControlled, autoLimited: refreshAutoLimited, pending: refreshPending })
+  refreshRunners.current = { controlled: refreshControlled, autoLimited: refreshAutoLimited, pending: refreshPending }
+
+  const flushRefreshes = useCallback(() => {
+    refreshTimer.current = null
+    // holdRefreshes() re-arms the timer once the last action settles.
+    if (actionsInFlight.current > 0) return
+    const keys = Array.from(queuedRefresh.current)
+    queuedRefresh.current.clear()
+    keys.forEach((key) => void refreshRunners.current[key]())
+  }, [])
+
+  const queueRefresh = useCallback((...keys: RefreshKey[]) => {
+    keys.forEach((key) => queuedRefresh.current.add(key))
+    if (refreshTimer.current === null && queuedRefresh.current.size > 0) {
+      refreshTimer.current = window.setTimeout(flushRefreshes, REFRESH_COALESCE_MS)
+    }
+  }, [flushRefreshes])
+
+  useEffect(() => () => {
+    if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current)
+  }, [])
+
+  /** Hold background refreshes for the duration of `fn`; its own refresh covers them. */
+  const holdRefreshes = useCallback(async <T,>(fn: () => Promise<T>): Promise<T> => {
+    actionsInFlight.current += 1
+    try {
+      return await fn()
+    } finally {
+      actionsInFlight.current -= 1
+      queueRefresh()
+    }
+  }, [queueRefresh])
 
   const refreshExclusions = useCallback(async () => {
     try {
@@ -988,6 +1044,9 @@ export default function Balance({
   }, [messageApi])
 
   const fetchData = useCallback(async () => {
+    // Everything a queued refresh would fetch is fetched here.
+    queuedRefresh.current.clear()
+    lastControlledFetch.current = Date.now()
     try {
       const [apps, controlled, pending, autoLimited, exclusionRows, networkControl] = await Promise.allSettled([
         api.getApps(),
@@ -1087,11 +1146,15 @@ export default function Balance({
   // process remains alive. Refresh the per-scope snapshot while this tab is visible.
   useEffect(() => {
     if (!active) return
+    // Measured from the last fetch of any kind, not a fixed beat: the list is never
+    // older than CONTROLLED_POLL_MS, and a fetch an event or action just made pushes
+    // the next poll back instead of being repeated. The check itself is local.
     const timer = window.setInterval(() => {
-      refreshControlled()
-    }, 3000)
+      if (Date.now() - lastControlledFetch.current < CONTROLLED_POLL_MS - REFRESH_COALESCE_MS) return
+      queueRefresh('controlled')
+    }, CONTROLLED_POLL_CHECK_MS)
     return () => window.clearInterval(timer)
-  }, [active, refreshControlled])
+  }, [active, queueRefresh])
 
   // Advance the "Limited For" column. Local only, no request, and only while there is
   // something to count, so an idle tab does no work.
@@ -1136,25 +1199,25 @@ export default function Balance({
         // remove it from the pending queue immediately without waiting for the refresh
         // to complete.  This prevents the card from showing a stale entry during the
         // async round-trip.
-        // Note: the reverse (status === PENDING) needs refreshPending(), because adding
+        // Note: the reverse (status === PENDING) needs a pending refresh, because adding
         // to pendingApps requires a full AppInfo object the SSE payload does not carry.
         if (event.status !== APP_STATUS.PENDING) {
           setPendingApps((prev) => prev.filter((app) => app.app_id !== event.app_id))
         } else {
-          refreshPending()
+          queueRefresh('pending')
         }
 
         // Refresh only what this event can have changed. The controlled list carries the
         // per-process rows and limit flags, so it is refreshed for every status change;
         // the auto-limited list only moves when a limit is applied or lifted.
-        refreshControlled()
+        queueRefresh('controlled')
         if (
           event.status === APP_STATUS.LIMITED ||
           event.status === APP_STATUS.A_LIMITED ||
           event.status === APP_STATUS.RUNNING ||
           event.status === APP_STATUS.STOPPED
         ) {
-          refreshAutoLimited()
+          queueRefresh('autoLimited')
         }
       } else if (event.purpose === 'notify') {
         // Live pressure level for the Auto Limited card — state only, no request.
@@ -1174,14 +1237,14 @@ export default function Balance({
           event.status === 'auto_limit_restored_by_user' ||
           event.status === 'app_closed_limit_restored'
         ) {
-          refreshAutoLimited()
+          queueRefresh('autoLimited')
           return
         }
         // Another client changed Freeze or CPU Affinity (or the reaper unpinned an exited app):
         // the Frozen / CPU tags and the Freeze button are the only things that move, and no
         // other event announces it.
         if (event.status === 'cpu_affinity_changed' || event.status === 'app_frozen_changed') {
-          refreshControlled()
+          queueRefresh('controlled')
           return
         }
         // System-level notifications (no specific app_id)
@@ -1195,7 +1258,7 @@ export default function Balance({
           )
         }
       }
-    }, [messageApi, refreshAutoLimited, refreshControlled, refreshPending]),
+    }, [messageApi, queueRefresh]),
     active
   )
 
@@ -1203,8 +1266,11 @@ export default function Balance({
     return async () => {
       setActionLoading((prev) => ({ ...prev, [key]: true }))
       try {
-        await fn()
-        await fetchData()
+        // fetchData() refreshes every list, so `fn` need not refresh any itself.
+        await holdRefreshes(async () => {
+          await fn()
+          await fetchData()
+        })
       } catch (e: unknown) {
         messageApi.error(e instanceof Error ? e.message : 'Operation failed')
       } finally {
@@ -1362,7 +1428,10 @@ export default function Balance({
     }
   }
 
-  const submitResourceLimit = async () => {
+  // Ends with fetchData(), like withLoading actions, so events it triggers wait for that.
+  const submitResourceLimit = () => holdRefreshes(applyLimitDialog)
+
+  const applyLimitDialog = async () => {
     if (!limitDialog.app) return
 
     setLimitDialog((prev) => ({ ...prev, submitting: true }))
@@ -1470,7 +1539,7 @@ export default function Balance({
 
   // Restoring by hand also opts the app out of auto-limiting until the exclusion is removed
   // or the service restarts. Registered apps return to Manual Control; new discoveries leave
-  // the table entirely, so refresh both sources after the restore.
+  // the table entirely; withLoading's fetchData() refreshes both sources.
   const handleAutoLimitRestore = (row: { app_id: string; app_name?: string; effective_app_id?: string }) =>
     withLoading(`autolimit-restore-${row.effective_app_id ?? row.app_id}`, async () => {
       await api.autoLimitRestore({ app_id: row.app_id })
@@ -1486,7 +1555,6 @@ export default function Balance({
         duration: 8,
       })
       messageApi.warning({ content: AUTO_LIMIT_EXCLUSION_HINT, duration: 8 })
-      await Promise.allSettled([refreshAutoLimited(), refreshControlled()])
     })()
 
   // Take Control (controlled auto-limited row): flip an auto-limited app to a manual limit
@@ -1500,7 +1568,6 @@ export default function Balance({
       messageApi.success(
         `${row.app_name || row.app_id} moved to manual control — limit kept in place, manual controls unlocked`,
       )
-      await Promise.allSettled([refreshAutoLimited(), refreshControlled()])
     })()
 
   // An unmanaged auto-limited row has no persistent identity yet. Extract stable identity
@@ -1534,7 +1601,6 @@ export default function Balance({
         messageApi.success(
           `${knownApp.app_name} is now managed as a manual limit — its caps were carried over`,
         )
-        await Promise.allSettled([refreshAutoLimited(), refreshControlled()])
         return
       }
 
@@ -1600,7 +1666,6 @@ export default function Balance({
       messageApi.success(
         `${row.app_name || row.app_id} is now managed as a manual limit — its caps were carried over, and you can edit or restore it directly`,
       )
-      await Promise.allSettled([refreshAutoLimited(), refreshControlled()])
     })()
 
   const controlledColumns: ColumnsType<ControlRow> = [
@@ -2665,7 +2730,7 @@ export default function Balance({
               // Per-instance churn of an app that keeps its status emits no SSE event,
               // and this tab does not poll — so pull the rows when the user asks to
               // see them.
-              if (keys.length > expandedProcessRows.length) refreshControlled()
+              if (keys.length > expandedProcessRows.length) queueRefresh('controlled')
             },
             expandedRowRender: (record) => {
               const rows = record.process_status_rows ?? []

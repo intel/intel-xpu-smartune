@@ -4236,22 +4236,24 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
     )
   }, [active, balancerEnabled])
 
-  usePolling(
-    fetchTopApps,
-    foreground ? refreshIntervalMs : INACTIVE_REFRESH_INTERVAL_MS,
-    !quietActive,
-  )
+  // Top apps and the two summaries are only shown on this page, so they poll only
+  // while it is on screen: not on another page, not in a background browser tab.
+  // usePolling fetches at once when they are re-enabled, and each fetch is a full
+  // snapshot (the diagnostics one re-reads its whole 1 h window), so returning
+  // shows current data with nothing missing. fetchDynamic keeps polling in the
+  // background because it accumulates the trend history point by point.
+  usePolling(fetchTopApps, refreshIntervalMs, foreground && !quietActive)
 
   usePolling(
     fetchDiagnosticsSummary,
     COCKPIT_REFRESH_INTERVAL_MS,
-    !quietActive && diagnosticsEnabled,
+    foreground && !quietActive && diagnosticsEnabled,
   )
 
   usePolling(
     fetchControlSummary,
     COCKPIT_REFRESH_INTERVAL_MS,
-    active && !quietActive && balancerEnabled,
+    foreground && !quietActive && balancerEnabled,
   )
 
   usePolling(

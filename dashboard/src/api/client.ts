@@ -197,38 +197,8 @@ export async function login(token: string): Promise<boolean> {
   return ok
 }
 
-/**
- * URL for the SSE stream with the token in the query string. EventSource cannot
- * set custom headers, so the server also accepts the token via ?token= for it.
- */
-export function appEventsUrl(): string {
-  const token = getToken()
-  return token ? `/api/app/events?token=${encodeURIComponent(token)}` : '/api/app/events'
-}
-
-// Identifies this browser tab to the benchmark event stream for as long as the
-// page is loaded. Toggling the log channel reconnects, and the server uses this
-// to retire the connection being replaced rather than counting both against its
-// client limit — it cannot otherwise tell a superseded stream from a live one
-// until the next heartbeat write fails.
-const BENCH_CLIENT_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-
-/**
- * URL for the Benchmark tab's SSE stream (benchmark/service/events.py).
- *
- * `withLogs` asks the server to also stream the running job's output. It is off
- * while the tab is off screen: job/env/result events still arrive (that is how a
- * backgrounded dashboard reports a finished run), but a build writes megabytes
- * of log that nobody is looking at.
- */
-export function benchEventsUrl(withLogs: boolean): string {
-  const params = new URLSearchParams()
-  const token = getToken()
-  if (token) params.set('token', token)
-  if (withLogs) params.set('logs', '1')
-  params.set('client', BENCH_CLIENT_ID)
-  return `/api/bench/events?${params.toString()}`
-}
+// SSE stream URLs live in events/streamManager.ts: they are built inside the
+// shared worker, which cannot import this module (axios, localStorage).
 
 export function sendHeartbeat(sessionId: string): Promise<void> {
   return post<void>('/smartune/ui/heartbeat', { session_id: sessionId })

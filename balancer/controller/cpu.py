@@ -13,6 +13,7 @@ systemd hosts, so the controller is enabled lazily on every ancestor of the
 target (the same idea as ``IOController.enable_io_controller``).
 """
 
+import errno
 import os
 import re
 import threading
@@ -184,15 +185,43 @@ class CPUController:
             with self._lock:
                 self._originals.pop(directory, None)
             return True, "cgroup already gone"
+        target = os.path.join(directory, "cpuset.cpus")
+        written = original
         try:
-            write_cgroup_file(original, os.path.join(directory, "cpuset.cpus"))
+            write_cgroup_file(original, target)
         except OSError as exc:
-            return False, f"restore cpuset.cpus failed: {exc.strerror or exc}"
+            fallback = self._unpin_fallback(directory, original, exc)
+            if fallback is None:
+                return False, f"restore cpuset.cpus failed: {exc.strerror or exc}"
+            try:
+                write_cgroup_file(fallback, target)
+            except OSError as exc2:
+                return False, f"restore cpuset.cpus failed: {exc2.strerror or exc2}"
+            written = fallback
         with self._lock:
             self._originals.pop(directory, None)
         logger.info("Restored cpuset.cpus of %s to %r (empty = all cores)",
-                    os.path.basename(directory), original)
+                    os.path.basename(directory), written)
         return True, "ok"
+
+    def _unpin_fallback(self, directory: str, original: str, exc: OSError) -> Optional[str]:
+        """What to write instead of an empty ``cpuset.cpus`` the kernel refused.
+
+        Kernels before 7.0 (upstream 272bd8183376) reject clearing a non-empty
+        ``cpuset.cpus`` with ENOSPC while the cgroup still has tasks -- e.g. the
+        shell left in a shared terminal scope after the app exits.  Writing the
+        parent's effective cpus unpins just the same; it only stops tracking
+        later parent/hotplug changes, and the scope is reaped by systemd anyway.
+        """
+        if original or exc.errno != errno.ENOSPC:
+            return None
+        parent = self._read(os.path.dirname(directory), "cpuset.cpus.effective")
+        if not parent:
+            return None
+        logger.info("Kernel refused to clear cpuset.cpus of populated %s (pre-7.0); "
+                    "unpinning to parent's effective cpus %s",
+                    os.path.basename(directory), parent)
+        return parent
 
     def restore_all(self) -> int:
         """Shutdown path: put every bound cgroup back; returns how many failed."""

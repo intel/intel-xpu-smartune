@@ -3305,6 +3305,33 @@ class DynamicBalancer:
                 seen.append(cpus)
         return seen
 
+    def release_cpu_affinity(self, app_id: str) -> "tuple[bool, str]":
+        """Unpin every cgroup this app was bound to, before it leaves control.
+
+        Works from the tracked directories rather than the app's live cgroups:
+        an exited app reports none, yet its shared scope can still be pinned.
+        Cgroups that fail to restore stay tracked so the reaper and
+        ``restore_all`` can retry them.
+        """
+        with self._affinity_lock:
+            tracked = self._affinity_apps.get(app_id)
+            dirs = sorted(tracked["dirs"]) if tracked else []
+            app_name = tracked["app_name"] if tracked else ""
+        if not dirs:
+            return True, "not bound"
+        restored, failures = [], []
+        with self._affinity_op_lock:
+            for d in dirs:
+                ok, msg = self.control_manager.cpu.restore(d)
+                (restored if ok else failures).append(d if ok else msg)
+        self._forget_affinity(app_id, restored)
+        if restored:
+            self._notify_ui_refresh(app_id, app_name, 'cpu_affinity_changed')
+        if failures:
+            return False, "; ".join(failures)
+        logger.info(f"Released CPU affinity of {app_id} ({len(restored)} cgroup(s))")
+        return True, "Affinity restored"
+
     def _forget_affinity(self, app_id: str, dirs: "list[str]") -> None:
         with self._affinity_lock:
             tracked = self._affinity_apps.get(app_id)

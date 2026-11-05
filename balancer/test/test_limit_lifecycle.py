@@ -79,6 +79,15 @@ class _MergeCfg:
         self.controlled_apps = entries
         return True
 
+    def remove_from_list_section(self, section, match):
+        before = len(self.controlled_apps)
+        self.controlled_apps = [e for e in self.controlled_apps
+                                if any(e.get(k) != v for k, v in match.items())]
+        removed = before - len(self.controlled_apps)
+        if removed:
+            self.writes.append((section, self.controlled_apps))
+        return removed
+
 
 class _Prefetcher:
     """Stand-in for TopConsumerPrefetcher: records how often it was resolved."""
@@ -1803,6 +1812,73 @@ class PurgeControlledAppTests(unittest.TestCase):
         self.assertEqual(cfg.writes, [])
         service.restore_resource.assert_called_once_with('existing.scope')
 
+    def _purge(self, service):
+        cfg = _MergeCfg()
+        service.get_limit_snapshot.return_value = {'limited': False}
+        with (
+            mock.patch('config.config.b_config', cfg),
+            mock.patch('smartune_api._token_is_valid', return_value=True),
+            mock.patch.object(balance_service_mod, '_service', service),
+            mock.patch.object(balance_service_mod, 'AIAppPriority'),
+            mock.patch.object(balance_service_mod, 'adjust_oom_priority'),
+        ):
+            response = balance_service_mod.app.test_client().post(
+                '/app/purge_controlled_app', json={'id': 'existing.scope'},
+            )
+        return response.get_json(), cfg
+
+    def test_purge_unpins_cpu_affinity(self):
+        service = mock.Mock()
+        service.release_cpu_affinity.return_value = (True, "Affinity restored")
+        body, cfg = self._purge(service)
+        self.assertEqual(body['retcode'], 0, body)
+        service.release_cpu_affinity.assert_called_once_with('existing.scope')
+        self.assertEqual(cfg.controlled_apps, [])
+
+    def test_purge_keeps_config_when_cpu_affinity_cannot_restore(self):
+        """Deleting the app removes the only UI path to unpin it, so a failed unpin blocks the delete."""
+        service = mock.Mock()
+        service.release_cpu_affinity.return_value = (False, "restore cpuset.cpus failed: boom")
+        body, cfg = self._purge(service)
+        self.assertNotEqual(body['retcode'], 0)
+        self.assertIn("CPU affinity", body['retmsg'])
+        self.assertEqual(len(cfg.controlled_apps), 1)
+        self.assertEqual(cfg.writes, [])
+        service.remove_control.assert_not_called()
+
+
+class SetToControlAffinityTests(unittest.TestCase):
+    def _post(self, service, controlled):
+        with (
+            mock.patch('smartune_api._token_is_valid', return_value=True),
+            mock.patch.object(balance_service_mod, '_service', service),
+            mock.patch.object(balance_service_mod, 'AIAppPriority'),
+            mock.patch.object(balance_service_mod, 'adjust_oom_priority'),
+            mock.patch.object(balance_service_mod, 'restore_config_entry'),
+            mock.patch.object(balance_service_mod, 'check_app_running_status', return_value="stopped"),
+            mock.patch.object(balance_service_mod, 'callback_manager'),
+        ):
+            return balance_service_mod.app.test_client().post(
+                '/app/set_to_control',
+                json={'app_id': 'demo.scope', 'app_name': 'demo', 'controlled': controlled},
+            ).get_json()
+
+    def test_disabling_control_unpins_cpu_affinity(self):
+        service = mock.Mock()
+        service.release_cpu_affinity.return_value = (True, "not bound")
+        self.assertEqual(self._post(service, False)['retcode'], 0)
+        service.release_cpu_affinity.assert_called_once_with('demo.scope')
+
+    def test_disable_still_succeeds_when_unpin_fails(self):
+        service = mock.Mock()
+        service.release_cpu_affinity.return_value = (False, "boom")
+        self.assertEqual(self._post(service, False)['retcode'], 0)
+
+    def test_enabling_control_leaves_affinity_alone(self):
+        service = mock.Mock()
+        self.assertEqual(self._post(service, True)['retcode'], 0)
+        service.release_cpu_affinity.assert_not_called()
+
 
 class AffinityReaperTests(unittest.TestCase):
     """A closed app is unpinned: its cgroup can outlive it (shared scope), and the
@@ -1876,6 +1952,31 @@ class AffinityReaperTests(unittest.TestCase):
                 b.set_cpu_affinity("app1", "demo", "p")
         self.assertEqual([(d["app_id"], d["status"], d["purpose"]) for d in sent],
                          [("app1", "cpu_affinity_changed", "notify")] * 2)
+
+    def test_release_unpins_tracked_dirs_even_when_app_reports_none(self):
+        """An exited app reports no cgroups, but its shared scope may still be pinned."""
+        b = self._balancer({10}, alive=set())
+        b._app_cgroup_targets = lambda *a: ([], [])
+        with mock.patch.object(balancer_mod.app_utils.callback_manager, "send_callback_notification"):
+            self.assertEqual(b.release_cpu_affinity("app1"), (True, "Affinity restored"))
+        b.control_manager.cpu.restore.assert_called_once_with("/cg/a.scope")
+        self.assertEqual(b._affinity_apps, {})
+
+    def test_release_keeps_failed_dirs_tracked_for_retry(self):
+        b = self._balancer({10}, alive={10})
+        b._affinity_apps["app1"]["dirs"] = {"/cg/a.scope", "/cg/b.scope"}
+        b.control_manager.cpu.restore.side_effect = \
+            lambda d: (True, "ok") if d == "/cg/a.scope" else (False, "ENOSPC")
+        with mock.patch.object(balancer_mod.app_utils.callback_manager, "send_callback_notification"):
+            ok, msg = b.release_cpu_affinity("app1")
+        self.assertFalse(ok)
+        self.assertIn("ENOSPC", msg)
+        self.assertEqual(b._affinity_apps["app1"]["dirs"], {"/cg/b.scope"})
+
+    def test_release_of_unbound_app_is_a_noop(self):
+        b = self._balancer({10}, alive={10})
+        self.assertEqual(b.release_cpu_affinity("other"), (True, "not bound"))
+        b.control_manager.cpu.restore.assert_not_called()
 
     def test_manual_restore_stops_tracking(self):
         b = self._balancer({10}, alive={10})

@@ -457,6 +457,14 @@ export const api = {
     if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
     return res.data.data
   },
+  // Bind or restore; resolves to the server's account of what now applies.
+  applyCpuAffinity: async (payload: CpuAffinityPayload) => {
+    const res = await client.post<ApiResponse<void>>(
+      '/app/cpu_affinity', payload, { timeout: 30_000 },
+    )
+    if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
+    return res.data.retmsg
+  },
   getLimitSnapshot: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<LimitSnapshotData>('/app/limit_snapshot', payload),
   // One result per entry, in order. Checked in a batch rather than per

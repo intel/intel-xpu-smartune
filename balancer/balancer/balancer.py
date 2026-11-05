@@ -3305,6 +3305,39 @@ class DynamicBalancer:
                 seen.append(cpus)
         return seen
 
+    def _tracked_affinity_dirs(self, app_id: str) -> "list[str]":
+        """The cgroups this app was pinned in, whether or not it still reports them."""
+        with self._affinity_lock:
+            tracked = self._affinity_apps.get(app_id)
+            return sorted(tracked["dirs"]) if tracked else []
+
+    def release_cpu_affinity(self, app_id: str) -> "tuple[bool, str]":
+        """Unpin every cgroup this app was bound to, before it leaves control.
+
+        Works from the tracked directories rather than the app's live cgroups:
+        an exited app reports none, yet its shared scope can still be pinned.
+        Cgroups that fail to restore stay tracked so the reaper and
+        ``restore_all`` can retry them.
+        """
+        with self._affinity_lock:
+            tracked = self._affinity_apps.get(app_id)
+            app_name = tracked["app_name"] if tracked else ""
+        dirs = self._tracked_affinity_dirs(app_id)
+        if not dirs:
+            return True, "not bound"
+        restored, failures = [], []
+        with self._affinity_op_lock:
+            for d in dirs:
+                ok, msg = self.control_manager.cpu.restore(d)
+                (restored if ok else failures).append(d if ok else msg)
+        self._forget_affinity(app_id, restored)
+        if restored:
+            self._notify_ui_refresh(app_id, app_name, 'cpu_affinity_changed')
+        if failures:
+            return False, "; ".join(failures)
+        logger.info(f"Released CPU affinity of {app_id} ({len(restored)} cgroup(s))")
+        return True, "Affinity restored"
+
     def _forget_affinity(self, app_id: str, dirs: "list[str]") -> None:
         with self._affinity_lock:
             tracked = self._affinity_apps.get(app_id)
@@ -4189,12 +4222,8 @@ class DynamicBalancer:
         from controller.cpu import core_class_options, format_cpu_list
         from monitor.metrics.cpu import detect_core_groups
         options = core_class_options(detect_core_groups())
-        cgroups = [
-            {"cgroup": os.path.basename(d),
-             "cpus": self.control_manager.cpu.read_cpus(d),
-             "bound": self.control_manager.cpu.is_bound(d)}
-            for d in self._app_cgroup_targets(app_id, app_name)[0]
-        ]
+        cgroups = [self.control_manager.cpu.cgroup_state(d)
+                   for d in self._app_cgroup_targets(app_id, app_name)[0]]
         return {"classes": {k: format_cpu_list(v) for k, v in options.items()},
                 "cgroups": cgroups,
                 "last": self.control_manager.cpu.last_choice(app_id)}
@@ -4220,6 +4249,15 @@ class DynamicBalancer:
             'purpose': 'notify',
         }, False)
 
+    @staticmethod
+    def _restore_summary(app_name: str, results: list) -> str:
+        """One line when every cgroup ended up the same, else one entry per cgroup."""
+        outcomes = {msg for _, _, msg in results}
+        if len(outcomes) <= 1:
+            return f"{app_name} restored: {outcomes.pop() if outcomes else 'nothing to restore'}"
+        return f"{app_name} restored: " + "; ".join(
+            f"{os.path.basename(d)} -> {msg}" for d, _, msg in results)
+
     def _set_cpu_affinity(self, app_id: str, app_name: str, cpu_class: str,
                          cpus: Optional[str] = None,
                          target_cgroups: Optional[list] = None) -> "tuple[bool, str]":
@@ -4232,18 +4270,18 @@ class DynamicBalancer:
         from controller.cpu import resolve_cpus
         from monitor.metrics.cpu import detect_core_groups
         dirs, pids = self._app_cgroup_targets(app_id, app_name)
-        if target_cgroups:
-            wanted = {os.path.basename(str(c)) for c in target_cgroups if str(c).strip()}
-            dirs = [d for d in dirs if os.path.basename(d) in wanted]
+        wanted = {os.path.basename(str(c)) for c in (target_cgroups or []) if str(c).strip()}
+        in_scope = (lambda d: os.path.basename(d) in wanted) if wanted else (lambda d: True)
+        dirs = [d for d in dirs if in_scope(d)]
         if (cpu_class or "").lower() == "restore":
-            # Restore also covers bound cgroups the app no longer reports, if any.
-            dirs = dirs or [d for d in self.control_manager.cpu.bound_cgroups()
-                            if os.path.basename(d) in {os.path.basename(str(c)) for c in (target_cgroups or [])}]
-            failures = [msg for ok, msg in (self.control_manager.cpu.restore(d) for d in dirs) if not ok]
+            # An exited app reports no cgroups, yet the ones it was pinned in may still be.
+            dirs = dirs or [d for d in self._tracked_affinity_dirs(app_id) if in_scope(d)]
+            results = [(d, *self.control_manager.cpu.restore(d)) for d in dirs]
+            failures = [msg for _, ok, msg in results if not ok]
             if failures:
                 return False, "; ".join(failures)
             self._forget_affinity(app_id, dirs)
-            return True, "Affinity restored"
+            return True, self._restore_summary(app_name, results)
         if not dirs:
             return False, f"No running cgroup found for {app_name}"
         online = set(range(os.cpu_count() or 1))
@@ -4255,8 +4293,11 @@ class DynamicBalancer:
             ok, detail = self.control_manager.cpu.set_cpus(d, value)
             if not ok:
                 logger.error(f"Set affinity failed for {app_id} ({os.path.basename(d)}): {detail}")
-                for prev in done:       # don't leave a half-bound app
-                    self.control_manager.cpu.restore(prev)
+                # Don't leave a half-bound app.  The failed cgroup counts too: set_cpus
+                # may have written it before the effective check refused the result.
+                rollback = done + ([d] if self.control_manager.cpu.is_bound(d) else [])
+                undone = [p for p in rollback if self.control_manager.cpu.restore(p)[0]]
+                self._forget_affinity(app_id, undone)
                 return False, detail
             done.append(d)
         with self._affinity_lock:

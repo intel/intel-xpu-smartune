@@ -13,6 +13,7 @@ systemd hosts, so the controller is enabled lazily on every ancestor of the
 target (the same idea as ``IOController.enable_io_controller``).
 """
 
+import errno
 import os
 import re
 import threading
@@ -56,6 +57,17 @@ def format_cpu_list(cpus: Iterable[int]) -> str:
     return ",".join(parts)
 
 
+NO_RESTRICTION = "no restriction"
+
+
+def describe_cpus(spec: Optional[str]) -> str:
+    """A ``cpuset.cpus`` restriction for people; empty inherits the parent's cpus.
+
+    Not "all cores": a parent slice may itself be confined (systemd AllowedCPUs).
+    """
+    return f"CPU {spec}" if spec else NO_RESTRICTION
+
+
 def core_class_options(groups: dict) -> Dict[str, List[int]]:
     """The non-empty core classes of a ``detect_core_groups()`` result."""
     mapping = {"p": "p_cores", "e": "e_cores", "lpe": "lpe_cores"}
@@ -95,6 +107,7 @@ class CPUController:
     def __init__(self, cgroup_mount: str):
         self.cgroup_mount = cgroup_mount
         self._originals: Dict[str, str] = {}   # cgroup dir -> original cpuset.cpus
+        self._applied: Dict[str, str] = {}     # cgroup dir -> the value we last wrote
         # app_id -> last successful selection.  Server lifetime only: stopping the service
         # restores every binding, so nothing needs to outlive it.
         self._last_choices: Dict[str, dict] = {}
@@ -148,6 +161,40 @@ class CPUController:
         with self._lock:
             return list(self._originals)
 
+    def cgroup_state(self, directory: str) -> dict:
+        """Everything the UI needs about one cgroup's pinning.
+
+        ``configured`` is the restriction ``cpuset.cpus`` imposes ("" = none, see
+        :meth:`_restriction`); ``original`` is what :meth:`restore` will put back,
+        None when SmarTune has not pinned it (a non-empty ``configured`` then came
+        from outside SmarTune).
+        """
+        directory = os.path.realpath(directory)
+        with self._lock:
+            original = self._originals.get(directory)
+        return {"cgroup": os.path.basename(directory),
+                "cpus": self.read_cpus(directory),
+                "configured": self._restriction(directory, self._read(directory, "cpuset.cpus")),
+                "bound": original is not None,
+                "original": original}
+
+    def _restriction(self, directory: str, value: Optional[str]) -> Optional[str]:
+        """*value* as a restriction: "" when it covers every cpu the parent allows.
+
+        Such a list restricts nothing, and it is exactly what the ENOSPC fallback
+        writes in place of "" -- without this it would later pass for a limit set
+        outside SmarTune, and be recorded as the "original" of the next pin.
+        """
+        if not value:
+            return value
+        parent = self._read(os.path.dirname(directory), "cpuset.cpus.effective")
+        try:
+            if parent and parse_cpu_list(value) >= parse_cpu_list(parent):
+                return ""
+        except ValueError:
+            pass
+        return value
+
     # -- actions ---------------------------------------------------------
     def set_cpus(self, directory: str, cpus: str) -> Tuple[bool, str]:
         directory = os.path.realpath(directory)
@@ -158,6 +205,9 @@ class CPUController:
         original = self._read(directory, "cpuset.cpus")
         if original is None:
             return False, "cpuset.cpus is not available for this cgroup"
+        # A no-op list (e.g. left by the ENOSPC fallback) is recorded as "", so restore
+        # brings back real inheritance wherever the kernel allows it.
+        original = self._restriction(directory, original)
         try:
             write_cgroup_file(cpus, os.path.join(directory, "cpuset.cpus"))
         except OSError as exc:
@@ -165,6 +215,7 @@ class CPUController:
         with self._lock:
             # setdefault: a second set keeps the first original, never our own value.
             self._originals.setdefault(directory, original)
+            self._applied[directory] = cpus
         effective = self.read_cpus(directory)
         try:
             same = effective is not None and parse_cpu_list(effective) == parse_cpu_list(cpus)
@@ -175,24 +226,88 @@ class CPUController:
         return True, "ok"
 
     def restore(self, directory: str) -> Tuple[bool, str]:
+        """Undo SmarTune's pinning: put back the value seen before the first set.
+
+        On success the message says what now applies (``"no restriction"``,
+        ``"CPU 2-3"``...), so callers can show it as is.  A value changed by
+        someone else since our last write is theirs, so it is left alone.
+        """
         directory = os.path.realpath(directory)
         with self._lock:
             original = self._originals.get(directory)
+            applied = self._applied.get(directory)
         if original is None:
-            return True, "not bound"
+            current = self._restriction(directory, self._read(directory, "cpuset.cpus"))
+            return True, (f"{describe_cpus(current)} (set outside SmarTune, unchanged)"
+                          if current else NO_RESTRICTION)
         if not os.path.isdir(directory):
-            with self._lock:
-                self._originals.pop(directory, None)
+            self._forget(directory)
             return True, "cgroup already gone"
+        target = os.path.join(directory, "cpuset.cpus")
+        if not os.path.exists(target):
+            # cpuset was switched off above this cgroup (systemd re-realising a slice,
+            # an admin): the pin went with it, and writing would fail forever.
+            self._forget(directory)
+            logger.info("cpuset controller is disabled for %s; its pin is already gone",
+                        os.path.basename(directory))
+            return True, f"{NO_RESTRICTION} (cpuset controller disabled)"
+        current = self._read(directory, "cpuset.cpus")
+        if self._changed_elsewhere(current, applied):
+            self._forget(directory)
+            logger.info("cpuset.cpus of %s was changed outside SmarTune to %r; leaving it",
+                        os.path.basename(directory), current)
+            return True, f"{describe_cpus(current)} (changed outside SmarTune, kept)"
+        written = original
         try:
-            write_cgroup_file(original, os.path.join(directory, "cpuset.cpus"))
+            write_cgroup_file(original, target)
         except OSError as exc:
-            return False, f"restore cpuset.cpus failed: {exc.strerror or exc}"
+            fallback = self._unpin_fallback(directory, original, exc)
+            if fallback is None:
+                return False, f"restore cpuset.cpus failed: {exc.strerror or exc}"
+            try:
+                write_cgroup_file(fallback, target)
+            except OSError as exc2:
+                return False, f"restore cpuset.cpus failed: {exc2.strerror or exc2}"
+            written = fallback
+        self._forget(directory)
+        logger.info("Restored cpuset.cpus of %s to %r (empty = inherit)",
+                    os.path.basename(directory), written)
+        # The ENOSPC fallback writes the parent's cpus: still no restriction to the user.
+        return True, describe_cpus(original)
+
+    def _forget(self, directory: str) -> None:
         with self._lock:
             self._originals.pop(directory, None)
-        logger.info("Restored cpuset.cpus of %s to %r (empty = all cores)",
-                    os.path.basename(directory), original)
-        return True, "ok"
+            self._applied.pop(directory, None)
+
+    @staticmethod
+    def _changed_elsewhere(current: Optional[str], applied: Optional[str]) -> bool:
+        """True when cpuset.cpus no longer holds the value we wrote."""
+        if current is None or applied is None:
+            return False            # cannot tell: restore as usual
+        try:
+            return parse_cpu_list(current) != parse_cpu_list(applied)
+        except ValueError:
+            return False
+
+    def _unpin_fallback(self, directory: str, original: str, exc: OSError) -> Optional[str]:
+        """What to write instead of an empty ``cpuset.cpus`` the kernel refused.
+
+        Kernels before 7.0 (upstream 272bd8183376) reject clearing a non-empty
+        ``cpuset.cpus`` with ENOSPC while the cgroup still has tasks -- e.g. the
+        shell left in a shared terminal scope after the app exits.  Writing the
+        parent's effective cpus unpins just the same; it only stops tracking
+        later parent/hotplug changes, and the scope is reaped by systemd anyway.
+        """
+        if original or exc.errno != errno.ENOSPC:
+            return None
+        parent = self._read(os.path.dirname(directory), "cpuset.cpus.effective")
+        if not parent:
+            return None
+        logger.info("Kernel refused to clear cpuset.cpus of populated %s (pre-7.0); "
+                    "unpinning to parent's effective cpus %s",
+                    os.path.basename(directory), parent)
+        return parent
 
     def restore_all(self) -> int:
         """Shutdown path: put every bound cgroup back; returns how many failed."""

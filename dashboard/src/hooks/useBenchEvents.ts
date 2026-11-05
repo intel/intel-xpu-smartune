@@ -3,13 +3,14 @@
 //
 // The Benchmark tab's server-push channel (benchmark/service/events.py).
 //
-// One EventSource for the whole app, opened at the App level rather than inside
+// One stream for the whole app, requested at the App level rather than inside
 // the tab, because a benchmark run outlives the user's attention: a build takes
 // an hour, and the point of the connection is that they can go and do something
-// else and still be told when it finished.
+// else and still be told when it finished. The connection itself is shared by
+// every dashboard tab of this origin (events/sseHub.ts).
 //
-// Two hooks, so exactly one component owns the socket:
-//   useBenchStream  – App calls this once; it holds the connection.
+// Two hooks, so exactly one component owns the stream:
+//   useBenchStream  – App calls this once; it requests the stream.
 //   useBenchEvent   – anything else subscribes to what arrives.
 //
 // A module-level emitter rather than a context: the value would be a stable
@@ -17,12 +18,8 @@
 
 import { useEffect, useRef } from 'react'
 
-import { benchEventsUrl } from '../api/client'
 import type { BenchEvent } from '../api/types'
-
-// Mirrors useAppEvents: long enough not to hammer a server that is restarting,
-// short enough that the tab feels live again once it is back.
-const RECONNECT_DELAY_MS = 3000
+import { requestBenchStream, subscribe } from '../events/sseHub'
 
 type Listener = (event: BenchEvent) => void
 
@@ -72,37 +69,18 @@ export function useBenchEvent(handler: Listener, enabled = true): void {
 export function useBenchStream(enabled: boolean, withLogs: boolean): void {
   useEffect(() => {
     if (!enabled) return
-
-    let source: EventSource | null = null
-    let retry: ReturnType<typeof setTimeout> | null = null
-    let closed = false
-
-    function connect() {
-      if (closed) return
-      source = new EventSource(benchEventsUrl(withLogs))
-
-      source.onmessage = (message) => {
-        try {
-          emit(JSON.parse(message.data) as BenchEvent)
-        } catch {
-          // Heartbeats are comment lines and never reach onmessage; anything
-          // else unparseable is a server-side bug we cannot act on here.
-        }
+    const unsubscribe = subscribe('bench', (raw) => {
+      try {
+        emit(JSON.parse(raw) as BenchEvent)
+      } catch {
+        // Heartbeats are comment lines and never reach onmessage; anything
+        // else unparseable is a server-side bug we cannot act on here.
       }
-
-      source.onerror = () => {
-        source?.close()
-        source = null
-        if (!closed) retry = setTimeout(connect, RECONNECT_DELAY_MS)
-      }
-    }
-
-    connect()
-
+    })
+    const release = requestBenchStream(withLogs)
     return () => {
-      closed = true
-      if (retry) clearTimeout(retry)
-      source?.close()
+      release()
+      unsubscribe()
     }
   }, [enabled, withLogs])
 }

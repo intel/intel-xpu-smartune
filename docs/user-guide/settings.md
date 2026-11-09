@@ -8,10 +8,48 @@ and which log patterns become diagnostic events.
 
 Settings is organized into sections. Most pages have a **basic** view and an
 **advanced** toggle for finer parameters. Unsaved edits are flagged so you don't
-navigate away by accident.
+navigate away by accident. Under each numeric field you will see its startup
+default, a suggested step, and what raising or lowering the value does (see
+[Field guidance and presets](#field-guidance-and-presets)).
 
 <!-- Screenshot: the Settings panel open on the System pressure section. -->
 ![Settings](images/settings-overview.png)
+
+## Field guidance and presets
+
+Most parameters are numbers that are hard to pick blindly, so each one carries
+guidance directly under the input box:
+
+- **`Default … · step …`** — the value the backend started with, and a suggested
+  step for adjusting it.
+- **↑ / ↓ lines** — what happens when you raise or lower the value.
+- **Notes** — constraints and risks (for example, a Worst-disk weight below about
+  0.8 can stop `io.max` from ever triggering on multi-disk machines), and **when a
+  change takes effect** where it is not immediate.
+
+In tables of identical fields (bandwidth min/max, disk rates, per-disk
+adjustment, minimum app I/O) each cell shows only its default, and the ↑ / ↓
+explanation appears once below the table.
+
+Four fields are **dropdown presets** because raw numbers are hard to reason about:
+*Update interval*, *Memory gate steepness*, *Sigmoid steepness* and *Worst-disk
+weight*. Pick a named level, or choose **Custom…** to type a value. A stored value
+that matches no level is shown as Custom rather than snapped to the nearest one.
+
+## Saving, resetting and restoring defaults
+
+- **Save all** (page header) writes every page with unsaved edits.
+- **Reset**, **Restore startup defaults** and **Save page** sit at the bottom right
+  and act on the page in view.
+- **Reset** discards unsaved edits and reloads the saved values.
+- **Restore startup defaults** fills the form with the values the backend started
+  with. Nothing is saved until you press **Save page**. It does not touch network
+  interface selection, controlled system ports, the Auto control master switch, or
+  diagnostic rules.
+
+Saved changes take effect immediately, are written to `config.yaml`, and are
+visible to every connected client. After the backend restarts, the saved values
+become the new startup defaults.
 
 ## System Overview
 
@@ -26,6 +64,9 @@ Tune the composite [system pressure](home.md) score:
 - **CPU busy threshold (%)** and **Memory busy threshold (%)** — when each input
   starts contributing to pressure.
 - **Memory gate steepness** — how sharply memory scarcity ramps the score.
+- **Level thresholds** — step 5; they must stay in increasing order.
+- **Resource weights** (advanced) — plain numbers for CPU, memory and I/O; only
+  the ratio between them matters.
 
 ## Disk I/O pressure
 
@@ -47,6 +88,10 @@ Enable or disable each control subsystem and set its policy:
 
 - **System Control** — automatic CPU/memory limiting and governor switching.
 - **Disk I/O Control** — the `io.max` throttling policy.
+
+> Changed limit rates apply the next time a limit is set. Limits already in force
+> keep their old value until the next limit or restore step.
+
 - **Network I/O Control** — traffic shaping, including:
   - **Auto network control** — let SmarTune shape traffic automatically.
   - **Per-app packet flood protection** — guard against a single app flooding

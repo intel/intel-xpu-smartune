@@ -48,6 +48,35 @@ export interface DiagEventCatalogEntry {
   default_enabled: boolean
 }
 
+// Settings field guidance from GET /monitor/config-hints (config/field_hints.py).
+export interface ConfigHintPreset {
+  label: string
+  value: number
+  desc: string
+}
+
+export interface ConfigFieldHint {
+  kind: 'number' | 'preset'
+  min?: number
+  max?: number
+  step?: number
+  unit?: string
+  integer?: boolean
+  presets?: ConfigHintPreset[]
+  custom?: boolean
+  up: string
+  down: string
+  note?: string
+  apply?: string
+}
+
+export interface ConfigHintsData {
+  fields: Record<string, ConfigFieldHint>
+  sections: Record<string, { restorable: boolean; keep?: string[] }>
+  // API-shaped values from when the backend started, per restorable section.
+  startup_defaults: Record<string, Record<string, unknown>>
+}
+
 export interface DiagEventCatalogData {
   events: DiagEventCatalogEntry[]
 }

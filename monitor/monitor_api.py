@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import copy
 import json
 import os
 import re
@@ -2797,6 +2798,46 @@ _CONFIG_SPECS = {
 }
 
 
+# Startup defaults: each section's view as it was before the first edit of this run.
+# Edits are persisted to config.yaml, so after a restart the persisted values simply
+# become the new defaults.  Captured lazily because some getters need live monitors, but
+# always ahead of the first write (see update_config_generic), and every section is
+# written only through that route, so the snapshot is the value the backend started with.
+_startup_defaults: Dict[str, dict] = {}
+_startup_defaults_lock = threading.Lock()
+
+
+def _capture_startup_default(section: str) -> Optional[dict]:
+    with _startup_defaults_lock:
+        if section not in _startup_defaults:
+            try:
+                _startup_defaults[section] = copy.deepcopy(dict(_CONFIG_SPECS[section]["get"]()))
+            except Exception as exc:
+                logger.warning("startup default for config '%s' unavailable: %s", section, exc)
+                return None
+        return _startup_defaults[section]
+
+
+@monitor_bp.route('/config-hints', methods=['GET'])
+def get_config_hints():
+    """Static field guidance plus each restorable section's startup defaults, for Settings."""
+    try:
+        from config.field_hints import FIELD_HINTS, SECTION_HINTS
+
+        defaults = {}
+        for section, hint in SECTION_HINTS.items():
+            if hint.get("restorable") and section in _CONFIG_SPECS:
+                snapshot = _capture_startup_default(section)
+                if snapshot is not None:
+                    defaults[section] = snapshot
+        return construct_response(
+            data={"fields": FIELD_HINTS, "sections": SECTION_HINTS, "startup_defaults": defaults},
+            retmsg="Successfully retrieved config hints")
+    except Exception as e:
+        logger.error(f"get_config_hints failed: {str(e)}")
+        return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
+
+
 @monitor_bp.route('/config/<section>', methods=['GET'])
 def get_config_section(section):
     """Get one auto-control config group (see _CONFIG_SPECS)."""
@@ -2842,6 +2883,8 @@ def update_config_generic(section):
         if conflict:
             return conflict
 
+        # Must run before the first write: this is what makes the snapshot "as started".
+        _capture_startup_default(section)
         logger.info("Updating config '%s' from %s: %s", section, request.remote_addr, updates)
         spec["write"](updates)
         if section == "network_control" and callable(_network_config_reload_notifier):

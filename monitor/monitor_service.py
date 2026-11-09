@@ -43,8 +43,8 @@ try:
 except Exception:  # pragma: no cover
     def emit_event(*_a, **_k):
         return None
-from utils.ui_lease import get_ui_lease_manager
-from utils.http_utils import apply_request_limits, QuietWSGIRequestHandler
+from utils import ui_shutdown
+from utils.http_utils import apply_request_limits, DeferredHandshakeSSLContext, QuietWSGIRequestHandler
 
 app = Flask(__name__)
 apply_request_limits(app)
@@ -117,13 +117,13 @@ def _handle_signal(signum, frame):
 
 
 def _request_ui_shutdown():
-    """UI-lease watchdog callback: the last dashboard UI is gone, so exit.
+    """The dashboard's "Stop service" (see utils.ui_shutdown).
 
-    Runs on the watchdog thread; signal handlers only fire on the main thread,
-    so we raise SIGTERM to ourselves. The existing _handle_signal then performs
-    the same graceful teardown + SystemExit(0) as `systemctl stop`, and exit
-    code 0 means systemd's Restart=on-failure will not bring us back."""
-    logger.info("UI closed; shutting down monitor service.")
+    Runs on a timer thread; signal handlers only fire on the main thread, so we
+    raise SIGTERM to ourselves. The existing _handle_signal then performs the
+    same graceful teardown as `systemctl stop`, and the unit lists SIGTERM in
+    RestartPreventExitStatus, so systemd does not bring it back."""
+    logger.info("Stopping monitor service as requested from the dashboard.")
     os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -163,11 +163,13 @@ def main():
                    "dashboard_ui": "mounted",
                })
 
-    # Packaged deployments may stop the service when the last dashboard closes.
-    if os.environ.get("SMARTUNE_UI_LEASE"):
-        get_ui_lease_manager().enable(_request_ui_shutdown)
+    # Packaged deployments (run_monitor.sh sets SMARTUNE_UI_SHUTDOWN) let the
+    # dashboard stop the service.
+    if os.environ.get("SMARTUNE_UI_SHUTDOWN"):
+        ui_shutdown.enable(_request_ui_shutdown)
 
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    # Handshake in the request thread, not accept(): see DeferredHandshakeSSLContext.
+    ssl_context = DeferredHandshakeSSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_context.load_cert_chain(CERT_FILE, KEY_FILE)
     ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
 

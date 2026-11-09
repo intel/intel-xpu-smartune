@@ -6,21 +6,39 @@
 #
 # Rendered by build_deb.sh: @RUN_SCRIPT@ is the install-time run script for the
 # selected package variant — run_monitor.sh (smartune.py -m) for the monitor-only
-# deb, run_all.sh (smartune.py -a, balancer + monitor) for the full deb. The
-# installed unit filename stays smartune-monitor.service in both variants so the
-# authhelper, start_gui.sh and prerm can reference a fixed name.
+# deb, run_all.sh (smartune.py -a, balancer + monitor) for the full deb. Both
+# variants install it as intel-smartune.service so the authhelper, start_gui.sh
+# and prerm can reference a fixed name.
 
 [Unit]
-Description=Intel XPU SmarTune Monitor
+Description=Intel XPU SmarTune
 After=network-online.target
 Wants=network-online.target
+# Cap automatic restarts: at most 3 starts per 2 minutes, then the unit stays
+# failed. Without this, RestartSec=5 keeps every attempt outside systemd's default
+# 10s rate-limit window, so a persistent startup failure loops forever. The
+# desktop icon (smartune-authhelper) runs `systemctl reset-failed` first, so an
+# explicit user launch always gets a fresh try.
+StartLimitIntervalSec=120
+StartLimitBurst=3
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/opt/intel/smartune
+# Admin settings (SMARTUNE_LISTEN); a conffile, so upgrades keep edits. The
+# leading "-" lets the service start with built-in defaults if it was deleted.
+EnvironmentFile=-/etc/default/intel-smartune
 ExecStart=@RUN_SCRIPT@
+# Restart after a genuine crash (non-zero exit, SIGSEGV, SIGABRT, ...), but not:
+#   SIGKILL / SIGTERM -- someone killed the process on purpose (kill, kill -9);
+#                        bringing it back 5s later defeats them. Note an OOM
+#                        kill is also SIGKILL; relaunch from the desktop icon.
+#   exit 3            -- the run script found the port already taken (e.g. a
+#                        source-tree instance is running); retrying cannot help.
+# `systemctl stop` never triggers a restart, whatever the exit status.
 Restart=on-failure
+RestartPreventExitStatus=3 SIGKILL SIGTERM
 RestartSec=5
 KillSignal=SIGINT
 TimeoutStopSec=20

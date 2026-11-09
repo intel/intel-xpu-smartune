@@ -20,8 +20,8 @@ the **[Install guide](../install.md)**.
 
 | Way | Best for | Dashboard URL |
 | --- | --- | --- |
-| **[From source](../install.md#run-from-source)** | development, a quick trial | `http://<host-ip>:39527/` |
-| **[From source as a systemd service](../install.md#run-as-a-systemd-service)** | a source install that starts on boot and restarts on failure | `http://<host-ip>:39527/` |
+| **[From source](../install.md#run-from-source)** | development, a quick trial | `https://<host-ip>:39527/` |
+| **[From source as a systemd service](../install.md#run-as-a-systemd-service)** | a source install that starts on boot and restarts on failure | `https://<host-ip>:39527/` |
 | **[Debian package](../install.md#debian-package)** | end users (self-contained, no dev server) | `https://localhost:9001` |
 
 The Debian package comes in two variants: `smartune-monitor` (Home, Applications,

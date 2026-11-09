@@ -33,7 +33,7 @@ intel-xpu-smartune/
 ├── logs/                       # Runtime logs
 ├── docs/                       # User guide, install, reference, design notes (see docs/README.md)
 ├── config/                     # config.yaml (thresholds, weights, app list) and config loader
-├── utils/                      # Shared utilities: logger, app_utils, http_utils, quiet_mode, ui_lease
+├── utils/                      # Shared utilities: logger, app_utils, http_utils, quiet_mode, ui_shutdown
 ├── db/                         # Peewee ORM database model for controlled app records
 ├── monitor/                    # System monitoring components (runs standalone):
 │   ├── monitor_service.py      #   Standalone monitor entry point (own Flask app, port 9001)

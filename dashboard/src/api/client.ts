@@ -52,6 +52,7 @@ import type {
   BenchQuietModeState,
   BenchRunSampleData,
   CapabilitiesData,
+  ShutdownStatus,
   DiagBootsData,
   DiagContextData,
   DiagContextQuery,
@@ -121,6 +122,17 @@ let onUnauthorized: (() => void) | null = null
 export function setUnauthorizedHandler(handler: (() => void) | null): void {
   onUnauthorized = handler
 }
+
+// Once the service has been stopped from the dashboard (App's Stop service),
+// every request stays pending instead of failing: pollers wait on it and so
+// stop on their own, and pages keep their last data instead of filling with
+// errors. Nothing is left to answer them until the service is started again,
+// which opens a fresh page.
+let requestsHalted = false
+export function haltRequests(): void {
+  requestsHalted = true
+}
+client.interceptors.request.use((config) => (requestsHalted ? new Promise<never>(() => {}) : config))
 
 // Attach the token to every outgoing request.
 client.interceptors.request.use((config) => {
@@ -198,25 +210,8 @@ export async function login(token: string): Promise<boolean> {
   return ok
 }
 
-// SSE stream URLs live in events/streamManager.ts: they are built inside the
-// shared worker, which cannot import this module (axios, localStorage).
-
-export function sendHeartbeat(sessionId: string): Promise<void> {
-  return post<void>('/smartune/ui/heartbeat', { session_id: sessionId })
-}
-
-export function sendUiRelease(sessionId: string): void {
-  const token = getToken()
-  fetch('/api/smartune/ui/release', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { [AUTH_HEADER]: token } : {}),
-    },
-    body: JSON.stringify({ session_id: sessionId }),
-    keepalive: true,
-  }).catch(() => {})
-}
+// SSE stream URLs live in events/streamManager.ts, next to the code that opens
+// the streams for every tab (events/leaderHub.ts).
 
 async function get<T>(url: string): Promise<T> {
   const res = await client.get<ApiResponse<T>>(url)
@@ -274,6 +269,10 @@ export const api = {
   // `benchmark`: 1 = the /bench API is mounted here (NOT that its environment is
   // installed — that comes from getBenchEnv().ready).
   getCapabilities: () => get<CapabilitiesData>('/smartune/capabilities'),
+  // Stop the service from the dashboard (packaged deployments: capabilities.shutdown).
+  // The status lists what a stop would end, for the confirmation.
+  getShutdownStatus: () => get<ShutdownStatus>('/smartune/shutdown'),
+  stopService: () => post<{ stopping: boolean }>('/smartune/shutdown'),
   getDiagEvents: (params: DiagEventQuery = {}) => {
     const q = new URLSearchParams()
     for (const [k, v] of Object.entries(params)) {

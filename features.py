@@ -140,6 +140,14 @@ def mount_benchmark(app) -> bool:
         return False
 
     app.register_blueprint(bench_bp)
+    # A setup or benchmark run lasts up to an hour and lives in this service's
+    # cgroup, so stopping the service kills it: the dashboard's stop
+    # confirmation says so while one runs.
+    from benchmark.service import jobs
+    from utils import ui_shutdown
+    ui_shutdown.add_busy_check(
+        "the running benchmark job", lambda: jobs.manager.current() is not None
+    )
     # Where the pipeline lives and which account will run it, once, at startup.
     # The same lines head every job log; having them in the service log too is
     # what answers "why is the tab like this" before any job has been started.

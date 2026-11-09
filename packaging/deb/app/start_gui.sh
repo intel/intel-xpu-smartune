@@ -8,7 +8,7 @@
 # pops the graphical polkit password prompt.
 
 URL="https://localhost:9001"
-UNIT="smartune-monitor.service"
+UNIT="intel-smartune.service"
 # Fixed-path privileged helper. Elevated via pkexec; a polkit action registered
 # against this exact path (com.intel.smartune.policy) gives the auth prompt a
 # readable message instead of dumping the raw command line into the dialog.

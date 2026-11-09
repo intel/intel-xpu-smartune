@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect, useMemo } from 'react'
-import { Tabs, Layout, Typography, Space, Alert, Badge, Button, Dropdown, Empty, Tag, message, notification, Tooltip, Menu, Avatar } from 'antd'
+import { Tabs, Layout, Typography, Space, Alert, Badge, Button, Dropdown, Empty, Tag, message, notification, Tooltip, Menu, Avatar, Modal } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   DashboardOutlined,
@@ -24,6 +24,7 @@ import {
   UserOutlined,
   DownOutlined,
   ExportOutlined,
+  PoweroffOutlined,
 } from '@ant-design/icons'
 import SettingsModal from './components/SettingsModal'
 import SystemOverview from './components/SystemOverview'
@@ -38,9 +39,9 @@ import About from './components/About'
 import LoginGate from './components/LoginGate'
 import { COLORS } from './styles/theme'
 import type { ColorMode } from './styles/theme'
-import { api, getToken, clearToken, setUnauthorizedHandler, consumeUrlToken, login } from './api/client'
+import { api, getToken, clearToken, setUnauthorizedHandler, consumeUrlToken, login, haltRequests } from './api/client'
+import { suspendStreams } from './events/sseHub'
 import { GlobalConfigNoticesProvider, useGlobalConfigNotices } from './hooks/useGlobalConfigNotices'
-import { useUiLease } from './hooks/useUiLease'
 import { useBenchEvent, useBenchStream } from './hooks/useBenchEvents'
 import { useAppEvents } from './hooks/useAppEvents'
 import type { DiagAlert } from './api/types'
@@ -50,6 +51,9 @@ import type { AlertHandlingMark } from './utils/alertPolicy'
 const { Header, Content, Sider } = Layout
 
 const BENCHMARK_TAB = 'models'
+
+// Tells every dashboard tab of this origin that the service was stopped.
+const SERVICE_CHANNEL = 'smartune-service'
 
 // The header alert center shows only the first few alerts needing attention;
 // the rest are one click away in Diagnostics.
@@ -130,6 +134,8 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   // so showing the tab would give a page that 404s on every request.
   const [benchmarkEnabled, setBenchmarkEnabled] = useState(false)
   const [diagnosticsEnabled, setDiagnosticsEnabled] = useState(false)
+  // Whether this server lets the dashboard stop it (packaged deployments only).
+  const [shutdownEnabled, setShutdownEnabled] = useState(false)
   // Set from the Processes tab's "Add to balancer" action; consumed by the Balance tab.
   const [registerKeyword, setRegisterKeyword] = useState<string | null>(null)
   // Gate the whole app behind a valid access token. A stored token is assumed
@@ -144,6 +150,15 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   // validated, hold rendering so the login gate does not flash before we know
   // whether the auto-login succeeds. Only blocks when such a token is present.
   const [booting, setBooting] = useState(() => /[#&]token=/.test(window.location.hash))
+  // When the service was stopped from this or another tab (null while running).
+  // The page stays on screen, frozen, under a notice: everything that talks to
+  // the server keys off `live`, and requests and streams are halted below.
+  const [stoppedAt, setStoppedAt] = useState<string | null>(null)
+  const serviceStopped = stoppedAt !== null
+  const live = authed && !serviceStopped
+  const markServiceStopped = useCallback(() => {
+    setStoppedAt((prev) => prev ?? new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }))
+  }, [])
 
   // Consume a one-shot token passed in the URL hash by the desktop launcher and
   // auto-login with it, so clicking the desktop icon lands straight in the app.
@@ -169,7 +184,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   }, [])
 
   useEffect(() => {
-    if (!authed) return
+    if (!live) return
     api
       .getCapabilities()
       .then((c) => {
@@ -177,12 +192,13 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
         // Absent on older servers, which never served /bench at all.
         setBenchmarkEnabled(c.benchmark === 1)
         setDiagnosticsEnabled(c.diagnostics === 1)
+        setShutdownEnabled(c.shutdown === 1)
       })
       .catch(() => {
         setBalancerEnabled(true)
         setDiagnosticsEnabled(false)
       })
-  }, [authed])
+  }, [live])
 
   const loadAlerts = useCallback(() => {
     api.getDiagAlerts(true, 200)
@@ -191,11 +207,11 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   }, [])
 
   useEffect(() => {
-    if (!authed || !diagnosticsEnabled) return undefined
+    if (!live || !diagnosticsEnabled) return undefined
     loadAlerts()
     const timer = window.setInterval(loadAlerts, 30000)
     return () => window.clearInterval(timer)
-  }, [authed, diagnosticsEnabled, loadAlerts])
+  }, [live, diagnosticsEnabled, loadAlerts])
 
   const alertCenterGroups = useMemo(() => {
     const groups: Record<AlertHandlingMark, DiagAlert[]> = { needs_attention: [], acknowledged: [], silenced: [] }
@@ -206,19 +222,16 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   }, [currentAlerts])
   const needsAttentionCount = alertCenterGroups.needs_attention.length
 
-  // Hold an open-UI lease while logged in so the packaged monitor can stop
-  // itself once the last dashboard tab is closed. No-op against a server that
-  // doesn't arm the watchdog (dev / balancer).
-  useUiLease(authed)
-
   // The benchmark event stream is owned here rather than by the tab: a setup
   // takes an hour and a run can take longer, so the whole point is that the user
   // goes elsewhere and is told when it is done. Log deltas are only requested
   // while the tab is actually on screen -- see benchEventsUrl.
   const benchTabActive = activeTab === BENCHMARK_TAB
-  useBenchStream(authed && benchmarkEnabled, benchTabActive)
+  useBenchStream(live && benchmarkEnabled, benchTabActive)
 
   const [notify, notifyHolder] = notification.useNotification()
+  // Hook form so the confirmation follows the app's light/dark theme.
+  const [modal, modalHolder] = Modal.useModal()
 
   useBenchEvent(
     useCallback(
@@ -251,7 +264,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
       },
       [benchTabActive, notify],
     ),
-    authed && benchmarkEnabled,
+    live && benchmarkEnabled,
   )
 
   // A freeze the user forgot silently starves the app, so the reminder must reach them
@@ -282,13 +295,128 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
       },
       [notify],
     ),
-    authed,
+    live,
   )
 
   const handleLogout = useCallback(() => {
     clearToken()
     setAuthed(false)
   }, [])
+
+  // A stop from any tab ends the session in all of them (each tab of this
+  // origin listens), so none is left polling a server that is gone.
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return undefined
+    const channel = new BroadcastChannel(SERVICE_CHANNEL)
+    channel.onmessage = (event: MessageEvent<{ type?: string }>) => {
+      if (event.data?.type === 'stopped') markServiceStopped()
+    }
+    return () => channel.close()
+  }, [markServiceStopped])
+
+  // Freeze the page once the service is gone: requests stay pending (pollers
+  // stop, pages keep their last data), streams close, and notifications whose
+  // buttons would lead nowhere are dismissed.
+  useEffect(() => {
+    if (!serviceStopped) return
+    haltRequests()
+    suspendStreams()
+    notify.destroy()
+  }, [serviceStopped, notify])
+
+  // `inert` (React 18 has no prop for it) keeps keyboard focus out of the
+  // frozen page too, not only the mouse.
+  const frozenShellRef = useCallback(
+    (el: HTMLDivElement | null) => el?.toggleAttribute('inert', serviceStopped),
+    [serviceStopped],
+  )
+  // A mask over the page (like a modal's) rather than dimming the page itself:
+  // it also takes every click, and it repaints reliably in a tab that was in
+  // the background when the stop arrived.
+  const stoppedNotice = serviceStopped ? (
+    <>
+    <div
+      aria-hidden="true"
+      style={{ position: 'fixed', inset: 0, zIndex: 1999, background: COLORS.bg, opacity: 0.65 }}
+    />
+    <div
+      role="status"
+      style={{
+        position: 'fixed',
+        top: 16,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        zIndex: 2000,
+        width: 'min(560px, calc(100vw - 32px))',
+      }}
+    >
+      <Alert
+        type="info"
+        showIcon
+        icon={<PoweroffOutlined />}
+        message={`SmarTune service stopped at ${stoppedAt}`}
+        description={
+          <>
+            This page no longer updates.
+            <br />
+            Start SmarTune again from the desktop icon.
+          </>
+        }
+        style={{ boxShadow: '0 6px 24px rgba(0, 0, 0, 0.35)' }}
+      />
+    </div>
+    </>
+  ) : null
+
+  const handleStopService = useCallback(async () => {
+    // What a stop would end right now. Best-effort: if this fails, the
+    // confirmation still explains what stopping does in general.
+    let busy: string[] = []
+    try {
+      busy = (await api.getShutdownStatus()).busy
+    } catch {
+      /* offer the stop anyway */
+    }
+    modal.confirm({
+      title: 'Stop the SmarTune service?',
+      icon: <PoweroffOutlined />,
+      content: (
+        <div>
+          <p style={{ marginBottom: busy.length > 0 ? 8 : 0 }}>
+            The SmarTune service will stop, and the dashboard will close in every open tab.
+          </p>
+          {/* Only what this stop actually ends; nothing more to say when idle. */}
+          {busy.length > 0 ? (
+            <>
+              <p style={{ marginBottom: 4 }}>This also ends:</p>
+              <ul style={{ paddingLeft: 20, marginBottom: 0 }}>
+                {busy.map((reason) => (
+                  <li key={reason}>{reason.charAt(0).toUpperCase() + reason.slice(1)}</li>
+                ))}
+              </ul>
+            </>
+          ) : null}
+        </div>
+      ),
+      okText: 'Stop service',
+      okButtonProps: { danger: true },
+      cancelText: 'Cancel',
+      onOk: async () => {
+        try {
+          await api.stopService()
+        } catch (err) {
+          message.error(`Could not stop the service: ${(err as Error).message}`)
+          return
+        }
+        if (typeof BroadcastChannel !== 'undefined') {
+          const channel = new BroadcastChannel(SERVICE_CHANNEL)
+          channel.postMessage({ type: 'stopped' })
+          channel.close()
+        }
+        markServiceStopped()
+      },
+    })
+  }, [modal, markServiceStopped])
 
   // Leaving the header only makes sense to use Diagnostics context: its Alerts
   // section, or one alert's row there.
@@ -664,12 +792,22 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   }
 
   if (!authed) {
-    return <LoginGate onAuthenticated={() => setAuthed(true)} />
+    return (
+      <>
+        {stoppedNotice}
+        <div ref={frozenShellRef}>
+          <LoginGate onAuthenticated={() => setAuthed(true)} />
+        </div>
+      </>
+    )
   }
 
   return (
     <GlobalConfigNoticesProvider>
       {notifyHolder}
+      {modalHolder}
+      {stoppedNotice}
+      <div ref={frozenShellRef}>
       <Layout className="app-shell" style={{ minHeight: '100vh', background: COLORS.bg }}>
         <Sider
           className="app-sidebar"
@@ -795,6 +933,18 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
                     label: 'Sign out',
                     onClick: handleLogout,
                   },
+                  ...(shutdownEnabled
+                    ? [
+                        { type: 'divider' as const },
+                        {
+                          key: 'stop-service',
+                          icon: <PoweroffOutlined />,
+                          label: 'Stop service',
+                          danger: true,
+                          onClick: () => void handleStopService(),
+                        },
+                      ]
+                    : []),
                 ],
               }}
             >
@@ -820,6 +970,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
           </Content>
         </Layout>
       </Layout>
+      </div>
     </GlobalConfigNoticesProvider>
   )
 }

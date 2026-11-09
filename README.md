@@ -68,7 +68,7 @@ bash start_dashboard.sh       # dev server on port 39527
 **3. Open the dashboard** in a browser, using the host machine's IP address:
 
 ```text
-http://<host-ip>:39527/
+https://<host-ip>:39527/
 ```
 
 **4. Sign in** with the access token the backend generated on first start. Read it

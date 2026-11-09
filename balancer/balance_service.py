@@ -37,8 +37,9 @@ except ModuleNotFoundError as exc:
         return None
 from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, fetch_unregistered_apps, get_priority_value, get_app_processes_for_app, get_cgroup_path_by_pid, reconcile_controlled_apps, restore_config_entry, serialize_config_meta
 from utils import quiet_mode
-from utils.http_utils import RetCode, construct_response, apply_request_limits, QuietWSGIRequestHandler
+from utils.http_utils import RetCode, construct_response, apply_request_limits, DeferredHandshakeSSLContext, QuietWSGIRequestHandler
 from utils.logger import get_logger
+from utils import ui_shutdown
 logger = get_logger(__name__)
 try:
     from diagnostics import emit_event  # best-effort seam; no-op if stripped
@@ -224,6 +225,55 @@ def _handle_signal(signum, frame):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     raise KeyboardInterrupt
+
+
+def _active_control():
+    """Busy check for the dashboard's stop: is the balancer controlling an app?
+
+    That is: a resource limit (manual or automatic) or a Freeze is in force, a
+    CPU affinity is pinned, network QoS rules are shaping an app, or an app
+    launched under critical pressure is held stopped (SIGSTOP) waiting to be
+    resumed. Stopping undoes all of these (Balancer.shutdown restores them and
+    resumes held apps), which the confirmation tells the user.
+
+    Returns what a stop would end, as a noun phrase for the dashboard's
+    "This also ends:" list, when busy; else None. Everything is read from
+    the balancer's live in-memory state -- the same registries shutdown()
+    restores from -- never from the DB status column, which a crash can leave
+    stale.
+    """
+    if _service is None:
+        return None
+    balancer = _service.balancer
+    with balancer.all_limits.lock:
+        entries = list(balancer.all_limits.apps.values())
+    if entries:
+        frozen = sum(1 for e in entries if e.frozen)
+        return (f"resource limits on {len(entries)} app(s)"
+                + (f", {frozen} of them frozen" if frozen else ""))
+    pinned = balancer.control_manager.cpu.bound_cgroups()
+    if pinned:
+        return f"CPU affinity pins on {len(pinned)} cgroup(s)"
+    # Populated only while network control is enabled and a controlled app runs.
+    shaped = len(getattr(balancer.network_controller, "app_filter_info", None) or {})
+    if shaped:
+        return f"network QoS rules on {shaped} app(s)"
+    # Held apps sit in app_priority_queue; app_pending_queue is the hand-off
+    # from the BPF intercept that feeds it.
+    if len(balancer.app_priority_queue) or not balancer.bpf_monitor.app_pending_queue.empty():
+        return "the pause on apps held under pressure (they will resume)"
+    return None
+
+
+def _request_ui_shutdown():
+    """The dashboard's "Stop service" (see utils.ui_shutdown).
+
+    Runs on a timer thread; signal handlers only fire on the main thread, so we
+    raise SIGTERM to ourselves. _handle_signal then unwinds main() through the
+    same graceful teardown as `systemctl stop`, and the unit lists SIGTERM in
+    RestartPreventExitStatus, so systemd does not bring it back."""
+    logger.info("Stopping SmarTune service as requested from the dashboard.")
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 def _shutdown_service_once():
@@ -2192,8 +2242,16 @@ def main():
         start_service()
         app._service_initialized = True
 
+    # Packaged deployments (run_all.sh sets SMARTUNE_UI_SHUTDOWN) let the
+    # dashboard stop the service. Armed after start_service() so the SIGTERM it
+    # sends lands on _handle_signal rather than the default handler.
+    if os.environ.get("SMARTUNE_UI_SHUTDOWN"):
+        ui_shutdown.add_busy_check("app controls", _active_control)
+        ui_shutdown.enable(_request_ui_shutdown)
+
     # Create secure SSL context with recommended settings
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    # Handshake in the request thread, not accept(): see DeferredHandshakeSSLContext.
+    ssl_context = DeferredHandshakeSSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_context.load_cert_chain(CERT_FILE, KEY_FILE)
     ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
 

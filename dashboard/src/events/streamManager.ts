@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Owns the dashboard's two server-push streams (/app/events and /bench/events)
-// for one "client": the shared worker serving every tab (sseHub.worker.ts), or a
-// single tab when SharedWorker is unavailable (sseHub.ts falls back).
+// for one "client": the leading tab's hub serving every tab (leaderHub.ts), or a
+// single tab when tab election is unavailable (sseHub.ts falls back).
 //
 // Why this exists: HTTP/1.1 allows only 6 connections per origin, shared by every
 // tab. Each EventSource holds one forever, so opening them per tab (or per hook)
 // starved ordinary requests once two dashboards were open. Whatever runs this
 // opens each stream at most once.
 //
-// No DOM dependencies beyond EventSource and timers, so it runs in a worker.
+// No DOM dependencies beyond EventSource and timers.
 
 export type StreamName = 'app' | 'bench'
 

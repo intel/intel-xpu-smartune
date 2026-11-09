@@ -4859,4 +4859,39 @@ class DynamicBalancer:
             self.handle_thread.join(timeout=1)
         if hasattr(self, "app_intercept_thread"):
             self.app_intercept_thread.join(timeout=1)
+        self._resume_held_apps_on_exit()
         logger.info("Service stopped; all threads have exited")
+
+    def _resume_held_apps_on_exit(self) -> None:
+        """SIGCONT every app still held for launching under critical pressure.
+
+        Nothing resumes them once the service is gone, so without this they stay
+        stopped forever. Runs after the threads above have been asked to stop:
+        the hand-off queue from the BPF intercept first, then the priority queue
+        the handle loop moves them into."""
+        held = []
+        pending = self.bpf_monitor.app_pending_queue
+        while True:
+            try:
+                held.append(pending.get_nowait())
+            except queue.Empty:
+                break
+            except Exception as exc:  # a closed multiprocessing queue, etc.
+                logger.warning(f"Could not drain the pending-app queue on exit: {exc}")
+                break
+        while not self.app_priority_queue.empty():
+            app_data, _priority = self.app_priority_queue.get()
+            held.append(app_data)
+        for app_data in held:
+            try:
+                os.kill(app_data['pid'], signal.SIGCONT)
+                logger.info(f"Resumed held app on exit: {app_data['app_name']} (PID: {app_data['pid']})")
+            except ProcessLookupError:
+                continue  # already gone; it is not running either
+            except Exception as exc:
+                logger.warning(f"Failed to resume held app {app_data.get('app_name')} on exit: {exc}")
+                continue
+            try:
+                app_utils.update_app_status(app_data['app_id'], "running")
+            except Exception as exc:
+                logger.debug(f"Could not record {app_data.get('app_name')} as running: {exc}")

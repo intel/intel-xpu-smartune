@@ -70,8 +70,8 @@ All endpoints return a standardized JSON structure:
 |----------|----------|--------|-------------|--------------|
 | Auth | `/auth/login` | POST | User authentication | SHA256 token validation |
 | Service | `/smartune/capabilities` | GET | What this server serves | Balancer / benchmark / diagnostics flags |
-| Service | `/smartune/ui/heartbeat` | POST | Renew an open-UI lease | Posted every few seconds per tab |
-| Service | `/smartune/ui/release` | POST | Release an open-UI lease | Best-effort on tab close |
+| Service | `/smartune/shutdown` | GET | Whether the dashboard may stop the service | Lists work a stop would end |
+| Service | `/smartune/shutdown` | POST | Stop the service | Packaged (deb) deployments only |
 | App | `/app/get_apps` | GET, POST | List all apps | Optional DB sync |
 | App | `/app/set_priority` | POST | Set app priority | OOM score auto-adjustment |
 | App | `/app/set_network_priority` | POST | Set network priority | Drives the tc/HTB class |
@@ -191,7 +191,8 @@ All endpoints return a standardized JSON structure:
   "data": {
     "capabilities": 1,
     "benchmark": 1,
-    "diagnostics": 1
+    "diagnostics": 1,
+    "shutdown": 1
   }
 }
 ```
@@ -203,54 +204,59 @@ All endpoints return a standardized JSON structure:
 | capabilities | int | `1` = balancer + monitor, `0` = monitor only |
 | benchmark | int | `1` = the `/bench` API is mounted here, `0` = not available |
 | diagnostics | int | `1` = the `/diag` API is mounted here, `0` = not available |
+| shutdown | int | `1` = this dashboard may stop the service (`/smartune/shutdown`), `0` = not offered |
 
 **Notes:**
 - `benchmark: 1` only means the feature is **mounted**, NOT that its Python environment is installed — the dashboard needs the tab to exist in order to offer the "install environment" action. Readiness comes from `GET /bench/env`.
 
 ---
 
-#### POST /smartune/ui/heartbeat
+#### GET /smartune/shutdown
 
-**Purpose:** Renew an open-UI lease. Each dashboard tab posts this every few seconds so the server knows a UI is still open; the lease lapses shortly after the posts stop.
+**Purpose:** Tell the dashboard whether it may stop this service, and what a stop right now would end, so its confirmation can say so.
 
-**Request:**
-
-| Type | Parameter | Required | Format | Description |
-|------|-----------|----------|--------|-------------|
-| Body | session_id | Yes | string | Non-empty identifier for this browser tab |
-
-**Request Example:**
-```json
-{
-  "session_id": "tab-7f3a1c"
-}
-```
+**Request:** No parameters.
 
 **Response:**
 ```json
 {
   "retcode": 0,
   "retmsg": "success",
-  "data": {"ok": true}
+  "data": {
+    "available": true,
+    "busy": ["the running benchmark job", "resource limits on 2 app(s), 1 of them frozen"]
+  }
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| available | bool | `true` only in packaged (deb) deployments, whose run scripts set `SMARTUNE_UI_SHUTDOWN=1`, and only for a request over loopback (`localhost`) |
+| busy | string[] | What a stop would end, as noun phrases (the dashboard lists them under "This also ends:"): a running benchmark job, apps under resource limits / Freeze, pinned CPU affinity, network QoS rules, apps held under critical pressure. Empty when idle |
+
+---
+
+#### POST /smartune/shutdown
+
+**Purpose:** Stop the service from the dashboard. It answers first, then shuts down the same way as `systemctl stop`: limits, Freeze, CPU affinity and network QoS rules are restored, held apps are resumed, and a running benchmark job ends. systemd does not restart it; the desktop icon starts it again.
+
+**Request:** No parameters.
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Service is stopping",
+  "data": {"stopping": true}
 }
 ```
 
 **Notes:**
-- A missing or empty `session_id` returns `RetCode.ARGUMENT_ERROR` with `{"ok": false}`.
-- Only acted on when the UI-lease watchdog is armed (the packaged monitor); otherwise it is recorded harmlessly.
-
----
-
-#### POST /smartune/ui/release
-
-**Purpose:** Release an open-UI lease. Sent best-effort on `pagehide` (a keepalive fetch), so closing a tab winds the lease down promptly instead of waiting for the heartbeat to lapse.
-
-**Request:** Same `session_id` body as `/smartune/ui/heartbeat`.
-
-**Response:** `{"ok": true}`.
-
-**Notes:**
-- Same `RetCode.ARGUMENT_ERROR` on a missing `session_id`.
+- Not offered in a run from the source tree: there it returns `RetCode.PERMISSION_ERROR` with `{"stopping": false}`.
+- Only accepted over loopback (`127.0.0.0/8`, `::1`): from a browser on this machine that opened the dashboard as `localhost` / `127.0.0.1`, as the desktop icon does. Opened by any IP, this machine's own included, the button is not shown and the request is refused. The packaged service binds `127.0.0.1` anyway; this keeps a remote dashboard from stopping it if the service is rebound to all interfaces. A remote request gets `RetCode.PERMISSION_ERROR`.
+- A busy service is stopped all the same; `GET /smartune/shutdown` is what lets the caller warn first.
 
 ---
 

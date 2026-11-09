@@ -68,27 +68,32 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$HERE" rev-parse --show-toplevel)"
 
 # Two mutually-exclusive package variants sharing the install dir and service
-# name (see --full). The flag switches only: package name, staged source paths,
-# control template, install-time run script, and the venv site-packages mode.
+# name (see --full). The flag switches only: package name, launcher name,
+# staged source paths, control template, install-time run script, and the venv
+# site-packages mode.
 #   monitor-only (default): smartune-monitor, isolated venv, smartune.py -m.
 #   full (--full/--all):    smartune, --system-site-packages venv (for the
 #                           apt-installed bcc), balancer + monitor, smartune.py -a.
 if [ "$FULL" -eq 1 ]; then
     PKG_NAME="smartune"
+    APP_NAME="Intel XPU SmarTune"
     CONTROL_TMPL="control.full"
     RUN_SCRIPT="run_all.sh"
     VENV_MODE="system"
     # Monitor subset PLUS the balancer and the benchmark toolchain. benchmark/ is
     # only ~800 KB of scripts once its generated runtime/ is excluded (see
     # STAGE_EXCLUDES); the monitor-only variant ships without it and hides the tab.
-    SRC_PATHS=(smartune.py smartune_api.py features.py requirements.txt monitor utils db config balancer benchmark)
+    SRC_PATHS=(smartune.py smartune_api.py features.py requirements.txt monitor utils db config diagnostics balancer benchmark)
     echo "==> Building FULL package (balancer + monitor): $PKG_NAME"
 else
     PKG_NAME="smartune-monitor"
+    APP_NAME="Intel XPU SmarTune Monitor"
     CONTROL_TMPL="control"
     RUN_SCRIPT="run_monitor.sh"
     VENV_MODE="isolated"
-    SRC_PATHS=(smartune.py smartune_api.py features.py requirements.txt monitor utils db config)
+    # diagnostics/ is required in both variants: monitor_api, monitor_service and
+    # smartune_api import it unconditionally (scrub_text / emit_event).
+    SRC_PATHS=(smartune.py smartune_api.py features.py requirements.txt monitor utils db config diagnostics)
     echo "==> Building monitor-only package: $PKG_NAME"
 fi
 STAGE="$REPO_ROOT/build/${PKG_NAME}_${VERSION}_${ARCH}"
@@ -100,6 +105,7 @@ rm -rf "$STAGE" "$DEB_OUT"
 mkdir -p "$APP_DIR" \
          "$STAGE/DEBIAN" \
          "$STAGE/lib/systemd/system" \
+         "$STAGE/etc/default" \
          "$STAGE/usr/share/applications" \
          "$STAGE/usr/share/icons/hicolor/scalable/apps" \
          "$STAGE/usr/share/polkit-1/actions"
@@ -119,7 +125,7 @@ fi
 
 # --- 2. Clean source tree ---------------------------------------------------
 echo "==> Staging application tree"
-# Copy only the modules the selected variant imports (config/db/utils/monitor +
+# Copy only the modules the selected variant imports (config/db/utils/monitor/diagnostics +
 # smartune*.py/features.py, plus balancer/ for --full), straight from the working tree so
 # local changes are picked up and node_modules / dev assets are never touched.
 # Runtime/dev artifacts are dropped at COPY time rather than deleted afterwards.
@@ -187,13 +193,21 @@ install -m 0755 "$HERE/app/start_gui.sh"        "$APP_DIR/start_gui.sh"
 install -m 0755 "$HERE/app/smartune-authhelper" "$APP_DIR/smartune-authhelper"
 
 # --- 3. systemd unit, desktop entry, icon -----------------------------------
-# The unit filename stays smartune-monitor.service in both variants (authhelper /
+# Both variants install the same unit, intel-smartune.service (authhelper /
 # start_gui.sh / prerm reference it by that fixed name); only its ExecStart
 # differs, rendered from the template to point at the variant's run script.
+SERVICE_UNIT="intel-smartune.service"
 sed -e "s#@RUN_SCRIPT@#/opt/intel/smartune/$RUN_SCRIPT#" \
-    "$HERE/templates/smartune.service.in" > "$STAGE/lib/systemd/system/smartune-monitor.service"
-chmod 0644 "$STAGE/lib/systemd/system/smartune-monitor.service"
-install -m 0644 "$HERE/smartune-monitor.desktop" "$STAGE/usr/share/applications/smartune-monitor.desktop"
+    "$HERE/templates/smartune.service.in" > "$STAGE/lib/systemd/system/$SERVICE_UNIT"
+chmod 0644 "$STAGE/lib/systemd/system/$SERVICE_UNIT"
+# Admin settings read by the unit (EnvironmentFile), e.g. the listen address.
+# Listed in DEBIAN/conffiles below so upgrades keep the admin's edits.
+install -m 0644 "$HERE/intel-smartune.default" "$STAGE/etc/default/intel-smartune"
+# The launcher's file name stays smartune-monitor.desktop in both variants
+# (postinst/prerm copy and remove it by that name); only the title shown differs.
+sed -e "s/@APP_NAME@/$APP_NAME/g" "$HERE/smartune-monitor.desktop" \
+    > "$STAGE/usr/share/applications/smartune-monitor.desktop"
+chmod 0644 "$STAGE/usr/share/applications/smartune-monitor.desktop"
 install -m 0644 "$HERE/smartune-monitor.svg" \
                 "$STAGE/usr/share/icons/hicolor/scalable/apps/smartune-monitor.svg"
 
@@ -205,8 +219,10 @@ install -m 0644 "$HERE/com.intel.smartune.policy" \
 # --- 4. DEBIAN control + maintainer scripts ---------------------------------
 sed -e "s/@VERSION@/$VERSION/" -e "s/@ARCH@/$ARCH/" \
     "$HERE/templates/$CONTROL_TMPL" > "$STAGE/DEBIAN/control"
+echo "/etc/default/intel-smartune" > "$STAGE/DEBIAN/conffiles"
 for s in postinst prerm postrm; do
-    install -m 0755 "$HERE/templates/$s" "$STAGE/DEBIAN/$s"
+    sed -e "s/@APP_NAME@/$APP_NAME/g" "$HERE/templates/$s" > "$STAGE/DEBIAN/$s"
+    chmod 0755 "$STAGE/DEBIAN/$s"
 done
 
 # --- 5. Build ----------------------------------------------------------------
@@ -221,4 +237,4 @@ echo ""
 echo "Done: $DEB_OUT"
 echo "  Install:  sudo apt install $DEB_OUT      # resolves Depends"
 echo "        or  sudo dpkg -i $DEB_OUT && sudo apt-get -f install"
-echo "  Launch:   application menu -> 'Intel XPU SmarTune Monitor' (or the desktop icon)"
+echo "  Launch:   application menu -> '$APP_NAME' (or the desktop icon)"

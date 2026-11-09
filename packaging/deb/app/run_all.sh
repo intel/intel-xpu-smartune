@@ -39,7 +39,7 @@ if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
     openssl req -x509 -newkey rsa:4096 \
         -keyout "$KEY_FILE" -out "$CERT_FILE" \
         -days 365 -nodes -subj "/CN=localhost" \
-        -addext "subjectAltName=IP:127.0.0.1"
+        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
     chmod 644 "$CERT_FILE"
     chmod 600 "$KEY_FILE"
 fi
@@ -59,13 +59,28 @@ if [ ! -s "$TOKEN_FILE" ]; then
 fi
 chmod 600 "$TOKEN_FILE"
 
-# 3. UI-lease auto-shutdown: on demand launch means nothing stops this root
-# service when the user closes the dashboard. With this flag the service tracks
-# open-UI leases (heartbeats from each tab) and exits cleanly once the last one
-# is gone; exit code 0 means systemd's Restart=on-failure won't revive it. The
-# grace windows have sensible defaults (see utils/ui_lease.py) and can be tuned
-# via SMARTUNE_UI_*_GRACE env vars if needed.
-export SMARTUNE_UI_LEASE=1
+# 3. Started on demand from the desktop icon, the service runs until the user
+# stops it: this flag adds a "Stop service" action to the dashboard (see
+# utils/ui_shutdown.py). `systemctl stop intel-smartune` works as well.
+export SMARTUNE_UI_SHUTDOWN=1
+
+# 3a. Listen address, from /etc/default/intel-smartune (the unit's
+# EnvironmentFile): every interface unless the admin set 127.0.0.1, so other
+# machines can open the dashboard by this host's IP. The server itself
+# defaults to 127.0.0.1 when run from a source tree.
+export BALANCER_HOST="${SMARTUNE_LISTEN:-0.0.0.0}"
+echo "[smartune] Dashboard will listen on $BALANCER_HOST:${BALANCER_PORT:-9001} (SMARTUNE_LISTEN in /etc/default/intel-smartune)."
+
+# 3b. Refuse to start if the port is already taken (typically a SmarTune started
+# from a source tree). Exit 3 is listed in the unit's RestartPreventExitStatus, so
+# systemd gives up at once instead of restart-looping on "Address already in use".
+PORT="${BALANCER_PORT:-9001}"
+if command -v ss >/dev/null 2>&1 && [ -n "$(ss -Hltn "sport = :$PORT" 2>/dev/null)" ]; then
+    echo "[smartune] ERROR: port $PORT is already in use by another program:" >&2
+    ss -Hltnp "sport = :$PORT" >&2 || true
+    echo "[smartune] Stop that program, then launch SmarTune again." >&2
+    exit 3
+fi
 
 # 4. Launch the combined balancer + monitor (port 9001, serves the dashboard UI
 # and its /api). smartune.py -a handles the balancer/ chdir + sys.path setup.

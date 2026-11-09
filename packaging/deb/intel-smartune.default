@@ -1,0 +1,10 @@
+# Settings for intel-smartune.service, read when the service starts.
+# Package upgrades keep your edits. Apply a change with:
+#   sudo systemctl restart intel-smartune
+
+# Address the dashboard listens on (port 9001).
+#   0.0.0.0    every interface: other machines open https://<this-machine-ip>:9001
+#              and sign in with the access token (sudo cat /opt/intel/smartune/key/api_token)
+#   127.0.0.1  this machine only: https://localhost:9001
+# Stopping the service from the dashboard works only from this machine, at localhost.
+SMARTUNE_LISTEN=0.0.0.0

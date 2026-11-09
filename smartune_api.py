@@ -8,6 +8,7 @@
 
 import hashlib
 import hmac
+import ipaddress
 import os
 import secrets
 import threading
@@ -20,7 +21,7 @@ from diagnostics import emit_event
 from utils.http_utils import RetCode, construct_response
 from utils.logger import get_logger
 logger = get_logger(__name__)
-from utils.ui_lease import get_ui_lease_manager
+from utils import ui_shutdown
 
 # The dashboard queries /smartune/capabilities to learn whether the server it is
 # connected to provides the full balancer feature set or is a monitor-only
@@ -322,6 +323,8 @@ def get_capabilities():
 
     `capabilities`: 1 = balancer + monitor, 0 = monitor only.
     `benchmark`:    1 = the /bench API is mounted, 0 = not available here.
+    `shutdown`:     1 = this dashboard may stop the service (packaged only,
+                    and only when opened as localhost).
 
     Note that benchmark=1 only means the feature is mounted, NOT that its Python
     environment is installed -- the dashboard needs the tab to exist in order to
@@ -332,44 +335,60 @@ def get_capabilities():
             "capabilities": 1 if _balancer_available else 0,
             "benchmark": 1 if _benchmark_available else 0,
             "diagnostics": 1 if _diagnostics_available else 0,
+            "shutdown": 1 if _can_stop_from_here() else 0,
         },
         retmsg="Successfully retrieved capabilities",
     )
 
 
-def _lease_session_id():
-    """Extract a non-empty session_id from the JSON body, or None."""
-    data = request.get_json(silent=True) or {}
-    sid = data.get("session_id")
-    return sid if isinstance(sid, str) and sid else None
+def _from_loopback():
+    """Whether the request came over loopback: localhost, 127.0.0.0/8 or ::1.
+
+    Only a browser on this host opening the dashboard as localhost (which the
+    desktop icon does) may stop the service -- not one opening it by any IP,
+    this machine's own included. The packaged service binds 127.0.0.1, so
+    normally nothing else can reach it; this also holds if someone rebinds it
+    to all interfaces (BALANCER_HOST / MONITOR_HOST=0.0.0.0). remote_addr is the
+    TCP peer and no proxy headers are trusted, so a client cannot fake it.
+    """
+    try:
+        addr = ipaddress.ip_address(request.remote_addr or "")
+    except ValueError:
+        return False
+    # A dual-stack socket reports an IPv4 client as ::ffff:a.b.c.d, which Python
+    # before 3.13 does not count as loopback.
+    return (getattr(addr, "ipv4_mapped", None) or addr).is_loopback
 
 
-@smartune_bp.route('/ui/heartbeat', methods=['POST'])
-def ui_heartbeat():
-    """Renew an open-UI lease. Each dashboard tab posts this every few seconds so
-    the server knows a UI is still open; the lease lapses shortly after the posts
-    stop. Only acted on when the UI-lease watchdog is armed (packaged monitor);
-    otherwise it is recorded harmlessly. See utils.ui_lease."""
-    sid = _lease_session_id()
-    if not sid:
+def _can_stop_from_here():
+    return ui_shutdown.available() and _from_loopback()
+
+
+@smartune_bp.route('/shutdown', methods=['GET'])
+def shutdown_status():
+    """Whether this dashboard may stop the service, and what a stop would cut
+    short (shown in its confirmation). See utils.ui_shutdown."""
+    return construct_response(data={
+        "available": _can_stop_from_here(),
+        "busy": ui_shutdown.busy_reasons(),
+    })
+
+
+@smartune_bp.route('/shutdown', methods=['POST'])
+def shutdown():
+    """Stop the service (packaged deployments only). Answers first, then exits
+    the same way as `systemctl stop`: controls are undone, a running benchmark
+    job ends, and systemd does not restart it. Only accepted over loopback."""
+    if not _from_loopback():
+        logger.warning(f"Refused a stop request from {request.remote_addr}: "
+                       "the service can only be stopped via localhost.")
         return construct_response(
-            data={"ok": False}, retcode=RetCode.ARGUMENT_ERROR,
-            retmsg="session_id is required",
+            data={"stopping": False}, retcode=RetCode.PERMISSION_ERROR,
+            retmsg="The service can only be stopped from a dashboard opened as localhost",
         )
-    get_ui_lease_manager().heartbeat(sid)
-    return construct_response(data={"ok": True})
-
-
-@smartune_bp.route('/ui/release', methods=['POST'])
-def ui_release():
-    """Release an open-UI lease. Sent best-effort on pagehide (keepalive fetch)
-    so closing a tab winds the lease down promptly instead of waiting for the
-    heartbeat to lapse."""
-    sid = _lease_session_id()
-    if not sid:
+    if not ui_shutdown.request():
         return construct_response(
-            data={"ok": False}, retcode=RetCode.ARGUMENT_ERROR,
-            retmsg="session_id is required",
+            data={"stopping": False}, retcode=RetCode.PERMISSION_ERROR,
+            retmsg="Stopping from the dashboard is not enabled for this deployment",
         )
-    get_ui_lease_manager().release(sid)
-    return construct_response(data={"ok": True})
+    return construct_response(data={"stopping": True}, retmsg="Service is stopping")

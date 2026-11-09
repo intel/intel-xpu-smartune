@@ -15,9 +15,16 @@
 # systemctl start is idempotent, so re-running against a live unit is a no-op.
 set -u
 
-UNIT="smartune-monitor.service"
+UNIT="intel-smartune.service"
 TOKEN_FILE="/opt/intel/smartune/key/api_token"
 
+# An explicit launch from the desktop icon must always get a fresh try: clear a
+# failed state (and the StartLimitBurst counter) left by earlier crashes,
+# otherwise systemd refuses with "start request repeated too quickly". Skipped
+# while the unit is active so a running service is never touched.
+if ! systemctl is-active --quiet "$UNIT"; then
+    systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+fi
 systemctl start "$UNIT" >&2 || exit 1
 for _ in $(seq 1 20); do [ -s "$TOKEN_FILE" ] && break; sleep 0.5; done
 cat "$TOKEN_FILE" 2>/dev/null

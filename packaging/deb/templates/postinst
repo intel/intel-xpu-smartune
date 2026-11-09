@@ -40,7 +40,16 @@ case "$1" in
         update-desktop-database /usr/share/applications 2>/dev/null || true
         gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
 
-        echo "[smartune] Installed. Launch from the application menu or desktop icon 'Intel XPU SmarTune Monitor'."
+        echo "[smartune] Installed. Launch from the application menu or desktop icon '@APP_NAME@'."
+        # Say where the running service can be reached, per the admin's setting.
+        LISTEN="$( . /etc/default/intel-smartune 2>/dev/null; echo "${SMARTUNE_LISTEN:-0.0.0.0}" )"
+        if [ "$LISTEN" = "127.0.0.1" ]; then
+            echo "[smartune] Dashboard: https://localhost:9001 (this machine only)."
+        else
+            echo "[smartune] Dashboard: https://localhost:9001 here, https://<this-machine-ip>:9001 from" \
+                 "other machines while it runs (sign in with: sudo cat $INSTALL_DIR/key/api_token)."
+            echo "[smartune] For this machine only, set SMARTUNE_LISTEN=127.0.0.1 in /etc/default/intel-smartune."
+        fi
         ;;
 esac
 

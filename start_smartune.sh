@@ -51,7 +51,7 @@ else
     sudo openssl req -x509 -newkey rsa:4096 \
         -keyout "$KEY_FILE" -out "$CERT_FILE" \
         -days 365 -nodes -subj "/CN=localhost" \
-        -addext "subjectAltName=IP:127.0.0.1"
+        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 
     if [ $? -ne 0 ]; then
         echo "Certificate generation failed" >&2

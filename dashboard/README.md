@@ -20,10 +20,14 @@ cd dashboard
 bash start_dashboard.sh        # auto-installs Node.js if missing, then starts the dev server
 ```
 
-Open **http://localhost:39527** in your browser.
+Open **https://localhost:39527** in your browser.
 
 > The script forwards all `/api/*` requests to `https://127.0.0.1:9001` through the Vite proxy,
-> so the backend's self-signed TLS certificate does **not** cause browser warnings.
+> so the backend's own certificate never reaches the browser. The dev server itself serves
+> HTTPS with a self-signed certificate generated on first start (`.dev-cert/`): accept the
+> browser warning once. HTTPS keeps the page a secure context when opened by IP, which the
+> dashboard needs to share its live-update connections across tabs. `VITE_DEV_HTTP=1`
+> serves plain http instead.
 
 ---
 
@@ -108,11 +112,11 @@ Output:
 ```
   VITE v7.x  ready in xxx ms
 
-  ➜  Local:   http://localhost:39527/
+  ➜  Local:   https://localhost:39527/
   ➜  Network: use --host to expose
 ```
 
-Open **http://localhost:39527** in your browser.
+Open **https://localhost:39527** in your browser.
 
 ---
 

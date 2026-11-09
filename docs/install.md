@@ -4,8 +4,8 @@ Three ways to run SmarTune — pick **one**:
 
 | Method | Best for | Dashboard URL |
 | --- | --- | --- |
-| [Run from source](#run-from-source) — start the backend by hand | Development, a quick trial | `http://<host-ip>:39527/` (dev server) |
-| [Run from source as a systemd service](#run-as-a-systemd-service) | A long-running source install that starts on boot and restarts on failure | `http://<host-ip>:39527/` (dev server) |
+| [Run from source](#run-from-source) — start the backend by hand | Development, a quick trial | `https://<host-ip>:39527/` (dev server) |
+| [Run from source as a systemd service](#run-as-a-systemd-service) | A long-running source install that starts on boot and restarts on failure | `https://<host-ip>:39527/` (dev server) |
 | [Debian package](#debian-package) | End users: self-contained, bundled venv, built dashboard | `https://localhost:9001` |
 
 **Verified platforms:** Intel MTL, PTL, and Wildcat Lake on Ubuntu / Debian
@@ -68,8 +68,12 @@ cd dashboard
 bash start_dashboard.sh    # dev server on port 39527, binds 0.0.0.0
 ```
 
-Open `http://<host-ip>:39527/` (or `http://localhost:39527/` on the host
+Open `https://<host-ip>:39527/` (or `https://localhost:39527/` on the host
 itself). The dev server proxies API calls to the backend on port 9001.
+It serves HTTPS with a self-signed certificate generated on first start
+(`dashboard/.dev-cert/`), so the browser shows a warning once; accept it to
+continue. Set `VITE_DEV_HTTP=1` to serve plain http instead (multiple tabs
+opened by IP may then hang).
 
 **Sign in.** The dashboard asks for an access token. The backend creates it on first
 start; read it with `sudo cat key/api_token` and paste it into the sign-in screen
@@ -119,7 +123,7 @@ Two mutually exclusive packages — install **one**:
 
 `smartune` supersedes `smartune-monitor` (it declares `Conflicts/Replaces/Provides`),
 so installing one automatically replaces the other. Both install to
-`/opt/intel/smartune` and register the **same** `smartune-monitor.service`.
+`/opt/intel/smartune` and register the **same** `intel-smartune.service`.
 
 The full package additionally needs the balancer's native dependencies, which
 `apt install` pulls automatically (so it needs apt repository access at install
@@ -162,15 +166,18 @@ sudo apt install ./build/smartune_*.deb            # full (balancer + monitor)
 ```
 
 Use `apt install` rather than `dpkg -i` so system dependencies are resolved.
-The installation also adds the **Intel XPU SmarTune Monitor** application
-launcher (plus a desktop shortcut when supported) and `smartune-monitor.service`.
+The installation also adds an application launcher (plus a desktop shortcut when
+supported) and `intel-smartune.service`. The launcher is named
+**Intel XPU SmarTune** for the full package and **Intel XPU SmarTune Monitor**
+for the monitor-only package.
 The service is not enabled at boot; the launcher starts it on demand via
-`pkexec systemctl start smartune-monitor.service`.
+`pkexec systemctl start intel-smartune.service`.
 
 ### Launch
 
 1. Open the application menu, search for `Intel XPU` or `SmarTune`, and select
-   **Intel XPU SmarTune Monitor**.
+   **Intel XPU SmarTune** (full package) or **Intel XPU SmarTune Monitor**
+   (monitor-only package).
 
    ![Search for Intel XPU SmarTune](images/deb-search-smartune.png)
 
@@ -186,12 +193,38 @@ The service is not enabled at boot; the launcher starts it on demand via
 
    ![Intel XPU SmarTune dashboard](user-guide/images/home-overview.png)
 
+### Stop
+
+Closing the browser leaves the service running. To stop it, open the account
+menu at the top right and select **Stop service**. The confirmation lists
+anything still in progress: stopping ends a running benchmark job and returns
+controlled apps to normal. Every open dashboard tab then shows that the service
+stopped; start it again from the launcher. **Stop service** appears only in a
+dashboard opened at `https://localhost:9001` on this machine.
+`sudo systemctl stop intel-smartune.service` works too.
+
+### Open the dashboard from another machine
+
+While the service runs, other machines can open `https://<this-machine-ip>:9001`:
+
+1. Accept the browser's certificate warning (the certificate is self-signed).
+2. Sign in with the access token. Read it on this machine with
+   `sudo cat /opt/intel/smartune/key/api_token`.
+
+The service is still started from this machine's launcher, and can only be
+stopped from here. If a firewall is active, allow the port, e.g.
+`sudo ufw allow 9001/tcp`.
+
+To keep the dashboard on this machine only, set `SMARTUNE_LISTEN=127.0.0.1` in
+`/etc/default/intel-smartune` and run `sudo systemctl restart intel-smartune`.
+Package upgrades keep this file.
+
 ### Service and troubleshooting
 
 ```bash
-systemctl status smartune-monitor.service
-sudo journalctl -u smartune-monitor.service -b --no-pager
-sudo systemctl start smartune-monitor.service       # or: stop
+systemctl status intel-smartune.service
+sudo journalctl -u intel-smartune.service -b --no-pager
+sudo systemctl start intel-smartune.service       # or: stop
 curl -k -I https://localhost:9001/
 ```
 

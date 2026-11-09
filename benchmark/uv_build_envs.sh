@@ -128,7 +128,10 @@ install_combo() {
     local trio_ver="${ov}.0"   # openvino-tokenizers / openvino-genai use <OV>.0
     echo ""
     echo "==== OV ${ov} + transformers ${tf}  ->  ${dir} ===="
-    "${UV_BIN}" venv "${dir}" --python 3.12 || return 1
+    # Only reached when ${dir} is missing or failed the usability check, i.e. a
+    # previous build was interrupted (cancelled, crashed) and left a partial
+    # venv. --clear rebuilds it; without it uv refuses ("already exists").
+    "${UV_BIN}" venv --clear "${dir}" --python 3.12 || return 1
     "${UV_BIN}" pip install --python "${dir}/bin/python" --torch-backend cpu \
         -r "${BASE_REQS}" \
         "openvino==${ov}" \
@@ -195,7 +198,9 @@ bootstrap() {
     else
         echo "==== base huggingface venv  ->  ${BASE_VENV} ===="
         mkdir -p "$(dirname "${BASE_VENV}")"
-        "${UV_BIN}" venv "${BASE_VENV}" --python 3.12 || return 1
+        # Reached only when the venv is missing or broken (e.g. a cancelled
+        # bootstrap left it half-built): --clear rebuilds it in place.
+        "${UV_BIN}" venv --clear "${BASE_VENV}" --python 3.12 || return 1
         # jinja2 is needed by the build stage (gen_wrapper.py renders the run
         # scripts from templates); it runs in this base venv, so install it here
         # alongside the download toolchain rather than only in the OV columns.

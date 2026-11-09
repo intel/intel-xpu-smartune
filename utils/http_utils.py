@@ -1,18 +1,55 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import ssl
+
 from flask import jsonify, make_response, request
 from enum import Enum, IntEnum
 from werkzeug.serving import WSGIRequestHandler
 
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
+# Seconds any single read or write on a client connection may block: the TLS
+# handshake, an idle keep-alive wait, a client not reading an event stream. An
+# event stream itself stays open indefinitely; only a stalled peer is dropped.
+CLIENT_SOCKET_TIMEOUT = 30
+
+
+class DeferredHandshakeSSLContext(ssl.SSLContext):
+    """Server TLS context whose handshake runs in the request thread.
+
+    werkzeug wraps the listening socket with this context, and by default
+    accept() then performs the TLS handshake -- on the server's single accept
+    thread. One client that connects and never sends its TLS hello (a port
+    scanner, a browser's speculative pre-connect, a proxy that gave up) stalls
+    every other request until it disconnects. Accepted sockets made with
+    do_handshake_on_connect=False return at once; QuietWSGIRequestHandler then
+    completes the handshake in its own thread, under CLIENT_SOCKET_TIMEOUT.
+    """
+
+    def wrap_socket(self, sock, *args, **kwargs):
+        kwargs["do_handshake_on_connect"] = False
+        return super().wrap_socket(sock, *args, **kwargs)
+
 
 class QuietWSGIRequestHandler(WSGIRequestHandler):
-    """Use a product-only Server header for Werkzeug responses."""
+    """Use a product-only Server header for Werkzeug responses, and finish the
+    TLS handshake that DeferredHandshakeSSLContext moved off the accept thread."""
+
+    timeout = CLIENT_SOCKET_TIMEOUT  # applied to the connection in setup()
 
     def version_string(self):
         return "SmarTune"
+
+    def handle(self):
+        if isinstance(self.connection, ssl.SSLSocket):
+            try:
+                self.connection.do_handshake()
+            except OSError:
+                # Timed out, reset, not TLS, or the browser rejected our
+                # self-signed certificate: nothing to serve, nobody else waits.
+                return
+        super().handle()
 
 
 class CustomEnum(Enum):

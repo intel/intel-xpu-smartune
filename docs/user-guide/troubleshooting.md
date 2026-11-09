@@ -6,7 +6,7 @@
 
 1. Confirm the service is running:
    ```bash
-   systemctl status smartune-monitor.service
+   systemctl status intel-smartune.service
    ```
 2. Check the local endpoint directly:
    ```bash
@@ -15,7 +15,7 @@
 3. Inspect recent logs:
    ```bash
    tail -f logs/smartune.log          # source install
-   sudo journalctl -u smartune-monitor.service -b --no-pager   # package install
+   sudo journalctl -u intel-smartune.service -b --no-pager   # package install
    ```
 
 ## The browser says "Not Secure"

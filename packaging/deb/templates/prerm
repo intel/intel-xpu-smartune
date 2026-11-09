@@ -6,7 +6,7 @@ set -e
 case "$1" in
     remove|deconfigure)
         # Stop the service if it happens to be running (it is never enabled).
-        systemctl stop smartune-monitor.service 2>/dev/null || true
+        systemctl stop intel-smartune.service 2>/dev/null || true
 
         # Remove the best-effort desktop-icon copies dropped by postinst.
         for user_home in /home/*; do

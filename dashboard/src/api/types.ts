@@ -11,6 +11,14 @@ export interface CapabilitiesData {
   capabilities: number
   benchmark?: number
   diagnostics?: number
+  /** 1 = the dashboard may stop this service (packaged deployments). */
+  shutdown?: number
+}
+
+export interface ShutdownStatus {
+  available: boolean
+  /** Work a stop right now would end or undo; empty when idle. */
+  busy: string[]
 }
 
 export type DiagSeverity = 'info' | 'warning' | 'error' | 'critical'

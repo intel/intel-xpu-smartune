@@ -11,7 +11,6 @@ import {
   Card,
   Form,
   Input,
-  InputNumber,
   Switch,
   Select,
   Row,
@@ -40,6 +39,7 @@ import {
   DeleteOutlined,
   FilterOutlined,
   PlusOutlined,
+  UndoOutlined,
 } from '@ant-design/icons'
 import { api } from '../api/client'
 import type {
@@ -52,6 +52,8 @@ import type {
 } from '../api/types'
 import { COLORS } from '../styles/theme'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
+import { HintNote, HintScopeContext, HintedCell, HintedItem, useConfigHints } from './settingsHints'
+import type { HintScope } from './settingsHints'
 
 const { Text } = Typography
 
@@ -210,6 +212,13 @@ interface SaveHandle {
   // in-progress edit conflict for no reason).
   isDirty?: () => boolean
   save: () => Promise<SaveOutcome>
+  // Page-footer actions. Reset drops unsaved edits; restore fills the startup defaults and is
+  // left undefined where the card has none, so the footer only offers it when it can act.
+  reset?: () => void
+  restore?: () => void
+  // Set by the registration wrapper: whether the card currently offers the action above.
+  canReset?: () => boolean
+  canRestore?: () => boolean
 }
 
 interface SaveRegistry {
@@ -217,6 +226,9 @@ interface SaveRegistry {
   // Cards ping this when their edit state may have changed, so the dialog can
   // re-read isDirty() and mark the tab. Cheap: one call per handle, no polling.
   notifyDirty: () => void
+  // Cards ping this when what the footer can offer changed (startup defaults arrived).
+  // Separate from notifyDirty so keystrokes do not re-render the whole dialog.
+  notifyCapabilities: () => void
 }
 
 const SettingsSaveContext = React.createContext<SaveRegistry | null>(null)
@@ -236,9 +248,21 @@ function useRegisterSave(id: string, handle: SaveHandle) {
       validate: () => Promise.resolve(latest.current.validate?.() ?? true),
       isDirty: () => latest.current.isDirty?.() ?? true,
       save: () => latest.current.save(),
+      // Always present, and answer from the newest closure: whether a card can restore
+      // is only known once its hints arrive, after the handle has registered.
+      reset: () => latest.current.reset?.(),
+      restore: () => latest.current.restore?.(),
+      canReset: () => !!latest.current.reset,
+      canRestore: () => !!latest.current.restore,
     }),
     [registry, id, tabKey],
   )
+}
+
+// Lets a card report that the footer actions it offers changed.
+function useNotifyCapabilities() {
+  const registry = useContext(SettingsSaveContext)
+  return useCallback(() => registry?.notifyCapabilities(), [registry])
 }
 
 // Lets a card report "my edit state changed" without threading props through it.
@@ -287,6 +311,39 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
     dirty.current = false
     notifyDirty()
   }, [notifyDirty])
+
+  // Startup defaults arrive API-shaped; run them through the same conversion as a
+  // conflict reload so they land in the form's own shape (percentages, flattened fields).
+  const hints = useConfigHints()
+  const notifyCapabilities = useNotifyCapabilities()
+  const sectionHint = hints?.sections[scope]
+  const startupDefaults = useMemo(() => {
+    const raw = hints?.startup_defaults[scope]
+    if (!raw || !sectionHint?.restorable) return null
+    try {
+      return currentToValues(raw)
+    } catch (error) {
+      console.error(`Could not convert startup defaults of ${scope}`, error)
+      return null
+    }
+    // currentToValues is an inline closure; the section's hints are what actually change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hints, scope])
+  const hintScope = useMemo<HintScope>(
+    () => ({ section: scope, hints, defaults: startupDefaults, markDirty }),
+    [scope, hints, startupDefaults, markDirty],
+  )
+
+  // Fills the form only; Save still goes through the usual validation and conflict check.
+  const restoreStartupDefaults = () => {
+    if (!startupDefaults) return
+    const values = { ...startupDefaults }
+    // Hardware-derived or user-picked fields (e.g. which NICs are controlled) are not defaults.
+    for (const key of sectionHint?.keep ?? []) delete values[key]
+    form.setFieldsValue(values)
+    markDirty()
+    message.info(`${title}: startup defaults filled in. Save to apply them.`)
+  }
 
   const doLoad = useCallback(async () => {
     setLoading(true)
@@ -379,7 +436,18 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
     }
   }
 
-  useRegisterSave(scope, { validate, isDirty: () => dirty.current, save: onSave })
+  // Hints arrive after the card has registered; tell the footer so it can offer Restore.
+  useEffect(() => {
+    notifyCapabilities()
+  }, [startupDefaults, notifyCapabilities])
+
+  useRegisterSave(scope, {
+    validate,
+    isDirty: () => dirty.current,
+    save: onSave,
+    reset: doLoad,
+    restore: startupDefaults ? restoreStartupDefaults : undefined,
+  })
 
   return (
     <Card size="small" title={title} style={{ marginBottom: 16 }}>
@@ -389,22 +457,15 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
         </div>
       )}
       <Spin spinning={loading}>
-        <Form form={form} layout="vertical" onFieldsChange={markDirty}>
-          {children}
-        </Form>
+        <HintScopeContext.Provider value={hintScope}>
+          <Form form={form} layout="vertical" onFieldsChange={markDirty}>
+            {children}
+          </Form>
+        </HintScopeContext.Provider>
         <Text type="secondary" style={{ fontSize: 12 }}>
           Last saved: {formatTimestamp(updatedAt)}
         </Text>
-        <div>
-          <Button
-            icon={<ReloadOutlined />}
-            onClick={doLoad}
-            disabled={saving}
-            style={{ marginTop: 12 }}
-          >
-            Reset
-          </Button>
-        </div>
+
       </Spin>
     </Card>
   )
@@ -496,7 +557,7 @@ function MonitoredSectionsCard() {
     }
   }
 
-  useRegisterSave('monitored_sections', { isDirty: () => dirty.current, save: handleSave })
+  useRegisterSave('monitored_sections', { isDirty: () => dirty.current, save: handleSave, reset: load })
 
   return (
     <Card size="small" title="System Overview" style={{ marginBottom: 16 }}>
@@ -542,9 +603,6 @@ function MonitoredSectionsCard() {
             Last saved: {formatTimestamp(updatedAt)}
           </Text>
         </div>
-        <Button icon={<ReloadOutlined />} onClick={load} disabled={saving} style={{ marginTop: 12 }}>
-          Reset
-        </Button>
       </Spin>
     </Card>
   )
@@ -844,15 +902,15 @@ function SystemPressurePanel() {
       >
         <Row gutter={16}>
           <Col span={8}>
-            <Form.Item
+            <HintedItem
               label="Update interval (s)"
               name="regular_update_sys_pressure_time"
               tooltip="How often the system-pressure level is recomputed. Lower reacts faster but costs more CPU."
-              required={false}
               rules={[{ required: true, type: 'number', min: 1, max: 3600 }]}
-            >
-              <InputNumber style={{ width: '100%' }} min={1} max={3600} step={1} />
-            </Form.Item>
+              min={1}
+              max={3600}
+              step={1}
+            />
           </Col>
         </Row>
 
@@ -865,14 +923,15 @@ function SystemPressurePanel() {
         <Row gutter={16}>
           {(['low', 'medium', 'high', 'critical'] as const).map((k) => (
             <Col span={6} key={k}>
-              <Form.Item
+              <HintedItem
                 label={k[0].toUpperCase() + k.slice(1)}
                 name={['thresholds', k]}
-                required={false}
                 rules={[{ required: true, type: 'number', min: 1, max: 100 }]}
-              >
-                <InputNumber style={{ width: '100%' }} min={1} max={100} step={1} addonAfter="%" />
-              </Form.Item>
+                min={1}
+                max={100}
+                step={5}
+                addonAfter="%"
+              />
             </Col>
           ))}
         </Row>
@@ -887,51 +946,50 @@ function SystemPressurePanel() {
           <Row gutter={16}>
             {(['cpu', 'memory', 'io'] as const).map((k) => (
               <Col span={8} key={k}>
-                <Form.Item
+                <HintedItem
                   label={k === 'io' ? 'I/O' : k[0].toUpperCase() + k.slice(1)}
                   name={['weights', k]}
-                  required={false}
                   rules={[{ required: true, type: 'integer', min: 0 }]}
-                >
-                  <InputNumber style={{ width: '100%' }} min={0} step={1} />
-                </Form.Item>
+                  min={0}
+                  step={1}
+                />
               </Col>
             ))}
           </Row>
 
           <Row gutter={16}>
             <Col span={8}>
-              <Form.Item
+              <HintedItem
                 label="Memory gate steepness"
                 name="mem_gate_steepness"
                 tooltip="Steepness of the memory-discount sigmoid gate: larger makes the transition around the memory busy point sharper."
-                required={false}
                 rules={[{ required: true, type: 'number', min: 1, max: 50 }]}
-              >
-                <InputNumber style={{ width: '100%' }} min={1} max={50} step={0.5} />
-              </Form.Item>
+                min={1}
+                max={50}
+                step={0.5}
+              />
             </Col>
             <Col span={8}>
-              <Form.Item
+              <HintedItem
                 label="Memory busy threshold (%)"
                 name="memory_busy_threshold"
                 tooltip="Memory usage percentage where memory pressure starts to be treated as busy."
-                required={false}
                 rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
-              >
-                <InputNumber style={{ width: '100%' }} min={0} max={100} step={1} />
-              </Form.Item>
+                min={0}
+                max={100}
+                step={5}
+              />
             </Col>
             <Col span={8}>
-              <Form.Item
+              <HintedItem
                 label="CPU busy threshold (%)"
                 name="cpu_busy_threshold"
                 tooltip="CPU usage percentage where CPU pressure starts to be treated as busy."
-                required={false}
                 rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
-              >
-                <InputNumber style={{ width: '100%' }} min={0} max={100} step={1} />
-              </Form.Item>
+                min={0}
+                max={100}
+                step={5}
+              />
             </Col>
           </Row>
         </AdvancedSection>
@@ -975,14 +1033,15 @@ function DiskPressurePanel() {
         <Row gutter={16}>
           {(['low', 'medium', 'high', 'critical'] as const).map((k) => (
             <Col span={6} key={k}>
-              <Form.Item
+              <HintedItem
                 label={k[0].toUpperCase() + k.slice(1)}
                 name={['disk_thresholds', k]}
-                required={false}
                 rules={[{ required: true, type: 'number', min: 1, max: 100 }]}
-              >
-                <InputNumber style={{ width: '100%' }} min={1} max={100} step={1} addonAfter="%" />
-              </Form.Item>
+                min={1}
+                max={100}
+                step={5}
+                addonAfter="%"
+              />
             </Col>
           ))}
         </Row>
@@ -1001,40 +1060,40 @@ function DiskPressurePanel() {
               ['util', 'Utilisation'],
             ] as const).map(([key, label]) => (
               <Col span={8} key={key}>
-                <Form.Item
+                <HintedItem
                   label={label}
                   name={['sub_weights', key]}
-                  required={false}
                   rules={[{ required: true, type: 'number', min: 0, max: 1 }]}
-                >
-                  <InputNumber style={{ width: '100%' }} min={0} max={1} step={0.05} />
-                </Form.Item>
+                  min={0}
+                  max={1}
+                  step={0.05}
+                />
               </Col>
             ))}
           </Row>
 
           <Row gutter={16}>
             <Col span={8}>
-              <Form.Item
+              <HintedItem
                 label="Sigmoid steepness"
                 name="sigmoid_k"
                 tooltip="Steepness of the curve that squashes each sub-signal around its media-specific half-point: larger is more switch-like, smaller is a gentler ramp."
-                required={false}
                 rules={[{ required: true, type: 'number', min: 1, max: 50 }]}
-              >
-                <InputNumber style={{ width: '100%' }} min={1} max={50} step={0.5} />
-              </Form.Item>
+                min={1}
+                max={50}
+                step={0.5}
+              />
             </Col>
             <Col span={8}>
-              <Form.Item
+              <HintedItem
                 label="Worst-disk weight"
                 name="max_p_weight"
                 tooltip="How strongly the single busiest disk carries the aggregate: 0 is a plain mean (one hammered disk among many is averaged away), 1 lets the worst disk decide on its own."
-                required={false}
                 rules={[{ required: true, type: 'number', min: 0, max: 1 }]}
-              >
-                <InputNumber style={{ width: '100%' }} min={0} max={1} step={0.05} />
-              </Form.Item>
+                min={0}
+                max={1}
+                step={0.05}
+              />
             </Col>
           </Row>
         </AdvancedSection>
@@ -1062,7 +1121,7 @@ function NetworkPressurePanel() {
           return {
             values: {
               network_thresholds: toPercentageThresholds(d.network_thresholds),
-              network_pressure_model_rx_drop_weight: Number(d.network_pressure_model?.rx_drop_weight ?? 0.5),
+              network_pressure_model_rx_drop_weight: Number(d.network_pressure_model?.rx_drop_weight ?? 0.3),
             },
             updatedAt: d.updated_at,
           }
@@ -1076,7 +1135,7 @@ function NetworkPressurePanel() {
         currentToValues={(c) => ({
           network_thresholds: toPercentageThresholds(c.network_thresholds as Record<string, number>),
           network_pressure_model_rx_drop_weight: Number(
-            ((c.network_pressure_model as { rx_drop_weight?: number } | undefined)?.rx_drop_weight) ?? 0.5,
+            ((c.network_pressure_model as { rx_drop_weight?: number } | undefined)?.rx_drop_weight) ?? 0.3,
           ),
         })}
       >
@@ -1089,14 +1148,15 @@ function NetworkPressurePanel() {
         <Row gutter={16}>
           {(['low', 'medium', 'high', 'critical'] as const).map((level) => (
             <Col span={6} key={level}>
-              <Form.Item
+              <HintedItem
                 label={level[0].toUpperCase() + level.slice(1)}
                 name={['network_thresholds', level]}
-                required={false}
                 rules={[{ required: true, type: 'number', min: 1, max: 100 }]}
-              >
-                <InputNumber style={{ width: '100%' }} min={1} max={100} step={1} addonAfter="%" />
-              </Form.Item>
+                min={1}
+                max={100}
+                step={5}
+                addonAfter="%"
+              />
             </Col>
           ))}
         </Row>
@@ -1104,15 +1164,15 @@ function NetworkPressurePanel() {
         <AdvancedSection>
           <Row gutter={16}>
             <Col span={8}>
-              <Form.Item
+              <HintedItem
                 label="RX drop weight"
                 name="network_pressure_model_rx_drop_weight"
                 tooltip="Weight of generic rx_dropped distress in RX pressure scoring. Lower values make RX drops contribute less to pressure; valid range is 0 to 1."
-                required={false}
                 rules={[{ required: true, type: 'number', min: 0, max: 1 }]}
-              >
-                <InputNumber style={{ width: '100%' }} min={0} max={1} step={0.05} />
-              </Form.Item>
+                min={0}
+                max={1}
+                step={0.05}
+              />
             </Col>
           </Row>
         </AdvancedSection>
@@ -1130,20 +1190,31 @@ function LimitRateRow({ resource, disabled }: { resource: 'cpu' | 'memory'; disa
   const enabled = (Form.useWatch([resource, 'enabled'], form) ?? true) as boolean
   const ratesDisabled = disabled || !enabled
   return (
-    <Row gutter={12} align="bottom">
-      <Col span={4}>
-        <Form.Item label={resource === 'cpu' ? 'CPU' : 'Memory'} name={[resource, 'enabled']} valuePropName="checked">
-          <Switch checkedChildren="On" unCheckedChildren="Off" disabled={disabled} />
-        </Form.Item>
-      </Col>
-      {PRIORITIES.map((p) => (
-        <Col span={5} key={p.key}>
-          <Form.Item label={p.label} name={[resource, 'rate', p.key]} rules={[{ type: 'number', min: 1, max: 100 }]}>
-            <InputNumber style={{ width: '100%' }} min={1} max={100} step={1} addonAfter="%" disabled={ratesDisabled} />
+    <>
+      <Row gutter={12} align="top">
+        <Col span={4}>
+          <Form.Item label={resource === 'cpu' ? 'CPU' : 'Memory'} name={[resource, 'enabled']} valuePropName="checked">
+            <Switch checkedChildren="On" unCheckedChildren="Off" disabled={disabled} />
           </Form.Item>
         </Col>
-      ))}
-    </Row>
+        {PRIORITIES.map((p) => (
+          <Col span={5} key={p.key}>
+            <HintedItem
+              label={p.label}
+              name={[resource, 'rate', p.key]}
+              rules={[{ type: 'number', min: 1, max: 100 }]}
+              min={1}
+              max={100}
+              step={5}
+              addonAfter="%"
+              disabled={ratesDisabled}
+              compact
+            />
+          </Col>
+        ))}
+      </Row>
+      <HintNote name={[resource, 'rate', 'high']} />
+    </>
   )
 }
 
@@ -1177,12 +1248,19 @@ function DiskRateMatrix({ disabled }: { disabled?: boolean }) {
           </Col>
           {DISK_FIELDS.map((f) => (
             <Col span={5} key={f.key}>
-              <Form.Item name={['disk_io', 'rate', p.key, f.key]} noStyle rules={[{ type: 'number', min: 1 }]}>
-                <InputNumber style={{ width: '100%' }} min={1} step={f.key.endsWith('iops') ? 100 : 1} disabled={ratesDisabled} />
-              </Form.Item>
+              <HintedCell
+                name={['disk_io', 'rate', p.key, f.key]}
+                rules={[{ type: 'number', min: 1 }]}
+                min={1}
+                step={f.key.endsWith('iops') ? 500 : 10}
+                disabled={ratesDisabled}
+              />
             </Col>
           ))}
         </Row>
+      ))}
+      {DISK_FIELDS.map((f) => (
+        <HintNote key={f.key} name={['disk_io', 'rate', 'high', f.key]} title={f.label} />
       ))}
     </>
   )
@@ -1202,21 +1280,26 @@ const DISK_MEDIA: Array<{ key: DiskMedia; label: string }> = [
 // a priority means the same fraction of what the device can actually do.
 function DiskScaleMatrix({ disabled }: { disabled?: boolean }) {
   return (
-    <Row gutter={[8, 8]}>
-      {DISK_MEDIA.map((m) => (
-        <Col span={8} key={m.key}>
-          <Form.Item
-            label={<Text type="secondary" style={{ fontSize: 12 }}>{m.label}</Text>}
-            name={['disk_io', 'media_scale', m.key]}
-            rules={[{ type: 'number', min: 0.01, max: 1 }]}
-            style={{ marginBottom: 0 }}
-          >
-            <InputNumber style={{ width: '100%' }} min={0.01} max={1} step={0.05}
-                         addonAfter="x" disabled={disabled} />
-          </Form.Item>
-        </Col>
-      ))}
-    </Row>
+    <>
+      <Row gutter={[8, 8]}>
+        {DISK_MEDIA.map((m) => (
+          <Col span={8} key={m.key}>
+            <HintedItem
+              label={<Text type="secondary" style={{ fontSize: 12 }}>{m.label}</Text>}
+              name={['disk_io', 'media_scale', m.key]}
+              rules={[{ type: 'number', min: 0.01, max: 1 }]}
+              min={0.01}
+              max={1}
+              step={0.05}
+              addonAfter="x"
+              disabled={disabled}
+              compact
+            />
+          </Col>
+        ))}
+      </Row>
+      <HintNote name={['disk_io', 'media_scale', 'nvme']} />
+    </>
   )
 }
 
@@ -1242,17 +1325,27 @@ function DiskFloorMatrix({ disabled }: { disabled?: boolean }) {
             <Text type={disabled ? 'secondary' : undefined}>{m.label}</Text>
           </Col>
           <Col span={9}>
-            <Form.Item name={['disk_io', 'candidate_floor', m.key, 'mb_s']} noStyle rules={[{ type: 'number', min: 0.1 }]}>
-              <InputNumber style={{ width: '100%' }} min={0.1} step={1} disabled={disabled} />
-            </Form.Item>
+            <HintedCell
+              name={['disk_io', 'candidate_floor', m.key, 'mb_s']}
+              rules={[{ type: 'number', min: 0.1 }]}
+              min={0.1}
+              step={1}
+              disabled={disabled}
+            />
           </Col>
           <Col span={9}>
-            <Form.Item name={['disk_io', 'candidate_floor', m.key, 'iops']} noStyle rules={[{ type: 'number', min: 1 }]}>
-              <InputNumber style={{ width: '100%' }} min={1} step={50} disabled={disabled} />
-            </Form.Item>
+            <HintedCell
+              name={['disk_io', 'candidate_floor', m.key, 'iops']}
+              rules={[{ type: 'number', min: 1 }]}
+              min={1}
+              step={50}
+              disabled={disabled}
+            />
           </Col>
         </Row>
       ))}
+      <HintNote name={['disk_io', 'candidate_floor', 'nvme', 'mb_s']} title="Bandwidth" />
+      <HintNote name={['disk_io', 'candidate_floor', 'nvme', 'iops']} title="IOPS" />
     </>
   )
 }
@@ -1294,6 +1387,37 @@ function AutoControlPanel() {
     dirty.current = false
     notifyDirty()
   }, [notifyDirty])
+
+  // Startup defaults arrive API-shaped (rates as ratios); convert like load() does so they
+  // land in the form's own shape. The master `enabled` switch is a different endpoint and
+  // is not part of limit_policy, so a restore leaves it alone.
+  const hints = useConfigHints()
+  const notifyCapabilities = useNotifyCapabilities()
+  const startupDefaults = useMemo(() => {
+    const raw = hints?.startup_defaults.limit_policy as unknown as LimitPolicyData | undefined
+    if (!raw || !hints?.sections.limit_policy?.restorable) return null
+    return {
+      cpu: toPercentageRates(raw.cpu),
+      memory: toPercentageRates(raw.memory),
+      disk_io: raw.disk_io,
+    }
+    // toPercentageRates is a pure helper redefined each render; the hints are what change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hints])
+  const hintScope = useMemo<HintScope>(
+    () => ({ section: 'limit_policy', hints, defaults: startupDefaults, markDirty }),
+    [hints, startupDefaults, markDirty],
+  )
+  // Fills the form only; Save still validates and checks for a conflicting edit.
+  const restoreStartupDefaults = () => {
+    if (!startupDefaults) return
+    form.setFieldsValue(startupDefaults)
+    markDirty()
+    message.info('Smartune control: startup defaults filled in. Save to apply them.')
+  }
+  useEffect(() => {
+    notifyCapabilities()
+  }, [startupDefaults, notifyCapabilities])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -1406,13 +1530,13 @@ function AutoControlPanel() {
     }
   }
 
-  useRegisterSave('auto_control', { validate, isDirty: () => dirty.current, save: onSave })
-
-  const resetButton = (
-    <Button icon={<ReloadOutlined />} onClick={load} disabled={saving} style={{ marginTop: 12 }}>
-      Reset
-    </Button>
-  )
+  useRegisterSave('auto_control', {
+    validate,
+    isDirty: () => dirty.current,
+    save: onSave,
+    reset: load,
+    restore: startupDefaults ? restoreStartupDefaults : undefined,
+  })
 
   return (
     <Spin spinning={loading}>
@@ -1420,6 +1544,7 @@ function AutoControlPanel() {
           sections are one config section server-side, so they are saved and reset
           together. The switch sits on the outer card because it governs both channels,
           not just CPU/memory. */}
+      <HintScopeContext.Provider value={hintScope}>
       <Form form={form} layout="vertical" onFieldsChange={markDirty}>
         <Card size="small" title="Smartune Control" style={{ marginBottom: 16 }}>
           <Form.Item
@@ -1522,10 +1647,9 @@ function AutoControlPanel() {
               Last saved: {formatTimestamp(limitTs ?? enabledTs)}
             </Text>
           </div>
-          {/* One Reset for the whole block, matching the single Save in the footer. */}
-          <div>{resetButton}</div>
         </Card>
       </Form>
+      </HintScopeContext.Provider>
     </Spin>
   )
 }
@@ -1708,17 +1832,18 @@ function NetworkPanel() {
                     </Divider>
                     <Row gutter={12}>
                       <Col span={8}>
-                        <Form.Item
+                        <HintedItem
                           label="Candidate threshold (PPS)"
                           name={['network_pps_policy', 'app_pps_high']}
                           tooltip="A lower-priority app must exceed this outbound packet rate, while causing network harm, before packet flood protection can select it for limiting. Use it as the upper reference when setting the per-app cap."
                           rules={[{ required: true, type: 'integer', min: 1 }]}
-                        >
-                          <InputNumber style={{ width: '100%' }} min={1} step={1000} disabled={!networkControlEnabled || !pressureShapingEnabled || !packetFloodProtectionEnabled} />
-                        </Form.Item>
+                          min={1}
+                          step={5000}
+                          disabled={!networkControlEnabled || !pressureShapingEnabled || !packetFloodProtectionEnabled}
+                        />
                       </Col>
                       <Col span={8}>
-                        <Form.Item
+                        <HintedItem
                           label="Per-app cap (PPS)"
                           name={['network_pps_policy', 'pps_cap_rate']}
                           tooltip="The sustained packet-rate limit applied after an app exceeds the candidate threshold and is selected for protection. Packets above this rate are dropped after its burst allowance is used."
@@ -1734,18 +1859,20 @@ function NetworkPanel() {
                               },
                             }),
                           ]}
-                        >
-                          <InputNumber style={{ width: '100%' }} min={1} step={1000} disabled={!networkControlEnabled || !pressureShapingEnabled || !packetFloodProtectionEnabled} />
-                        </Form.Item>
+                          min={1}
+                          step={5000}
+                          disabled={!networkControlEnabled || !pressureShapingEnabled || !packetFloodProtectionEnabled}
+                        />
                       </Col>
                       <Col span={8}>
-                        <Form.Item
+                        <HintedItem
                           label="Burst (packets)"
                           name={['network_pps_policy', 'pps_cap_burst']}
                           rules={[{ required: true, type: 'integer', min: 1 }]}
-                        >
-                          <InputNumber style={{ width: '100%' }} min={1} step={100} disabled={!networkControlEnabled || !pressureShapingEnabled || !packetFloodProtectionEnabled} />
-                        </Form.Item>
+                          min={1}
+                          step={500}
+                          disabled={!networkControlEnabled || !pressureShapingEnabled || !packetFloodProtectionEnabled}
+                        />
                       </Col>
                     </Row>
                   </AdvancedSection>
@@ -1826,7 +1953,7 @@ function NetworkPanel() {
                         <Text>{pri[0].toUpperCase() + pri.slice(1)}</Text>
                       </Col>
                       <Col span={5}>
-                        <Form.Item
+                        <HintedCell
                           name={['config_network_bw', pri, 'min']}
                           rules={[
                             { required: true, type: 'number', min: 0, max: 100 },
@@ -1845,38 +1972,31 @@ function NetworkPanel() {
                               },
                             }),
                           ]}
-                          noStyle
-                        >
-                          <InputNumber
-                            style={{ width: '100%' }}
-                            min={0}
-                            max={100}
-                            step={1}
-                            addonAfter="%"
-                            disabled={!networkControlEnabled}
-                          />
-                        </Form.Item>
+                          min={0}
+                          max={100}
+                          step={5}
+                          addonAfter="%"
+                          disabled={!networkControlEnabled}
+                        />
                       </Col>
                       <Col span={5}>
-                        <Form.Item
+                        <HintedCell
                           name={['config_network_bw', pri, 'max']}
                           rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
-                          noStyle
-                        >
-                          <InputNumber
-                            style={{ width: '100%' }}
-                            min={0}
-                            max={100}
-                            step={1}
-                            addonAfter="%"
-                            disabled={!networkControlEnabled}
-                          />
-                        </Form.Item>
+                          min={0}
+                          max={100}
+                          step={5}
+                          addonAfter="%"
+                          disabled={!networkControlEnabled}
+                        />
                       </Col>
                     </Row>
                   ))}
 
-                  <Text type={minimumRatioExceeded ? 'danger' : 'secondary'} style={{ display: 'block', marginTop: 4 }}>
+                  <HintNote name={['config_network_bw', 'critical', 'min']} title="Min (%)" />
+                  <HintNote name={['config_network_bw', 'critical', 'max']} title="Max (%)" />
+
+                  <Text type={minimumRatioExceeded ? 'danger' : 'secondary'} style={{ display: 'block', marginTop: 8 }}>
                     Application minimum allocation: {displayedApplicationMinimumRatioTotal}% / {applicationMinimumRatioLimit}% ({reservedMinimumRatio}% reserved for system ports)
                   </Text>
                   {!minimumRatioExceeded && displayedApplicationMinimumRatioTotal < applicationMinimumRatioLimit && (
@@ -2009,6 +2129,9 @@ export default function SettingsModal({ active: _active, balancerEnabled, onActi
   const [saving, setSaving] = useState(false)
   const [activeTab, setActiveTab] = useState(firstTabKey)
   const [dirtyTabs, setDirtyTabs] = useState<string[]>([])
+  // Bumped when a card's footer actions change; the handles live in a ref, so this is what
+  // makes the footer re-read them.
+  const [, setCapabilityTick] = useState(0)
 
   useEffect(() => {
     if (tabIntent?.key && tabs.some((tab) => tab.key === tabIntent.key)) {
@@ -2037,11 +2160,16 @@ export default function SettingsModal({ active: _active, balancerEnabled, onActi
   const registry = React.useMemo<SaveRegistry>(() => ({
     register: (id, tabKey, handle) => {
       handles.current.set(id, { tabKey, handle })
+      // The footer reads the handles at render time, so a card that mounts (or goes away)
+      // after the dialog rendered must prompt one more render to be offered Reset.
+      setCapabilityTick((tick) => tick + 1)
       return () => {
         handles.current.delete(id)
+        setCapabilityTick((tick) => tick + 1)
       }
     },
     notifyDirty: refreshDirty,
+    notifyCapabilities: () => setCapabilityTick((tick) => tick + 1),
   }), [refreshDirty])
 
   const dirtyHandles = () => [...handles.current.values()].filter(({ handle }) => handle.isDirty?.() ?? true)
@@ -2090,6 +2218,16 @@ export default function SettingsModal({ active: _active, balancerEnabled, onActi
       return
     }
     runSave(pending)
+  }
+
+  const pageHandles = () => [...handles.current.values()].filter(({ tabKey }) => tabKey === activeTab)
+  const canResetPage = pageHandles().some(({ handle }) => handle.canReset?.())
+  const canRestorePage = pageHandles().some(({ handle }) => handle.canRestore?.())
+  const resetPage = () => {
+    pageHandles().forEach(({ handle }) => handle.reset?.())
+  }
+  const restorePage = () => {
+    pageHandles().forEach(({ handle }) => handle.restore?.())
   }
 
   const titleFor = (key: string) => tabs.find((tab) => tab.key === key)?.title ?? key
@@ -2163,19 +2301,6 @@ export default function SettingsModal({ active: _active, balancerEnabled, onActi
               </Button>
             </span>
           </Tooltip>
-          <Tooltip title={dirtyTabs.includes(activeTab) ? 'Save this page and keep editing' : 'No unsaved changes on this page'}>
-            <span>
-              <Button
-                type={dirtyTabs.includes(activeTab) ? 'primary' : 'default'}
-                icon={<SaveOutlined />}
-                loading={saving}
-                disabled={!dirtyTabs.includes(activeTab)}
-                onClick={savePage}
-              >
-                Save page
-              </Button>
-            </span>
-          </Tooltip>
         </Space>
       </div>
       <SettingsSaveContext.Provider value={registry}>
@@ -2194,6 +2319,38 @@ export default function SettingsModal({ active: _active, balancerEnabled, onActi
           style={{ minHeight: 440 }}
         />
       </SettingsSaveContext.Provider>
+      {/* Bottom right, where the eye ends after editing; Save all stays in the header. */}
+      <div className="settings-page__footer">
+        <Space>
+          {canResetPage && (
+            <Tooltip title="Discard unsaved edits on this page and reload the saved values.">
+              <Button icon={<ReloadOutlined />} onClick={resetPage} disabled={saving}>
+                Reset
+              </Button>
+            </Tooltip>
+          )}
+          {canRestorePage && (
+            <Tooltip title="Fill in the values this backend started with. Nothing is saved until you press Save page.">
+              <Button icon={<UndoOutlined />} onClick={restorePage} disabled={saving}>
+                Restore startup defaults
+              </Button>
+            </Tooltip>
+          )}
+          <Tooltip title={dirtyTabs.includes(activeTab) ? 'Save this page and keep editing' : 'No unsaved changes on this page'}>
+            <span>
+              <Button
+                type={dirtyTabs.includes(activeTab) ? 'primary' : 'default'}
+                icon={<SaveOutlined />}
+                loading={saving}
+                disabled={!dirtyTabs.includes(activeTab)}
+                onClick={savePage}
+              >
+                Save page
+              </Button>
+            </span>
+          </Tooltip>
+        </Space>
+      </div>
     </div>
   )
 }

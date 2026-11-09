@@ -62,6 +62,7 @@ import type {
   DiagEventQuery,
   DiagEventsData,
   DiagEventCatalogData,
+  ConfigHintsData,
   DiagAlertsData,
   DiagControlLifecycleQuery,
   DiagControlLifecyclesData,
@@ -767,6 +768,7 @@ export const api = {
     }>('/bench/results/job', { job }),
 
   getConfig: <T>(section: string) => get<T>(`/monitor/config/${section}`),
+  getConfigHints: () => get<ConfigHintsData>('/monitor/config-hints'),
   getDiagEventCatalog: () => get<DiagEventCatalogData>('/diag/event-catalog'),
   updateConfig: <T extends { updated_at?: number }>(
     section: string,

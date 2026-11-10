@@ -2006,9 +2006,17 @@
   gap: 12px;
 }
 
+.perf-gpu-head > :first-child {
+  min-width: 0;
+}
+
+/* Same head as the NPU detail on every width: identity on the left, the
+   utilization pinned top-right and never broken across lines. */
 .perf-gpu-util {
+  flex: none;
   text-align: right;
   min-width: 96px;
+  white-space: nowrap;
 }
 
 .perf-gpu-chart {
@@ -2204,6 +2212,26 @@
   }
 }
 
+@container workspace (width < 744px) {
+  /* Once wrapped, the pinned header would cover too much of a small screen. */
+  .perf-header--sticky {
+    position: relative;
+    top: auto;
+  }
+
+  .perf-header-title {
+    flex-wrap: wrap;
+    flex-basis: 100%;
+    gap: 4px 10px;
+  }
+
+  .perf-host-context-link {
+    max-width: 100%;
+    padding-left: 0;
+    border-left: 0;
+  }
+}
+
 @media (max-width: 768px) {
   .perf-health-overview {
     grid-template-columns: minmax(0, 1fr);
@@ -2217,9 +2245,10 @@
     justify-content: flex-start;
   }
 
+  /* Tall enough for the end labels of all six series to sit apart. */
   .perf-system-health-chart {
     flex: none;
-    height: 96px;
+    height: 160px;
     min-height: 0;
   }
 
@@ -2242,6 +2271,11 @@
   .perf-host-context {
     width: 100%;
     flex-wrap: wrap;
+  }
+
+  /* In the column header the desktop 520px flex-basis would become a height. */
+  .perf-header-title {
+    flex: none;
   }
 
   .perf-host-context-link {
@@ -2271,14 +2305,6 @@
   .perf-engine-grid,
   .perf-engine-current-grid {
     grid-template-columns: 1fr;
-  }
-
-  .perf-gpu-head {
-    flex-direction: column;
-  }
-
-  .perf-gpu-util {
-    text-align: left;
   }
 
   .perf-gpu-summary-head {
@@ -2622,4 +2648,47 @@
 
 :root[data-theme='light'] .perf-device-drawer .perf-dcard-bar {
   background: var(--color-border);
+}
+
+/* Phone layout for the device drill-down modal: use the full width (80vw left
+   ~310px), and let card heads wrap their headline under the title instead of
+   squeezing the title into a single-character column. */
+@media (max-width: 767px) {
+  .perf-device-modal .ant-modal {
+    width: calc(100vw - 16px) !important;
+    max-width: none;
+    margin: 8px auto;
+  }
+
+  .perf-device-modal .ant-modal-content {
+    padding: 16px 12px;
+  }
+
+  .perf-device-modal .ant-modal-body {
+    padding: 0 !important;
+  }
+
+  .perf-device-modal .perf-core-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .perf-device-detail-heading,
+  .perf-dcard-card-head {
+    flex-wrap: wrap;
+  }
+
+  .perf-dcard-card-title {
+    white-space: nowrap;
+  }
+
+  .perf-dcard-card-headline {
+    white-space: normal;
+  }
+
+  .perf-dcard-stat-label {
+    overflow: hidden;
+    letter-spacing: 0.04em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 }

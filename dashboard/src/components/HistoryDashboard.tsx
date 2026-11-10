@@ -18,6 +18,7 @@ import type { BenchQuietModeState, DynamicInfoData, HistoryData, HistoryRetentio
 import { COLORS, getGpuChartColors } from '../styles/theme'
 import { useMonitoredSections } from '../hooks/useMonitoredSections'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
+import { useIsCompactWorkspace } from '../hooks/useWorkspaceWidth'
 
 const { Text, Title } = Typography
 
@@ -850,6 +851,19 @@ function buildGpuTrendSeries(items: HistorySnapshotItem[]): GpuTrendSeries[] {
   return Array.from(seriesMap.values()).filter((series) => series.points.length > 0)
 }
 
+// In a compact workspace two 64px value axes plus margins left the plot ~120px wide.
+const COMPACT_AXIS_WIDTH = 40
+
+type ChartMargin = { top: number; right: number; left: number; bottom: number }
+
+function useChartFit() {
+  const compact = useIsCompactWorkspace()
+  return {
+    axisWidth: (width: number) => (compact ? Math.min(width, COMPACT_AXIS_WIDTH) : width),
+    margin: (margin: ChartMargin): ChartMargin => (compact ? { ...margin, left: 0, right: 4 } : margin),
+  }
+}
+
 function LegendToggleItem({
   value,
   color,
@@ -946,6 +960,7 @@ function ConfigurableChart<T extends { timestamp: string; ts: number }>({
   hoverPanel?: boolean
   order?: number
 }) {
+  const chartFit = useChartFit()
   const defaults = useMemo(() => allSeries.filter((s) => s.defaultOn !== false).map((s) => s.key), [allSeries])
   const [active, toggle] = usePersistedSet(storageKey, defaults)
   const [hoverData, setHoverData] = useState<Array<{ name: string; value: unknown; color: string; unit: string }> | null>(null)
@@ -1085,7 +1100,7 @@ function ConfigurableChart<T extends { timestamp: string; ts: number }>({
           <ResponsiveContainer width="100%" height="100%">
             <LineChart
               data={data}
-              margin={{ top: 4, right: rightUnit ? 32 : 16, left: 16, bottom: 0 }}
+              margin={chartFit.margin({ top: 4, right: rightUnit ? 32 : 16, left: 16, bottom: 0 })}
               onMouseMove={hoverPanel ? handleMouseMove : undefined}
               onMouseLeave={hoverPanel ? handleMouseLeave : undefined}
             >
@@ -1100,7 +1115,7 @@ function ConfigurableChart<T extends { timestamp: string; ts: number }>({
                 domain={leftDomain}
                 tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                 tickFormatter={unitFormat(leftUnit)}
-                width={64}
+                width={chartFit.axisWidth(64)}
                 label={{ value: leftUnit, angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 12, fontWeight: 600, dy: -4 }}
               />
               {rightUnit && (
@@ -1110,7 +1125,7 @@ function ConfigurableChart<T extends { timestamp: string; ts: number }>({
                   domain={rightDomain}
                   tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                   tickFormatter={unitFormat(rightUnit)}
-                  width={64}
+                  width={chartFit.axisWidth(64)}
                   label={{ value: rightUnit, angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 12, fontWeight: 600, dy: -4 }}
                 />
               )}
@@ -1209,6 +1224,7 @@ function GpuHistoryCard({
   hidden?: Set<string>
   onToggle: (key: string) => void
 }) {
+  const chartFit = useChartFit()
   const toggle = onToggle
 
   // Shared brush state so both charts stay aligned
@@ -1272,7 +1288,7 @@ function GpuHistoryCard({
       </div>
       <div style={{ width: '100%', height: 280 }}>
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={series.points} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
+          <LineChart data={series.points} margin={chartFit.margin({ top: 4, right: 20, left: 0, bottom: 0 })}>
             <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
             <XAxis
               {...timeAxisProps(xDomain)}
@@ -1284,14 +1300,14 @@ function GpuHistoryCard({
               domain={[0, 100]}
               tick={{ fill: COLORS.textMuted, fontSize: 11 }}
               tickFormatter={(val: string | number) => `${val}%`}
-              width={52}
+              width={chartFit.axisWidth(52)}
               label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11, offset: 14 }}
             />
             <YAxis
               yAxisId="freq"
               orientation="right"
               tick={{ fill: COLORS.textMuted, fontSize: 11 }}
-              width={56}
+              width={chartFit.axisWidth(56)}
               label={{ value: 'MHz', angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 11, offset: 10 }}
             />
             <Tooltip
@@ -1339,7 +1355,7 @@ function GpuHistoryCard({
       </div>
       <div style={{ width: '100%', height: 160 }}>
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={series.points} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
+          <LineChart data={series.points} margin={chartFit.margin({ top: 4, right: 20, left: 0, bottom: 0 })}>
             <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
             <XAxis
               {...timeAxisProps(xDomain)}
@@ -1349,7 +1365,7 @@ function GpuHistoryCard({
             <YAxis
               tick={{ fill: COLORS.textMuted, fontSize: 11 }}
               tickFormatter={(val: string | number) => `${val}W`}
-              width={56}
+              width={chartFit.axisWidth(56)}
               label={{ value: 'W', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11, offset: 14 }}
             />
             <Tooltip
@@ -1545,6 +1561,7 @@ function CpuPerCoreHistoryCard({ info, timeWindow }: { info: CpuPerCoreInfo; tim
 }
 
 export default function HistoryDashboard({ active, historyRangeIntent, onHistoryRangeIntentConsumed }: Props) {
+  const chartFit = useChartFit()
   const [rangePreset, setRangePreset] = useState<RangePreset>('15m')
   const [customRange, setCustomRange] = useState<[Dayjs | null, Dayjs | null] | null>(null)
   const { publishNotice } = useGlobalConfigNotices()
@@ -2333,7 +2350,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
         />
       ) : null}
 
-      <div style={STICKY_TOOLBAR_STYLE}>
+      <div className="history-sticky-toolbar" style={STICKY_TOOLBAR_STYLE}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <Title level={5} style={{ color: COLORS.text, margin: 0 }}>
             History Trends
@@ -2514,7 +2531,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
               </div>
               <div style={{ width: '100%', height: 240 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={pressureTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
+                  <LineChart data={pressureTrendPoints} margin={chartFit.margin({ top: 4, right: 20, left: 0, bottom: 0 })}>
                     <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
                     <XAxis
                       {...timeAxisProps(brushedDomain(pressureTrendPoints, pressureBrush, timeWindow))}
@@ -2525,7 +2542,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
                       domain={[0, 100]}
                       tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                       tickFormatter={(val: string | number) => `${val}%`}
-                      width={52}
+                      width={chartFit.axisWidth(52)}
                       label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11, offset: 14 }}
                     />
                     <Tooltip
@@ -2676,7 +2693,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
                 </div>
                 <div style={{ width: '100%', height: 260 }}>
                   <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={diskTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
+                    <LineChart data={diskTrendPoints} margin={chartFit.margin({ top: 4, right: 20, left: 0, bottom: 0 })}>
                       <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
                       <XAxis
                         {...timeAxisProps(brushedDomain(diskTrendPoints, diskBrush[diskName], timeWindow))}
@@ -2688,7 +2705,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
                         domain={[0, 100]}
                         tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                         tickFormatter={(val: string | number) => `${val}%`}
-                        width={52}
+                        width={chartFit.axisWidth(52)}
                         label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11, offset: 14 }}
                       />
                       <YAxis
@@ -2697,7 +2714,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
                         domain={bwDomain}
                         tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                         tickFormatter={(val: string | number) => typeof val === 'number' ? val.toFixed(1) : `${val}`}
-                        width={56}
+                        width={chartFit.axisWidth(56)}
                         label={{ value: 'MB/s', angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 11, offset: 10 }}
                       />
                       <Tooltip
@@ -2782,7 +2799,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
                 </div>
                 <div style={{ width: '100%', height: 260 }}>
                   <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={networkTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
+                    <LineChart data={networkTrendPoints} margin={chartFit.margin({ top: 4, right: 20, left: 0, bottom: 0 })}>
                       <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
                       <XAxis
                         {...timeAxisProps(brushedDomain(networkTrendPoints, networkBrush[nicName], timeWindow))}
@@ -2794,7 +2811,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
                         domain={[0, 100]}
                         tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                         tickFormatter={(val: string | number) => `${val}%`}
-                        width={52}
+                        width={chartFit.axisWidth(52)}
                         label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11, offset: 14 }}
                       />
                       <YAxis
@@ -2803,7 +2820,7 @@ export default function HistoryDashboard({ active, historyRangeIntent, onHistory
                         domain={bwDomain}
                         tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                         tickFormatter={(val: string | number) => typeof val === 'number' ? val.toFixed(1) : `${val}`}
-                        width={56}
+                        width={chartFit.axisWidth(56)}
                         label={{ value: 'Mbps', angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 11, offset: 10 }}
                       />
                       <Tooltip

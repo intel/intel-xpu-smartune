@@ -140,8 +140,18 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
   color: var(--color-text-muted);
   font-size: 13px;
+  white-space: nowrap;
+}
+
+.app-header__actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
 }
 
 .app-main {
@@ -210,13 +220,13 @@ body {
   font-size: 10px;
 }
 
-.app-sidebar .ant-menu {
+.app-nav .ant-menu {
   border-inline-end: 0;
   background: transparent;
   color: var(--color-text-muted);
 }
 
-.app-sidebar .ant-menu-item-group-title {
+.app-nav .ant-menu-item-group-title {
   padding: 14px 12px 6px;
   color: var(--color-text-tertiary);
   font-size: 11px;
@@ -224,7 +234,7 @@ body {
   text-transform: uppercase;
 }
 
-.app-sidebar .ant-menu-item {
+.app-nav .ant-menu-item {
   width: 100%;
   height: 40px;
   margin: 2px 0;
@@ -245,12 +255,12 @@ body {
   stroke-width: 1.8;
 }
 
-.app-sidebar .ant-menu-item:hover {
+.app-nav .ant-menu-item:hover {
   background: var(--color-row-alt);
   color: var(--color-tab-accent);
 }
 
-.app-sidebar .ant-menu-item-selected {
+.app-nav .ant-menu-item-selected {
   background: var(--color-accent-soft);
   color: var(--color-tab-accent);
   font-weight: 600;
@@ -259,6 +269,9 @@ body {
 .app-content-area {
   min-width: 0;
   padding-top: 20px;
+  /* Pages size their content by `@container workspace` rules: the sider makes
+     the viewport a poor proxy for the width a page actually has. */
+  container: workspace / inline-size;
 }
 
 .app-content-tabs > .ant-tabs-nav {
@@ -432,57 +445,49 @@ body {
   }
 }
 
-@media (max-width: 768px) {
+/* A landscape phone is ~390px tall: page toolbars pinned under the app header
+   would leave too little to scroll, so only the app header stays pinned. The
+   History toolbar's sticky style is inline, hence the !important. */
+@media (max-height: 500px) {
+  .perf-header--sticky,
+  .diagnostics-toolbar,
+  .settings-nav,
+  .history-sticky-toolbar,
+  .perf-pressure-rail {
+    position: relative !important;
+    top: auto !important;
+  }
+}
+
+/* Wrapped in a compact workspace the grouped nav is ~280px tall, too much to
+   keep pinned. Workspace rules use 744px, the JS COMPACT_WORKSPACE_WIDTH. */
+@container workspace (width < 744px) {
+  .settings-nav {
+    position: static;
+  }
+}
+
+/* Below the AntD `md` breakpoint the sider is replaced by a drawer (App.tsx),
+   so the workspace gets the full viewport width. */
+@media (max-width: 767px) {
   .app-header {
+    gap: 8px;
+    height: 56px;
     padding: 0 12px;
   }
 
-  .app-header .ant-typography {
-    font-size: 16px;
+  .app-header__breadcrumb {
+    gap: 6px;
+    font-size: 14px;
+  }
+
+  .app-header__actions {
+    gap: 4px;
   }
 
   .app-workspace {
+    min-height: calc(100vh - 56px);
     padding: 0 12px 12px;
-  }
-
-  .app-shell {
-    display: block;
-  }
-
-  .app-sidebar {
-    width: 100% !important;
-    height: auto !important;
-    padding: 8px 0;
-    position: static !important;
-    overflow-x: auto;
-    border-right: 0;
-    border-bottom: 1px solid var(--color-border);
-  }
-
-  .app-sidebar__brand {
-    display: none;
-  }
-
-  .app-sidebar .ant-menu-item-group-title {
-    display: none;
-  }
-
-  .app-sidebar .ant-menu {
-    display: flex;
-    min-width: max-content;
-  }
-
-  .app-sidebar .ant-menu-item-group,
-  .app-sidebar .ant-menu-item-group-list {
-    display: flex;
-    margin: 0;
-  }
-
-  .app-sidebar .ant-menu-item {
-    width: auto;
-    margin: 0 2px;
-    padding: 0 10px;
-    white-space: nowrap;
   }
 
   .app-content-area {
@@ -551,4 +556,18 @@ body {
 :root[data-theme='light'] .control-center-tabs .ant-tabs-tab.ant-tabs-tab-active .ant-tabs-tab-btn,
 :root[data-theme='light'] .control-center-tabs .ant-tabs-tab.ant-tabs-tab-active .anticon {
   color: var(--color-tab-accent);
+}
+
+/* Priority x field matrices in Settings: the grid is the meaning, so in a
+   compact workspace it scrolls sideways instead of stacking cells away from
+   their headers. */
+@container workspace (width < 744px) {
+  .settings-matrix {
+    overflow-x: auto;
+  }
+
+  .settings-matrix > .ant-row {
+    flex-wrap: nowrap;
+    min-width: 560px;
+  }
 }

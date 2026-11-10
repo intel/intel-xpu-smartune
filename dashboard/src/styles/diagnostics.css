@@ -2055,6 +2055,11 @@
     display: none;
   }
 
+  /* With the peak hidden the desktop 146px reservation pushes the value off the card. */
+  .diagnostics-utilization-value {
+    min-width: 0;
+  }
+
   .diagnostics-overview-empty {
     align-items: flex-start;
     flex-direction: column;
@@ -2168,4 +2173,127 @@
    the range re-centers on it. */
 .diagnostics-alerts-table .diagnostics-alert-row--focused > td {
   background: var(--color-accent-soft) !important;
+}
+
+/* Diagnostics report drawer on a phone: full width, tighter padding, and the
+   report-scoped rows (which out-rank the page's phone rules) re-fitted. */
+@media (max-width: 767px) {
+  .diagnostics-report-drawer .ant-drawer-content-wrapper {
+    width: 100vw !important;
+  }
+
+  .diagnostics-report-drawer .ant-drawer-header {
+    padding: 12px;
+  }
+
+  .diagnostics-report-drawer .ant-drawer-body {
+    padding: 12px;
+  }
+
+  .diagnostics-report-drawer .ant-drawer-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .diagnostics-report-findings {
+    padding: 12px;
+  }
+
+  .diagnostics-report-findings-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .diagnostics-report-finding-panel-heading {
+    flex-wrap: wrap;
+    gap: 4px 12px;
+  }
+
+  .diagnostics-report-overview-grid .diagnostics-utilization-row {
+    grid-template-columns: minmax(72px, 0.8fr) minmax(64px, 1fr) auto;
+  }
+}
+
+/* Workspace-width rules: with the sider open or collapsed, a 768-1100px
+   viewport leaves the page far less room than its media query suggests. */
+@container workspace (max-width: 899px) {
+  .diagnostics-overview-sections {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@container workspace (max-width: 759px) {
+  .diagnostics-time-selection {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+
+  .diagnostics-boot-controls {
+    padding-right: 0;
+    border-right: 0;
+  }
+}
+
+/* Compact Diagnostics page (workspace < 744px, the JS COMPACT_WORKSPACE_WIDTH). */
+@container workspace (width < 744px) {
+  /* Wrapped it is ~230px tall; pinned, it would hide the page. */
+  .diagnostics-toolbar {
+    position: relative;
+    top: auto;
+  }
+
+  .diagnostics-pressure-legend {
+    flex-wrap: wrap;
+    gap: 2px 8px;
+    min-width: 0;
+  }
+
+  /* A three-column row leaves the name ~72px, so names like "Platform
+     management" truncate. Two lines instead: full name and count, then the bar
+     across the whole row. */
+  .diagnostics-domain-distribution-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'label value'
+      'track track';
+    row-gap: 4px;
+  }
+
+  .diagnostics-domain-distribution-label {
+    grid-area: label;
+  }
+
+  .diagnostics-domain-distribution-track {
+    grid-area: track;
+  }
+
+  .diagnostics-domain-distribution-value {
+    grid-area: value;
+  }
+}
+
+/* The same two-line domain rows in the report drawer, which sits outside the
+   workspace and is sized by the viewport. Its selector out-ranks the plain one. */
+@media (max-width: 767px) {
+  .diagnostics-report-drawer .diagnostics-domain-distribution-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'label value'
+      'track track';
+    row-gap: 4px;
+  }
+
+  .diagnostics-report-drawer .diagnostics-domain-distribution-label {
+    grid-area: label;
+  }
+
+  .diagnostics-report-drawer .diagnostics-domain-distribution-track {
+    grid-area: track;
+  }
+
+  .diagnostics-report-drawer .diagnostics-domain-distribution-value {
+    grid-area: value;
+  }
 }

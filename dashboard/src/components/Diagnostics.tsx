@@ -72,6 +72,8 @@ import { COLORS } from '../styles/theme'
 import { alertHandlingMark, alertLifecycleText, alertOccurrenceForEvent, isAlertableEvent, isAlertSilenced } from '../utils/alertPolicy'
 import type { AlertHandlingMark } from '../utils/alertPolicy'
 import AlertPolicyList from './AlertPolicyList'
+import { useIsNarrowViewport } from '../hooks/useIsNarrowViewport'
+import { useIsCompactWorkspace } from '../hooks/useWorkspaceWidth'
 import '../styles/diagnostics.css'
 
 // Benchmark KPI results for the investigated job, rendered in the investigation
@@ -664,8 +666,27 @@ function normalizedSeverity(level: string): keyof typeof severityColors {
 }
 
 const EVENT_TIMELINE_LABEL_WIDTH = 176
+// In a narrow box the full-width gutter would leave the plots about 120px wide.
+const EVENT_TIMELINE_LABEL_WIDTH_COMPACT = 96
+const EVENT_TIMELINE_LABEL_MAX_CHARS_COMPACT = 13
 const EVENT_TIMELINE_LEFT_GUTTER = 12
-const EVENT_TIMELINE_PLOT_LEFT = EVENT_TIMELINE_LABEL_WIDTH + EVENT_TIMELINE_LEFT_GUTTER
+
+/**
+ * Lane label gutter shared by the event, pressure, and resource timelines so
+ * their time axes line up. `compact` is decided by whoever owns the box the
+ * timelines sit in: the page workspace, or the viewport for the report drawer.
+ */
+function timelineGutterFor(compact: boolean) {
+  const labelWidth = compact ? EVENT_TIMELINE_LABEL_WIDTH_COMPACT : EVENT_TIMELINE_LABEL_WIDTH
+  return {
+    compact,
+    labelWidth,
+    plotLeft: labelWidth + EVENT_TIMELINE_LEFT_GUTTER,
+    fitLabel: (label: string) => compact && label.length > EVENT_TIMELINE_LABEL_MAX_CHARS_COMPACT
+      ? `${label.slice(0, EVENT_TIMELINE_LABEL_MAX_CHARS_COMPACT - 1)}…`
+      : label,
+  }
+}
 
 type EventLane = string
 
@@ -1002,7 +1023,7 @@ function pressureRuns(points: DiagResourceTrendPoint[], channel: string, step: n
 // Pressure levels as thin state lanes under the utilization chart, sharing its
 // time axis and plot insets. Kept off the chart itself: pressure (stall) and
 // utilization (busy) are different measures on the same 0-100 scale.
-function PressureLanes({ points, from, to }: { points: DiagResourceTrendPoint[]; from: number; to: number }) {
+function PressureLanes({ points, from, to, plotLeft }: { points: DiagResourceTrendPoint[]; from: number; to: number; plotLeft: number }) {
   const span = to - from
   const lanes = PRESSURE_LANES.filter((lane) => points.some((point) => point.pressure?.[lane.key]))
   if (!lanes.length || span <= 0) return null
@@ -1016,7 +1037,7 @@ function PressureLanes({ points, from, to }: { points: DiagResourceTrendPoint[];
   return (
     <div className='diagnostics-pressure-lanes'>
       <div className='diagnostics-pressure-lane'>
-        <Text className='diagnostics-pressure-lane-label' type='secondary' style={{ width: EVENT_TIMELINE_PLOT_LEFT }}>Pressure</Text>
+        <Text className='diagnostics-pressure-lane-label' type='secondary' style={{ width: plotLeft }}>Pressure</Text>
         <div className='diagnostics-pressure-legend'>
           {(['low', 'medium', 'high', 'critical'] as const).map((level) => (
             <span key={level}><i style={{ background: pressureLevelColor(level) }} />{PRESSURE_LEVEL_LABELS[level]}</span>
@@ -1026,7 +1047,7 @@ function PressureLanes({ points, from, to }: { points: DiagResourceTrendPoint[];
       </div>
       {lanes.map((lane) => (
         <div className='diagnostics-pressure-lane' key={lane.key}>
-          <Text className='diagnostics-pressure-lane-label' type='secondary' style={{ width: EVENT_TIMELINE_PLOT_LEFT }}>{lane.label}</Text>
+          <Text className='diagnostics-pressure-lane-label' type='secondary' style={{ width: plotLeft }}>{lane.label}</Text>
           <div className='diagnostics-pressure-lane-track' style={{ background: `${COLORS.border}99` }}>
             {pressureRuns(points, lane.key, step).map((run) => {
               if (run.to <= from || run.from >= to) return null
@@ -1083,6 +1104,10 @@ function contextTargetForEvent(event: DiagEvent): ContextTarget | null {
 }
 
 export default function Diagnostics({ active, alertsRequest, currentAlerts, rangeIntent, onOpenHistory }: Props) {
+  // Page timelines follow the workspace; the report drawer is sized by the viewport.
+  const timelineGutter = timelineGutterFor(useIsCompactWorkspace())
+  const narrowViewport = useIsNarrowViewport()
+  const reportGutter = timelineGutterFor(narrowViewport)
   const [events, setEvents] = useState<DiagEvent[]>([])
   const [controlLifecycles, setControlLifecycles] = useState<DiagControlLifecycle[]>([])
   const [records, setRecords] = useState<DiagLogRecord[]>([])
@@ -2800,7 +2825,11 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
         {eventsLoading ? null : allDisplayedEvents.length ? (
           <>
             <div className='diagnostics-event-timeline diagnostics-event-timeline--selectable' style={{ height: Math.max(220, eventTimeline.lanes.length * 46 + 72) }}>
-              <span className='diagnostics-event-domain-heading'>Domain</span>
+              {/* Sits over the lane labels, so it shares their width. When compact the
+                  wrapped legend needs that corner, and the lane names say "domain". */}
+              {timelineGutter.compact ? null : (
+                <span className='diagnostics-event-domain-heading' style={{ width: timelineGutter.labelWidth }}>Domain</span>
+              )}
               {eventTimeline.points.length === 0 ? (
                 <span className='diagnostics-event-timeline-empty'>No events in this window</span>
               ) : null}
@@ -2834,10 +2863,10 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                     ticks={eventTimeline.lanes.map((_, index) => index)}
                     tickFormatter={(index) => {
                       const lane = eventTimeline.lanes[index]
-                      return lane ? `${lane} (${eventTimeline.laneCounts.get(lane) || 0})` : ''
+                      return lane ? `${timelineGutter.fitLabel(lane)} (${eventTimeline.laneCounts.get(lane) || 0})` : ''
                     }}
                     tick={{ fill: COLORS.textMuted, fontSize: 11 }}
-                    width={EVENT_TIMELINE_LABEL_WIDTH}
+                    width={timelineGutter.labelWidth}
                     reversed
                   />
                   <RechartsTooltip
@@ -2849,7 +2878,8 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                   <Legend
                     verticalAlign='top'
                     align='right'
-                    height={28}
+                    // The legend wraps to two lines when compact.
+                    height={timelineGutter.compact ? 44 : 28}
                     content={() => (
                       <div className='diagnostics-event-severity-legend' aria-label='Event severity legend'>
                         <span className='diagnostics-event-severity-legend-title'>Severity</span>
@@ -2946,7 +2976,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
             </div>
             <div className='diagnostics-event-brush' aria-label='Event timeline zoom control'>
               <ResponsiveContainer width='100%' height='100%'>
-                <LineChart data={eventBrushPoints} margin={{ top: 0, right: 16, left: EVENT_TIMELINE_PLOT_LEFT, bottom: 0 }}>
+                <LineChart data={eventBrushPoints} margin={{ top: 0, right: 16, left: timelineGutter.plotLeft, bottom: 0 }}>
                   <Line dataKey='x' stroke='transparent' dot={false} isAnimationActive={false} />
                   <Brush
                     dataKey='x'
@@ -3012,7 +3042,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                     {activeResourceTrendSeries.length ? (
                       <div className='diagnostics-resource-lanes-chart'>
                         <ResponsiveContainer width='100%' height='100%'>
-                          <LineChart data={visibleResourceTrend} margin={{ top: 8, right: 16, bottom: 0, left: EVENT_TIMELINE_PLOT_LEFT - 48 }}>
+                          <LineChart data={visibleResourceTrend} margin={{ top: 8, right: 16, bottom: 0, left: timelineGutter.plotLeft - 48 }}>
                             <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray='3 3' vertical={false} />
                             <XAxis type='number' dataKey='ts_epoch' domain={[eventViewRange.from, eventViewRange.to]} tickFormatter={eventActivityTick} tick={{ fill: COLORS.textMuted, fontSize: 11 }} minTickGap={36} />
                             <YAxis type='number' domain={[0, 100]} ticks={[0, 50, 100]} width={48} tick={{ fill: COLORS.textMuted, fontSize: 11 }} tickFormatter={(value) => `${value}%`} label={{ value: 'Utilization', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11 }} />
@@ -3023,7 +3053,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                         </ResponsiveContainer>
                       </div>
                     ) : <Text className='diagnostics-resource-lanes-empty' type='secondary'>Select a resource to display its trend</Text>}
-                    <PressureLanes points={visibleResourceTrend} from={eventViewRange.from} to={eventViewRange.to} />
+                    <PressureLanes points={visibleResourceTrend} from={eventViewRange.from} to={eventViewRange.to} plotLeft={timelineGutter.plotLeft} />
                       </>
                     ),
                   },
@@ -3453,6 +3483,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
 
       <Drawer
         title="Diagnostics report"
+        rootClassName='diagnostics-report-drawer'
         open={reportOpen}
         onClose={() => setReportOpen(false)}
         width='min(1180px, calc(100vw - 24px))'
@@ -3580,6 +3611,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                         rowKey="dedup_key"
                         pagination={false}
                         dataSource={reportPayload.alert_summary}
+                        scroll={narrowViewport ? { x: 'max-content' } : undefined}
                         columns={[
                           { title: 'Severity', width: 110, render: (_: unknown, alert: DiagAlert) => severityTag(alert.severity) },
                           { title: 'Alert', render: (_: unknown, alert: DiagAlert) => alert.summary || alert.event_type },
@@ -3630,7 +3662,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                     <ScatterChart margin={{ top: 12, right: 12, left: EVENT_TIMELINE_LEFT_GUTTER, bottom: 0 }}>
                       <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray='3 3' />
                       <XAxis type='number' dataKey='x' domain={[reportQueryRange.from, reportQueryRange.to]} tickFormatter={reportEventActivityTick} tick={{ fill: COLORS.textMuted, fontSize: 10 }} minTickGap={36} />
-                      <YAxis type='number' dataKey='y' domain={[-0.5, Math.max(0.5, reportTimeline.lanes.length - 0.5)]} ticks={reportTimeline.lanes.map((_, index) => index)} tickFormatter={(index) => reportTimeline.lanes[index] || ''} tick={{ fill: COLORS.textMuted, fontSize: 10 }} width={EVENT_TIMELINE_LABEL_WIDTH} reversed />
+                      <YAxis type='number' dataKey='y' domain={[-0.5, Math.max(0.5, reportTimeline.lanes.length - 0.5)]} ticks={reportTimeline.lanes.map((_, index) => index)} tickFormatter={(index) => reportGutter.fitLabel(reportTimeline.lanes[index] || '')} tick={{ fill: COLORS.textMuted, fontSize: 10 }} width={reportGutter.labelWidth} reversed />
                       <RechartsTooltip content={eventTimelineTooltip} allowEscapeViewBox={{ y: true }} wrapperStyle={{ zIndex: 30 }} />
                       <Scatter
                         data={reportTimeline.points}
@@ -3673,7 +3705,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                 </div>
                 {reportResourceTrendSeries.length ? <div className='diagnostics-resource-lanes-chart'>
                   <ResponsiveContainer width='100%' height='100%'>
-                    <LineChart data={reportResourceTrend} margin={{ top: 8, right: 16, bottom: 0, left: EVENT_TIMELINE_PLOT_LEFT - 48 }}>
+                    <LineChart data={reportResourceTrend} margin={{ top: 8, right: 16, bottom: 0, left: reportGutter.plotLeft - 48 }}>
                       <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray='3 3' vertical={false} />
                       <XAxis type='number' dataKey='ts_epoch' domain={[reportQueryRange.from, reportQueryRange.to]} tickFormatter={reportEventActivityTick} tick={{ fill: COLORS.textMuted, fontSize: 11 }} minTickGap={36} />
                       <YAxis type='number' domain={[0, 100]} ticks={[0, 50, 100]} width={48} tick={{ fill: COLORS.textMuted, fontSize: 11 }} tickFormatter={(value) => `${value}%`} label={{ value: 'Utilization', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11 }} />

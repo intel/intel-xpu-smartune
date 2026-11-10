@@ -413,6 +413,7 @@ export function EditAppProcessesModal({ open, app, onClose, onSuccess }: Props) 
         dataSource={candidates}
         columns={candidateColumns}
         rowSelection={rowSelection}
+        scroll={{ x: 720 }}
         pagination={{ pageSize: 6, hideOnSinglePage: true }}
         locale={{ emptyText: emptyHint }}
       />

@@ -46,6 +46,9 @@ const SEARCH_DEBOUNCE_MS = 300
 // Rows per page in the discovery table, and therefore the point past which
 // "current page" and "all results" stop meaning the same thing.
 const CANDIDATE_PAGE_SIZE = 8
+// Executable and Cmdline take whatever is left, so the table scrolls on a
+// phone instead of shrinking them to a single character.
+const CANDIDATE_TABLE_MIN_WIDTH = 720
 
 export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props) {
   const [step, setStep] = useState(STEP_PICK)
@@ -512,6 +515,7 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
             dataSource={candidates}
             columns={candidateColumns}
             rowSelection={rowSelection}
+            scroll={{ x: CANDIDATE_TABLE_MIN_WIDTH }}
             pagination={{
               pageSize: CANDIDATE_PAGE_SIZE,
               hideOnSinglePage: true,
@@ -523,7 +527,7 @@ export function AddAppWizard({ open, onClose, onSuccess, initialKeyword }: Props
             // one only appears once the results outgrow a single page, where
             // it would otherwise duplicate the first.
             title={candidates.length > 0 ? () => (
-              <Space size={24}>
+              <Space size={[24, 4]} wrap>
                 {candidates.length > CANDIDATE_PAGE_SIZE && (
                   <Checkbox
                     checked={selectionScopes.page.checked}

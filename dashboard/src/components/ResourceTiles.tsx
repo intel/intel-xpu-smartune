@@ -179,8 +179,9 @@ export function StatTile({ label, value, color, percent, sub, details }: StatTil
             <RightOutlined style={{ color: COLORS.textMuted, fontSize: 9 }} />
           ))}
       </div>
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, marginTop: 2 }}>
-        <Text style={{ color: color ?? COLORS.text, fontSize: 20, fontWeight: 600 }}>{value}</Text>
+      {/* The value never breaks; on a narrow tile the sub text wraps below it. */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', columnGap: 6, marginTop: 2 }}>
+        <Text style={{ color: color ?? COLORS.text, fontSize: 20, fontWeight: 600, whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }}>{value}</Text>
         {sub && <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>{sub}</Text>}
       </div>
       {typeof percent === 'number' && (

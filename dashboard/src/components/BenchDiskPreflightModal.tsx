@@ -37,6 +37,7 @@ import {
   type DiskPreflightItem,
   type DiskRow,
 } from '../utils/benchDisk'
+import { useIsNarrowViewport } from '../hooks/useIsNarrowViewport'
 
 const { Text } = Typography
 
@@ -120,6 +121,7 @@ export default function BenchDiskPreflightModal({
   onDownload,
   onCancel,
 }: Props) {
+  const narrowViewport = useIsNarrowViewport()
   const rows = useMemo(() => buildDiskRows(items), [items])
   const columns = useMemo(() => columnsFor(pricing), [pricing])
 
@@ -207,6 +209,7 @@ export default function BenchDiskPreflightModal({
           <Table<DiskRow>
             size="small"
             columns={columns}
+            scroll={narrowViewport ? { x: 'max-content' } : undefined}
             dataSource={rows}
             pagination={false}
           />

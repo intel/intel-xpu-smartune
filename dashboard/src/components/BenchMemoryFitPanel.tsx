@@ -29,6 +29,7 @@ import {
   modelMaxWindow,
   resolveDeviceTargets,
 } from '../utils/benchMemory'
+import { useIsNarrowViewport } from '../hooks/useIsNarrowViewport'
 
 const { Text } = Typography
 
@@ -316,6 +317,7 @@ export default function BenchMemoryFitPanel({
   choice,
   onChoiceChange,
 }: Props) {
+  const narrowViewport = useIsNarrowViewport()
   const model = item.model
   const windowChoices = useMemo(() => windowChoicesFor(model), [model])
   const { window: contextTokens, streams } = resolveChoice(model, choice)
@@ -386,7 +388,7 @@ export default function BenchMemoryFitPanel({
         />
       )}
 
-      <Table<ConfigRow> size="small" columns={COLUMNS} dataSource={rows} pagination={false} />
+      <Table<ConfigRow> size="small" columns={COLUMNS} dataSource={rows} pagination={false} scroll={narrowViewport ? { x: 'max-content' } : undefined} />
 
       {/* Every figure that depends on the model reads N/A without a footprint,
           which on its own looks like a bug rather than like missing data. The

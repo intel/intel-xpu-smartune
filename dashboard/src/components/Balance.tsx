@@ -187,6 +187,7 @@ import { useAppEvents } from '../hooks/useAppEvents'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 import { AddAppWizard } from './AddAppWizard'
 import { EditAppProcessesModal } from './EditAppProcessesModal'
+import { useIsCompactWorkspace } from '../hooks/useWorkspaceWidth'
 
 const { Text } = Typography
 const { Option } = Select
@@ -429,6 +430,7 @@ function ExcludedAppsTable({
   loading: boolean
   onRemove: (row: AutoLimitExclusion) => Promise<void>
 }) {
+  const compactWorkspace = useIsCompactWorkspace()
   const [removing, setRemoving] = useState<Record<string, boolean>>({})
 
   const remove = async (row: AutoLimitExclusion) => {
@@ -501,6 +503,7 @@ function ExcludedAppsTable({
       <Table
         columns={columns}
         dataSource={rows.map((row) => ({ ...row, key: row.key }))}
+        scroll={compactWorkspace ? { x: 'max-content' } : undefined}
         size="small"
         loading={loading}
         pagination={false}
@@ -897,6 +900,7 @@ export default function Balance({
   registerKeyword,
   onRegisterConsumed,
 }: Props) {
+  const compactWorkspace = useIsCompactWorkspace()
   const [allApps, setAllApps] = useState<AppInfo[]>([])
   const [controlledApps, setControlledApps] = useState<AppInfo[]>([])
   const [pendingApps, setPendingApps] = useState<AppInfo[]>([])
@@ -2812,6 +2816,7 @@ export default function Balance({
                 <Table
                   columns={processStatusColumns}
                   dataSource={rows}
+                  scroll={compactWorkspace ? { x: 'max-content' } : undefined}
                   size="small"
                   pagination={false}
                   rowKey={(row) => row.key}

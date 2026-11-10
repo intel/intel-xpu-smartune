@@ -551,13 +551,15 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
         <div
           style={{
             display: 'flex',
+            flexWrap: 'wrap',
             justifyContent: 'space-between',
             alignItems: 'center',
+            gap: 8,
             marginBottom: 12,
           }}
         >
-          <Space>
-            <Title level={5} style={{ color: COLORS.text, margin: 0 }}>
+          <Space wrap>
+            <Title level={5} style={{ color: COLORS.text, margin: 0, whiteSpace: 'nowrap' }}>
               All Processes
             </Title>
             {totalCount > 0 && (
@@ -581,7 +583,7 @@ export default function Processes({ active, balancerEnabled, onRegister }: Props
               Group by app
             </Checkbox>
           </Space>
-          <Space>
+          <Space wrap>
             <Input
               size="small"
               placeholder="Filter by name / PID / user / cmd"

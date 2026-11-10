@@ -49,6 +49,7 @@ import BenchRerunModal, { type RerunConflict } from './BenchRerunModal'
 import { COLORS } from '../styles/theme'
 import type { DiskPreflightItem } from '../utils/benchDisk'
 import { formatBytes, matchesModel } from '../utils/benchMetrics'
+import { useContentWidth } from '../hooks/useContentWidth'
 
 const { Text, Paragraph } = Typography
 
@@ -58,6 +59,8 @@ const { Text, Paragraph } = Typography
 const MAX_LOG_CHARS = 400_000
 
 const SIDER_WIDTH = 320
+// Narrowest workspace beside the list before the page switches to one pane.
+const MIN_WORKSPACE_WIDTH = 420
 
 // Benchmark Results is what ran, Analysis is how the runs stack up, Logs is the
 // live output. The keys keep the old short names: they are state, not labels.
@@ -280,6 +283,11 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   const [mainTab, setMainTab] = useState<MainTab>('results')
   const [starting, setStarting] = useState(false)
   const [siderOpen, setSiderOpen] = useState(true)
+  // Without room for the list and a usable workspace side by side (a phone, or
+  // a tablet beside the sider), the open list takes the full width and the
+  // workspace waits behind it.
+  const [panesRef, panesWidth] = useContentWidth<HTMLDivElement>()
+  const compact = panesWidth !== null && panesWidth < SIDER_WIDTH + MIN_WORKSPACE_WIDTH
   // Whether a measured run could start right now. A measured run takes the
   // machine quiet for its duration, and cannot do that while the balancer is
   // holding automatic limits on an app -- so the answer is shown here, before
@@ -1389,12 +1397,13 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
   const paneHeight = 'calc(100vh - var(--app-sticky-top, 120px) - 24px)'
 
   return (
-    <div style={{ display: 'flex', gap: 12, marginTop: 12, height: paneHeight }}>
+    <div ref={panesRef} style={{ display: 'flex', gap: 12, marginTop: 12, height: paneHeight }}>
       {siderOpen ? (
         <div
           style={{
-            width: SIDER_WIDTH,
-            flex: `0 0 ${SIDER_WIDTH}px`,
+            width: compact ? undefined : SIDER_WIDTH,
+            flex: compact ? '1 1 auto' : `0 0 ${SIDER_WIDTH}px`,
+            minWidth: 0,
             border: `1px solid ${COLORS.border}`,
             borderRadius: 6,
             background: COLORS.panelBg,
@@ -1412,7 +1421,10 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
             filter={filter}
             onFilterChange={setFilter}
             selectedId={selectedId}
-            onSelect={setSelectedId}
+            onSelect={(id) => {
+              setSelectedId(id)
+              if (compact) setSiderOpen(false)
+            }}
             checkedIds={checkedIds}
             onCheckedChange={changeChecked}
             onRefreshList={() => void refreshModelList()}
@@ -1450,7 +1462,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         </Tooltip>
       </div>
 
-      <div style={{ flex: 1, minWidth: 0, overflow: 'auto' }}>
+      <div style={{ flex: 1, minWidth: 0, overflow: 'auto', display: compact && siderOpen ? 'none' : undefined }}>
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           {envError && (
             <Alert

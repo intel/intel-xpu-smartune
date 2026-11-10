@@ -26,6 +26,7 @@ import type { AppResourceEntry, AppDiskIoEntry, ProcessEntry, WeightsTopData, Dy
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 import { ProcessActionsMenu, useProcessDetail } from './ProcessActions'
 import { buildGpuLabelMap } from '../utils/gpu'
+import { useContentWidth } from '../hooks/useContentWidth'
 
 const { Text, Title } = Typography
 
@@ -35,6 +36,18 @@ const { Text, Title } = Typography
 // just return the same ten.
 const TOP_COUNT_OPTIONS = [3, 5, 10]
 const DEFAULT_TOP_COUNT = 3
+// Column widths are percentages. `fit` is the narrowest width the columns still
+// read at, so a panel at least that wide shows the table without scrolling (a
+// 1280px laptop included). Narrower panels must scroll anyway, and scroll at
+// `roomy`, which leaves whole header words and numbers instead of ~55px columns.
+const TABLE_WIDTH = {
+  app: { fit: 760, roomy: 1100 },
+  disk: { fit: 640, roomy: 760 },
+}
+
+function tableScrollX(panelWidth: number | null, { fit, roomy }: { fit: number; roomy: number }): number {
+  return panelWidth === null || panelWidth >= fit ? fit : roomy
+}
 
 // Fields shared by both tables that drive the row's Operation menu and its
 // expandable child-process list.  pids spans every process the app owns.
@@ -337,6 +350,7 @@ function SettingsModal({ visible, onClose }: SettingsModalProps) {
 // ========== Main Component ==========
 
 export default function AppResources({ active, balancerEnabled, onRegister }: Props) {
+  const [panelRef, panelWidth] = useContentWidth<HTMLDivElement>()
   const [rows, setRows] = useState<AppRow[]>([])
   const [diskRows, setDiskRows] = useState<DiskIoRow[]>([])
   // pid -> full process detail, used to render each app's expandable child list.
@@ -978,6 +992,7 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
         {/* Top Resource Consumer */}
         <Col span={24}>
           <div
+            ref={panelRef}
             style={{
               background: COLORS.panelBg,
               border: `1px solid ${COLORS.border}`,
@@ -997,6 +1012,7 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
               size="small"
               pagination={false}
               tableLayout="fixed"
+              scroll={{ x: tableScrollX(panelWidth, TABLE_WIDTH.app) }}
               expandable={expandableFor<AppRow>(true)}
               rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
               style={{ color: COLORS.text }}
@@ -1035,6 +1051,7 @@ export default function AppResources({ active, balancerEnabled, onRegister }: Pr
               size="small"
               pagination={false}
               tableLayout="fixed"
+              scroll={{ x: tableScrollX(panelWidth, TABLE_WIDTH.disk) }}
               expandable={expandableFor<DiskIoRow>(false)}
               rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
               style={{ color: COLORS.text }}

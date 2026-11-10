@@ -901,7 +901,7 @@ function SystemPressurePanel() {
         })}
       >
         <Row gutter={16}>
-          <Col span={8}>
+          <Col xs={24} sm={12} md={8}>
             <HintedItem
               label="Update interval (s)"
               name="regular_update_sys_pressure_time"
@@ -922,7 +922,7 @@ function SystemPressurePanel() {
         </Divider>
         <Row gutter={16}>
           {(['low', 'medium', 'high', 'critical'] as const).map((k) => (
-            <Col span={6} key={k}>
+            <Col xs={24} sm={12} md={6} key={k}>
               <HintedItem
                 label={k[0].toUpperCase() + k.slice(1)}
                 name={['thresholds', k]}
@@ -945,7 +945,7 @@ function SystemPressurePanel() {
           </Divider>
           <Row gutter={16}>
             {(['cpu', 'memory', 'io'] as const).map((k) => (
-              <Col span={8} key={k}>
+              <Col xs={24} sm={12} md={8} key={k}>
                 <HintedItem
                   label={k === 'io' ? 'I/O' : k[0].toUpperCase() + k.slice(1)}
                   name={['weights', k]}
@@ -958,7 +958,7 @@ function SystemPressurePanel() {
           </Row>
 
           <Row gutter={16}>
-            <Col span={8}>
+            <Col xs={24} sm={12} md={8}>
               <HintedItem
                 label="Memory gate steepness"
                 name="mem_gate_steepness"
@@ -969,7 +969,7 @@ function SystemPressurePanel() {
                 step={0.5}
               />
             </Col>
-            <Col span={8}>
+            <Col xs={24} sm={12} md={8}>
               <HintedItem
                 label="Memory busy threshold (%)"
                 name="memory_busy_threshold"
@@ -980,7 +980,7 @@ function SystemPressurePanel() {
                 step={5}
               />
             </Col>
-            <Col span={8}>
+            <Col xs={24} sm={12} md={8}>
               <HintedItem
                 label="CPU busy threshold (%)"
                 name="cpu_busy_threshold"
@@ -1032,7 +1032,7 @@ function DiskPressurePanel() {
         </Divider>
         <Row gutter={16}>
           {(['low', 'medium', 'high', 'critical'] as const).map((k) => (
-            <Col span={6} key={k}>
+            <Col xs={24} sm={12} md={6} key={k}>
               <HintedItem
                 label={k[0].toUpperCase() + k.slice(1)}
                 name={['disk_thresholds', k]}
@@ -1059,7 +1059,7 @@ function DiskPressurePanel() {
               ['queue', 'Queue depth'],
               ['util', 'Utilisation'],
             ] as const).map(([key, label]) => (
-              <Col span={8} key={key}>
+              <Col xs={24} sm={12} md={8} key={key}>
                 <HintedItem
                   label={label}
                   name={['sub_weights', key]}
@@ -1073,7 +1073,7 @@ function DiskPressurePanel() {
           </Row>
 
           <Row gutter={16}>
-            <Col span={8}>
+            <Col xs={24} sm={12} md={8}>
               <HintedItem
                 label="Sigmoid steepness"
                 name="sigmoid_k"
@@ -1084,7 +1084,7 @@ function DiskPressurePanel() {
                 step={0.5}
               />
             </Col>
-            <Col span={8}>
+            <Col xs={24} sm={12} md={8}>
               <HintedItem
                 label="Worst-disk weight"
                 name="max_p_weight"
@@ -1147,7 +1147,7 @@ function NetworkPressurePanel() {
         </Divider>
         <Row gutter={16}>
           {(['low', 'medium', 'high', 'critical'] as const).map((level) => (
-            <Col span={6} key={level}>
+            <Col xs={24} sm={12} md={6} key={level}>
               <HintedItem
                 label={level[0].toUpperCase() + level.slice(1)}
                 name={['network_thresholds', level]}
@@ -1163,7 +1163,7 @@ function NetworkPressurePanel() {
 
         <AdvancedSection>
           <Row gutter={16}>
-            <Col span={8}>
+            <Col xs={24} sm={12} md={8}>
               <HintedItem
                 label="RX drop weight"
                 name="network_pressure_model_rx_drop_weight"
@@ -1191,6 +1191,7 @@ function LimitRateRow({ resource, disabled }: { resource: 'cpu' | 'memory'; disa
   const ratesDisabled = disabled || !enabled
   return (
     <>
+      <div className="settings-matrix">
       <Row gutter={12} align="top">
         <Col span={4}>
           <Form.Item label={resource === 'cpu' ? 'CPU' : 'Memory'} name={[resource, 'enabled']} valuePropName="checked">
@@ -1213,6 +1214,7 @@ function LimitRateRow({ resource, disabled }: { resource: 'cpu' | 'memory'; disa
           </Col>
         ))}
       </Row>
+      </div>
       <HintNote name={[resource, 'rate', 'high']} />
     </>
   )
@@ -1231,6 +1233,7 @@ function DiskRateMatrix({ disabled }: { disabled?: boolean }) {
   const ratesDisabled = disabled
   return (
     <>
+      <div className="settings-matrix">
       <Row gutter={8}>
         <Col span={4} />
         {DISK_FIELDS.map((f) => (
@@ -1259,6 +1262,7 @@ function DiskRateMatrix({ disabled }: { disabled?: boolean }) {
           ))}
         </Row>
       ))}
+      </div>
       {DISK_FIELDS.map((f) => (
         <HintNote key={f.key} name={['disk_io', 'rate', 'high', f.key]} title={f.label} />
       ))}
@@ -1283,7 +1287,7 @@ function DiskScaleMatrix({ disabled }: { disabled?: boolean }) {
     <>
       <Row gutter={[8, 8]}>
         {DISK_MEDIA.map((m) => (
-          <Col span={8} key={m.key}>
+          <Col xs={24} sm={12} md={8} key={m.key}>
             <HintedItem
               label={<Text type="secondary" style={{ fontSize: 12 }}>{m.label}</Text>}
               name={['disk_io', 'media_scale', m.key]}
@@ -1793,7 +1797,7 @@ function NetworkPanel() {
                     The network policy below only applies while network control is enabled.
                   </Text>
                   <Row gutter={16}>
-                    <Col span={10}>
+                    <Col xs={24} md={10}>
                       <Form.Item
                         label="Auto network control"
                         name="enable_network_pressure_shaping"
@@ -1807,7 +1811,7 @@ function NetworkPanel() {
                         />
                       </Form.Item>
                     </Col>
-                    <Col span={14}>
+                    <Col xs={24} md={14}>
                       <Form.Item
                         label="Per-app packet flood protection"
                         name="enable_app_pps_police"
@@ -1831,7 +1835,7 @@ function NetworkPanel() {
                       />
                     </Divider>
                     <Row gutter={12}>
-                      <Col span={8}>
+                      <Col xs={24} sm={12} md={8}>
                         <HintedItem
                           label="Candidate threshold (PPS)"
                           name={['network_pps_policy', 'app_pps_high']}
@@ -1842,7 +1846,7 @@ function NetworkPanel() {
                           disabled={!networkControlEnabled || !pressureShapingEnabled || !packetFloodProtectionEnabled}
                         />
                       </Col>
-                      <Col span={8}>
+                      <Col xs={24} sm={12} md={8}>
                         <HintedItem
                           label="Per-app cap (PPS)"
                           name={['network_pps_policy', 'pps_cap_rate']}
@@ -1864,7 +1868,7 @@ function NetworkPanel() {
                           disabled={!networkControlEnabled || !pressureShapingEnabled || !packetFloodProtectionEnabled}
                         />
                       </Col>
-                      <Col span={8}>
+                      <Col xs={24} sm={12} md={8}>
                         <HintedItem
                           label="Burst (packets)"
                           name={['network_pps_policy', 'pps_cap_burst']}
@@ -1942,17 +1946,17 @@ function NetworkPanel() {
                   </Divider>
 
                   <Row gutter={12} align="middle" style={{ marginBottom: 6 }}>
-                    <Col span={6}><Text type="secondary" style={{ whiteSpace: 'nowrap' }}>Network priority</Text></Col>
-                    <Col span={5}><Text type="secondary">Min (%)</Text></Col>
-                    <Col span={5}><Text type="secondary">Max (%)</Text></Col>
+                    <Col xs={8} md={6}><Text type="secondary">Network priority</Text></Col>
+                    <Col xs={8} md={5}><Text type="secondary">Min (%)</Text></Col>
+                    <Col xs={8} md={5}><Text type="secondary">Max (%)</Text></Col>
                   </Row>
 
                   {(['critical', 'high', 'low'] as const).map((pri) => (
                     <Row gutter={12} align="middle" key={pri} style={{ marginBottom: 8 }}>
-                      <Col span={6}>
+                      <Col xs={8} md={6}>
                         <Text>{pri[0].toUpperCase() + pri.slice(1)}</Text>
                       </Col>
-                      <Col span={5}>
+                      <Col xs={8} md={5}>
                         <HintedCell
                           name={['config_network_bw', pri, 'min']}
                           rules={[
@@ -1979,7 +1983,7 @@ function NetworkPanel() {
                           disabled={!networkControlEnabled}
                         />
                       </Col>
-                      <Col span={5}>
+                      <Col xs={8} md={5}>
                         <HintedCell
                           name={['config_network_bw', pri, 'max']}
                           rules={[{ required: true, type: 'number', min: 0, max: 100 }]}

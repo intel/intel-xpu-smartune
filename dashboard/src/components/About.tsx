@@ -235,7 +235,9 @@ function SectionCard({
       </div>
       <Descriptions
         size="small"
-        column={descColumns}
+        column={descColumns > 1
+          ? { xs: 1, sm: 1, md: descColumns, lg: descColumns, xl: descColumns, xxl: descColumns }
+          : descColumns}
         style={{ marginTop: 8 }}
         labelStyle={{ color: COLORS.textMuted, fontSize: 12, width: hero ? 118 : 140 }}
         contentStyle={{ color: COLORS.text, fontSize: 12, wordBreak: 'break-word' }}
@@ -465,8 +467,8 @@ export default function About({ active }: Props) {
 
   return (
     <div style={{ padding: '16px 0' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <Space size={8}>
+      <div className="about-header">
+        <Space size={8} wrap>
           <InfoCircleOutlined style={{ color: COLORS.tabAccent }} />
           <Title level={4} style={{ color: COLORS.text, margin: 0 }}>
             About

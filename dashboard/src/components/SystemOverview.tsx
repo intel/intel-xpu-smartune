@@ -59,6 +59,7 @@ import { useMonitoredSections } from '../hooks/useMonitoredSections'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 import { createLiveDiagnosticWindow, summarizeVisibleDiagnosticEvents } from '../utils/diagnosticEvents'
 import { getGpuComputeUnits, type GpuComputeUnits } from '../utils/gpuTopology'
+import { useIsNarrowViewport } from '../hooks/useIsNarrowViewport'
 import '../styles/performance.css'
 
 const { Text, Title } = Typography
@@ -3268,6 +3269,20 @@ function ChartLegend({
   )
 }
 
+const SPARK_TITLE_OVERLAY_STYLE: React.CSSProperties = { color: COLORS.textMuted, fontSize: 10, position: 'absolute', top: 2, left: 2, zIndex: 1 }
+// At the narrow design width the top axis tick sits where the overlay would.
+const SPARK_TITLE_STACKED_STYLE: React.CSSProperties = { color: COLORS.textMuted, fontSize: 10, display: 'block', marginBottom: 2 }
+
+/**
+ * Design width of the utilization sparkline in the GPU / NPU detail cards. The
+ * SVG keeps its aspect ratio, so a 640-wide design shown ~300px wide in the
+ * narrow-viewport modal would halve its height and its axis text. The modal is
+ * sized by the viewport, hence the viewport check.
+ */
+function useDetailSparkWidth(): number {
+  return useIsNarrowViewport() ? 320 : 640
+}
+
 function NpuDetailCard({
   npuParsed,
   npuName,
@@ -3283,6 +3298,7 @@ function NpuDetailCard({
   getSeries: (key: string) => Array<number | null>
   trendWindow: '1m' | '5m'
 }) {
+  const sparkWidth = useDetailSparkWidth()
   const util = typeof npuParsed?.utilization_percent === 'number' ? normalizePercent(npuParsed.utilization_percent) : null
   const powerW = typeof npuParsed?.power_w === 'number' ? npuParsed.power_w : null
   const freqMhz = typeof npuParsed?.frequency_mhz === 'number' ? npuParsed.frequency_mhz : null
@@ -3343,8 +3359,8 @@ function NpuDetailCard({
   return (
     <Card className="perf-card perf-rise" bodyStyle={{ padding: 16 }}>
       {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
-        <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 8 }}>
+        <div style={{ minWidth: 0 }}>
           <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>NPU</Text>
           <Text style={{ color: COLORS.textMuted, fontSize: 10, display: 'block', marginTop: 2 }}>
             {npuName.replace(/\s*\[[0-9a-f]{4}:[0-9a-f]{4}\]\s*$/i, '').trim() || 'Intel NPU'}
@@ -3355,9 +3371,9 @@ function NpuDetailCard({
             </Text>
           )}
         </div>
-        <div style={{ textAlign: 'right' }}>
+        <div style={{ flex: 'none', textAlign: 'right' }}>
           <Text style={{ color: COLORS.textMuted, fontSize: 10, display: 'block' }}>Util</Text>
-          <Text style={{ color: PERF_COLORS.npu, fontSize: 22, fontWeight: 700 }}>
+          <Text style={{ color: PERF_COLORS.npu, fontSize: 22, fontWeight: 700, whiteSpace: 'nowrap' }}>
             {isNumber(util) ? util.toFixed(1) : '—'}
             <span style={{ color: COLORS.textMuted, fontSize: 12, marginLeft: 4 }}>%</span>
           </Text>
@@ -3366,10 +3382,10 @@ function NpuDetailCard({
 
       {/* Utilization trend sparkline */}
       <div style={{ position: 'relative', marginBottom: 10 }}>
-        <Text style={{ color: COLORS.textMuted, fontSize: 10, position: 'absolute', top: 2, left: 2, zIndex: 1 }}>Util %</Text>
+        <Text style={sparkWidth < 640 ? SPARK_TITLE_STACKED_STYLE : SPARK_TITLE_OVERLAY_STYLE}>Util %</Text>
         <Sparkline
           data={utilSeries}
-          width={640}
+          width={sparkWidth}
           height={60}
           stroke={PERF_COLORS.npu}
           responsive
@@ -3507,6 +3523,7 @@ function GpuDeviceCard({
   memBwGbS?: number | null
   memBwEstimated?: boolean
 }) {
+  const sparkWidth = useDetailSparkWidth()
   const utilSeries = getSeries(`gpu:${device.id}:util`)
   const gt0FreqSeries = getSeries(`gpu:${device.id}:freq:gt0:cur_mhz`)
   const gt1FreqSeries = getSeries(`gpu:${device.id}:freq:gt1:cur_mhz`)
@@ -3608,10 +3625,10 @@ function GpuDeviceCard({
 
       {/* Utilization trend */}
       <div className="perf-gpu-chart" style={{ marginTop: 8, position: 'relative' }}>
-        <Text style={{ color: COLORS.textMuted, fontSize: 10, position: 'absolute', top: 2, left: 2, zIndex: 1 }}>Util %</Text>
+        <Text style={sparkWidth < 640 ? SPARK_TITLE_STACKED_STYLE : SPARK_TITLE_OVERLAY_STYLE}>Util %</Text>
         <Sparkline
           data={utilSeries}
-          width={640}
+          width={sparkWidth}
           height={60}
           stroke={PERF_COLORS.gpu}
           responsive
@@ -5259,7 +5276,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
           <div className="perf-device-detail-stack">
             <Card className="perf-card perf-rise" bodyStyle={{ padding: 16 }}>
               <div className="perf-device-detail-heading">
-                <Space size={8}>
+                <Space size={[8, 2]} wrap>
                   <ThunderboltOutlined style={{ color: PERF_COLORS.cpu }} />
                   <Text style={{ color: COLORS.text, fontWeight: 600 }}>Summary</Text>
                   {cpuSnapshotMeta && <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>{cpuSnapshotMeta}</Text>}
@@ -5307,7 +5324,7 @@ function SystemOverview({ active, onNavigate, onOpenSettings, onOpenDiagnostics,
               return (
                 <Card key={group.label} className="perf-card perf-rise" bodyStyle={{ padding: 16 }}>
                   <div className="perf-device-detail-heading">
-                    <Space size={8}>
+                    <Space size={[8, 2]} wrap>
                       <ThunderboltOutlined style={{ color: PERF_COLORS.cpu }} />
                       <Text style={{ color: COLORS.text, fontWeight: 600 }}>{group.label}</Text>
                       {frequencyRange && <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>{frequencyRange}</Text>}

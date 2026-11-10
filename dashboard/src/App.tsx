@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect, useMemo } from 'react'
-import { Tabs, Layout, Typography, Space, Alert, Badge, Button, Dropdown, Empty, Tag, message, notification, Tooltip, Menu, Avatar, Modal } from 'antd'
+import { Tabs, Layout, Typography, Space, Alert, Badge, Button, Dropdown, Drawer, Empty, Tag, message, notification, Tooltip, Menu, Avatar, Modal } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   DashboardOutlined,
@@ -47,6 +47,9 @@ import { useAppEvents } from './hooks/useAppEvents'
 import type { DiagAlert } from './api/types'
 import { alertHandlingMark } from './utils/alertPolicy'
 import type { AlertHandlingMark } from './utils/alertPolicy'
+import { useIsNarrowViewport } from './hooks/useIsNarrowViewport'
+import { useContentWidth } from './hooks/useContentWidth'
+import { WorkspaceWidthContext } from './hooks/useWorkspaceWidth'
 
 const { Header, Content, Sider } = Layout
 
@@ -125,6 +128,10 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   const [settingsSection, setSettingsSection] = useState<string | null>(null)
   const [settingsTabIntent, setSettingsTabIntent] = useState<{ key: string; requestId: number } | null>(null)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  // A narrow viewport has no room for the sider: navigation moves to a drawer.
+  const narrowViewport = useIsNarrowViewport()
+  const [navDrawerOpen, setNavDrawerOpen] = useState(false)
+  const [workspaceRef, workspaceWidth] = useContentWidth<HTMLDivElement>()
   const [historyRangeIntent, setHistoryRangeIntent] = useState<HistoryRangeIntent | null>(null)
   // 1 = balancer + monitor, 0 = monitor only. Default to enabled so older
   // servers without the /smartune/capabilities endpoint keep full behaviour.
@@ -561,16 +568,20 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
 
   // Publish the sticky application header height so page-level toolbars can
   // stay below it in the content workspace.
+  // The header only exists once signed in, and its height changes with the
+  // narrow-viewport layout, so observe the element itself rather than window resizes.
   useEffect(() => {
-    const measure = () => {
-      const header = document.querySelector('.ant-layout-header') as HTMLElement | null
-      const offset = header?.offsetHeight ?? 64
-      document.documentElement.style.setProperty('--app-sticky-top', `${offset}px`)
+    if (booting || !authed) return
+    const header = document.querySelector('.ant-layout-header') as HTMLElement | null
+    if (!header) return
+    const publish = () => {
+      document.documentElement.style.setProperty('--app-sticky-top', `${header.offsetHeight}px`)
     }
-    measure()
-    window.addEventListener('resize', measure)
-    return () => window.removeEventListener('resize', measure)
-  }, [])
+    publish()
+    const observer = new ResizeObserver(publish)
+    observer.observe(header)
+    return () => observer.disconnect()
+  }, [booting, authed])
 
   const tabs = [
     {
@@ -786,6 +797,45 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
     settings: 'Settings',
   }
 
+  const navigation = (
+    <>
+      <div className="app-sidebar__brand">
+        <div
+          style={{
+            width: 28,
+            height: 28,
+            background: `linear-gradient(135deg, ${COLORS.accent} 0%, #3a6fd8 100%)`,
+            borderRadius: 6,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <DashboardOutlined style={{ color: '#fff', fontSize: 14 }} />
+        </div>
+        <Typography.Title
+          level={4}
+          style={{ color: COLORS.text, margin: 0, fontWeight: 600 }}
+        >
+          Intel XPU SmarTune
+        </Typography.Title>
+      </div>
+      <Menu
+        mode="inline"
+        selectedKeys={[activeTab]}
+        items={navigationItems}
+        onClick={({ key }) => {
+          setActiveTab(key)
+          setNavDrawerOpen(false)
+        }}
+      />
+    </>
+  )
+
+  const navToggleLabel = narrowViewport
+    ? 'Open navigation'
+    : sidebarCollapsed ? 'Expand navigation' : 'Collapse navigation'
+
   // Validating a URL-hash bootstrap token — hold off rendering the gate.
   if (booting) {
     return <div style={{ minHeight: '100vh', background: COLORS.bg }} />
@@ -809,53 +859,43 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
       {stoppedNotice}
       <div ref={frozenShellRef}>
       <Layout className="app-shell" style={{ minHeight: '100vh', background: COLORS.bg }}>
-        <Sider
-          className="app-sidebar"
-          width={264}
-          collapsedWidth={64}
-          collapsible
-          collapsed={sidebarCollapsed}
-          trigger={null}
-          onCollapse={setSidebarCollapsed}
-          theme={colorMode}
-          style={{
-            background: COLORS.panelBg,
-            borderRight: `1px solid ${COLORS.border}`,
-            top: 0,
-            height: '100vh',
-            overflow: 'auto',
-          }}
-        >
-          <div className="app-sidebar__brand">
-            <div
-              style={{
-                width: 28,
-                height: 28,
-                background: `linear-gradient(135deg, ${COLORS.accent} 0%, #3a6fd8 100%)`,
-                borderRadius: 6,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-              }}
-            >
-              <DashboardOutlined style={{ color: '#fff', fontSize: 14 }} />
-            </div>
-            <Typography.Title
-              level={4}
-              style={{ color: COLORS.text, margin: 0, fontWeight: 600 }}
-            >
-              Intel XPU SmarTune
-            </Typography.Title>
-          </div>
-          <Menu
-            mode="inline"
-            selectedKeys={[activeTab]}
-            items={navigationItems}
-            onClick={({ key }) => {
-              setActiveTab(key)
+        {narrowViewport ? (
+          <Drawer
+            className="app-nav app-nav-drawer"
+            placement="left"
+            width={264}
+            closable={false}
+            open={navDrawerOpen}
+            onClose={() => setNavDrawerOpen(false)}
+            styles={{ body: { padding: '0 12px 20px', background: COLORS.panelBg } }}
+          >
+            {navigation}
+          </Drawer>
+        ) : (
+          <Sider
+            className="app-nav app-sidebar"
+            width={264}
+            collapsedWidth={64}
+            collapsible
+            collapsed={sidebarCollapsed}
+            trigger={null}
+            onCollapse={setSidebarCollapsed}
+            // Tablet widths (768-991px): start as the icon rail so the page
+            // keeps ~640px instead of ~450px; the toggle still expands it.
+            breakpoint="lg"
+            onBreakpoint={setSidebarCollapsed}
+            theme={colorMode}
+            style={{
+              background: COLORS.panelBg,
+              borderRight: `1px solid ${COLORS.border}`,
+              top: 0,
+              height: '100vh',
+              overflow: 'auto',
             }}
-          />
-        </Sider>
+          >
+            {navigation}
+          </Sider>
+        )}
         <Layout className="app-main" style={{ background: COLORS.bg }}>
           <Header
             className="app-header"
@@ -868,27 +908,35 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
             }}
           >
             <div className="app-header__breadcrumb">
-              <Tooltip title={sidebarCollapsed ? 'Expand navigation' : 'Collapse navigation'}>
+              {/* A tap would leave the hover tooltip stuck on touch screens. */}
+              <Tooltip title={narrowViewport ? undefined : navToggleLabel}>
                 <Button
                   type="text"
                   size="small"
-                  icon={sidebarCollapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-                  aria-label={sidebarCollapsed ? 'Expand navigation' : 'Collapse navigation'}
-                  onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+                  icon={narrowViewport || sidebarCollapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+                  aria-label={navToggleLabel}
+                  onClick={() => {
+                    if (narrowViewport) setNavDrawerOpen(true)
+                    else setSidebarCollapsed((collapsed) => !collapsed)
+                  }}
                 />
               </Tooltip>
-              <DashboardOutlined />
-              <Typography.Text>Intel XPU SmarTune</Typography.Text>
-              <span>/</span>
-              <Typography.Text strong>{pageTitles[activeTab] ?? 'Home'}</Typography.Text>
+              {narrowViewport ? null : (
+                <>
+                  <DashboardOutlined />
+                  <Typography.Text>Intel XPU SmarTune</Typography.Text>
+                  <span>/</span>
+                </>
+              )}
+              <Typography.Text strong ellipsis>{pageTitles[activeTab] ?? 'Home'}</Typography.Text>
               {activeTab === 'settings' && settingsSection ? (
                 <>
                   <span>/</span>
-                  <Typography.Text strong>{settingsSection}</Typography.Text>
+                  <Typography.Text strong ellipsis>{settingsSection}</Typography.Text>
                 </>
               ) : null}
             </div>
-            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div className="app-header__actions">
             <Tooltip title={colorMode === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}>
               <Button
                 type="text"
@@ -958,14 +1006,16 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
 
           <Content className="app-workspace" style={{ background: COLORS.bg }}>
             <GlobalConfigNoticeBar />
-            <div className="app-content-area">
-              <Tabs
-                className="app-content-tabs"
-                activeKey={activeTab}
-                onChange={setActiveTab}
-                items={tabs}
-                renderTabBar={() => <div />}
-              />
+            <div className="app-content-area" ref={workspaceRef}>
+              <WorkspaceWidthContext.Provider value={workspaceWidth}>
+                <Tabs
+                  className="app-content-tabs"
+                  activeKey={activeTab}
+                  onChange={setActiveTab}
+                  items={tabs}
+                  renderTabBar={() => <div />}
+                />
+              </WorkspaceWidthContext.Provider>
             </div>
           </Content>
         </Layout>

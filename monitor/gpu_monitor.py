@@ -374,6 +374,32 @@ def detect_gpu_devices():
 # sysfs frequency / RC6 reading (no PMU needed)
 # ---------------------------------------------------------------------------
 
+def read_sysfs_throttle(card_name):
+    """Read Xe GPU throttle state from sysfs, keyed by GT name.
+
+    Xe exposes device/tile*/gt*/freq0/throttle/{status,reasons,reason_*}. The
+    firmware sets ``status`` while the GT is held below its requested frequency
+    and one ``reason_*`` flag per cause (pl1, pl2, pl4, thermal, prochot, ratl,
+    vr_tdc, vr_thermalert). Returns {} where the interface is absent (i915,
+    older kernels), so callers leave the throttle fields at their defaults.
+    """
+    base = Path(f"/sys/class/drm/{card_name}")
+    out = {}
+    for throttle_path in sorted(base.glob("device/tile*/gt*/freq0/throttle")):
+        status = sysfs_read_int(str(throttle_path / "status"))
+        if status is None:
+            continue
+        reasons = []
+        for reason_file in sorted(throttle_path.glob("reason_*")):
+            if sysfs_read_int(str(reason_file)):
+                reasons.append(reason_file.name[len("reason_"):])
+        out[throttle_path.parent.parent.name] = {
+            "throttled": bool(status),
+            "reasons": reasons,
+        }
+    return out
+
+
 def read_sysfs_freq(card_name):
     """Read GPU frequency info from sysfs. Works for both i915 and Xe."""
     base = Path(f"/sys/class/drm/{card_name}")
@@ -1761,6 +1787,7 @@ class GPUMonitor:
         for mon, s1, s2 in zip(self.monitors, samples1, samples2):
             r = mon.compute(s1, s2)
             if r:
+                self._attach_throttle(mon, r)
                 results.append(r)
         return results
 
@@ -1775,9 +1802,19 @@ class GPUMonitor:
         for mon, prev, cur in zip(self.monitors, self._prev_samples, cur_samples):
             r = mon.compute(prev, cur)
             if r:
+                self._attach_throttle(mon, r)
                 results.append(r)
         self._prev_samples = cur_samples
         return results
+
+    @staticmethod
+    def _attach_throttle(mon, result):
+        """Merge per-GT throttle status/reasons into result["frequency"]."""
+        for gt_name, thr in read_sysfs_throttle(mon.card).items():
+            result.setdefault("frequency", {}).setdefault(gt_name, {}).update({
+                "throttled": thr["throttled"],
+                "throttle_reasons": thr["reasons"],
+            })
 
     def close(self):
         for m in self.monitors:

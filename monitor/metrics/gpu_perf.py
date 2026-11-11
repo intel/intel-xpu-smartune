@@ -108,6 +108,23 @@ def _get_or_init_monitor():
         return None
 
 
+# The kernel flags a GT as throttled whenever the package is at a limit, even
+# if that GT is asleep and loses nothing. Only a GT that is awake (RC6
+# residency below this threshold) counts as actually affected.
+ACTIVE_RC6_MAX_PCT = 50.0
+
+
+def gt_effectively_throttled(throttled: Any, rc6_pct: Optional[float]) -> bool:
+    """Whether a GT is throttled *and* doing work, i.e. actually affected.
+
+    Unknown activity (no rc6_pct) is treated as not affected: without it the
+    flag cannot be told apart from an idle GT sharing a package-wide limit, and
+    a missed alert is preferable to a false one."""
+    if not throttled or rc6_pct is None:
+        return False
+    return rc6_pct < ACTIVE_RC6_MAX_PCT
+
+
 def _convert_monitor_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Convert GPUMonitor.compute() output to the standard GPU usage format."""
     devices: List[Dict[str, Any]] = []
@@ -121,6 +138,7 @@ def _convert_monitor_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         freqs: List[Dict[str, Any]] = []
         for gt_name in sorted(freq_data.keys()):
             f = freq_data[gt_name]
+            throttled = gt_effectively_throttled(f.get("throttled"), f.get("rc6_pct"))
             freqs.append({
                 "name": gt_name,
                 "min_mhz": f.get("min_mhz"),
@@ -128,8 +146,8 @@ def _convert_monitor_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "act_mhz": f.get("act_mhz"),
                 "max_mhz": f.get("max_mhz"),
                 "rc6_pct": f.get("rc6_pct"),
-                "throttled": False,
-                "throttle_reasons": [],
+                "throttled": throttled,
+                "throttle_reasons": (f.get("throttle_reasons") or []) if throttled else [],
             })
 
         # --- Power ---

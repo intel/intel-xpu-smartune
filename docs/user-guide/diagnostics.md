@@ -66,6 +66,7 @@ events*, but only a fixed set of event types creates one:
 | `PLATFORM_KERNEL_PANIC` | critical | Acknowledging it |
 | `RESOURCE_MEMORY_OOM_KILL` | critical | Acknowledging it |
 | `DEVICE_GPU_HANG` | critical | Acknowledging it |
+| `DEVICE_GPU_THROTTLED` | warning | The GPU stops being throttled (confirmed over 3 consecutive samples) |
 | `PLATFORM_SERVICE_CRASHED` | critical | The same service starts again |
 | `PLATFORM_SYSTEMD_RESTART_LOOP` | error | 2 minutes without a new detection (escalates to critical when detected 3 times in 5 minutes) |
 | `CONTROL_CPU_LIMIT_FAILED` | error | The CPU limit recovers |

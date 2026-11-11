@@ -34,6 +34,7 @@ ALERT_POLICIES = {
     "PLATFORM_KERNEL_PANIC": {"severity": "critical", "for_seconds": 0, "close_on_ack": True},
     "RESOURCE_MEMORY_OOM_KILL": {"severity": "critical", "for_seconds": 0, "close_on_ack": True},
     "DEVICE_GPU_HANG": {"severity": "critical", "for_seconds": 0, "close_on_ack": True},
+    "DEVICE_GPU_THROTTLED": {"severity": "warning", "for_seconds": 0},
     "PLATFORM_SERVICE_CRASHED": {"severity": "critical", "for_seconds": 0},
     "PLATFORM_SYSTEMD_RESTART_LOOP": {
         "severity": "error", "for_seconds": 0, "ttl_seconds": 120,
@@ -76,6 +77,8 @@ def dedup_key_for(event):
 def _recovery_target(event_type):
     if event_type == "PLATFORM_SERVICE_STARTED":
         return "PLATFORM_SERVICE_CRASHED"
+    if event_type == "DEVICE_GPU_THROTTLE_CLEARED":
+        return "DEVICE_GPU_THROTTLED"
     if event_type.endswith("_LIMIT_RECOVERED"):
         return event_type.replace("_LIMIT_RECOVERED", "_LIMIT_FAILED")
     return None

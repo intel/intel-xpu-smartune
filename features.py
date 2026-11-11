@@ -228,6 +228,13 @@ def mount_diagnostics(app) -> bool:
         start_pressure_loop()
     except Exception:
         logger.exception("Diagnostics episode loop could not be started")
+    # Background GPU throttle monitor: turns the driver-reported throttle state in
+    # the persisted snapshots into debounced throttled/cleared events.
+    try:
+        from diagnostics.gpu_throttle import start_gpu_throttle_loop
+        start_gpu_throttle_loop()
+    except Exception:
+        logger.exception("Diagnostics GPU throttle loop could not be started")
     # Wire benchmark lifecycle -> events via the JobManager observer (no-op when
     # benchmark is absent). Kept here so benchmark never imports diagnostics.
     try:

@@ -8,6 +8,8 @@ EVENT_CATALOG = (
     ("RESOURCE_SYSTEM_PRESSURE_CHANGED", "System pressure change", "Overall system pressure entered, changed, or recovered from an elevated state.", "hardware", True),
     ("PLATFORM_KERNEL_PANIC", "Kernel panic", "Kernel reported an unrecoverable panic.", "hardware", False),
     ("DEVICE_GPU_HANG", "GPU hang", "System journal reported a GPU hang.", "compute", False),
+    ("DEVICE_GPU_THROTTLED", "GPU throttled", "GPU frequency was held down by a power, thermal, or current limit reported by the driver.", "compute", True),
+    ("DEVICE_GPU_THROTTLE_CLEARED", "GPU throttling cleared", "GPU throttling ended.", "compute", False),
     ("PLATFORM_SERVICE_CRASHED", "Service crash", "SmarTune service terminated unexpectedly.", "platform", False),
     ("PLATFORM_SYSTEMD_RESTART_LOOP", "Service restart loop", "Systemd reported repeated service restarts.", "platform", False),
     ("LOG_ERROR", "Service error log", "SmarTune emitted an error-level log record.", "platform", True),

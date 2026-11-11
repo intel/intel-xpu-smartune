@@ -399,17 +399,18 @@ benchmark:
   # filesystem if space is tight. Note that `apt purge` removes the install dir
   # wholesale, so a path set here is also what survives a purge.
   env_root: ""
-  # HuggingFace access token for gated repos. Empty = fall back to the HF_TOKEN
-  # environment variable. Passed to subprocesses via the environment only -- it is
-  # never written into a generated script.
+  # Network access for environment builds, the model list and model downloads.
+  # This is the place to set them on a machine without the dashboard.
+  # Settings > Proxy & HuggingFace does the same and wins over the values here.
+  # Precedence per key: Settings page > here > the service's environment
+  # (http_proxy / HF_TOKEN / ... exported before start, or
+  # /etc/default/intel-smartune for the package).
   hf_token: ""
-  # Empty = https://huggingface.co. Set to a mirror where the hub is unreachable.
-  hf_endpoint: "https://huggingface.co"
-  # Proxy for model downloads. Empty = direct. Site-specific, hence configured
-  # here rather than hardcoded in the vendored scripts.
+  # Empty = https://huggingface.co. The token is sent to whatever endpoint is set.
+  hf_endpoint: ""
   http_proxy: ""
   https_proxy: ""     # empty = reuse http_proxy
-  no_proxy: ""
+  no_proxy: ""        # e.g. localhost,127.0.0.1,.example.com
   # Optional upstream network profile (scheme1 / scheme2), which selects the HF
   # endpoint and download tuning. Empty = no profile.
   network_profile: ""

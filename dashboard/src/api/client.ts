@@ -39,6 +39,9 @@ import type {
   BenchDiskData,
   BenchEnvData,
   BenchJob,
+  BenchNetworkData,
+  BenchNetworkTestResult,
+  BenchNetworkUpdate,
   BenchModelsData,
   BenchModelMemory,
   BenchPrecision,
@@ -579,6 +582,24 @@ export const api = {
   // the section-specific shapes are provided by the caller via the type param.
   // --- Benchmark ---------------------------------------------------------
   getBenchEnv: () => get<BenchEnvData>('/bench/env'),
+  // Proxy / HF endpoint / HF token for benchmark downloads and builds. Saving
+  // takes effect for the next job, no restart; 409 = another client saved first.
+  getBenchNetwork: () => get<BenchNetworkData>('/bench/network'),
+  updateBenchNetwork: (body: BenchNetworkUpdate, expectedUpdatedAt?: number) =>
+    postWithConflict<BenchNetworkData & { success: boolean; updated_at: number }>(
+      '/bench/network',
+      { ...body, expected_updated_at: expectedUpdatedAt ?? null },
+    ),
+  // Probes PyPI and the hub through a draft of the settings (nothing is saved).
+  // Each probe is capped server-side, so this answers within ~15 s.
+  // An empty body tests the saved settings rather than a draft.
+  testBenchNetwork: (body: BenchNetworkUpdate | Record<string, never>) =>
+    client
+      .post<ApiResponse<BenchNetworkTestResult>>('/bench/network/test', body, { timeout: 30_000 })
+      .then((res) => {
+        if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
+        return res.data.data
+      }),
   // force=false against an existing environment answers 'conflict' so the caller
   // can confirm before moving a working one aside and rebuilding it. Deciding
   // that means reading the venv's package list, which the server refuses to guess

@@ -66,9 +66,10 @@ a new one is installed.
 because `optimum-cli`, `ovms` and `pip` all spawn children that would otherwise
 survive as orphans holding the device.
 
-**No credentials on disk.** The HF token and proxy reach the pipeline through the
-subprocess environment only (`env.build_subprocess_env`). Rendered run scripts
-under `runtime/runs/` contain no secrets.
+**Secrets go through the environment only.** The HF token and proxy password are
+passed to jobs as environment variables (`env.build_subprocess_env`) and are never
+written to any file under `runtime/`, which the unprivileged job user can read. Run
+scripts do not contain them, and job logs mask them.
 
 **Auth comes for free.** Registering `bench_bp` on a SmarTune app puts every route
 behind `smartune_api.auth_bp`'s app-wide `X-Auth-Token` gate and the service's TLS.
@@ -80,7 +81,29 @@ carried over.
 
 The `benchmark:` block in `config/config.yaml`. Every key is optional; see the
 comments there. `enabled: false` (or an absent `benchmark/` directory) leaves the
-blueprint unregistered and hides the tab.
+blueprint unregistered and hides the tab. The proxy, HF endpoint and HF token in
+that block are one of several layers; see the next section.
+
+### Network: proxy, HF endpoint, HF token
+
+`netcfg.py` resolves `hf_token`, `hf_endpoint`, `http_proxy`, `https_proxy` and
+`no_proxy` from four layers, first non-empty wins:
+
+| Layer | Where | Set it | Applies |
+|---|---|---|---|
+| settings | `key/bench_network.json` (0600) | dashboard: Settings > Proxy & HuggingFace | next job |
+| config | `benchmark:` block of `config/config.yaml` | edit the file (no dashboard needed) | restart |
+| env | the service process's environment | `export` before `start_smartune.sh` (it uses `sudo -E`); `/etc/default/intel-smartune` for the package | restart |
+| none | -- | -- | direct / anonymous |
+
+`https_proxy` follows `http_proxy` unless it is set at the same layer or a higher
+one. A "direct connection" switch in Settings ignores every inherited proxy.
+
+systemd does not inherit the proxy of a login shell, so a packaged install behind a
+proxy fails its first environment build or model-list refresh until one of the
+layers above is set. Saving in Settings restarts the automatic work that failed
+(the base environment install, the model list); user-started setups and runs are
+left to the user.
 
 Both service entry points mount it through `features.mount_benchmark`,
 which imports this package behind a guard: a deployment that ships without
@@ -113,6 +136,9 @@ All routes require `X-Auth-Token`.
 | GET | `/bench/env` | environment status, current job; installs the base venv if missing |
 | POST | `/bench/env/setup` | install the environment; `{"ov": "2026.3.1"}` adds that runtime, `{"force": true}` rebuilds |
 | GET | `/bench/env/setup/log?offset=` | setup log tail |
+| GET | `/bench/network` | proxy / HF settings: Settings-page values, what is in effect and from which layer; token never returned |
+| POST | `/bench/network` | save them (`hf_token: {"action": "keep"\|"set"\|"clear"}`), with `expected_updated_at`; 409 on conflict. Pushes a `network` event (same secret-free shape as the GET; also part of the stream's `snapshot`) |
+| POST | `/bench/network/test` | probe PyPI, the HF endpoint and the token through a draft of the settings (empty body = the saved ones), and check that an `https://` proxy address really speaks TLS (≤ 15 s) |
 | GET | `/bench/models?search=&limit=` | cached model list |
 | POST | `/bench/models/refresh` | re-run the HuggingFace search |
 | POST | `/bench/run` | `{"models":[{"id","build":[...]}],"opt":"build\|benchmark\|all"}` |

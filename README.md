@@ -39,6 +39,7 @@ without modifying or restarting the apps.
 **Benchmark**
 - Download AI models and benchmark them on this machine (OpenVINO / GenAI)
 - Compare runs side by side and see how load affects results
+- Behind a proxy or using a HuggingFace mirror / token: set them in Settings > Proxy & HuggingFace, or without the dashboard in `config/config.yaml` (`benchmark:` block) or the service environment (see [benchmark/service/README.md](benchmark/service/README.md#network-proxy-hf-endpoint-hf-token))
 
 **Diagnostics**
 - A timeline of what happened and what SmarTune did about it

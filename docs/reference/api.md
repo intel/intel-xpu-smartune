@@ -58,6 +58,7 @@ All endpoints return a standardized JSON structure:
 | 401 | UNAUTHORIZED | Unauthorized access |
 | 404 | NOT_EXISTING | Requested resource does not exist |
 | 409 | CONFLICT | Optimistic concurrency conflict |
+| 429 | TOO_MANY_REQUESTS | Rate limited, or the same operation is already running (e.g. `POST /bench/network/test`) |
 | 500 | SERVER_ERROR | Internal server error |
 
 ---

@@ -17,7 +17,7 @@ from utils.http_utils import RetCode, construct_response
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
-from benchmark.service import env, events, jobs, models, results, runner
+from benchmark.service import env, events, jobs, models, netcfg, results, runner
 
 bench_bp = Blueprint('bench', __name__, url_prefix='/bench')
 
@@ -137,6 +137,77 @@ def get_env():
             retcode=RetCode.EXCEPTION_ERROR,
             retmsg="Failed to probe the benchmark environment",
         )
+
+
+# --- network settings (proxy / HF endpoint / HF token) ----------------------
+
+@bench_bp.route('/network', methods=['GET'])
+def get_network():
+    """Settings-page values plus what is in effect and where it came from.
+
+    The HF token is write-only: only whether one is set, and a short preview,
+    ever leave the server. Proxy passwords are masked.
+    """
+    try:
+        return construct_response(data=netcfg.view(),
+                                  retmsg="Successfully retrieved benchmark network settings")
+    except Exception:
+        logger.exception("Failed to read benchmark network settings")
+        return construct_response(retcode=RetCode.EXCEPTION_ERROR,
+                                  retmsg="Failed to read benchmark network settings")
+
+
+@bench_bp.route('/network', methods=['POST'])
+def update_network():
+    """Save the network settings (key/bench_network.json, 0600).
+
+    Takes effect for the next subprocess; no restart. Automatic work that the
+    old settings made fail (the base environment install, the model list) is
+    restarted, and reported under ``restarted``.
+    """
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return construct_response(data={"success": False}, retcode=RetCode.ARGUMENT_ERROR,
+                                  retmsg="Request body must be a JSON object")
+    try:
+        outcome, data = netcfg.save(body, body.get("expected_updated_at"))
+    except ValueError as exc:
+        return construct_response(data={"success": False}, retcode=RetCode.ARGUMENT_ERROR,
+                                  retmsg=str(exc))
+    except OSError:
+        logger.exception("Failed to write benchmark network settings")
+        return construct_response(data={"success": False}, retcode=RetCode.EXCEPTION_ERROR,
+                                  retmsg=f"Could not write {netcfg.STORE_FILE}")
+    if outcome == "conflict":
+        return construct_response(
+            data={"success": False, "current": data}, retcode=RetCode.CONFLICT,
+            retmsg="Configuration was modified by another client; please reload.")
+
+    try:
+        data["restarted"] = env.retry_after_network_change()
+    except Exception:
+        logger.exception("Failed to resume benchmark work after a network change")
+        data["restarted"] = []
+    events.publish_network()
+    data["success"] = True
+    return construct_response(data=data, retmsg="Successfully updated benchmark network settings")
+
+
+@bench_bp.route('/network/test', methods=['POST'])
+def test_network():
+    """Probe PyPI and the HF hub (and the token) through the given draft settings.
+
+    The body has the POST /bench/network shape; empty means "the saved ones".
+    Every probe outcome is a normal answer -- only a malformed draft is an error.
+    """
+    body = request.get_json(silent=True) or None
+    try:
+        data = netcfg.check_connection(body)
+    except ValueError as exc:
+        return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg=str(exc))
+    except netcfg.TestBusy as exc:
+        return construct_response(retcode=RetCode.TOO_MANY_REQUESTS, retmsg=str(exc))
+    return construct_response(data=data, retmsg="Network test finished")
 
 
 @bench_bp.route('/env/setup', methods=['POST'])

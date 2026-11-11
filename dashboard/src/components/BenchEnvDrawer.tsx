@@ -15,12 +15,20 @@
 // that is already installed and reads as Ready, so nothing here would otherwise
 // ask to be rebuilt. It moves the base venv *and* the selected runtime aside and
 // installs both again from the current requirements.
+//
+// The network an install goes through is shown here too, with a test, because
+// this is where an install is started and where a wrong proxy costs the most:
+// minutes into a build. It is only shown: the settings are edited in one place,
+// Settings > Proxy & HuggingFace, so there is never a question of which copy
+// is in force.
 
 import React from 'react'
-import { Alert, Button, Descriptions, Divider, Drawer, Select, Space, Table, Tag, Tooltip, Typography } from 'antd'
-import { ReloadOutlined, ToolOutlined } from '@ant-design/icons'
+import { Alert, Button, Descriptions, Divider, Drawer, Select, Space, Table, Tag, Tooltip, Typography, message } from 'antd'
+import { ApiOutlined, ReloadOutlined, ToolOutlined } from '@ant-design/icons'
 
-import type { BenchEnvData } from '../api/types'
+import { api } from '../api/client'
+import type { BenchEnvData, BenchNetworkData, BenchNetworkTestResult } from '../api/types'
+import { NetworkTestAlert, networkLines } from './BenchNetworkShared'
 
 const { Text, Paragraph } = Typography
 
@@ -39,6 +47,10 @@ interface Props {
   // Force a reinstall of an environment that is already in place -- the path for
   // "I edited the requirements". Confirmed by the caller, not here.
   onRebuildAll?: (version: string) => void
+  /** The proxy / HuggingFace settings in force; installs and downloads use them. */
+  network?: BenchNetworkData | null
+  /** Open Settings > Proxy & HuggingFace, where they are changed. */
+  onOpenNetworkSettings?: () => void
 }
 
 export function versionSummary(versions: Record<string, string | null>): string {
@@ -99,6 +111,55 @@ export function EnvStatusTag({ env, installing }: { env: BenchEnvData | null; in
   }
   if (env?.venv_exists) return <Tag color="warning">Incomplete</Tag>
   return <Tag>Not installed</Tag>
+}
+
+/**
+ * What an install will go through -- proxy, hub, token -- and a test of it
+ * against the saved settings, before minutes are spent on a build.
+ */
+function NetworkField({ network, onOpenSettings }: {
+  network: BenchNetworkData
+  onOpenSettings?: () => void
+}) {
+  const [testing, setTesting] = React.useState(false)
+  const [result, setResult] = React.useState<BenchNetworkTestResult | null>(null)
+  const lines = networkLines(network)
+
+  // A result is about the settings it ran with; a save elsewhere retires it.
+  React.useEffect(() => setResult(null), [network.updated_at])
+
+  const runTest = async () => {
+    setTesting(true)
+    setResult(null)
+    try {
+      setResult(await api.testBenchNetwork({}))
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Network test failed')
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  return (
+    <Field label="Network (used by installs and downloads)">
+      <Space direction="vertical" size={4} style={{ width: '100%' }}>
+        <Text style={{ fontSize: 12 }}>Proxy: {lines.proxy}</Text>
+        <Text style={{ fontSize: 12 }}>HuggingFace: {lines.endpoint}</Text>
+        <Text style={{ fontSize: 12 }}>Access token: {lines.token}</Text>
+        <Space size={8} wrap style={{ marginTop: 4 }}>
+          <Button size="small" icon={<ApiOutlined />} loading={testing} onClick={() => void runTest()}>
+            Test connection
+          </Button>
+          {onOpenSettings && (
+            <Button size="small" type="link" style={{ paddingInline: 0 }} onClick={onOpenSettings}>
+              Change in Settings
+            </Button>
+          )}
+        </Space>
+        {result && <NetworkTestAlert result={result} onClose={() => setResult(null)} />}
+      </Space>
+    </Field>
+  )
 }
 
 /**
@@ -163,6 +224,8 @@ export default function BenchEnvDrawer({
   ovChoices,
   onSetup,
   onRebuildAll,
+  network,
+  onOpenNetworkSettings,
 }: Props) {
   const ready = !!env?.ready
   const installedOvs = env?.ov_versions ?? []
@@ -253,6 +316,7 @@ export default function BenchEnvDrawer({
       </Descriptions>
 
       <div style={{ marginTop: 12 }}>
+        {network && <NetworkField network={network} onOpenSettings={onOpenNetworkSettings} />}
         <OvReference detail={env?.ov_versions_detail} />
         <Field label="Runtime root">
           <PathValue value={env?.env_root} />

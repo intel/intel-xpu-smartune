@@ -5,6 +5,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -92,24 +93,37 @@ def normalize_github_target(target: str, revision: str | None) -> tuple[str, str
     return clone_url, derived_revision, safe_name(repo)
 
 
+def _mask_proxy(proxy: str) -> str:
+    """user:password@host -> user:***@host, for anything printed to the job log."""
+    return re.sub(r"(://[^:/@]*):[^@/]*@", r"\1:***@", proxy)
+
+
 def normalize_network_env() -> None:
-    """Fill in the HF endpoint and mirror the proxy across all four spellings.
+    """Fill in the HF endpoint and set each proxy in both spellings.
 
     The inherited environment wins: the caller (SmarTune's benchmark/service/env.py, or a
     shell that sourced env/global_vars.sh) is what knows this site's proxy, so
-    overriding it here would pin every download to one hard-coded one.
+    overriding it here would pin every download to one hard-coded one. The HTTP
+    and HTTPS proxies stay distinct when both are given -- the Settings page can
+    set them separately -- and one only stands in for the other when it is unset.
     """
     os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
 
-    proxy = (os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
-             or os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY"))
-    if proxy:
-        # wget/curl/requests each read a different spelling; keep them consistent.
-        for key in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"):
-            os.environ[key] = proxy
+    http = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY") or ""
+    https = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY") or ""
+    http, https = http or https, https or http
+    # wget/curl/requests each read a different spelling; keep them consistent.
+    for key, value in (("http_proxy", http), ("https_proxy", https)):
+        if value:
+            os.environ[key] = os.environ[key.upper()] = value
 
-    print(f"[INFO] Effective HF_ENDPOINT={os.environ['HF_ENDPOINT']}")
-    print(f"[INFO] Effective proxy={proxy or 'direct (no proxy configured)'}")
+    print(f"[INFO] Effective HF_ENDPOINT={_mask_proxy(os.environ['HF_ENDPOINT'])}")
+    # Masked: this lands in the job log, which the dashboard streams to the browser.
+    if http == https:
+        shown = _mask_proxy(http) if http else "direct (no proxy configured)"
+    else:
+        shown = f"http={_mask_proxy(http)} https={_mask_proxy(https)}"
+    print(f"[INFO] Effective proxy={shown}")
 
 
 def resolve_huggingface_model_id(model_id: str) -> str:
@@ -272,17 +286,20 @@ def download_wget(target: str, output_dir: Path) -> Path:
     ]
 
     # Proxies are site-specific, so they come from the environment (SmarTune
-    # exports config.yaml's benchmark.http_proxy via benchmark/service/env.py) rather than
+    # exports its network settings via benchmark/service/env.py) rather than
     # being hardcoded to one corporate network. With no proxy configured this is
     # a single direct attempt; with one configured we retry direct if it fails,
-    # which covers a proxy that cannot reach the requested host.
-    configured_proxy = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+    # which covers a proxy that cannot reach the requested host. The proxy for
+    # the target's own scheme: an https:// URL goes through the HTTPS proxy.
+    scheme = "https" if target.lower().startswith("https://") else "http"
+    configured_proxy = (os.environ.get(f"{scheme}_proxy")
+                        or os.environ.get(f"{scheme.upper()}_PROXY"))
     proxies: list[str | None] = [configured_proxy, None] if configured_proxy else [None]
     last_error: subprocess.CalledProcessError | None = None
     for attempt_index, proxy in enumerate(proxies, start=1):
         try:
             print(f"[INFO] wget attempt {attempt_index}/{len(proxies)} "
-                  f"using proxy={proxy or 'direct'}")
+                  f"using proxy={_mask_proxy(proxy) if proxy else 'direct'}")
             run_cmd(cmd, env=proxy_env(proxy))
             break
         except subprocess.CalledProcessError as exc:

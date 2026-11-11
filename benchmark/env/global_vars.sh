@@ -85,7 +85,8 @@ export MODELSCOPE_CACHE=${DIR_ENV_ROOT}/.gen/modelscope_cache
 #
 # Default is EMPTY -- no proxy is imposed. A proxy that is right for one site is
 # wrong (and a silent connectivity failure) for every other, so the corporate
-# endpoints now live in config.yaml (benchmark.http_proxy / https_proxy), not here.
+# endpoints now come from the dashboard's Settings page, config.yaml
+# (benchmark.http_proxy / https_proxy) or the service environment, not here.
 #
 # Note $1 is only consulted when it looks like a profile name: this file is
 # `source`d, so a bare $1 would otherwise pick up the *caller's* first positional

@@ -1,6 +1,7 @@
 # Settings for intel-smartune.service, read when the service starts.
 # Package upgrades keep your edits. Apply a change with:
 #   sudo systemctl restart intel-smartune
+# Readable by root only (0600): it may hold a proxy password or an HF token.
 
 # Address the dashboard listens on (port 9001).
 #   0.0.0.0    every interface: other machines open https://<this-machine-ip>:9001
@@ -8,3 +9,17 @@
 #   127.0.0.1  this machine only: https://localhost:9001
 # Stopping the service from the dashboard works only from this machine, at localhost.
 SMARTUNE_LISTEN=0.0.0.0
+
+# Network access for the Models (benchmark) tab -- environment builds and model
+# downloads. systemd does not pass on the proxy of your login shell, so a machine
+# behind a proxy needs it here, in the benchmark block of
+# /opt/intel/smartune/config/config.yaml, or in Settings > Proxy & HuggingFace in
+# the dashboard (no restart needed). Precedence: Settings > config.yaml > this
+# file. Uncomment to use.
+#http_proxy=http://proxy.example.com:911
+#https_proxy=http://proxy.example.com:911
+#no_proxy=localhost,127.0.0.1
+# HuggingFace mirror, for sites where huggingface.co is unreachable.
+#HF_ENDPOINT=https://huggingface.co
+# Access token, needed only for gated or private models.
+#HF_TOKEN=

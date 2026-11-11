@@ -22,6 +22,7 @@ import type {
   BenchMatrixRow,
   BenchModel,
   BenchModelsState,
+  BenchNetworkData,
   BenchPlanCommand,
   BenchPrecision,
   BenchPreflightBlocker,
@@ -108,6 +109,8 @@ interface RunReviewState {
 interface BenchmarkProps {
   /** Switch the app to the Balancer tab. Absent in monitor-only mode. */
   onOpenBalance?: () => void
+  /** Open Settings at the benchmark proxy / HuggingFace page. */
+  onOpenNetworkSettings?: () => void
 }
 
 /**
@@ -170,13 +173,16 @@ function blockerLine(blocker: BenchPreflightBlocker): string {
 // No `active` prop: the stream App holds keeps this component current whether or
 // not the tab is on screen, which is the whole point -- coming back to a
 // finished run is instant, with nothing to re-fetch.
-export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
+export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: BenchmarkProps) {
   const [env, setEnv] = useState<BenchEnvData | null>(null)
   const [envError, setEnvError] = useState<string | null>(null)
   const [envOpen, setEnvOpen] = useState(false)
 
   const [models, setModels] = useState<BenchModel[]>([])
   const [modelsState, setModelsState] = useState<BenchModelsState | null>(null)
+  // Proxy / HuggingFace settings as in force now, shown in the Environment
+  // drawer. Seeded over REST like env, then kept current by the stream.
+  const [netInfo, setNetInfo] = useState<BenchNetworkData | null>(null)
   const [modelsLoading, setModelsLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<ModelFilter>('all')
@@ -458,6 +464,14 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     setCaseOpen(true)
   }, [])
 
+  const loadNetwork = useCallback(async () => {
+    try {
+      setNetInfo(await api.getBenchNetwork())
+    } catch {
+      // Only the indicator depends on it; without the data it is not drawn.
+    }
+  }, [])
+
   const loadEnv = useCallback(async () => {
     try {
       setEnv(await api.getBenchEnv())
@@ -499,7 +513,8 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
     loadModels()
     loadResults()
     loadPreflight()
-  }, [loadEnv, loadModels, loadResults, loadPreflight])
+    loadNetwork()
+  }, [loadEnv, loadModels, loadResults, loadPreflight, loadNetwork])
 
   // Select the newest benchmarked model once both result and model data arrive.
   useEffect(() => {
@@ -592,6 +607,7 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
             setEnvError(null)
             trackJob(event.job)
             if (event.models) setModelsState(event.models)
+            if (event.network) setNetInfo(event.network)
             if (event.log) {
               // A snapshot re-states the whole tail, so it replaces rather than
               // appends -- this is also how a reconnect resyncs a log it may
@@ -632,6 +648,9 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
           case 'env':
             setEnv(event.env)
             setEnvError(null)
+            break
+          case 'network':
+            setNetInfo(event.network)
             break
           case 'models':
             setModelsState(event.models)
@@ -1558,7 +1577,8 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
               </Space>
             )}
             {/* Its own status is the label, so a glance at the corner answers
-                "can I run anything" without opening the drawer. */}
+                "can I run anything" without opening the drawer, which also shows
+                the network installs and downloads go through. */}
             <Button
               size="small"
               icon={<ToolOutlined />}
@@ -1727,6 +1747,11 @@ export default function Benchmark({ onOpenBalance }: BenchmarkProps) {
         ovChoices={ovOptions}
         onSetup={(version) => void startSetup(false, version)}
         onRebuildAll={rebuildAll}
+        network={netInfo}
+        onOpenNetworkSettings={onOpenNetworkSettings && (() => {
+          setEnvOpen(false)
+          onOpenNetworkSettings()
+        })}
       />
     </div>
   )

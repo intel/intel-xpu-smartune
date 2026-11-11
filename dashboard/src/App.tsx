@@ -746,6 +746,13 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
             children: (
               <Benchmark
                 onOpenBalance={balancerEnabled ? () => setActiveTab('optimizer') : undefined}
+                onOpenNetworkSettings={() => {
+                  setSettingsTabIntent((current) => ({
+                    key: 'benchmark_network',
+                    requestId: (current?.requestId ?? 0) + 1,
+                  }))
+                  setActiveTab('settings')
+                }}
               />
             ),
           },
@@ -768,6 +775,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
         <SettingsModal
           active={activeTab === 'settings'}
           balancerEnabled={balancerEnabled}
+          benchmarkEnabled={benchmarkEnabled}
           onActiveTabChange={setSettingsSection}
           tabIntent={settingsTabIntent}
         />

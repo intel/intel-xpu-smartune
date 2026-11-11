@@ -40,6 +40,7 @@ import {
   FilterOutlined,
   PlusOutlined,
   UndoOutlined,
+  CloudDownloadOutlined,
 } from '@ant-design/icons'
 import { api } from '../api/client'
 import type {
@@ -49,9 +50,15 @@ import type {
   LimitPolicyData,
   DiskMedia,
   DiagEventCatalogEntry,
+  BenchNetEffective,
+  BenchNetSource,
+  BenchNetworkData,
+  BenchNetworkTestResult,
+  BenchNetworkUpdate,
 } from '../api/types'
 import { COLORS } from '../styles/theme'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
+import { NetworkTestAlert, PROXY_SCHEME_WARNING } from './BenchNetworkShared'
 import { HintNote, HintScopeContext, HintedCell, HintedItem, useConfigHints } from './settingsHints'
 import type { HintScope } from './settingsHints'
 
@@ -113,6 +120,9 @@ interface Props {
   // In monitor-only deployments (started with `-m`) the balancer is not running,
   // so control settings tabs are hidden — only Monitor applies.
   balancerEnabled: boolean
+  // Whether this server mounts /bench (capabilities.benchmark). The monitor-only
+  // package does not, and then the Benchmark settings page is omitted.
+  benchmarkEnabled?: boolean
   onActiveTabChange?: (title: string) => void
   tabIntent?: { key: string; requestId: number } | null
 }
@@ -2029,6 +2039,349 @@ function NetworkPanel() {
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark tab: proxy, HuggingFace endpoint and token for model downloads and
+// environment builds (GET/POST /bench/network). Stored root-only in
+// key/bench_network.json, not config.yaml, because it holds secrets. Each empty
+// value falls back to config.yaml's benchmark block, then to the service's own
+// environment: the ways to set them without this page.
+// ---------------------------------------------------------------------------
+const NET_SOURCE_LABEL: Record<BenchNetSource, string> = {
+  settings: 'this page',
+  config: 'config.yaml',
+  env: 'the service environment',
+  none: 'not set',
+}
+
+// Nothing after host:port: an unencoded '/', '?' or '#' in a password ends the
+// address early (the server rejects it too). SOCKS is not offered: the model
+// list and wget cannot use it.
+const PROXY_URL_RE = /^https?:\/\/[^\s/?#]+\/?$/
+const HTTP_URL_RE = /^https?:\/\/\S+$/
+
+const RESTARTED_LABEL: Record<string, string> = {
+  bootstrap: 'base environment install',
+  model_list: 'model list refresh',
+}
+
+function benchNetValues(d: BenchNetworkData): Record<string, unknown> {
+  return {
+    hf_endpoint: d.settings.hf_endpoint,
+    http_proxy: d.settings.http_proxy,
+    https_proxy: d.settings.https_proxy,
+    no_proxy: d.settings.no_proxy,
+    direct: d.settings.direct,
+    hf_token_new: '',
+    hf_token_clear: false,
+  }
+}
+
+function benchNetPayload(values: Record<string, unknown>): BenchNetworkUpdate {
+  const text = (key: string) => String(values[key] ?? '').trim()
+  const token = text('hf_token_new')
+  return {
+    hf_endpoint: text('hf_endpoint'),
+    http_proxy: text('http_proxy'),
+    https_proxy: text('https_proxy'),
+    no_proxy: text('no_proxy'),
+    direct: Boolean(values.direct),
+    hf_token: values.hf_token_clear
+      ? { action: 'clear' }
+      : token
+        ? { action: 'set', value: token }
+        : { action: 'keep' },
+  }
+}
+
+// An inherited no_proxy often runs to dozens of entries; shown whole, one field
+// pushes the form apart. The first few stay visible, the rest are a hover away.
+const LIST_PREVIEW = 3
+
+function EffectiveValue({ value, list }: { value: string; list?: boolean }) {
+  const items = list ? value.split(',').map((item) => item.trim()).filter(Boolean) : []
+  if (items.length <= LIST_PREVIEW) {
+    return <Text code style={{ wordBreak: 'break-all' }}>{value}</Text>
+  }
+  return (
+    <Tooltip
+      title={
+        <div style={{ maxHeight: 240, overflowY: 'auto' }}>
+          {items.map((item, i) => <div key={`${i}:${item}`}>{item}</div>)}
+        </div>
+      }
+    >
+      <span style={{ cursor: 'help' }}>
+        <Text code>{items.slice(0, LIST_PREVIEW).join(',')}</Text>
+        <span style={{ borderBottom: '1px dotted currentColor' }}>
+          and {items.length - LIST_PREVIEW} more
+        </span>
+      </span>
+    </Tooltip>
+  )
+}
+
+// What is in force for one field after the last save, and which layer it came from.
+function EffectiveNote({ entry, emptyText, list }: {
+  entry?: BenchNetEffective
+  emptyText: string
+  /** A comma-separated list (no_proxy): shortened when long. */
+  list?: boolean
+}) {
+  if (!entry) return null
+  let text: React.ReactNode
+  if (entry.direct) text = 'direct connection (forced on this page)'
+  else if (!entry.value) text = emptyText
+  else if (entry.follows) text = <>same as the HTTP proxy, <EffectiveValue value={entry.value} /></>
+  else text = <EffectiveValue value={entry.value} list={list} />
+  return (
+    <Text type="secondary" style={{ fontSize: 12 }}>
+      In effect: {text}
+      {entry.value && !entry.direct && <> (from {NET_SOURCE_LABEL[entry.source]})</>}
+    </Text>
+  )
+}
+
+function BenchNetworkFields({ info }: { info: BenchNetworkData | null }) {
+  const form = Form.useFormInstance()
+  const markDirty = useContext(HintScopeContext)?.markDirty
+  const direct = Form.useWatch('direct', form) as boolean | undefined
+  const clearToken = Form.useWatch('hf_token_clear', { form, preserve: true }) as boolean | undefined
+  const [testing, setTesting] = useState(false)
+  const [test, setTest] = useState<{ draft: string; result: BenchNetworkTestResult } | null>(null)
+
+  // A test result is about the values it ran with. Once the form moves on it
+  // would read as a verdict on values that were never tested, so it is shown
+  // only while the form still holds them (and again if they are put back).
+  const draft = JSON.stringify([
+    Form.useWatch('http_proxy', form),
+    Form.useWatch('https_proxy', form),
+    Form.useWatch('no_proxy', form),
+    direct,
+    Form.useWatch('hf_endpoint', form),
+    Form.useWatch('hf_token_new', form),
+    clearToken,
+  ])
+  const testResult = test && test.draft === draft ? test.result : null
+
+  // After a save the form still holds what was typed (a token in clear text, a
+  // proxy password). Show the stored, masked values instead.
+  useEffect(() => {
+    if (!info) return
+    form.setFieldsValue(benchNetValues(info))
+    // Rules run on edits only; this surfaces the https:// warning for a proxy
+    // already saved that way -- the one the user most needs to see it for.
+    form.validateFields(['http_proxy', 'https_proxy', 'hf_endpoint']).catch(() => undefined)
+  }, [info?.updated_at]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const runTest = async () => {
+    const tested = draft
+    setTesting(true)
+    setTest(null)
+    try {
+      const result = await api.testBenchNetwork(benchNetPayload(form.getFieldsValue(true)))
+      setTest({ draft: tested, result })
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Network test failed')
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  const eff = info?.effective
+  const tokenSet = !!info?.settings.hf_token_set
+  // A warning, not an error: a mirror is a legitimate choice, but the token goes
+  // with every request to it, and http:// sends everything in clear text.
+  const endpointWarning = {
+    warningOnly: true,
+    validator: (_: unknown, value?: string) => {
+      const url = String(value ?? '').trim()
+      if (!url) return Promise.resolve()
+      const notes: string[] = []
+      if (/^http:\/\//i.test(url)) {
+        notes.push('Plain http:// sends model traffic, and the access token if one is set, unencrypted.')
+      }
+      const typed = String(form.getFieldValue('hf_token_new') ?? '').trim() !== ''
+      const tokenInUse = typed || (!form.getFieldValue('hf_token_clear') && !!eff?.hf_token.set)
+      let host = ''
+      try {
+        host = new URL(url).hostname.toLowerCase()
+      } catch {
+        // Malformed: the pattern rule reports it.
+      }
+      if (tokenInUse && host && host !== 'huggingface.co' && !host.endsWith('.huggingface.co')) {
+        notes.push(`The access token is sent to ${host} with every request: set one only for a mirror you trust.`)
+      }
+      return notes.length ? Promise.reject(new Error(notes.join(' '))) : Promise.resolve()
+    },
+  }
+  const proxyRules = [
+    {
+      pattern: PROXY_URL_RE,
+      message: 'Use http://[user:password@]host:port, e.g. http://proxy.example.com:911. '
+        + 'In a password write # / ? @ as %23 %2F %3F %40.',
+    },
+    PROXY_SCHEME_WARNING,
+  ]
+
+  return (
+    <>
+      <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
+        <SectionLabel
+          text="Proxy"
+          tip="Used by environment builds (pip / uv / git) and model downloads. Leave a field empty to inherit it from config.yaml (benchmark block) or, failing that, the service environment (/etc/default/intel-smartune for the package). Those are also how these are set without this page."
+        />
+      </Divider>
+      <Row gutter={[16, 12]}>
+        <Col xs={24} md={12}>
+          <Form.Item label="HTTP proxy" name="http_proxy" rules={proxyRules} style={{ marginBottom: 4 }}>
+            <Input placeholder="http://proxy.example.com:911" disabled={direct} allowClear />
+          </Form.Item>
+          <EffectiveNote entry={eff?.http_proxy} emptyText="direct connection" />
+        </Col>
+        <Col xs={24} md={12}>
+          <Form.Item label="HTTPS proxy" name="https_proxy" rules={proxyRules} style={{ marginBottom: 4 }}>
+            <Input placeholder="Empty = same as the HTTP proxy" disabled={direct} allowClear />
+          </Form.Item>
+          <EffectiveNote entry={eff?.https_proxy} emptyText="direct connection" />
+        </Col>
+      </Row>
+      <Row gutter={[16, 12]} style={{ marginTop: 12 }}>
+        <Col xs={24} md={12}>
+          <Form.Item
+            label="No proxy for"
+            name="no_proxy"
+            tooltip="Comma-separated hosts or domains reached directly, e.g. localhost,127.0.0.1,.example.com"
+            style={{ marginBottom: 4 }}
+          >
+            <Input placeholder="localhost,127.0.0.1,.example.com" disabled={direct} allowClear />
+          </Form.Item>
+          <EffectiveNote entry={eff?.no_proxy} emptyText="none" list />
+        </Col>
+        <Col xs={24} md={12}>
+          <Form.Item
+            label="Direct connection"
+            name="direct"
+            valuePropName="checked"
+            tooltip="Ignore every proxy, including one inherited from config.yaml or the service environment. Proxies entered above are kept and apply again when this is turned off."
+          >
+            <Switch />
+          </Form.Item>
+        </Col>
+      </Row>
+
+      <Divider orientation="left" orientationMargin={0} plain style={{ margin: '16px 0 12px' }}>
+        <SectionLabel
+          text="HuggingFace"
+          tip="Where models are listed and downloaded from, and the token needed for gated repositories."
+        />
+      </Divider>
+      <Row gutter={[16, 12]}>
+        <Col xs={24} md={12}>
+          <Form.Item
+            label="Endpoint"
+            name="hf_endpoint"
+            tooltip="Empty = https://huggingface.co, unless config.yaml (benchmark.hf_endpoint) or HF_ENDPOINT in the service environment sets one."
+            rules={[{ pattern: HTTP_URL_RE, message: 'Use https://host[:port][/path]' }, endpointWarning]}
+            dependencies={['hf_token_new']}
+            style={{ marginBottom: 4 }}
+          >
+            <Input placeholder="https://huggingface.co" allowClear />
+          </Form.Item>
+          <EffectiveNote entry={eff?.hf_endpoint} emptyText="https://huggingface.co" />
+        </Col>
+        <Col xs={24} md={12}>
+          <Form.Item
+            label="Access token"
+            name="hf_token_new"
+            tooltip="Needed only for gated or private models. Write-only: once saved it is never shown again, only whether one is set."
+            style={{ marginBottom: 4 }}
+          >
+            <Input.Password
+              autoComplete="new-password"
+              disabled={!!clearToken}
+              placeholder={tokenSet
+                ? `Saved (${info?.settings.hf_token_preview ?? '****'}). Type to replace it`
+                : 'hf_…'}
+            />
+          </Form.Item>
+          <Space size={8} wrap>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {clearToken
+                ? 'Will be removed on save.'
+                : eff?.hf_token.set
+                  ? <>In effect: {eff.hf_token.preview} (from {NET_SOURCE_LABEL[eff.hf_token.source]})</>
+                  : 'In effect: none (anonymous access)'}
+            </Text>
+            {tokenSet && (
+              <Button
+                size="small"
+                type="link"
+                style={{ padding: 0, height: 'auto' }}
+                onClick={() => {
+                  form.setFieldsValue({ hf_token_clear: !clearToken, hf_token_new: '' })
+                  form.validateFields(['hf_endpoint']).catch(() => undefined)
+                  markDirty?.()
+                }}
+              >
+                {clearToken ? 'Keep the saved token' : 'Remove the saved token'}
+              </Button>
+            )}
+          </Space>
+        </Col>
+      </Row>
+
+      <Divider style={{ margin: '16px 0 12px' }} />
+      <Space direction="vertical" size={8} style={{ width: '100%', marginBottom: 12 }}>
+        <Space>
+          <Button icon={<ApiOutlined />} loading={testing} onClick={() => void runTest()}>
+            Test connection
+          </Button>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            Uses the values in this form, saved or not. Takes up to 15 seconds.
+          </Text>
+        </Space>
+        {testResult && <NetworkTestAlert result={testResult} onClose={() => setTest(null)} />}
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          Saved values apply to the next build, download or run, with no restart.
+          {info && <> Stored in <Text code>{info.store_file}</Text>, readable by root only.</>}
+        </Text>
+      </Space>
+    </>
+  )
+}
+
+function BenchNetworkPanel() {
+  const [info, setInfo] = useState<BenchNetworkData | null>(null)
+  return (
+    <FormCard
+      title="Benchmark network"
+      description="Proxy and HuggingFace access for the Models tab: environment builds, the model list, and model downloads."
+      scope="bench_network"
+      load={async () => {
+        const d = await api.getBenchNetwork()
+        setInfo(d)
+        return { values: benchNetValues(d), updatedAt: d.updated_at }
+      }}
+      save={async (values, ts) => {
+        const result = await api.updateBenchNetwork(benchNetPayload(values), ts)
+        if (result.status === 'ok') {
+          setInfo(result.data)
+          const restarted = (result.data.restarted ?? []).map((key) => RESTARTED_LABEL[key] ?? key)
+          if (restarted.length > 0) message.info(`Network settings applied. Retrying: ${restarted.join(', ')}.`)
+        }
+        return result
+      }}
+      currentToValues={(current) => {
+        const d = current as unknown as BenchNetworkData
+        setInfo(d)
+        return benchNetValues(d)
+      }}
+    >
+      <BenchNetworkFields info={info} />
+    </FormCard>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // One config section per tab. Each tab used to hold four cards, so opening the
 // dialog fired four requests at once and the page had to be scrolled to find
 // anything; a tab per section loads exactly what is being looked at.
@@ -2043,6 +2396,8 @@ interface SettingsTabDef {
   // Balancer-only sections: in monitor-only mode (`-m`) the balancer is not
   // running, so they are omitted entirely, matching the hidden Balancer tab in App.tsx.
   balancerOnly?: boolean
+  // Only where the benchmark feature is mounted, like the Models tab in App.tsx.
+  benchmarkOnly?: boolean
   group?: string
 }
 
@@ -2085,6 +2440,14 @@ const SETTINGS_TABS: SettingsTabDef[] = [
     icon: <FilterOutlined />,
     panel: <DiagnosticRulesPanel />,
   },
+  {
+    key: 'benchmark_network',
+    title: 'Proxy & HuggingFace',
+    icon: <CloudDownloadOutlined />,
+    panel: <BenchNetworkPanel />,
+    benchmarkOnly: true,
+    group: 'Benchmark',
+  },
 ]
 
 /**
@@ -2123,8 +2486,12 @@ function UnsavedDot() {
   )
 }
 
-export default function SettingsModal({ active: _active, balancerEnabled, onActiveTabChange, tabIntent }: Props) {
-  const tabs = SETTINGS_TABS.filter((tab) => balancerEnabled || !tab.balancerOnly)
+export default function SettingsModal({
+  active: _active, balancerEnabled, benchmarkEnabled = false, onActiveTabChange, tabIntent,
+}: Props) {
+  const tabs = SETTINGS_TABS.filter(
+    (tab) => (balancerEnabled || !tab.balancerOnly) && (benchmarkEnabled || !tab.benchmarkOnly),
+  )
   const firstTabKey = tabs[0].key
   // Cards register here while mounted. Panes stay mounted once visited, so this
   // holds every section the user has opened -- which is what lets Save all write

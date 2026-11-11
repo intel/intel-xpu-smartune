@@ -202,7 +202,8 @@ sed -e "s#@RUN_SCRIPT@#/opt/intel/smartune/$RUN_SCRIPT#" \
 chmod 0644 "$STAGE/lib/systemd/system/$SERVICE_UNIT"
 # Admin settings read by the unit (EnvironmentFile), e.g. the listen address.
 # Listed in DEBIAN/conffiles below so upgrades keep the admin's edits.
-install -m 0644 "$HERE/intel-smartune.default" "$STAGE/etc/default/intel-smartune"
+# 0600: it may carry a proxy password or HF_TOKEN; only root (systemd) reads it.
+install -m 0600 "$HERE/intel-smartune.default" "$STAGE/etc/default/intel-smartune"
 # The launcher's file name stays smartune-monitor.desktop in both variants
 # (postinst/prerm copy and remove it by that name); only the title shown differs.
 sed -e "s/@APP_NAME@/$APP_NAME/g" "$HERE/smartune-monitor.desktop" \

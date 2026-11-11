@@ -1270,6 +1270,72 @@ export interface BenchJob {
   size?: number
 }
 
+// --- Benchmark network settings (GET/POST /bench/network) --------------------
+// Each value resolves Settings page > config.yaml > the service's environment.
+export type BenchNetSource = 'settings' | 'config' | 'env' | 'none'
+
+export interface BenchNetEffective {
+  value: string
+  source: BenchNetSource
+  // https_proxy only: it is reusing http_proxy.
+  follows?: 'http_proxy'
+  // Proxies only: Settings forces a direct connection.
+  direct?: boolean
+}
+
+export interface BenchNetworkData {
+  // The Settings layer. Proxy passwords are masked; the token never leaves the server.
+  settings: {
+    hf_endpoint: string
+    http_proxy: string
+    https_proxy: string
+    no_proxy: string
+    direct: boolean
+    hf_token_set: boolean
+    hf_token_preview: string | null
+  }
+  effective: {
+    hf_endpoint: BenchNetEffective
+    http_proxy: BenchNetEffective
+    https_proxy: BenchNetEffective
+    no_proxy: BenchNetEffective
+    hf_token: { set: boolean; source: BenchNetSource; preview: string | null }
+  }
+  store_file: string
+  updated_at: number
+  // POST only: automatic work restarted because the settings changed.
+  restarted?: Array<'bootstrap' | 'model_list'>
+  success?: boolean
+}
+
+export interface BenchNetworkUpdate {
+  hf_endpoint: string
+  http_proxy: string
+  https_proxy: string
+  no_proxy: string
+  direct: boolean
+  hf_token: { action: 'keep' } | { action: 'clear' } | { action: 'set'; value: string }
+}
+
+export interface BenchNetworkCheck {
+  // proxy_tls[_2]: does an https:// proxy address really speak TLS.
+  name: 'pypi' | 'hf_endpoint' | 'hf_token' | 'proxy_tls' | `proxy_tls_${number}`
+  url?: string
+  via?: string
+  // null = not checked (an earlier probe it depends on failed).
+  ok: boolean | null
+  status?: number | null
+  kind?: string | null
+  detail?: string
+  user?: string | null
+  elapsed_ms?: number
+}
+
+export interface BenchNetworkTestResult {
+  ok: boolean
+  checks: BenchNetworkCheck[]
+}
+
 export interface BenchEnvData {
   enabled: boolean
   env_root: string
@@ -1423,12 +1489,14 @@ export type BenchEvent =
       log: BenchLogDelta | null
       models: BenchModelsState | null
       results_rev: number
+      network?: BenchNetworkData | null
     }
   | { type: 'job'; job: BenchJob }
   | ({ type: 'log' } & BenchLogDelta)
   | { type: 'env'; env: BenchEnvData }
   | { type: 'models'; models: BenchModelsState }
   | { type: 'results'; rev: number }
+  | { type: 'network'; network: BenchNetworkData }
 
 export interface BenchRunsData {
   current: BenchJob | null

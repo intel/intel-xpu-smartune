@@ -17,7 +17,7 @@ from config.config import b_config
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
-from benchmark.service import jobs, privilege
+from benchmark.service import jobs, netcfg, privilege
 
 # <repo>/benchmark/service/env.py -> <repo>/benchmark -> <repo>
 PKG_ROOT = Path(__file__).resolve().parent
@@ -132,30 +132,14 @@ def build_subprocess_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, st
                      "XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
             env.pop(name, None)
 
-    token = str(cfg.get("hf_token") or "").strip() or os.environ.get("HF_TOKEN", "")
-    if token:
-        env["HF_TOKEN"] = token
-    else:
-        env.pop("HF_TOKEN", None)
-
-    endpoint = str(cfg.get("hf_endpoint") or "").strip()
-    if endpoint:
-        env["HF_ENDPOINT"] = endpoint
+    # HF token / endpoint and proxies: Settings page > config.yaml > the
+    # service's own environment (see netcfg.py). Re-resolved on every call, so a value saved
+    # in Settings reaches the next job without a restart.
+    netcfg.apply_to_env(env)
 
     profile = str(cfg.get("network_profile") or "").strip()
     if profile:
         env["NETWORK_PROFILE"] = profile
-
-    # Export lower/upper-case proxy variants for tool compatibility.
-    http_proxy = str(cfg.get("http_proxy") or "").strip()
-    https_proxy = str(cfg.get("https_proxy") or "").strip() or http_proxy
-    if http_proxy:
-        env["http_proxy"] = env["HTTP_PROXY"] = http_proxy
-    if https_proxy:
-        env["https_proxy"] = env["HTTPS_PROXY"] = https_proxy
-    no_proxy = str(cfg.get("no_proxy") or "").strip()
-    if no_proxy:
-        env["no_proxy"] = env["NO_PROXY"] = no_proxy
 
     if extra:
         env.update(extra)
@@ -672,3 +656,40 @@ def _after_setup(job: jobs.Job) -> None:
     reason = models.refresh_if_stale()
     if reason:
         logger.info(f"Benchmark setup finished; model list not refreshed: {reason}")
+
+
+def retry_after_network_change() -> list:
+    """Resume the automatic work that a missing proxy or token stopped.
+
+    Called after the network settings are saved. Each automatic step tries once
+    per service session (so a dead network does not mean a retry storm), which
+    would otherwise leave a user who just fixed the proxy waiting for a restart.
+    Only work that started on its own is restarted; a user-started setup or run
+    is left for the user to re-launch. Returns what was started.
+    """
+    global _bootstrap_attempted
+    from benchmark.service import models
+
+    started = []
+    # Re-query PyPI for the OpenVINO version list on the next status read.
+    with _ov_choices_lock:
+        _ov_choices_cache["at"] = 0.0
+
+    if not enabled():
+        return started
+
+    if _bootstrap_attempted and _venv_python(paths()["venv"]) is None:
+        _bootstrap_attempted = False
+        try:
+            if maybe_bootstrap() is None:
+                started.append("bootstrap")
+        except Exception:
+            logger.exception("Could not restart the benchmark base environment install")
+
+    state = models.load_state()
+    if not state["refreshing"] and (not state["cached"] or state["last_error"]):
+        if models.refresh_async() is None:
+            started.append("model_list")
+    if started:
+        logger.info(f"Network settings changed; restarted: {', '.join(started)}")
+    return started

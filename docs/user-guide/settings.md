@@ -115,6 +115,69 @@ Enable or disable each control subsystem and set its policy:
 
 These rules drive what appears in [System diagnostics](diagnostics.md).
 
+## Benchmark: Proxy & HuggingFace
+
+Shown only on installs that include the Models (benchmark) tab. Environment
+builds, the model list and model downloads all reach the internet; this page sets
+how.
+
+- **HTTP / HTTPS proxy, No proxy for** — the proxy to go through. HTTPS proxy left
+  empty means "same as the HTTP proxy". Write the address with `http://` even in
+  the HTTPS field. The `https` in "HTTPS proxy" is the traffic it carries, not how
+  to reach the proxy. An `https://` address makes uv, pip and model downloads use
+  TLS to the proxy itself, and a proxy that does not speak TLS then fails with
+  `tls handshake eof`. The field warns when an address starts with `https://`.
+  A proxy password may contain any character, but write `#` `/` `?` `@` as
+  `%23` `%2F` `%3F` `%40`. SOCKS proxies are not supported.
+- **Direct connection** — ignore every proxy, including one inherited from
+  `config.yaml` or the service environment.
+- **Endpoint** — the HuggingFace hub, or a mirror where it is unreachable. The
+  access token is sent to whichever endpoint is set, so the field warns when a
+  token is in use with a mirror, and when the address is plain `http://`.
+- **Access token** — needed only for gated or private models. Write-only: after
+  saving you only see that one is set, never the token.
+
+Under each field, **In effect** shows the value in use and where it comes from.
+A field left empty inherits from `config.yaml`, then from the service's
+environment (see below). **Test connection** checks PyPI, the hub
+and the token with the values in the form, before you save. A saved token is
+only tested against the saved endpoint; to test it against a new one, type it
+again. For an `https://`
+proxy address it also checks that the proxy accepts TLS. That is the case the other
+checks cannot catch: they still pass through a plain proxy given as `https://`.
+
+Saved values apply to the next build, download or run — no restart. If the
+automatic environment install or the model-list refresh had failed for lack of a
+proxy, saving retries them; re-run anything you started yourself.
+
+The Models tab's **Environment** drawer shows the network an install will use,
+with its own **Test connection** (against the saved values) and a **Change in
+Settings** link to this page.
+
+**Without this page** (no dashboard, or before the first start), set them where
+the service can see them. A value on this page wins over both; `config.yaml` wins
+over the environment.
+
+| Where | How | Notes |
+|---|---|---|
+| `config/config.yaml`, `benchmark:` block | `hf_token`, `hf_endpoint`, `http_proxy`, `https_proxy`, `no_proxy`, then restart the service | Readable by every local user and replaced by a package upgrade: fine for the proxy, but keep the token elsewhere on shared machines |
+| Service environment, `./start_smartune.sh` (source) | the same shell: `export http_proxy=... https_proxy=... no_proxy=... HF_TOKEN=...` | |
+| Service environment, `.deb` package (systemd) | `/etc/default/intel-smartune`, then `sudo systemctl restart intel-smartune` | Root-only, kept on upgrade |
+
+```yaml
+benchmark:
+  http_proxy: "http://proxy.example.com:911"
+  https_proxy: ""            # empty = same as http_proxy
+  no_proxy: "localhost,127.0.0.1"
+  hf_endpoint: ""            # empty = https://huggingface.co
+  hf_token: ""
+```
+
+systemd does not see the proxy of your login shell. An invalid value in
+`config.yaml` is skipped with a warning in the service log. Values saved on this
+page are stored in `key/bench_network.json` (root-only, not in `config.yaml`),
+kept across upgrades and removed only by `apt purge`.
+
 ---
 
 Next: **[About](about.md)** — the platform's hardware and software inventory.

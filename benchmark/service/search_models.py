@@ -55,8 +55,8 @@ CACHE_FILE = CACHE_DIR / "models_cache.json"            # source models (the API
 OV_CACHE_FILE = CACHE_DIR / "models_cache_openvino.json"  # OpenVINO repos + mapping
 
 # Endpoint/download defaults. Anything already set in the environment wins, and
-# no proxy is imposed -- proxies are site-specific and belong in config.yaml
-# (benchmark.http_proxy / https_proxy), which env.py exports for us.
+# no proxy is imposed -- proxies are site-specific and come from the Settings
+# page or the service environment (netcfg.py), which env.py exports for us.
 HF_ENV_DEFAULTS = {
     "HF_ENDPOINT": "https://huggingface.co",
     "HF_HUB_DISABLE_XET": "1",
@@ -135,8 +135,10 @@ def _http_opener(env):
             if env.get(name):
                 proxies[scheme] = env[name]
                 break
-    handlers = [urllib.request.ProxyHandler(proxies)] if proxies else []
-    return urllib.request.build_opener(*handlers)
+    # Always explicit, even when empty: with no ProxyHandler urllib falls back to
+    # os.environ, which in the service process is the very environment the
+    # Settings page may be overriding with "direct connection".
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
 
 
 def _http_ls(env, *, author=None, search=None, limit=2000, sort="downloads", expand=None):

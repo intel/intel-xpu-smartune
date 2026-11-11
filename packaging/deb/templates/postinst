@@ -11,6 +11,9 @@ case "$1" in
         # Executables (git archive preserves mode bits, but be explicit).
         chmod 0755 "$INSTALL_DIR"/*.sh 2>/dev/null || true
         mkdir -p "$INSTALL_DIR/logs"
+        # dpkg keeps an edited conffile's old mode on upgrade, so tighten it here:
+        # it may now carry a proxy password or HF_TOKEN. Only root reads it.
+        chmod 0600 /etc/default/intel-smartune 2>/dev/null || true
 
         # Build the Python venv from the bundled wheels (offline). Under `set -e`
         # a failure here aborts postinst, so apt reports the install as failed

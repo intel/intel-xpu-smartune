@@ -14,7 +14,7 @@ from typing import Dict, Optional
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
-from benchmark.service import env, jobs, models
+from benchmark.service import env, jobs, models, netcfg
 
 # One browser tab holds one stream. The cap is a backstop against a client that
 # reconnects without closing: each subscriber costs a thread in the WSGI server.
@@ -150,6 +150,12 @@ def snapshot(with_log: bool = False) -> dict:
         logger.exception("Benchmark snapshot: failed to read the model cache state")
         model_state = None
 
+    try:
+        network = netcfg.view()   # secret-free: no token, proxy passwords masked
+    except Exception:
+        logger.exception("Benchmark snapshot: failed to read the network settings")
+        network = None
+
     return {
         "type": "snapshot",
         "env": status,
@@ -157,6 +163,7 @@ def snapshot(with_log: bool = False) -> dict:
         "log": log,
         "models": model_state,
         "results_rev": _results_rev,
+        "network": network,
     }
 
 
@@ -190,6 +197,17 @@ def publish_models() -> None:
         logger.exception("Failed to publish the benchmark model-cache state")
         return
     publish({"type": "models", "models": state})
+
+
+def publish_network() -> None:
+    """Announce saved network settings, so the Environment drawer's network
+    field follows a change made on the Settings page -- in this tab or another one."""
+    try:
+        view = netcfg.view()
+    except Exception:
+        logger.exception("Failed to publish the benchmark network settings")
+        return
+    publish({"type": "network", "network": view})
 
 
 def publish_results() -> None:

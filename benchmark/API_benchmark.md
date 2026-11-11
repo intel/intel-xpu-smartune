@@ -19,11 +19,14 @@ one exception noted under `GET /bench/events`.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/bench/events` | GET | SSE stream: job, log, env, models, results |
+| `/bench/events` | GET | SSE stream: job, log, env, models, results, network |
 | `/bench/env` | GET | Environment status; also bootstraps the base venv |
 | `/bench/env/setup` | POST | Install or rebuild the benchmark Python environment |
 | `/bench/env/ov` | POST | Switch the active OpenVINO version |
 | `/bench/env/setup/log` | GET | Incremental log of the most recent setup job |
+| `/bench/network` | GET | Proxy / HuggingFace settings and what is in effect |
+| `/bench/network` | POST | Save the proxy / HuggingFace settings |
+| `/bench/network/test` | POST | Probe PyPI, the HF endpoint and the token through draft settings |
 | `/bench/models` | GET | Cached model list, searchable |
 | `/bench/models/memory` | GET | Weight / KV-cache / logits footprint for one model |
 | `/bench/models/disk` | GET | Free space where weights land |
@@ -96,7 +99,7 @@ needs a separate "what is going on" request — on first load or after a reconne
 | Query | token | Yes | string | Auth token (see note) |
 
 **Response:** `text/event-stream`. Event names: `snapshot`, `job`, `log`, `env`, `models`,
-`results`.
+`results`, `network`.
 
 **Notes:**
 - **This route authenticates via `?token=`, not the `X-Auth-Token` header** — `EventSource`
@@ -109,6 +112,9 @@ needs a separate "what is going on" request — on first load or after a reconne
   than stack a second one on a connection the server cannot yet tell is dead.
 - Too many concurrent clients returns `RetCode.EXCEPTION_ERROR` as an ordinary JSON
   response, not a stream.
+- `network` carries `{"type": "network", "network": <GET /bench/network data>}` after every
+  successful `POST /bench/network`; the `snapshot` event has the same object under
+  `network` (`null` if it could not be read). Like the GET, it never contains the token.
 
 ---
 
@@ -246,6 +252,249 @@ bootstrapped here.
 
 **Notes:**
 - Returns `RetCode.NOT_EXISTING` when no setup has been run in this session.
+
+---
+
+## Network
+
+The proxy, HuggingFace endpoint and HuggingFace token used by environment builds, the
+model list and model downloads. Each value resolves from four layers, first non-empty wins:
+
+| `source` | Where | Changed by |
+|----------|-------|------------|
+| `settings` | `key/bench_network.json` (root-only, 0600) | `POST /bench/network`; applies to the next job, no restart |
+| `config` | `benchmark:` block of `config/config.yaml` | editing the file; service restart |
+| `env` | the service process's environment (`/etc/default/intel-smartune` for the package) | service restart |
+| `none` | default: direct connection, `https://huggingface.co`, no token | — |
+
+`https_proxy` follows `http_proxy` unless it is set at the same layer or a higher one.
+
+---
+
+### GET /bench/network
+
+**Purpose:** The values saved from the Settings page, and what is in effect for each field
+and which layer it came from.
+
+**Request:** No parameters.
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Successfully retrieved benchmark network settings",
+  "data": {
+    "settings": {
+      "hf_endpoint": "https://mirror.example.com",
+      "http_proxy": "http://alice:***@proxy.example.com:912",
+      "https_proxy": "",
+      "no_proxy": "",
+      "direct": false,
+      "hf_token_set": true,
+      "hf_token_preview": "hf_…wxyz"
+    },
+    "effective": {
+      "hf_token": {"set": true, "source": "settings", "preview": "hf_…wxyz"},
+      "hf_endpoint": {"value": "https://mirror.example.com", "source": "settings"},
+      "http_proxy": {"value": "http://alice:***@proxy.example.com:912", "source": "settings"},
+      "https_proxy": {
+        "value": "http://alice:***@proxy.example.com:912",
+        "source": "settings",
+        "follows": "http_proxy"
+      },
+      "no_proxy": {"value": "localhost,127.0.0.1", "source": "config"}
+    },
+    "store_file": "/opt/intel/smartune/key/bench_network.json",
+    "updated_at": 1794470916
+  }
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| settings | object | The Settings layer only. An empty string means the field is not set there and is inherited |
+| settings.hf_endpoint / http_proxy / https_proxy | string | Passwords in the URL are masked as `***` |
+| settings.no_proxy | string | Comma-separated, spaces removed |
+| settings.direct | bool | "Direct connection": ignore every proxy, from any layer |
+| settings.hf_token_set | bool | A token is saved in the Settings layer |
+| settings.hf_token_preview | string | First 3 and last 4 characters (`****` for short tokens), or `null` |
+| effective.&lt;field&gt;.value | string | The value jobs get. Passwords masked |
+| effective.&lt;field&gt;.source | string | `settings`, `config`, `env` or `none` (see above) |
+| effective.https_proxy.follows | string | `"http_proxy"` when the value is reused from `http_proxy`; absent otherwise |
+| effective.http_proxy/https_proxy.direct | bool | `true` when "Direct connection" empties them; `source` is then `settings` |
+| effective.hf_token | object | `{set, source, preview}`; the token itself is never returned |
+| store_file | string | Path of the Settings store on the server |
+| updated_at | int | Version of the Settings store (epoch seconds); `0` = never saved. Send it back as `expected_updated_at` |
+
+**Notes:**
+- An invalid value in `config.yaml` is skipped (with a warning in the service log), so
+  the next layer shows through.
+
+---
+
+### POST /bench/network
+
+**Purpose:** Save the Settings layer. Applies to the next job without a restart.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | expected_updated_at | Yes | int | `updated_at` from the GET this form was loaded from (`0` for a never-saved store) |
+| Body | http_proxy | No | string | `http(s)://[user:password@]host[:port]`. Empty or omitted = not set here (inherit) |
+| Body | https_proxy | No | string | Same format. Empty = follow `http_proxy` |
+| Body | no_proxy | No | string | Comma-separated host names, domains or addresses |
+| Body | hf_endpoint | No | string | `http(s)://host[:port][/path]`. Empty = inherit / `https://huggingface.co` |
+| Body | hf_token | No | object | `{"action": "keep"}` (default), `{"action": "set", "value": "hf_..."}` or `{"action": "clear"}` |
+| Body | direct | No | bool | Ignore every proxy (default `false`). The proxies entered are kept and apply again when it is turned off |
+
+**Request Example:**
+```json
+{
+  "expected_updated_at": 0,
+  "http_proxy": "http://alice:s3cret@proxy.example.com:912",
+  "https_proxy": "",
+  "no_proxy": "",
+  "hf_endpoint": "https://mirror.example.com",
+  "hf_token": {"action": "set", "value": "hf_abcdefghijklmnopqrstuvwxyz"},
+  "direct": false
+}
+```
+
+**Response:** The same object as `GET /bench/network`, plus:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| success | bool | `true` |
+| restarted | string[] | Automatic work restarted because it had failed under the old settings: `bootstrap` (base environment install), `model_list` (model-list refresh). Usually `[]` |
+
+```json
+{
+  "retcode": 0,
+  "retmsg": "Successfully updated benchmark network settings",
+  "data": {
+    "settings": { /* as GET */ },
+    "effective": { /* as GET */ },
+    "store_file": "/opt/intel/smartune/key/bench_network.json",
+    "updated_at": 1794470916,
+    "restarted": ["model_list"],
+    "success": true
+  }
+}
+```
+
+**Response (another client saved first):**
+```json
+{
+  "retcode": 409,
+  "retmsg": "Configuration was modified by another client; please reload.",
+  "data": {"success": false, "current": { /* GET /bench/network data */ }}
+}
+```
+
+**Notes:**
+- Every non-token field is replaced as a whole: a field left out is cleared from the
+  Settings layer, not kept. Send the full form.
+- A proxy or endpoint sent back exactly as the GET showed it (with `***`) keeps the stored
+  password. The masked form with a different host or user does not; it is saved literally.
+- Invalid input returns `RetCode.ARGUMENT_ERROR` with the reason in `retmsg`: a missing or
+  unsupported scheme (`socks5://` is rejected), anything after `host:port` in a proxy, an
+  unencoded `#` `/` `?` `@` in a password (write `%23` `%2F` `%3F` `%40`), control
+  characters, a token with spaces, `{"action": "set"}` with an empty value.
+- A failure to write the store returns `RetCode.EXCEPTION_ERROR`.
+- On success a `network` event goes to every `/bench/events` client.
+- User-started setups and runs that failed are not restarted; only the automatic work
+  listed under `restarted`.
+
+---
+
+### POST /bench/network/test
+
+**Purpose:** Check that PyPI, the HuggingFace endpoint and the token are reachable through
+a draft of the settings, before saving it. Nothing is saved.
+
+**Request:** The `POST /bench/network` body (without `expected_updated_at`), as a draft of
+the Settings layer; the `config` and `env` layers apply under it as usual. An empty body
+tests the saved settings.
+
+**Request Example:**
+```json
+{
+  "http_proxy": "http://proxy.example.com:912",
+  "hf_endpoint": "https://huggingface.co",
+  "hf_token": {"action": "keep"}
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Network test finished",
+  "data": {
+    "ok": false,
+    "checks": [
+      {
+        "name": "pypi",
+        "url": "https://pypi.org/simple/pip/",
+        "via": "http://proxy.example.com:912",
+        "ok": true,
+        "status": 200,
+        "elapsed_ms": 412
+      },
+      {
+        "name": "hf_endpoint",
+        "url": "https://huggingface.co/api/models?limit=1",
+        "via": "http://proxy.example.com:912",
+        "ok": true,
+        "status": 200,
+        "elapsed_ms": 655
+      },
+      {
+        "name": "hf_token",
+        "url": "https://huggingface.co/api/whoami-v2",
+        "via": "http://proxy.example.com:912",
+        "ok": false,
+        "kind": "auth",
+        "detail": "The HuggingFace token was rejected (invalid or expired).",
+        "status": 401,
+        "elapsed_ms": 380
+      }
+    ]
+  }
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| ok | bool | No check failed (`ok: null` checks do not count) |
+| checks[].name | string | `pypi`, `hf_endpoint`, `hf_token`, and `proxy_tls` / `proxy_tls_2` for each distinct `https://` proxy address |
+| checks[].url | string | What was probed; passwords masked |
+| checks[].via | string | Proxy the request went through (masked), or `direct`. Absent for `proxy_tls` |
+| checks[].ok | bool | `true` passed, `false` failed, `null` not checked |
+| checks[].status | int | HTTP status, when there was one |
+| checks[].kind | string | On failure: `dns`, `timeout`, `refused`, `unreachable`, `tls`, `proxy`, `proxy_auth`, `proxy_scheme`, `auth`, `http`, `error` |
+| checks[].detail | string | On failure or skip: a human-readable reason and hint |
+| checks[].user | string | `hf_token` only: the HuggingFace account name the token belongs to |
+| checks[].elapsed_ms | int | Time taken |
+
+**Notes:**
+- Every probe outcome is a normal `retcode: 0` answer; only an invalid draft is
+  `RetCode.ARGUMENT_ERROR`. Another test still running returns `429` (TOO_MANY_REQUESTS).
+- All probes run in parallel and the whole test is bounded at 15 s; a probe with no answer
+  by then is reported as `kind: "timeout"`.
+- `hf_token` is probed only when a token is in effect. A **saved** token is only sent where
+  jobs already send it: if the draft moves it to another endpoint (or, for an `http://`
+  endpoint, through another proxy), it is skipped with `ok: null` unless the draft types the
+  token again with `{"action": "set"}`.
+- `hf_token` is reported as `ok: null` when `hf_endpoint` itself is unreachable.
+- `proxy_tls` checks that an `https://` proxy address really speaks TLS. Python's urllib
+  (used by the other probes) reaches it with plain HTTP, so they can pass while uv, pip and
+  model downloads fail with `tls handshake eof`; `kind: "proxy_scheme"` reports that case.
 
 ---
 

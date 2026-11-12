@@ -11,7 +11,7 @@ from typing import Optional
 
 from utils.logger import get_logger
 logger = get_logger(__name__)
-from utils import app_utils
+from utils import app_utils, self_guard
 from config.config import b_config
 
 class Controller:
@@ -613,6 +613,9 @@ class Controller:
     def set_all_resources(self, app_id: str, cpu_quota: Optional[int] = None, mem_high: Optional[int] = None,
                           io_weight: Optional[int] = None, is_restore: bool = False):
         """Set resource limits for an application (CPU, memory, and IO)."""
+        if not is_restore and self_guard.is_protected(app_id):
+            logger.error("Refusing to limit %s: %s", app_id, self_guard.refusal([app_id]))
+            return False
         if is_restore:
             logger.debug(f"Restoring ALL resources for {app_id}")
             cpu_quota = mem_high = io_weight = None

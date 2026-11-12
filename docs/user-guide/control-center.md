@@ -10,14 +10,25 @@ them*. This is where automatic balancing meets your intent — you set priority
 and optional manual limits here, and SmarTune applies/relaxes cgroup limits as
 pressure rises and falls.
 
+The Control center has two tabs, split by what they act on:
+
+| Tab | Acts on | What it holds |
+| --- | --- | --- |
+| **App Control** | One application at a time | Priority, limits, freeze, CPU affinity, keep-alive, the launch queue |
+| **Device Control** | A device, whatever runs on it | [CPU and GPU frequency limits](#device-control) |
+
+The two are independent: Device Control settings are not tied to any app, and
+[automatic control](#how-automatic-control-works) never changes them. Everything
+below, up to [Device Control](#device-control), is on the **App Control** tab.
+
 <!-- Screenshot: the Control center with a list of controlled apps and their
      status/priority columns. -->
 ![Control center](images/control-center-overview.png)
 
 ## How automatic control works
 
-Automatic limiting runs only while the **Auto System Control** switch at the top
-of the Control center is **on**.
+Automatic limiting runs only while the **Auto control** switch is **on**. The
+switch is in **Settings → Auto Control**, not on this page.
 
 - **When:** [system or disk pressure](home.md) reaches **critical**. At *high*,
   SmarTune only identifies the next target; it does not limit yet.
@@ -31,7 +42,7 @@ of the Control center is **on**.
 
 SmarTune also switches the CPU frequency governor by pressure level.
 
-If you turn the switch **off**, apps that are currently auto-limited move to
+If you turn **Auto control** off, apps that are currently auto-limited move to
 Manual Control with their limits kept in place. Nothing is released all at
 once. Manual limits and network shaping keep working while the switch is off.
 
@@ -76,6 +87,20 @@ clamped to hardware-safe limits.
 For **Critical** apps, enable keep-alive so SmarTune reduces the chance the
 system OOM-killer terminates them under memory pressure (via `oom_score_adj`),
 while it keeps monitoring the process for stability.
+
+### What cannot be limited
+
+SmarTune refuses to limit, freeze or pin the cores of the cgroup it is running
+in, or of any cgroup above it, and tells you so. A limit belongs to a cgroup,
+not to a process: an app started straight from the same terminal as SmarTune
+shares the terminal's `vte-spawn-*.scope` with it, so limiting that app would
+throttle SmarTune itself (the dashboard stops responding), and freezing it
+would stop SmarTune with nothing left to thaw it. There is no override.
+
+To manage such an app, start it in a scope of its own, for example
+`systemd-run --user --scope <command>`. Benchmarks started from the
+[Models](models.md) tab already run in their own scope. Automatic control skips
+these cgroups, and restoring a limit that was set earlier is never blocked.
 
 ## Freezing an app
 
@@ -233,6 +258,56 @@ worse. When resources recover, queued apps launch automatically in priority
 order.
 
 - You can **Cancel Relaunch** to drop a pending queued launch you no longer want.
+
+## Device Control
+
+The **Device Control** tab limits the minimum and maximum frequency of a whole
+device. Use it, for example, to cap the CPU or GPU clock when you want less
+heat, noise or power, or to raise the minimum so the device does not idle down
+between bursts. It acts on the device, not on an app: every app on it is
+affected.
+
+There is a card per device:
+
+- **CPU** — one row per core group, such as **P-cores** and **LP E-cores**, with
+  the CPU numbers it covers. Groups the machine does not have are not listed.
+  Click **Set per policy** to open one row per cpufreq policy and set a single
+  policy on its own. Cores that share a policy always move together, so a row
+  can cover several cores.
+- **GPU** — one row per GT. On Xe, GT 0 is normally the render/compute GT and
+  GT 1 the media GT.
+- There is no NPU card: the NPU's frequency is managed by its firmware, and
+  the driver offers no runtime minimum or maximum to set.
+
+Each row shows the current clock, a two-handle slider for the minimum and the
+maximum, and the hardware range. Drag the handles, then click **Apply**; nothing
+is written until you do. The sliders stay inside the hardware range. When a row
+covers units whose hardware ranges differ (for example two P cores with
+different top clocks), a value above a unit's own top is applied as that unit's
+top.
+
+- A row shows a **Limited** tag while SmarTune holds it. Hover the tag to see the
+  range **Restore** will put back.
+- **Restore** puts the row back to the range it had before SmarTune first
+  changed it, even if you applied several times. **Restore all** does it for
+  every device.
+- If someone else changes the range while SmarTune holds it (for example a
+  power tool), that change is kept and **Restore** does not overwrite it.
+- Changes are manual only. SmarTune does not raise or lower these limits by
+  itself.
+- When SmarTune stops, every frequency it limited is restored to the system
+  default, as CPU affinity is. Nothing survives a reboot either way.
+
+Things to know:
+
+- A limit caps what the hardware may choose; the actual clock can sit lower. The
+  clock shown is a live reading, not the limit.
+- The [CPU frequency governor](#how-automatic-control-works) that automatic
+  control switches is a separate setting. A governor chooses a clock *within*
+  the range set here, so a lowered maximum still holds under `performance`.
+- Limits apply to every app on the device. To keep one app off a device, use
+  [CPU Affinity](#choosing-which-cpu-cores-an-app-runs-on) or
+  [Freeze](#freezing-an-app) in App Control.
 
 ---
 

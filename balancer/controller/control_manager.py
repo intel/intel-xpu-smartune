@@ -6,6 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, List, Optional, Tuple
 
 from utils.logger import get_logger
+from utils import self_guard
 logger = get_logger(__name__)
 from monitor.monitor_api import SystemPressureMonitor
 
@@ -18,6 +19,7 @@ from controller.memory import (
 )
 from controller import freeze
 from controller.governor import GovernorController
+from controller.freq import FreqController
 from controller.swap import ActionResult, GrowthPlan, SwapController
 from config.config import b_config
 
@@ -66,6 +68,7 @@ class ControlManager:
         self.cpu = CPUController(self.config.cgroup_mount)
         self.memory = MemoryController(self.config.cgroup_mount)
         self.governor = GovernorController()
+        self.freq = FreqController()
         self.swap = SwapController(self.config)
 
         self._executor = ThreadPoolExecutor(max_workers=1)
@@ -508,6 +511,9 @@ class ControlManager:
         A freeze is recorded *before* it is written, so a crash between the two
         cannot leave a frozen cgroup the next start does not know about.
         """
+        if frozen and self_guard.is_protected(cgroup):
+            # Freezing the service's own cgroup stops the service, and nothing is left to thaw it.
+            return False, self_guard.refusal([cgroup])
         path = self.memory.get_full_path(cgroup)
         if not os.path.isdir(path):
             if not frozen:

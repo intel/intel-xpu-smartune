@@ -30,7 +30,7 @@ import SettingsModal from './components/SettingsModal'
 import SystemOverview from './components/SystemOverview'
 import AppResources from './components/AppResources'
 import Processes from './components/Processes'
-import Balance from './components/Balance'
+import ControlCenter from './components/ControlCenter'
 import Benchmark from './components/Benchmark'
 import HistoryDashboard from './components/HistoryDashboard'
 import Diagnostics from './components/Diagnostics'
@@ -714,7 +714,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
               </Space>
             ),
             children: (
-              <Balance
+              <ControlCenter
                 active={activeTab === 'optimizer'}
                 balancerEnabled={balancerEnabled}
                 registerKeyword={registerKeyword}

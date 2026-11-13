@@ -26,6 +26,8 @@ import type {
   ResourceLimitProfileData,
   LimitSnapshotData,
   CpuAffinityPayload,
+  FreqSetPayload,
+  FreqStatus,
   CpuAffinityStatus,
   WeightsTopData,
   PassiveControlData,
@@ -467,6 +469,21 @@ export const api = {
     )
     if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
     return res.data.retmsg
+  },
+  // Device-level frequency limits.  Set clamps each unit to its own hardware range.
+  getFreqStatus: () => get<FreqStatus>('/device/freq/status'),
+  setFreq: async (payload: FreqSetPayload) => {
+    const res = await client.post<ApiResponse<void>>(
+      '/device/freq/set', payload, { timeout: 30_000 },
+    )
+    if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
+  },
+  // No units = restore every limited unit.
+  restoreFreq: async (units: string[] = []) => {
+    const res = await client.post<ApiResponse<void>>(
+      '/device/freq/restore', { units }, { timeout: 30_000 },
+    )
+    if (res.data.retcode !== 0) throw new Error(res.data.retmsg)
   },
   getLimitSnapshot: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<LimitSnapshotData>('/app/limit_snapshot', payload),

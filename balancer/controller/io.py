@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Union
 from config.config import b_config
 from utils.logger import get_logger
 logger = get_logger(__name__)
+from utils import self_guard
 from utils.app_utils import write_cgroup_file
 
 # A cgroup/unit name as it appears on disk: scope/service/slice names, digits,
@@ -228,6 +229,9 @@ class IOController:
         :param is_restore: when True, reset all limits to max
         :return: True if all operations succeeded
         """
+        if not is_restore and self_guard.is_protected(cgroup_id):
+            logger.error("Refusing io.max on %s: %s", cgroup_id, self_guard.refusal([cgroup_id]))
+            return False
         success = True
         disk_map = self.get_disk_id(disk_filter)  # {"nvme0n1": "259:0", "sda": "8:0"}
         if not disk_map:

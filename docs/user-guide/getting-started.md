@@ -104,7 +104,7 @@ will see some or all of these:
 | 🏠 **Home** | Live platform overview + Pressure Overview | [Home](home.md) |
 | 📦 **Applications** | Controlled apps' resource use + all processes | [Applications](applications.md) |
 | 📈 **History** | Long-term pressure & utilization trends | [History](history.md) |
-| 🎚️ **Control center** *(full only)* | Priority, limits, keep-alive, launch queue | [Control center](control-center.md) |
+| 🎚️ **Control center** *(full only)* | Priority, limits, keep-alive, launch queue, CPU/GPU frequency limits | [Control center](control-center.md) |
 | 🧪 **Models** *(when enabled)* | Download & benchmark AI models | [Models](models.md) |
 | 🩺 **System diagnostics** *(when enabled)* | Event timeline, alerts, logs, advice | [Diagnostics](diagnostics.md) |
 | ⚙️ **Settings** | Thresholds, control policies, diagnostic rules | [Settings](settings.md) |

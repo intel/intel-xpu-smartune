@@ -23,7 +23,7 @@ try:
 except Exception:  # pragma: no cover - diagnostics absent
     def record_control_action(*_a, **_k):
         return None
-from utils import app_utils, quiet_mode
+from utils import app_utils, quiet_mode, self_guard
 from config.config import b_config
 import threading
 from multiprocessing import JoinableQueue
@@ -834,6 +834,7 @@ class DynamicBalancer:
         self._affinity_apps: Dict[str, dict] = {}
         self._affinity_lock = threading.Lock()
         self._affinity_op_lock = threading.RLock()   # serialises bind/restore across clients and the reaper
+        self._freq_op_lock = threading.Lock()        # serialises device frequency writes across clients
 
         self.known_pids = set()
 
@@ -2476,6 +2477,10 @@ class DynamicBalancer:
         logger.debug(f"Adjusting resources for app: {app_id}")
 
         extra_cgroup_ids = target_app.get('extra_cgroups', [])
+        blocked = self_guard.protected_among([app_id] + list(extra_cgroup_ids))
+        if blocked:
+            logger.warning("Skipped auto limit for %s: %s", app_name, self_guard.refusal(blocked))
+            return
         manual_cgroups = [
             cgroup_id for cgroup_id in [app_id] + list(extra_cgroup_ids)
             if self.all_limits.by_any_id(cgroup_id, source="manual") is not None
@@ -3856,6 +3861,14 @@ class DynamicBalancer:
                 return {"skipped": reason}
             effective_app_ids = selected
 
+        blocked = self_guard.protected_among(effective_app_ids)
+        if blocked:
+            # Not "skipped": the user asked for something that must not happen, and has to be told.
+            reason = (f"Cannot limit {app_name}. {self_guard.refusal(blocked)}"
+                      + (" Untick that instance to limit the others." if len(effective_app_ids) > len(blocked) else ""))
+            logger.warning(reason)
+            return {"refused": reason}
+
         effective_app_id = effective_app_ids[0]   # primary (lexicographically smallest cgroup)
         extra_effective_ids = effective_app_ids[1:]
 
@@ -4238,6 +4251,36 @@ class DynamicBalancer:
             self._notify_ui_refresh(app_id, app_name, 'cpu_affinity_changed')
         return ok, msg
 
+    # -- device frequency limits (per device, not per app) ---------------
+    def get_freq(self) -> dict:
+        from monitor.metrics.cpu import detect_core_groups
+        return self.control_manager.freq.list_units(detect_core_groups())
+
+    def set_freq(self, units: list, min_mhz: float, max_mhz: float) -> "tuple[bool, str, dict]":
+        """Limit each unit to the range, clamped to its own hardware range.
+
+        Serialised with restores so two clients cannot interleave sysfs writes.
+        Returns ``(all_ok, message, {unit_id: {"ok", "message", ...applied}})``.
+        """
+        results = {}
+        with self._freq_op_lock:
+            for uid in units:
+                ok, msg, applied = self.control_manager.freq.set_range(
+                    uid, min_mhz, max_mhz, clamp=True)
+                results[uid] = {"ok": ok, "message": msg, **(applied or {})}
+        failed = [uid for uid, r in results.items() if not r["ok"]]
+        if failed:
+            return False, "; ".join(f"{uid}: {results[uid]['message']}" for uid in failed), results
+        return True, "ok", results
+
+    def restore_freq(self, units: Optional[list] = None) -> "tuple[bool, str]":
+        """Restore the given units, or every limited one when ``units`` is empty."""
+        freq = self.control_manager.freq
+        with self._freq_op_lock:
+            outcomes = [(uid, *freq.restore(uid)) for uid in (units or freq.limited_units())]
+        failed = [f"{uid}: {msg}" for uid, ok, msg in outcomes if not ok]
+        return (False, "; ".join(failed)) if failed else (True, "ok")
+
     def _notify_ui_refresh(self, app_id: str, app_name: str, status: str) -> None:
         """Tell every open UI to refresh this app: the Balance tab does not poll, it only
         updates on pushed events, so a change one client makes is invisible to the others
@@ -4284,6 +4327,9 @@ class DynamicBalancer:
             return True, self._restore_summary(app_name, results)
         if not dirs:
             return False, f"No running cgroup found for {app_name}"
+        blocked = self_guard.protected_among(dirs)
+        if blocked:
+            return False, f"Cannot pin {app_name}. {self_guard.refusal(blocked)}"
         online = set(range(os.cpu_count() or 1))
         value, msg = resolve_cpus(cpu_class, cpus, detect_core_groups(), online)
         if value is None:
@@ -4851,6 +4897,7 @@ class DynamicBalancer:
 
         self.restore_all_limited_apps_resources()
         self.control_manager.cpu.restore_all()
+        self.control_manager.freq.restore_all()
         self.network_controller.clear_network_rules_on_exit()
         self._release_swap_on_exit()
         if hasattr(self, "monitor_thread"):

@@ -20,21 +20,40 @@ class Digest:
     comparison: dict = None
 
 
+def _as_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        return date.fromisoformat(value)
+    if isinstance(value, date):
+        return value
+    raise ValueError("end_date must be an ISO date")
+
+
+def _local_midnight(day):
+    """Epoch seconds of 00:00 on *day* in the server's local time zone.
+
+    A calendar date means the operator's day, not the UTC one: in UTC+8 a UTC
+    day runs 08:00 to 08:00 and would leave the small hours out of "today".
+    Each boundary is resolved on its own so a DST change (a 23 or 25 hour day)
+    still lands on midnight.
+    """
+    return int(datetime.combine(day, time.min).astimezone().timestamp())
+
+
 def _daily_window(end_date):
-    if isinstance(end_date, datetime):
-        end_date = end_date.date()
-    elif isinstance(end_date, str):
-        end_date = date.fromisoformat(end_date)
-    if not isinstance(end_date, date):
-        raise ValueError("end_date must be an ISO date")
-    start = datetime.combine(end_date, time.min, tzinfo=timezone.utc)
-    end = start + timedelta(days=1)
-    return int(start.timestamp()), int(end.timestamp())
+    day = _as_date(end_date)
+    return _local_midnight(day), _local_midnight(day + timedelta(days=1))
 
 
 def _weekly_window(end_date):
-    day_start, day_end = _daily_window(end_date)
-    return day_start - 6 * 86400, day_end
+    """The seven local days ending with *end_date*."""
+    day = _as_date(end_date)
+    return _local_midnight(day - timedelta(days=6)), _local_midnight(day + timedelta(days=1))
+
+
+def _previous_week_start(end_date):
+    return _local_midnight(_as_date(end_date) - timedelta(days=13))
 
 
 class DigestGenerator:
@@ -46,7 +65,7 @@ class DigestGenerator:
 
     def generate_weekly(self, end_date):
         start_time, end_time = _weekly_window(end_date)
-        previous = self._summary_for_window(start_time - 7 * 86400, start_time)
+        previous = self._summary_for_window(_previous_week_start(end_date), start_time)
         return self._generate("week", start_time=start_time, end_time=end_time,
                               comparison={"previous_period": previous})
 

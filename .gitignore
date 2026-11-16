@@ -23,6 +23,11 @@ config/runtime_state.json
 # deb packaging build output
 /build/
 
+# Python packaging artifacts (e.g. from skills/install.sh running
+# `pip install sdk/`, which builds in-tree)
+sdk/build/
+*.egg-info/
+
 # Benchmark runtime tree: venv, downloaded models, IR, logs, generated run
 # scripts. Multi-GB and fully reproducible from setup_env.sh.
 benchmark/runtime/

@@ -551,7 +551,7 @@ an explicit range.
 | Type | Parameter | Required | Format | Description |
 |------|-----------|----------|--------|-------------|
 | Query | period | No | string | `day` (default) / `week` / `boot` / `range` |
-| Query | date | Conditional | string | `YYYY-MM-DD`; required for `day` and `week` |
+| Query | date | Conditional | string | `YYYY-MM-DD` in the server's local time zone; required for `day` and `week` |
 | Query | boot_id | Conditional | string | Required for `boot` |
 | Query | from | Conditional | int | Range start (epoch seconds) |
 | Query | to | Conditional | int | Range end (epoch seconds) |
@@ -567,15 +567,25 @@ GET /diag/digest?period=day&date=2026-10-13
   "retcode": 0,
   "retmsg": "success",
   "data": {
-    "period": "day",
-    "window": {"from": 1755734400, "to": 1755820800},
-    "summary": {"events": 142, "alerts": 3, "control_lifecycles": 5},
-    "sections": []
+    "period": {"kind": "day", "from": 1791820800, "to": 1791907200, "boot_id": null},
+    "generated_at": "2026-10-13T09:30:00.123456+00:00",
+    "event_stats": {"total": 142, "by_severity": {"info": 120, "warning": 18, "error": 4, "critical": 0}},
+    "alert_summary": [],
+    "range_alerts": [],
+    "config_changes": [],
+    "benchmark_regressions": [],
+    "active_alerts": [],
+    "comparison": null
   }
 }
 ```
 
 **Notes:**
+- `day` covers the given date from 00:00 to the next 00:00 in the server's local time zone,
+  and `week` the seven local days ending with it (`comparison.previous_period` is the seven
+  days before that). Each boundary is local midnight, so a day with a DST change lasts 23 or
+  25 hours. The example above is for a server in UTC+8.
+- `generated_at` is UTC; `period.from` / `period.to` are epoch seconds.
 - Supplying `from`/`to` forces `period` to `range`, whatever `period` was sent. The two must
   be given together, otherwise `from and to must be provided together`.
 - `period=boot` without `boot_id`, or `day`/`week` without `date`, returns

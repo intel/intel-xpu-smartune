@@ -13,6 +13,10 @@ export interface CapabilitiesData {
   diagnostics?: number
   /** 1 = the dashboard may stop this service (packaged deployments). */
   shutdown?: number
+  /** Product version, e.g. "1.5.0". Absent on servers before 1.5. */
+  version?: string
+  /** Version of the client-facing REST surface used by the SDK and agents. */
+  api_level?: number
 }
 
 export interface ShutdownStatus {

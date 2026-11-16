@@ -193,7 +193,9 @@ All endpoints return a standardized JSON structure:
     "capabilities": 1,
     "benchmark": 1,
     "diagnostics": 1,
-    "shutdown": 1
+    "shutdown": 1,
+    "version": "1.8.0",
+    "api_level": 1
   }
 }
 ```
@@ -206,6 +208,8 @@ All endpoints return a standardized JSON structure:
 | benchmark | int | `1` = the `/bench` API is mounted here, `0` = not available |
 | diagnostics | int | `1` = the `/diag` API is mounted here, `0` = not available |
 | shutdown | int | `1` = this dashboard may stop the service (`/smartune/shutdown`), `0` = not offered |
+| version | string | Product version. A deb build reports its package version; a source checkout reports the default in `smartune_api.py` |
+| api_level | int | Version of the REST surface used by the SDK, CLI and agents. Raised when a route they use is removed or changes shape; `smartune doctor` warns when it does not match the SDK |
 
 **Notes:**
 - `benchmark: 1` only means the feature is **mounted**, NOT that its Python environment is installed — the dashboard needs the tab to exist in order to offer the "install environment" action. Readiness comes from `GET /bench/env`.

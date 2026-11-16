@@ -76,6 +76,9 @@ import type {
   DiagEventsData,
   DiagEventCatalogData,
   ConfigHintsData,
+  ConfigRestoreResult,
+  PressureGroup,
+  PressureTuningResult,
   DiagAlertsData,
   DiagControlLifecycleQuery,
   DiagControlLifecyclesData,
@@ -847,6 +850,16 @@ export const api = {
 
   getConfig: <T>(section: string) => get<T>(`/monitor/config/${section}`),
   getConfigHints: () => get<ConfigHintsData>('/monitor/config-hints'),
+  // Writes startup or factory values straight back; there is no Save step afterwards.
+  restoreConfig: (kind: 'startup' | 'factory', sections?: string[]) =>
+    post<ConfigRestoreResult>('/monitor/config-restore', { kind, sections }),
+  // Proposes the next relax/tighten step from the form's current values (nothing is saved);
+  // without a direction it only reports where those values sit.
+  previewPressureTuning: (
+    group: PressureGroup,
+    current: Record<string, number>,
+    direction?: 'relax' | 'tighten',
+  ) => post<PressureTuningResult>(`/monitor/pressure-tuning/${group}`, { current, direction }),
   getDiagEventCatalog: () => get<DiagEventCatalogData>('/diag/event-catalog'),
   updateConfig: <T extends { updated_at?: number }>(
     section: string,

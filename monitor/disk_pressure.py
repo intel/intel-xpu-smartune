@@ -280,6 +280,10 @@ class DiskIOMonitor:
             'w_queue': _w('queue', _W_QUEUE),
             'w_util': _w('util', _W_UTIL),
             'sigmoid_k': _num('sigmoid_k', _SIGMOID_K),
+            # One factor on every await/queue half-point (the per-media tables stay
+            # config-only): >1 makes a disk read calmer, <1 more pressured. Ignored when
+            # not a positive number.
+            'half_point_scale': (lambda v: v if v > 0 else 1.0)(_num('half_point_scale', 1.0)),
             'util_half_pct': _media_map('util_half_pct', _UTIL_HALF),
             'activity_util_pct': _num('activity_util_pct', _ACTIVITY_UTIL_PCT),
             'await_half_ms': _media_map('await_half_ms', _AWAIT_HALF_MS),
@@ -444,10 +448,11 @@ class DiskIOMonitor:
             default = _for_media(model['queue_half'], media)
             queue_half = min(float(qd), default) if qd and qd >= 1 else default
 
+        scale = model['half_point_scale']
         return {
             'media': media,
-            'await_half_ms': _for_media(model['await_half_ms'], media),
-            'queue_half': queue_half,
+            'await_half_ms': _for_media(model['await_half_ms'], media) * scale,
+            'queue_half': queue_half * scale,
             'util_half_pct': _for_media(model['util_half_pct'], media),
             'activity_util_pct': model['activity_util_pct'],
         }

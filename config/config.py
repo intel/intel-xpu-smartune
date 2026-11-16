@@ -47,16 +47,21 @@ class Config:
     # None/empty falls back to a built-in default set. Not exposed in the UI.
     shell_tools: list = None
     cooldown_time: float = 15
-    cpu_busy_threshold: float = 90
+    cpu_busy_threshold: float = 90.0
     # Must track config.yaml: this default only applies when the key is missing,
     # so a mismatch means a config without the key behaves unlike every config
     # with it -- and memory_busy_threshold is the centre of the mem_scarcity
     # sigmoid, so the two values classify different machines as critical.
-    memory_busy_threshold: float = 80
+    memory_busy_threshold: float = 80.0
     # Steepness of the sigmoid (logistic) memory scarcity gate in pressure.py
     # (larger = sharper transition around the memory "busy" point). See
     # PressureAnalyzer._mem_scarcity_gate.
     mem_gate_steepness: float = 8.0
+    # EWMA smoothing of the non-critical pressure score, per channel (larger = reacts
+    # faster). Critical is entered from the raw score and is unaffected. Must track
+    # config.yaml; see PressureAnalyzer._ewma_alpha for the validity check.
+    system_score_ewma_alpha: float = 0.3
+    disk_score_ewma_alpha: float = 0.3
     regular_update_sys_pressure_time: float = 5
     monitor_idle_check_interval: float = 10
     # How often (seconds) the reaper checks whether a limited app has closed
@@ -752,7 +757,7 @@ class Config:
         """Persist the hardware-independent knobs of ``disk_pressure_model``::
 
             {"sub_weights": {"latency": 0.55, "queue": 0.35, "util": 0.10},
-             "sigmoid_k": 8.0, "max_p_weight": 0.8}
+             "sigmoid_k": 8.0, "max_p_weight": 0.8, "half_point_scale": 1.0}
 
         The per-media half-point maps are not settable here: they are calibrated per
         device class and are edited in config.yaml. Only changed leaves are rewritten
@@ -781,7 +786,7 @@ class Config:
                         current[key] = val
                         yaml_updates[("disk_pressure_model", "sub_weights", key)] = val
 
-            for key in ("sigmoid_k", "max_p_weight"):
+            for key in ("sigmoid_k", "max_p_weight", "half_point_scale"):
                 if key not in updates:
                     continue
                 try:

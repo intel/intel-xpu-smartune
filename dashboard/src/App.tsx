@@ -145,6 +145,13 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
   const [shutdownEnabled, setShutdownEnabled] = useState(false)
   // Set from the Processes tab's "Add to balancer" action; consumed by the Balance tab.
   const [registerKeyword, setRegisterKeyword] = useState<string | null>(null)
+  // Asks the Control Center to show App Control. Without it the Control Center reopens on
+  // whichever sub-tab was used last, e.g. Device Control, when a link meant the apps.
+  const [appControlIntent, setAppControlIntent] = useState(0)
+  const openAppControl = () => {
+    setAppControlIntent((n) => n + 1)
+    setActiveTab('optimizer')
+  }
   // Gate the whole app behind a valid access token. A stored token is assumed
   // valid until the server rejects a request with 401 (handled below).
   const [authed, setAuthed] = useState(() => !!getToken())
@@ -291,6 +298,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
               type="primary"
               size="small"
               onClick={() => {
+                setAppControlIntent((n) => n + 1)
                 setActiveTab('optimizer')
                 notify.destroy(`frozen-long-${event.app_id}`)
               }}
@@ -591,7 +599,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
         <SystemOverview
           active={activeTab === 'overview'}
           colorMode={colorMode}
-          onNavigate={setActiveTab}
+          onNavigate={(tab) => (tab === 'optimizer' ? openAppControl() : setActiveTab(tab))}
           onOpenDiagnostics={(window) => {
             setDiagnosticsRangeIntent((current) => ({
               window,
@@ -719,6 +727,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
                 balancerEnabled={balancerEnabled}
                 registerKeyword={registerKeyword}
                 onRegisterConsumed={() => setRegisterKeyword(null)}
+                appControlIntent={appControlIntent}
               />
             ),
           },
@@ -745,7 +754,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
             // balancer to block a run), so the prop is left off.
             children: (
               <Benchmark
-                onOpenBalance={balancerEnabled ? () => setActiveTab('optimizer') : undefined}
+                onOpenBalance={balancerEnabled ? openAppControl : undefined}
                 onOpenNetworkSettings={() => {
                   setSettingsTabIntent((current) => ({
                     key: 'benchmark_network',

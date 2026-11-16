@@ -143,7 +143,7 @@ pip dependencies are bundled into the package as offline wheels.
 packaging/deb/build_deb.sh [VERSION] [OPTIONS]
 ```
 
-`VERSION` defaults to `1.5.0`. Options:
+`VERSION` defaults to `1.8.0`. Options:
 
 - `--full` (alias `--all`): build the full `smartune` package; the default is monitor-only.
 - `--skip-ui`: reuse `dashboard/dist` instead of rebuilding the dashboard (it is built anyway if `dashboard/dist/index.html` is missing).

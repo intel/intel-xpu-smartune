@@ -289,6 +289,16 @@ _balancer_available = False
 _benchmark_available = False
 _diagnostics_available = False
 
+# Product version, reported by /smartune/capabilities. packaging/deb/build_deb.sh
+# rewrites this line in the staged copy, so a packaged build always reports its
+# package version; a source checkout reports this default.
+SMARTUNE_VERSION = "1.8.0"
+
+# Version of the REST surface that clients (the smartune SDK/CLI, agent skills,
+# MCP) depend on. Bump it when a route they use is removed or changes shape, and
+# raise SUPPORTED_API_LEVELS in sdk/smartune_sdk/client.py in the same change.
+API_LEVEL = 1
+
 
 def set_diagnostics_available(available: bool) -> None:
     """Mark whether the diagnostics blueprint (/diag) is mounted on this process.
@@ -325,6 +335,8 @@ def get_capabilities():
     `benchmark`:    1 = the /bench API is mounted, 0 = not available here.
     `shutdown`:     1 = this dashboard may stop the service (packaged only,
                     and only when opened as localhost).
+    `version`:      product version, e.g. "1.8.0".
+    `api_level`:    version of the client-facing REST surface (see API_LEVEL).
 
     Note that benchmark=1 only means the feature is mounted, NOT that its Python
     environment is installed -- the dashboard needs the tab to exist in order to
@@ -336,6 +348,8 @@ def get_capabilities():
             "benchmark": 1 if _benchmark_available else 0,
             "diagnostics": 1 if _diagnostics_available else 0,
             "shutdown": 1 if _can_stop_from_here() else 0,
+            "version": SMARTUNE_VERSION,
+            "api_level": API_LEVEL,
         },
         retmsg="Successfully retrieved capabilities",
     )

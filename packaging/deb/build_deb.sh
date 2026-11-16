@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-VERSION="1.5.0"
+VERSION="1.8.0"
 ARCH="amd64"
 SKIP_UI=0
 FULL=0
@@ -155,6 +155,12 @@ tar -C "$REPO_ROOT" "${STAGE_EXCLUDES[@]}" -cf - "${SRC_PATHS[@]}" | tar -C "$AP
 # pressure relax/tighten bounds read it, because config.yaml itself is edited in place.
 # Taken from the staged file so it is exactly what this package installs.
 install -m 0444 "$APP_DIR/config/config.yaml" "$APP_DIR/config/config.factory.yaml"
+
+# /smartune/capabilities reports the package version (agents check it via
+# `smartune doctor`), so stamp it into the staged copy, not the checkout.
+sed -i "s/^SMARTUNE_VERSION = \".*\"$/SMARTUNE_VERSION = \"$VERSION\"/" "$APP_DIR/smartune_api.py"
+grep -q "^SMARTUNE_VERSION = \"$VERSION\"$" "$APP_DIR/smartune_api.py" \
+    || { echo "ERROR: could not stamp SMARTUNE_VERSION into smartune_api.py" >&2; exit 1; }
 
 # The built UI (copied fresh so an uncommitted rebuild is picked up).
 mkdir -p "$APP_DIR/dashboard/dist"

@@ -28,6 +28,7 @@ Using the dashboard, one tab at a time. Start with *Getting started*.
 9. [About](user-guide/about.md) — hardware and software inventory
 10. [Common workflows](user-guide/workflows.md) — a few end-to-end tasks
 11. [Troubleshooting & FAQ](user-guide/troubleshooting.md)
+12. [Agent integration](user-guide/agent-integration.md) — deploy the SmarTune skills, CLI and MCP server for OpenClaw or Claude Code
 
 ## Reference
 
@@ -36,6 +37,8 @@ Using the dashboard, one tab at a time. Start with *Getting started*.
 | [Backend API](reference/api.md) | Core REST endpoints (`/auth`, `/smartune`, `/app`, `/monitor`) |
 | [Benchmark API](../benchmark/API_benchmark.md) | `/bench` endpoints (optional feature) |
 | [Diagnostics API](../diagnostics/API_diagnostics.md) | `/diag` endpoints (optional feature) |
+| [Agent API exposure](reference/agent-api-exposure.md) | Which endpoints agents can reach through the `smartune` CLI, skills and MCP server |
+| [SDK, CLI & MCP server](../sdk/README.md) | The `smartune` CLI and `smartune-mcp`: install, configuration variables, every command, exit codes, MCP tools, certificate pinning, tests |
 
 ## Design & internals
 

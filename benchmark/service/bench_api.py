@@ -10,6 +10,8 @@
 # own web server (an unauthenticated stdlib HTTP server on :8001 that would
 # Popen("bash", ...) for any caller) is not carried over.
 
+from typing import Optional
+
 from flask import Blueprint, Response, request, stream_with_context
 
 from utils import quiet_mode
@@ -17,7 +19,7 @@ from utils.http_utils import RetCode, construct_response
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
-from benchmark.service import env, events, jobs, models, netcfg, results, runner
+from benchmark.service import env, events, jobs, models, netcfg, results, runner, params
 
 bench_bp = Blueprint('bench', __name__, url_prefix='/bench')
 
@@ -102,6 +104,69 @@ def get_events():
     return response
 
 
+# --- benchmark parameters -------------------------------------------------
+
+def _param_tool():
+    tool = str(request.args.get("tool") or "").strip()
+    if tool not in params.bench_params.TOOLS:
+        return None
+    return tool
+
+
+@bench_bp.route('/params/schema', methods=['GET'])
+def get_param_schema():
+    """The parameter form for one tool (genai / benchmark_app) on one OpenVINO version.
+
+    The hand-written schema merged with what that version's tool actually
+    accepts; see benchmark/service/params.py. The first request for a version
+    that has not been probed yet waits for the probe (seconds).
+    """
+    tool = _param_tool()
+    if tool is None:
+        return construct_response(retcode=RetCode.ARGUMENT_ERROR,
+                                  retmsg="tool must be one of genai, benchmark_app")
+    ov = str(request.args.get("ov") or "").strip() or None
+    try:
+        data = params.schema(tool, ov)
+    except Exception as e:
+        logger.exception("Failed to build the benchmark parameter schema")
+        return construct_response(retcode=RetCode.EXCEPTION_ERROR,
+                                  retmsg=f"Failed to build the parameter schema: {e}")
+    return construct_response(data=data, retmsg="Successfully retrieved parameter schema")
+
+
+@bench_bp.route('/params/validate', methods=['POST'])
+def post_param_validate():
+    """Check one tool's configuration the way a run would; returns its case count."""
+    body = request.get_json(silent=True) or {}
+    tool = str(body.get("tool") or "")
+    if tool not in params.bench_params.TOOLS:
+        return construct_response(retcode=RetCode.ARGUMENT_ERROR,
+                                  retmsg="tool must be one of genai, benchmark_app")
+    ov = str(body.get("ov") or "").strip() or None
+    return construct_response(data=params.validate(tool, ov, body.get("config")),
+                              retmsg="Validated")
+
+
+@bench_bp.route('/params/predict', methods=['GET'])
+def get_param_predict():
+    """Which benchmark tool the router will give a model, so its form opens first."""
+    model_id = str(request.args.get("model") or "").strip()
+    ov = str(request.args.get("ov") or "").strip()
+    if not runner._MODEL_ID_RE.match(model_id) or not runner._OV_VERSION_RE.match(ov):
+        return construct_response(retcode=RetCode.ARGUMENT_ERROR,
+                                  retmsg="model and ov (X.Y.Z) are required")
+    try:
+        data = params.predict(model_id, ov)
+    except RuntimeError as e:
+        return construct_response(retcode=RetCode.NOT_EFFECTIVE, retmsg=str(e))
+    except Exception as e:
+        logger.exception("Failed to predict the benchmark tool")
+        return construct_response(retcode=RetCode.EXCEPTION_ERROR,
+                                  retmsg=f"Failed to predict the benchmark tool: {e}")
+    return construct_response(data=data, retmsg="Successfully predicted benchmark tool")
+
+
 # --- environment ----------------------------------------------------------
 
 @bench_bp.route('/env', methods=['GET'])
@@ -114,6 +179,13 @@ def get_env():
     """
     try:
         data = env.probe()
+        # Probe each installed OpenVINO version's tools for the parameter schema
+        # in the background, so the model configuration form is ready when opened.
+        # A no-op once cached.
+        try:
+            params.warm(data.get("ov_versions") or [])
+        except Exception:
+            logger.exception("Could not start the benchmark parameter probe")
         setup_job = jobs.manager.latest(kind="setup")
         data["setup_job"] = setup_job.to_dict() if setup_job else None
         current = jobs.manager.current()
@@ -442,6 +514,20 @@ def delete_model_local():
 
 # --- runs -----------------------------------------------------------------
 
+def _rounds_arg(body: dict) -> dict:
+    """The repetition settings of a run request (runner.normalize_rounds):
+    ``rounds``, ``sample_rounds`` (list, "all" or "none") and ``warmup``."""
+    return {"rounds": body.get("rounds"), "sample_rounds": body.get("sample_rounds"),
+            "warmup": bool(body.get("warmup"))}
+
+
+def _plan_arg(body: dict) -> Optional[str]:
+    """The id of the plan job the run was reviewed from, or None (an older client):
+    runner.start_run counts the case cap off that plan rather than an upper bound."""
+    plan = body.get("plan")
+    return str(plan) if plan else None
+
+
 @bench_bp.route('/run', methods=['POST'])
 def post_run():
     """Start a pipeline run over the selected models."""
@@ -454,7 +540,8 @@ def post_run():
     # Required for a benchmark (validated in runner); ignored for a build/download.
     ov = body.get("ov")
     try:
-        job = runner.start_run(body.get("models") or [], stage, devices, ov)
+        job = runner.start_run(body.get("models") or [], stage, devices, ov,
+                               rounds=_rounds_arg(body), plan_id=_plan_arg(body))
     except runner.InvalidRunRequest as e:
         return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg=str(e))
     except jobs.BenchBusy as exc:
@@ -538,8 +625,9 @@ def get_run_plan(run_id):
 def post_run_advanced():
     """Phase 2 of an advanced run: run the request with the operator's edits.
 
-    Same body as ``/run`` plus ``commands``, a map of case_key -> the command the
-    operator edited in the plan review. It must describe the same models/stage/
+    Same body as ``/run`` (including ``rounds`` / ``sample_rounds`` / ``warmup``)
+    plus ``commands``, a map of case_key -> the command the operator edited in the
+    plan review, and ``skip``, the case_keys they unticked. It must describe the same models/stage/
     devices/ov the plan was built from, so the rendered case_keys line up with the
     keys here; a key that matches no case simply never fires.
     """
@@ -553,9 +641,16 @@ def post_run_advanced():
             retcode=RetCode.ARGUMENT_ERROR,
             retmsg="commands must be an object of case_key -> command",
         )
+    skip = body.get("skip") or []
+    if not isinstance(skip, list):
+        return construct_response(
+            retcode=RetCode.ARGUMENT_ERROR,
+            retmsg="skip must be a list of case_keys",
+        )
     try:
         job = runner.start_run(
             body.get("models") or [], stage, devices, ov, cmd_overrides=commands,
+            skip_cases=skip, rounds=_rounds_arg(body), plan_id=_plan_arg(body),
         )
     except runner.InvalidRunRequest as e:
         return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg=str(e))

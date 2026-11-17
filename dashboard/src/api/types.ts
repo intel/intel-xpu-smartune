@@ -1229,6 +1229,107 @@ export interface BenchPlanCommand {
   device: string
   model_dir: string
   command: string
+  // The parameter-sweep combination this case is (gen_wrapper.py). Absent from a
+  // plan made by a pipeline older than sweeps.
+  tool?: BenchTool | null
+  variant_id?: string | null
+  params?: Record<string, BenchParamValue>
+  swept?: Record<string, BenchParamValue>
+  // A combination that cannot run as configured (a parameter its task does not
+  // take, a shape that disagrees with the batch size). It is skipped unless its
+  // command is edited.
+  errors?: string[]
+  warnings?: string[]
+}
+
+/** How many times a run measures every case (benchmark/service/runner.py
+ *  normalize_rounds): `sample_rounds` are the 1-based rounds the hardware sampler
+ *  runs in full for; `warmup` adds an unreported round 0 first. */
+export interface BenchRounds {
+  rounds: number
+  sample_rounds: number[]
+  warmup: boolean
+}
+
+// --- benchmark parameters (benchmark/scripts/params/bench_params.py) --------
+
+export type BenchTool = 'genai' | 'benchmark_app'
+export type BenchParamValue = string | number | boolean
+
+/** One tool's settings for a model. A list of more than one value is swept;
+ *  parameters in one `zip` group advance together instead of multiplying. */
+export interface BenchToolConfig {
+  params: Record<string, BenchParamValue | BenchParamValue[]>
+  zip?: string[][]
+}
+
+/** A model's settings per tool; only the section for the tool the router picks
+ *  is used, so a model can carry both. */
+export type BenchConfig = Partial<Record<BenchTool, BenchToolConfig>>
+
+export interface BenchParamSpec {
+  name: string
+  flags: string[]
+  type: 'int' | 'float' | 'str' | 'enum' | 'bool' | 'shape' | 'file'
+  label?: string
+  help?: string
+  default?: BenchParamValue | null
+  choices?: string[]
+  min?: number
+  max?: number
+  pattern?: string
+  // genai tasks it applies to; absent/null means every task.
+  tasks?: string[] | null
+  sweep?: boolean
+  short?: string
+  source?: string
+  // Known only from the installed tool's parser, not the hand-written schema.
+  advanced?: boolean
+  // false: the installed tool no longer has it. null: not checked (the
+  // OpenVINO version is not installed or could not be probed).
+  available: boolean | null
+  // What the tool itself falls back to when the flag is not passed. For the
+  // help text only: it is never put on the command line.
+  tool_default?: BenchParamValue
+}
+
+export interface BenchPromptFile {
+  name: string
+  tasks: string[] | null
+}
+
+export interface BenchParamSchema {
+  tool: BenchTool
+  ov: string | null
+  probed: boolean
+  probe_error: string | null
+  source: string | null
+  params: BenchParamSpec[]
+  prompt_files: BenchPromptFile[]
+  limits: { max_values: number; max_variants: number }
+}
+
+export interface BenchParamValidation {
+  ok: boolean
+  error: string | null
+  variants: number
+}
+
+/** Which tool the router will give a model (scripts/routing/predict_bench_tool.py). */
+export interface BenchToolPrediction {
+  model: string
+  // built: the router's own rules over the IR on disk. not_built: nothing is
+  // downloaded yet, so there is no IR to route -- download first.
+  source: 'built' | 'not_built'
+  tool: string | null
+  tools: string[]
+  task: string | null
+  // Each built precision's tool and task -- how a model whose precisions route
+  // to different tools is told apart.
+  precisions?: Record<string, { tool: string | null; task: string | null }>
+  // What each routed tool runs with when nothing is set: the task's defaults
+  // plus the schema's (genai), the detected input shape (benchmark_app).
+  defaults?: Partial<Record<BenchTool, Record<string, BenchParamValue>>>
 }
 
 // The plan phase's progress: the print-only job plus the commands it has listed.
@@ -1649,6 +1750,18 @@ export interface BenchMatrixRow {
   quant: string
   mode: string
   batch_size: string
+  // The parameter-sweep combination this case was, every parameter it ran with,
+  // and which of them its sweep varied. Empty for a case from before sweeps.
+  variant?: string
+  params?: Record<string, string>
+  swept?: string[]
+  // Multi-round runs: which round this case is (0 = the warm-up, left out of
+  // every median), of how many, and whether the hardware sampler ran in full for
+  // it. null / true for a single-round run.
+  round?: number | null
+  rounds?: number | null
+  sampled?: boolean
+  warmup?: boolean
   status: string
   task: string
   case_dir: string

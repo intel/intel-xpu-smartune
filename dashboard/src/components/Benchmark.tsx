@@ -27,6 +27,7 @@ import type {
   BenchPrecision,
   BenchPreflightBlocker,
   BenchPreflightData,
+  BenchRounds,
   BenchStage,
   DynamicInfoData,
   StaticInfoData,
@@ -42,6 +43,7 @@ import BenchModelDetail, { missingPrecisions } from './BenchModelDetail'
 import { applicablePrecisions, type ModelParams } from './BenchModelDetail'
 import BenchModelDeleteModal from './BenchModelDeleteModal'
 import BenchModelDrawer from './BenchModelDrawer'
+import { cleanBenchConfig } from './BenchParamsEditor'
 import BenchModelList, { type ModelFilter } from './BenchModelList'
 import BenchModelTiles from './BenchModelTiles'
 import BenchOutput, { JobStatusTag } from './BenchOutput'
@@ -63,6 +65,45 @@ const SIDER_WIDTH = 320
 // Narrowest workspace beside the list before the page switches to one pane.
 const MIN_WORKSPACE_WIDTH = 420
 
+// How often the run review asks whether its plan has finished, and how long it
+// waits after a failed ask.
+const PLAN_POLL_MS = 300
+const PLAN_POLL_RETRY_MS = 1200
+
+// Where every model's run settings are kept between visits. Versioned so a
+// change of shape starts clean rather than feeding old entries to new code.
+const SAVED_PARAMS_KEY = 'smartune.bench.modelParams.v1'
+
+function loadSavedParams(): Record<string, ModelParams> {
+  try {
+    const raw = window.localStorage.getItem(SAVED_PARAMS_KEY)
+    const parsed = raw ? JSON.parse(raw) : {}
+    if (!parsed || typeof parsed !== 'object') return {}
+    const out: Record<string, ModelParams> = {}
+    for (const [id, value] of Object.entries(parsed as Record<string, Partial<ModelParams>>)) {
+      if (!value || !Array.isArray(value.precisions) || !Array.isArray(value.devices)) continue
+      out[id] = {
+        precisions: value.precisions,
+        devices: value.devices,
+        ov: String(value.ov ?? ''),
+        args: String(value.args ?? ''),
+        bench: (value.bench && typeof value.bench === 'object' ? value.bench : {}) as ModelParams['bench'],
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function storeSavedParams(all: Record<string, ModelParams>) {
+  try {
+    window.localStorage.setItem(SAVED_PARAMS_KEY, JSON.stringify(all))
+  } catch {
+    // Storage full or disabled: the settings still hold for this visit.
+  }
+}
+
 // Benchmark Results is what ran, Analysis is how the runs stack up, Logs is the
 // live output. The keys keep the old short names: they are state, not labels.
 type MainTab = 'results' | 'compare' | 'output'
@@ -75,6 +116,10 @@ interface PendingRun {
   /** The command edits the review was left with, carried through the gate so
    *  answering it does not lose them. Empty for a download. */
   edits: Record<string, string>
+  /** The cases unticked in the review (case_keys). */
+  skip: string[]
+  /** How many times each case is measured, chosen in the review. */
+  rounds?: BenchRounds
 }
 
 /** The models array a run request carries; identical for a run and its plan. */
@@ -220,6 +265,10 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
   // there, so the server groups the models that agree about them and runs the
   // groups in sequence (benchmark/service/runner.py, run_groups).
   const [params, setParams] = useState<Record<string, ModelParams>>({})
+  // Every model's settings as last edited, kept across reloads and across the
+  // tile being closed: the benchmark parameters in particular are model-specific
+  // work the user should not have to redo before each Run.
+  const saved = useRef<Record<string, ModelParams>>(loadSavedParams())
   // What a model gets when it is first ticked: the last settings the user chose,
   // so a batch does not have to be configured one tile at a time. All three
   // devices to begin with, which is what the pipeline swept before the request
@@ -230,6 +279,7 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
     devices: ['cpu', 'gpu', 'npu'],
     ov: '',
     args: '',
+    bench: {},
   })
 
   const [job, setJob] = useState<BenchJob | null>(null)
@@ -349,7 +399,7 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
       const next: Record<string, ModelParams> = {}
       let changed = tileIds.length !== Object.keys(prev).length
       tileIds.forEach((id) => {
-        next[id] = prev[id] ?? defaults
+        next[id] = prev[id] ?? saved.current[id] ?? defaults
         if (!prev[id]) changed = true
       })
       return changed ? next : prev
@@ -362,7 +412,7 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
   const tileParams = useMemo(() => {
     const filled: Record<string, ModelParams> = {}
     tileIds.forEach((id) => {
-      filled[id] = params[id] ?? defaults
+      filled[id] = params[id] ?? saved.current[id] ?? defaults
     })
     return filled
   }, [tileIds, params, defaults])
@@ -383,10 +433,14 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
     })
   }, [tileIds])
 
-  /** Change one model's settings, and make them the default for the next tile. */
+  /** Change one model's settings, and make them the default for the next tile.
+   *  The benchmark parameters are not carried over: they are chosen for one
+   *  model's task, and on another model they would mostly be wrong. */
   const changeParams = useCallback((id: string, next: ModelParams) => {
     setParams((prev) => ({ ...prev, [id]: next }))
-    setDefaults(next)
+    setDefaults({ ...next, bench: {} })
+    saved.current = { ...saved.current, [id]: next }
+    storeSavedParams(saved.current)
   }, [])
 
   // --- REST loads ---------------------------------------------------------
@@ -839,8 +893,9 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
       const payload = ids
         .map((id) => {
           const model = byId.get(id)
-          const own = params[id] ?? defaults
+          const own = params[id] ?? saved.current[id] ?? defaults
           const extra = own.args.trim()
+          const bench = cleanBenchConfig(own.bench)
           return {
             id,
             build: model ? applicablePrecisions(model, own.precisions) : own.precisions,
@@ -850,6 +905,7 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
                   devices: own.devices,
                   ov: own.ov,
                   ...(extra ? { args: extra } : {}),
+                  ...(bench ? { bench } : {}),
                 }),
           }
         })
@@ -875,7 +931,13 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
   // the request the plan was rendered from rather than rebuilding it, so an
   // edit keyed by case_key lands on the case it was shown under.
   const launchRun = useCallback(
-    async (stage: BenchStage, ids: string[], edits: Record<string, string> = {}) => {
+    async (
+      stage: BenchStage,
+      ids: string[],
+      edits: Record<string, string> = {},
+      skip: string[] = [],
+      rounds?: BenchRounds,
+    ) => {
       if (!ids.length) return
       setStarting(true)
       setLaunching(true)
@@ -889,13 +951,16 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
         const payload = planned?.payload ?? built.payload
         const devices = planned ? planned.devices : built.first.devices
         const ov = planned ? planned.ov : built.first.ov
-        const res = Object.keys(edits).length
-          ? await api.startBenchAdvancedRun(payload, 'benchmark', edits, devices, ov)
+        const plan = planned?.jobId ?? undefined
+        const res = Object.keys(edits).length || skip.length
+          ? await api.startBenchAdvancedRun(payload, 'benchmark', edits, devices, ov, skip, rounds, plan)
           : await api.startBenchRun(
               payload,
               stage,
               stage === 'build' ? undefined : devices,
               stage === 'build' ? undefined : ov,
+              stage === 'build' ? undefined : rounds,
+              plan,
             )
         if (res.status === 'conflict') {
           // Two different conflicts arrive on this path. A busy execution slot
@@ -953,15 +1018,21 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
    * one of the things merging the two buttons fixes.
    */
   const proceedRun = useCallback(
-    (stage: BenchStage, ids: string[], edits: Record<string, string> = {}) => {
+    (
+      stage: BenchStage,
+      ids: string[],
+      edits: Record<string, string> = {},
+      skip: string[] = [],
+      rounds?: BenchRounds,
+    ) => {
       if (!ids.length) return
       const conflicts =
         stage === 'build' ? [] : findConflicts(matrix?.rows ?? [], ids, params)
       if (conflicts.length) {
-        setRerun({ stage, ids, conflicts, edits })
+        setRerun({ stage, ids, conflicts, edits, skip, rounds })
         return
       }
-      launchRun(stage, ids, edits)
+      launchRun(stage, ids, edits, skip, rounds)
     },
     [launchRun, matrix?.rows, params],
   )
@@ -1120,8 +1191,8 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
   }, [runReview, models, params, defaults])
 
   const confirmReview = useCallback(
-    (edits: Record<string, string>) => {
-      if (runReview) proceedRun('benchmark', runReview.ids, edits)
+    (edits: Record<string, string>, skip: string[], rounds: BenchRounds) => {
+      if (runReview) proceedRun('benchmark', runReview.ids, edits, skip, rounds)
     },
     [runReview, proceedRun],
   )
@@ -1152,7 +1223,7 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
   const keepAndRun = useCallback(() => {
     const pending = rerun
     setRerun(null)
-    if (pending) launchRun(pending.stage, pending.ids, pending.edits)
+    if (pending) launchRun(pending.stage, pending.ids, pending.edits, pending.skip, pending.rounds)
   }, [launchRun, rerun])
 
   const discardAndRun = useCallback(async () => {
@@ -1179,7 +1250,7 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
       }
       setRerun(null)
       await loadResults()
-      launchRun(pending.stage, pending.ids, pending.edits)
+      launchRun(pending.stage, pending.ids, pending.edits, pending.skip, pending.rounds)
     } catch (e) {
       // The old results are still there, so the run is not started: the user
       // asked for a clean slate and did not get one.
@@ -1192,12 +1263,21 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
   // Poll the plan job until it finishes, filling the review with the commands
   // it lists. Keyed on the job id and the ready flag, not the whole `runReview`
   // object, so a command update does not tear down and restart the timer (which
-  // would busy-loop the endpoint). The interval clears itself the moment the
-  // plan reports ready.
+  // would busy-loop the endpoint). Polling stops the moment the plan reports
+  // ready.
+  //
+  // A plan takes well under a second, so it is polled quickly -- the review is
+  // waiting on it -- and each poll is scheduled when the previous one answers
+  // rather than on a fixed interval, so a slow reply never stacks requests. A
+  // failed poll backs off to the old pace instead of repeating its error fast.
   useEffect(() => {
     if (!runReview || runReview.ready || !runReview.jobId) return
     const jobId = runReview.jobId
     let cancelled = false
+    let timer: number | undefined
+    const next = (delay: number) => {
+      if (!cancelled) timer = window.setTimeout(poll, delay)
+    }
     const poll = async () => {
       try {
         const data = await api.getBenchPlan(jobId)
@@ -1216,15 +1296,16 @@ export default function Benchmark({ onOpenBalance, onOpenNetworkSettings }: Benc
             : prev,
         )
         if (failed) message.error(failed)
+        if (!data.ready) next(PLAN_POLL_MS)
       } catch (e) {
         if (!cancelled) message.error(e instanceof Error ? e.message : String(e))
+        next(PLAN_POLL_RETRY_MS)
       }
     }
     poll()
-    const timer = window.setInterval(poll, 1200)
     return () => {
       cancelled = true
-      window.clearInterval(timer)
+      window.clearTimeout(timer)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runReview?.jobId, runReview?.ready])

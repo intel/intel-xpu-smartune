@@ -78,6 +78,20 @@ OV_REQS="${SCRIPT_DIR}/requirements/openvino.requirements.txt"   # project OV pi
 # column takes hours to build, and missing a single pure-python wheel is not a
 # reason to tear one down and start over.
 GENERATOR_DEPS=(defusedxml)
+
+# venv_ready <venv_dir>: the venv has openvino and transformers installed.
+#
+# Read from the installed distributions' metadata, not by importing them:
+# `import openvino,transformers` costs ~3s, and every run and every plan paid it
+# just to learn the column exists. A column missing either package still fails
+# here and is (re)built.
+venv_ready() {
+    local dir="$1"
+    [[ -x "${dir}/bin/python" ]] && "${dir}/bin/python" -c \
+        "import importlib.metadata as m; m.version('openvino'); m.version('transformers')" \
+        >/dev/null 2>&1
+}
+
 ensure_generator_deps() {
     local py="$1"
     "${py}" -c "import defusedxml" >/dev/null 2>&1 && return 0
@@ -237,8 +251,7 @@ install_ov_column() {
         else
             dir="${pool}/transformers_${tf}"
         fi
-        if [[ -x "${dir}/bin/python" ]] && \
-           "${dir}/bin/python" -c "import openvino,transformers" >/dev/null 2>&1; then
+        if venv_ready "${dir}"; then
             echo "==== OV ${ov} + tf ${tf}: exists, skip ===="
             continue
         fi
@@ -255,13 +268,13 @@ install_ov_column() {
 }
 
 # ensure <OV>: build the column on demand if it is not already usable. Called at
-# the start of every benchmark run (run_template.sh); a hit is a single import.
+# the start of every benchmark run and plan (run_template.sh); a hit is a metadata
+# read (venv_ready), tens of milliseconds.
 ensure_ov() {
     local ov="$1"
     validate_ov "${ov}"
     local venv="${OV_POOL}/ov_${ov}/venv"
-    if [[ -x "${venv}/bin/python" ]] && \
-       "${venv}/bin/python" -c "import openvino,transformers" >/dev/null 2>&1; then
+    if venv_ready "${venv}"; then
         echo ">> OV ${ov}: already built, skipping."
         # Columns built before a generator dep was introduced still need it:
         # run_template.sh activates this venv and then runs gen_wrapper in it.

@@ -27,6 +27,13 @@ from benchmark.service import privilege
 # plenty, and the load the sampler itself adds stays negligible.
 DEFAULT_PERIOD_S = 0.5
 
+# While the run has paused full sampling (see RunSampler.control_path), a light
+# row -- memory, page cache, swap, CPU package temperature, all plain /proc and
+# sysfs reads -- is still written at this slower rate. It is what gives every
+# round of a multi-round run its pre-run snapshot and memory footprint, at a cost
+# nothing like the full tick's perf counters, GPU busyness and NPU energy reads.
+LIGHT_PERIOD_S = 2.0
+
 # CSV schema. Kept flat and explicit so the analysis script's column map can be
 # read against it, and so a missing collector shows up as an empty cell rather
 # than shifting every column after it.
@@ -43,6 +50,8 @@ COLUMNS = (
     "memory_used_gb",
     "memory_available_gb",
     "memory_used_pct",
+    "memory_cached_gb",
+    "swap_used_gb",
     "memory_bandwidth_gb_s",
     "memory_bandwidth_pct",
     "memory_bandwidth_read_gb_s",
@@ -67,6 +76,29 @@ COLUMNS = (
 )
 
 
+def _meminfo_gb() -> Dict[str, Optional[float]]:
+    """Page cache and swap in use, from /proc/meminfo.
+
+    Neither is in "used" memory, and both say something about a case: a model
+    read from disk sits in the page cache until it is evicted (so a second run of
+    the same weights loads from memory), and swap in use before a run started is
+    memory pressure the run inherited.
+    """
+    fields: Dict[str, float] = {}
+    try:
+        with open("/proc/meminfo", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                name, _, rest = line.partition(":")
+                parts = rest.split()
+                if parts:
+                    fields[name] = float(parts[0]) / (1024 * 1024)  # kB -> GB
+    except (OSError, ValueError):
+        return {"memory_cached_gb": None, "swap_used_gb": None}
+    cached = (fields["Cached"] + fields.get("Buffers", 0.0)) if "Cached" in fields else None
+    swap = (fields["SwapTotal"] - fields.get("SwapFree", 0.0)) if "SwapTotal" in fields else None
+    return {"memory_cached_gb": _round(cached), "swap_used_gb": _round(swap)}
+
+
 def _round(value: Optional[float], digits: int = 2) -> Optional[float]:
     return None if value is None else round(value, digits)
 
@@ -83,10 +115,20 @@ class RunSampler:
     """
 
     def __init__(self, csv_path: Path, period_s: float = DEFAULT_PERIOD_S,
-                 quiet_owner: Optional[str] = None):
+                 quiet_owner: Optional[str] = None,
+                 control_path: Optional[Path] = None):
         self.csv_path = Path(csv_path)
         self.period_s = max(0.1, float(period_s))
         self.rows_written = 0
+        # The pipeline's switch for full sampling. While this file exists the
+        # loop writes only light rows (LIGHT_PERIOD_S); absent, it samples in
+        # full. A multi-round run creates it before each round that is not to be
+        # measured with metrics on and removes it before the ones that are
+        # (run_template.sh), so the collectors' own load stays out of those
+        # rounds' KPIs. The thread keeps running either way: it is also what
+        # renews the quiet-mode lease.
+        self.control_path = Path(control_path) if control_path else None
+        self.paused = False
         # Whose quiet-mode lease this thread renews, if any. The lease is what
         # stops the gate from outliving the run: if this thread dies without its
         # job reaching a terminal status, nothing renews and the watchdog
@@ -191,6 +233,7 @@ class RunSampler:
         return self._last_row
 
     def _loop(self) -> None:
+        last_light = 0.0
         while not self._stop.is_set():
             started = time.monotonic()
             if self.quiet_owner:
@@ -198,8 +241,32 @@ class RunSampler:
                 # manually down: the lease exists to stop the hold from leaking,
                 # not to record whether the gate is up.
                 quiet_mode.heartbeat(self.quiet_owner)
+            paused = self.control_path is not None and self.control_path.exists()
+            if paused != self.paused:
+                self.paused = paused
+                logger.info("Benchmark sampler %s", "paused (light rows only)" if paused else "resumed")
+                if not paused:
+                    # Re-baseline every delta collector and skip this tick, so the
+                    # first full row covers one real period rather than the whole
+                    # pause -- and the GPU's energy delta is not taken over the
+                    # microseconds since its new baseline.
+                    if self._cpu is not None:
+                        self._cpu.prime()
+                    if self._gpu is not None:
+                        self._gpu.sample()
+                    if self._membw is not None:
+                        self._membw.sample()
+                    self._stop.wait(self.period_s)
+                    continue
+            if paused and started - last_light < LIGHT_PERIOD_S:
+                self._stop.wait(self.period_s)
+                continue
             try:
-                row = self._sample()
+                if paused:
+                    last_light = started
+                    row = self._sample_light()
+                else:
+                    row = self._sample()
                 self._last_row = row
                 if self._writer is not None:
                     self._writer.writerow(row)
@@ -212,6 +279,27 @@ class RunSampler:
             # Subtract the work we just did, so the row rate stays at the
             # requested period instead of period + collection time.
             self._stop.wait(max(0.0, self.period_s - (time.monotonic() - started)))
+
+    def _sample_light(self) -> Dict[str, Any]:
+        """Memory and temperature only: what a paused round still records."""
+        row: Dict[str, Any] = {"timestamp_s": round(time.time(), 6)}
+        try:
+            mem = mem_metrics.get_memory_dynamic()
+            total, available = mem.get("total_gb"), mem.get("available_gb")
+            row["memory_used_gb"] = (
+                _round(total - available) if total is not None and available is not None else None)
+            row["memory_available_gb"] = available
+            row["memory_used_pct"] = mem.get("usage_percent")
+        except Exception:
+            pass
+        row.update(_meminfo_gb())
+        try:
+            temps = cpu_metrics.get_cpu_temperatures()
+            row["cpu_package_temp_c"] = temps.get("package_c")
+            row["cpu_package_tjmax_c"] = temps.get("package_tjmax_c")
+        except Exception:
+            pass
+        return row
 
     def _sample(self) -> Dict[str, Any]:
         row: Dict[str, Any] = {"timestamp_s": round(time.time(), 6)}
@@ -278,6 +366,7 @@ class RunSampler:
         except Exception:
             out.update({"memory_used_gb": None, "memory_available_gb": None,
                         "memory_used_pct": None})
+        out.update(_meminfo_gb())
 
         bw = self._membw.sample() if self._membw is not None else {}
         devices = bw.get("devices") or {}

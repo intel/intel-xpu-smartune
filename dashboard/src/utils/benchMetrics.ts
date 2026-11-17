@@ -132,9 +132,32 @@ export function bestValue(
 // are grouped under the test they belong to, and the best of them represents the
 // group wherever one row is all there is room for.
 
+/**
+ * Every benchmark parameter a case ran with, canonically ordered. Two cases of
+ * one parameter sweep differ here, so they are two tests; the same combination
+ * measured again by another job is the same string, so it is a repetition.
+ * Serialized as JSON rather than joined: a free-text value (a prompt) may hold
+ * "&" or "=" itself, and joined it could pass for another set of parameters.
+ */
+export function paramsKey(row: BenchMatrixRow): string {
+  return JSON.stringify(
+    Object.entries(row.params ?? {}).sort(([a], [b]) => a.localeCompare(b)),
+  )
+}
+
+/** The parameters this case's sweep varied, for a label: "batch_size=4 · shape=[4,3,640,640]". */
+export function paramsLabel(row: BenchMatrixRow): string {
+  const params = row.params ?? {}
+  return (row.swept ?? [])
+    .filter((k) => params[k] !== undefined)
+    .map((k) => `${k}=${params[k]}`)
+    .join(' · ')
+}
+
 /** What makes two measurements the same test rather than two tests. */
 export function testKey(row: BenchMatrixRow): string {
-  return [row.backend, row.model, row.precision || row.quant, row.device, row.batch_size, row.mode]
+  return [row.backend, row.model, row.precision || row.quant, row.device, row.batch_size, row.mode,
+          paramsKey(row)]
     .join('\u0000')
 }
 
@@ -180,6 +203,8 @@ export function groupByTest(
   const seenCase = new Map<string, Set<string>>()
   const byTest = new Map<string, BenchMatrixRow[]>()
   for (const row of rows) {
+    // A multi-round run's warm-up round is recorded but not a measurement.
+    if (row.warmup) continue
     const key = testKey(row)
     const cases = seenCase.get(key) ?? new Set<string>()
     const caseId = row.case_dir || row.log_file
@@ -351,4 +376,93 @@ export function deviceLabel(device: string): string {
 export function matchesModel(name: string, modelId: string): boolean {
   const normalize = (value: string) => value.toLowerCase().replace(/[/_.-]/g, '')
   return normalize(name ?? '').includes(normalize(modelId.split('/').pop() ?? modelId))
+}
+
+// --- multi-round runs ------------------------------------------------------
+//
+// A run can measure every case several times, each round in its own run
+// directory (benchmark/templates/run_template.sh). Within one job the rounds of a
+// configuration are folded the way the report folds them
+// (benchmark/scripts/analysis/analyze.py load_records): the warm-up is dropped,
+// KPIs come from the rounds the hardware sampler was paused for (its own load is
+// not in them) and everything else from the rounds it ran in full for, each side
+// falling back to all rounds when it has none.
+
+function median(values: number[]): number | undefined {
+  if (!values.length) return undefined
+  const v = [...values].sort((a, b) => a - b)
+  const mid = Math.floor(v.length / 2)
+  return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2
+}
+
+export interface RoundGroup {
+  key: string
+  /** Every round of this configuration, warm-up first. */
+  rounds: BenchMatrixRow[]
+  /** The rounds the medians were taken over (no warm-up). */
+  measured: BenchMatrixRow[]
+  /** One row standing for the configuration: folded metrics, and the identity
+   *  and case directory of a measured round (a sampled one when there is one,
+   *  so its drawer has the hardware curves). */
+  row: BenchMatrixRow
+  /** The primary KPI over the repetitions its median came from. */
+  primary?: { n: number; cv?: number; min: number; max: number }
+}
+
+/** Whether any of these rows came from a multi-round run. */
+export function hasRounds(rows: BenchMatrixRow[]): boolean {
+  return rows.some((row) => row.round != null)
+}
+
+/** Fold one job's rounds into one row per configuration. */
+export function foldRounds(rows: BenchMatrixRow[], primaryMetric?: string | null): RoundGroup[] {
+  const byConfig = new Map<string, BenchMatrixRow[]>()
+  for (const row of rows) {
+    const key = [row.backend, row.model, row.quant || row.precision, row.device, row.variant ?? '',
+                 paramsKey(row)].join('\u0000')
+    byConfig.set(key, [...(byConfig.get(key) ?? []), row])
+  }
+  const groups: RoundGroup[] = []
+  for (const [key, list] of byConfig) {
+    const rounds = [...list].sort((a, b) => (a.round ?? 0) - (b.round ?? 0))
+    const measured = rounds.filter((row) => !row.warmup)
+    const on = measured.filter((row) => row.sampled !== false)
+    const off = measured.filter((row) => row.sampled === false)
+    const metricKeys = new Set(measured.flatMap((row) => Object.keys(row.metrics ?? {})))
+    const values = (from: BenchMatrixRow[], k: string) =>
+      from.map((row) => row.metrics?.[k]).filter((v): v is number => Number.isFinite(v))
+    const metrics: Record<string, number> = {}
+    for (const k of metricKeys) {
+      const kpi = k.startsWith('kpi')
+      const preferred = values(kpi ? off : on, k)
+      const folded = median(preferred.length ? preferred : values(measured, k))
+      if (folded !== undefined) metrics[k] = folded
+    }
+    const rep = on[0] ?? measured[0] ?? rounds[0]
+    const ok = measured.filter((row) => row.status === 'ok').length
+    const row: BenchMatrixRow = {
+      ...rep,
+      metrics,
+      status: ok === measured.length ? 'ok' : ok === 0 ? rep.status : `${ok}/${measured.length} ok`,
+    }
+    let primary: RoundGroup['primary']
+    if (primaryMetric) {
+      const kOff = values(off, primaryMetric)
+      const v = kOff.length ? kOff : values(measured, primaryMetric)
+      if (v.length) {
+        const mean = v.reduce((a, b) => a + b, 0) / v.length
+        const sd = v.length > 1
+          ? Math.sqrt(v.reduce((a, b) => a + (b - mean) ** 2, 0) / (v.length - 1))
+          : undefined
+        primary = {
+          n: v.length,
+          cv: sd !== undefined && mean ? (sd / mean) * 100 : undefined,
+          min: Math.min(...v),
+          max: Math.max(...v),
+        }
+      }
+    }
+    groups.push({ key, rounds, measured, row, primary })
+  }
+  return groups
 }

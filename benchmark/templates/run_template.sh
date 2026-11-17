@@ -134,13 +134,63 @@ python "$SCRIPT_GEN_WRAPPER" \
 end=$(date +%s)
 echo "GenAI script generation duration: $((end - begin)) seconds"
 
-begin=$(date +%s)
-python "$SCRIPT_EXECUTE_WRAPPER" \
-  --scripts-metadata "$DIR_LOGS/benchmark_genai_scripts.json" \
-  --timeout "$TIMEOUT_BENCHMARK" \
-  --output "$DIR_LOGS/benchmark_genai_results.json"
-end=$(date +%s)
-echo "GenAI benchmark execution duration: $((end - begin)) seconds"
+# Rounds: every case measured BENCH_ROUNDS times (runner.py normalize_rounds),
+# round by round -- all cases once, then all of them again -- so drift over the
+# run (temperature, background load) lands on every configuration alike rather
+# than on whichever ran last. Route and wrapper generation above happen once;
+# only execution repeats. A plan pass runs one round: it only lists commands.
+#
+# Each round writes its own run directories: the commons append "_r<k>" to the
+# run name when BENCH_ROUND is set, so round k of this run lands in
+# "<BENCH_RUN_NAME>_r<k>_<DEVICE>". A single-round run sets none of this and
+# writes exactly the directories it always did.
+#
+# BENCH_SAMPLE_ROUNDS lists the rounds the hardware sampler runs in full for.
+# For the others the sampler is paused -- BENCH_SAMPLER_CONTROL is the file it
+# watches -- and records only light memory/temperature rows, so its own load
+# stays out of those rounds' KPIs. BENCH_WARMUP_ROUND=1 adds a round 0 first,
+# recorded but left out of the report's medians.
+_rounds="${BENCH_ROUNDS:-1}"
+[ -n "${BENCH_PRINT_ONLY:-}" ] && _rounds=1
+_first_round=1
+[ "${BENCH_WARMUP_ROUND:-0}" = "1" ] && [ -z "${BENCH_PRINT_ONLY:-}" ] && _first_round=0
+
+_round_is_sampled() {
+  local r
+  [ "$1" = "0" ] && return 1
+  for r in ${BENCH_SAMPLE_ROUNDS-1}; do [ "$r" = "$1" ] && return 0; done
+  return 1
+}
+
+for ((_round = _first_round; _round <= _rounds; _round++)); do
+  if [ "$_rounds" -gt 1 ] || [ "$_first_round" = "0" ]; then
+    export BENCH_ROUND="$_round"
+    export BENCH_ROUNDS_TOTAL="$_rounds"
+  else
+    unset BENCH_ROUND BENCH_ROUNDS_TOTAL
+  fi
+  if _round_is_sampled "$_round"; then
+    export BENCH_ROUND_SAMPLED=1
+    [ -n "${BENCH_SAMPLER_CONTROL:-}" ] && rm -f "$BENCH_SAMPLER_CONTROL"
+  else
+    export BENCH_ROUND_SAMPLED=0
+    [ -n "${BENCH_SAMPLER_CONTROL:-}" ] && : > "$BENCH_SAMPLER_CONTROL"
+  fi
+  [ -n "${BENCH_ROUND:-}" ] && echo "=== round ${BENCH_ROUND}/${_rounds}$([ "$_round" = "0" ] && echo " (warm-up)") \
+    -- full sampling: $([ "$BENCH_ROUND_SAMPLED" = "1" ] && echo on || echo off)"
+
+  begin=$(date +%s)
+  python "$SCRIPT_EXECUTE_WRAPPER" \
+    --scripts-metadata "$DIR_LOGS/benchmark_genai_scripts.json" \
+    --timeout "$TIMEOUT_BENCHMARK" \
+    --output "$DIR_LOGS/benchmark_genai_results${BENCH_ROUND:+_r${BENCH_ROUND}}.json"
+  end=$(date +%s)
+  echo "GenAI benchmark execution duration${BENCH_ROUND:+ (round ${BENCH_ROUND})}: $((end - begin)) seconds"
+done
+# Leave the sampler in full mode for whatever follows (aggregation reads no
+# samples, but a stale pause must not outlive the rounds).
+[ -n "${BENCH_SAMPLER_CONTROL:-}" ] && rm -f "$BENCH_SAMPLER_CONTROL"
+unset BENCH_ROUND BENCH_ROUNDS_TOTAL BENCH_ROUND_SAMPLED
 fi
 # =============== Data aggregation ===============
 # Skipped entirely for a plan (print-only) pass: a plan runs route -> gen_wrapper
@@ -198,14 +248,15 @@ for _bench_mode in genai app; do
   # The samples that DO cover them are still on disk -- benchmark/service/runner.py
   # keeps one CSV per run under DIR_RUNS, named after the run id that the
   # directory itself carries ("<timestamp>_<run_id>_<DEVICE>", with a "_g<n>"
-  # before the device when the run was split into groups) -- so the numbers are
+  # before the device when the run was split into groups and an "_r<k>" when it
+  # measured several rounds) -- so the numbers are
   # recomputed once, into the run's own file, and never disturbed again.
   for _run_dir in "$_backend_dir"/*/; do
     _run_dir="${_run_dir%/}"
     [ -f "$_run_dir/windowed_metric_medians.csv" ] && continue
     case "$(basename "$_run_dir")" in "${BENCH_RUN_NAME}"_*) continue ;; esac
     _run_id=$(basename "$_run_dir" \
-      | sed -n 's/^[0-9]\{8\}_[0-9]\{6\}_\([0-9a-f]\{1,\}\)\(_g[0-9]\{1,\}\)\{0,1\}_[A-Za-z]\{1,\}$/\1/p')
+      | sed -n 's/^[0-9]\{8\}_[0-9]\{6\}_\([0-9a-f]\{1,\}\)\(_g[0-9]\{1,\}\)\{0,1\}\(_r[0-9]\{1,\}\)\{0,1\}_[A-Za-z]\{1,\}$/\1/p')
     [ -n "$_run_id" ] || continue
     _past_csv="$DIR_RUNS/run_${_run_id}_metrics.csv"
     [ -f "$_past_csv" ] || continue
@@ -256,12 +307,29 @@ done
 # Last, deliberately: it is a note about the run, and a failure to write it must
 # not cost the results it describes. Absent from every run measured before this
 # block existed, which reads as unknown rather than as a wrong version.
+#
+# A round's directory also records which round it is, of how many, and whether
+# the sampler ran in full for it -- the series is BENCH_RUN_NAME, which every
+# round of this run shares.
 if [ -n "${BENCH_RUN_META:-}" ] && [ -n "${BENCH_RUN_NAME:-}" ]; then
   for _bench_mode in genai app; do
     for _run_dir in "$DIR_BENCHMARKS/$_bench_mode/${BENCH_RUN_NAME}"_*; do
       [ -d "$_run_dir" ] || continue
-      printf '%s\n' "$BENCH_RUN_META" > "$_run_dir/run_meta.json" \
-        || echo "[WARN] could not record run metadata in $_run_dir."
+      _round=$(basename "$_run_dir" | sed -n 's/^.*_r\([0-9]\{1,\}\)_[A-Za-z]\{1,\}$/\1/p')
+      # A single-round run's directory has no "_r<k>"; it ran as round 1.
+      _sampled=0
+      _round_is_sampled "${_round:-1}" && _sampled=1
+      python3 - "$BENCH_RUN_META" "$BENCH_RUN_NAME" "$_round" "${BENCH_ROUNDS:-1}" "$_sampled" \
+          > "$_run_dir/run_meta.json" <<'PY' || echo "[WARN] could not record run metadata in $_run_dir."
+import json, sys
+meta, series, rnd, rounds, sampled = sys.argv[1:6]
+payload = json.loads(meta)
+payload["series"] = series
+if rnd:
+    payload.update({"round": int(rnd), "rounds": int(rounds), "warmup": rnd == "0"})
+payload["sampled"] = sampled == "1"
+print(json.dumps(payload, separators=(",", ":")))
+PY
     done
   done
 fi

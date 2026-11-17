@@ -2,27 +2,6 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Merge per-run windowed_metric_medians.csv files into one backend table.
-
-Why this exists:
-- export_windowed_metric_medians.py windows each case against one run-level
-    metrics CSV.
-- Running it over a backend tree with multiple runs can leave older runs with
-    blank hardware medians because their windows are outside the current run's
-    samples.
-- This script merges per-run outputs so each run is aggregated against its own
-    samples.
-
-Merge semantics:
-- One row per case; later inputs win.
-- Callers pass existing backend CSV first and newer per-run CSVs after it.
-- Rows are replaced as a whole (no field back-fill from older rows).
-
-Pruning:
-- Rows whose case_dir no longer exists are dropped by default.
-- --keep-missing keeps those rows for moved/offline result trees.
-"""
-
 import argparse
 import csv
 import sys

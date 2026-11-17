@@ -452,6 +452,38 @@ export default function BenchCaseDrawer({ open, row, metrics, onClose }: Props) 
             { key: 'precision', label: 'Precision', children: row.precision || '-' },
             { key: 'batch', label: 'Batch size', children: row.batch_size || '-' },
             { key: 'mode', label: 'Mode', children: row.mode || '-' },
+            // Multi-round runs: which round this is and how it was measured.
+            ...(row.round != null
+              ? [{
+                  key: 'round',
+                  label: 'Round',
+                  children: row.warmup
+                    ? 'warm-up (not in the medians)'
+                    : `${row.round}${row.rounds ? ` of ${row.rounds}` : ''} · ` +
+                      (row.sampled === false ? 'light sampling (memory, temperature)' : 'full hardware sampling'),
+                }]
+              : []),
+            // Every parameter the case ran with, the swept ones marked.
+            ...(row.params && Object.keys(row.params).length
+              ? [{
+                  key: 'params',
+                  label: 'Parameters',
+                  span: 2,
+                  children: (
+                    <Space size={[4, 4]} wrap>
+                      {Object.entries(row.params).map(([k, v]) => (
+                        <Tag
+                          key={k}
+                          color={row.swept?.includes(k) ? 'blue' : undefined}
+                          style={{ marginInlineEnd: 0 }}
+                        >
+                          {k}={v}
+                        </Tag>
+                      ))}
+                    </Space>
+                  ),
+                }]
+              : []),
             {
               key: 'model_dir',
               label: 'Model directory',

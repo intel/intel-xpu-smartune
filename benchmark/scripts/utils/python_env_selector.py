@@ -145,15 +145,18 @@ def select_venv_for_route(
     Select venv for a route.
 
     Rule:
-    1) If current transformers version is within [min, max], use default venv.
+    1) If the default venv's transformers version is within [min, max], use it.
     2) Otherwise, find a compatible env under python_version_root and choose the
        highest compatible transformers version.
     3) Fallback to default venv when no compatible env is found.
+
+    The route carries only the model's bounds (min/max from its export config);
+    the version they are compared with is read here, from the default venv
+    itself -- the environment being chosen, not whichever one routed the model.
     """
     params = route.get("parameters", {}) if isinstance(route, dict) else {}
     version_info = params.get("version_info", {}) if isinstance(params, dict) else {}
 
-    current_version = _normalize_version(version_info.get("current_transformers_version"))
     min_version = _normalize_version(version_info.get("min_transformers_version"))
     max_version = _normalize_version(version_info.get("max_transformers_version"))
 
@@ -161,12 +164,24 @@ def select_venv_for_route(
     if max_version is None:
         max_version = min_version
 
+    if not min_version and not max_version:
+        return PythonEnvSelection(
+            venv_dir=default_venv_dir,
+            selected_transformers_version=None,
+            source="default",
+            reason="No transformers bounds in route, use default venv",
+        )
+
+    current_version = _read_transformers_version(Path(default_venv_dir)) or _normalize_version(
+        # A routes file written before the bounds were cached without it.
+        version_info.get("current_transformers_version"))
+
     if not current_version:
         return PythonEnvSelection(
             venv_dir=default_venv_dir,
             selected_transformers_version=None,
             source="default",
-            reason="No current_transformers_version in route, fallback to default venv",
+            reason="Could not read the default venv's transformers version, fallback to default venv",
         )
 
     if _version_in_range(current_version, min_version, max_version):

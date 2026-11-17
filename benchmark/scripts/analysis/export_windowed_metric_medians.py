@@ -2,25 +2,10 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Export one summary row per benchmark case from detail.log and metrics CSV.
-
-For each case:
-1) Parse backend KPIs from detail.log.
-2) Determine the measurement window (prefer PIPELINE TIME begin/end; fall back
-    to per-iteration timestamps with warm-up excluded).
-3) Slice metrics CSV to that window and compute per-column medians.
-
-The output is consumed by pivot_report.py / analyze.py and keyed by
-model_name/device/precision/batch_size derived from the case directory.
-
-SmarTune variant: hardware sampling is written in-process to a single run-level
-CSV (benchmark/service/sampler.py) provided via --metrics-csv, rather than
-multiple per-case collector CSVs. Upstream sync for this file requires a manual
-merge of behavior differences.
-"""
 
 import argparse
 import csv
+import json
 import statistics
 from datetime import datetime
 from pathlib import Path
@@ -115,6 +100,8 @@ METRICS_COLUMNS = {
     'memory_used_gb': 'memory_used_gb_median',
     'memory_available_gb': 'memory_available_gb_median',
     'memory_used_pct': 'memory_used_percent_median',
+    'memory_cached_gb': 'memory_cached_gb_median',
+    'swap_used_gb': 'swap_used_gb_median',
     'memory_bandwidth_gb_s': 'memory_bandwidth_gb_s_median',
     'memory_bandwidth_pct': 'memory_bandwidth_percent_median',
     'memory_bandwidth_read_gb_s': 'memory_bandwidth_read_gb_s_median',
@@ -137,6 +124,25 @@ METRICS_COLUMNS = {
 
 # Epoch seconds, matching the begin/end markers in detail.log.
 METRICS_TIMESTAMP_COLUMN = 'timestamp_s'
+
+# The state of the machine just before a case's process launched: what other
+# programs and the page cache already held, how much swap was in use, how hot
+# the package already was. Read from the last sample at or before case.json's
+# launch_ts, within PRE_RUN_LOOKBACK_S of it (the sampler runs at 2 Hz).
+PRE_RUN_COLUMNS = {
+    'memory_used_gb': 'pre_memory_used_gb',
+    'memory_used_pct': 'pre_memory_used_percent',
+    'memory_available_gb': 'pre_memory_available_gb',
+    'memory_cached_gb': 'pre_memory_cached_gb',
+    'swap_used_gb': 'pre_swap_used_gb',
+    'cpu_package_temp_c': 'pre_cpu_package_temp_c',
+    'npu_temperature_c': 'pre_npu_temperature_c',
+}
+PRE_RUN_LOOKBACK_S = 5.0
+
+# Written by run_case (benchmark/scripts/params/case_meta.py).
+CASE_JSON_NAME = 'case.json'
+PARAM_PREFIX = 'param_'
 
 
 def safe_float(value: str | None) -> float | None:
@@ -330,6 +336,30 @@ def median_or_blank(values: list[float]) -> str:
     return f'{statistics.median(values):.6f}'
 
 
+_METRICS_ROWS_CACHE: dict[Path, list[tuple[float, dict[str, str]]]] = {}
+
+
+def _metrics_rows(csv_path: Path) -> list[tuple[float, dict[str, str]]]:
+    """The metrics CSV as (timestamp, row) pairs, sorted, read once per file.
+
+    Every case is windowed out of the same run-level file, so re-reading it per
+    case made aggregation quadratic in the number of cases -- which a parameter
+    sweep multiplies.
+    """
+    cached = _METRICS_ROWS_CACHE.get(csv_path)
+    if cached is not None:
+        return cached
+    rows = []
+    with csv_path.open(encoding='utf-8', newline='') as handle:
+        for row in csv.DictReader(handle):
+            ts = safe_float(row.get(METRICS_TIMESTAMP_COLUMN))
+            if ts is not None:
+                rows.append((ts, row))
+    rows.sort(key=lambda pair: pair[0])
+    _METRICS_ROWS_CACHE[csv_path] = rows
+    return rows
+
+
 def collect_csv_medians(
     csv_path: Path | None,
     start_ts: float,
@@ -348,19 +378,36 @@ def collect_csv_medians(
     buckets: dict[str, list[float]] = {target: [] for target in METRICS_COLUMNS.values()}
     row_count = 0
 
-    with csv_path.open(encoding='utf-8', newline='') as handle:
-        for row in csv.DictReader(handle):
-            ts = safe_float(row.get(METRICS_TIMESTAMP_COLUMN))
-            if ts is None or ts < start_ts or ts > end_ts:
-                continue
-            row_count += 1
-            for source_name, target_name in METRICS_COLUMNS.items():
-                value = safe_float(row.get(source_name))
-                if value is not None:
-                    buckets[target_name].append(value)
+    for ts, row in _metrics_rows(csv_path):
+        if ts < start_ts or ts > end_ts:
+            continue
+        row_count += 1
+        for source_name, target_name in METRICS_COLUMNS.items():
+            value = safe_float(row.get(source_name))
+            if value is not None:
+                buckets[target_name].append(value)
 
     medians.update({key: median_or_blank(values) for key, values in buckets.items()})
     return medians, row_count
+
+
+def collect_pre_run(csv_path: Path | None, launch_ts: float | None) -> dict[str, str]:
+    """PRE_RUN_COLUMNS from the last sample before the case launched, or blanks."""
+    snapshot = {target: '' for target in PRE_RUN_COLUMNS.values()}
+    if csv_path is None or launch_ts is None or not csv_path.is_file():
+        return snapshot
+    before = None
+    for ts, row in _metrics_rows(csv_path):
+        if ts > launch_ts:
+            break
+        if ts >= launch_ts - PRE_RUN_LOOKBACK_S:
+            before = row
+    if before is None:
+        return snapshot
+    for source_name, target_name in PRE_RUN_COLUMNS.items():
+        value = safe_float(before.get(source_name))
+        snapshot[target_name] = '' if value is None else f'{value:.6f}'
+    return snapshot
 
 
 def catogary(case_dir: Path) -> dict[str, str]:
@@ -454,6 +501,91 @@ def catogary(case_dir: Path) -> dict[str, str]:
 
     return result
 
+def load_case_json(case_dir: Path) -> dict | None:
+    path = case_dir / CASE_JSON_NAME
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+_PRECISION_IN_QUANT = re.compile(
+    r'(fp32|fp16|fp64|int8|int4|uint8|uint4|bf16)', re.IGNORECASE)
+
+
+def _param_text(value) -> str:
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    return '' if value is None else str(value)
+
+
+_ROUND_DEVICE_SUFFIX = re.compile(r'(?:_r\d+)?_[A-Za-z]+$')
+
+
+def series_of(case_dir: Path) -> str:
+    """The run a case belongs to, every round of it together: its run directory
+    (the nearest one holding summary.tsv) without the "_r<k>" and device suffix."""
+    for parent in case_dir.parents:
+        if (parent / 'summary.tsv').is_file():
+            return _ROUND_DEVICE_SUFFIX.sub('', parent.name)
+    return ''
+
+
+def describe_case(case_dir: Path) -> tuple[dict[str, str], dict | None]:
+    """The dimensions of one case, and its case.json when it has one.
+
+    With case.json the model, precision, device and parameters are read from it;
+    only the platform still comes from the path, which is where it has always
+    been encoded. Without one (a case from before case.json existed) everything
+    comes from the path, and its bs<N> tag becomes param_batch_size so old and new
+    rows group on the same column.
+    """
+    result = catogary(case_dir)
+    case = load_case_json(case_dir)
+    if case is None:
+        batch = result.get('batch_size', '')
+        if batch.startswith('bs'):
+            result[PARAM_PREFIX + 'batch_size'] = batch[2:]
+        return result, None
+
+    model = str(case.get('model') or '')
+    quant = str(case.get('quant') or '')
+    base = model if (not quant or model.endswith(quant)) else f'{model}_{quant}'
+    result['model_name'], result['model_source'] = strip_precision_suffix(base or case_dir.name)
+    variant = str(case.get('variant_id') or '')
+    result['case_name'] = f'{base}__{variant}' if variant else base
+    device = str(case.get('device') or '').lower()
+    if device:
+        result['device'] = 'gpu' if 'gpu' in device else device
+    match = _PRECISION_IN_QUANT.search(quant)
+    if match:
+        result['precision'] = match.group(1).lower()
+    # The variant directory's name may contain "bs4", which catogary() would
+    # read as a legacy batch tag; the parameter columns below are the real thing.
+    result.pop('batch_size', None)
+    result['tool'] = str(case.get('tool') or '')
+    result['task'] = str(case.get('task') or '')
+    result['variant_id'] = variant
+    result['swept_keys'] = ';'.join(case.get('swept_keys') or [])
+    result['case_status'] = str(case.get('status') or '')
+    result['overridden'] = 'true' if case.get('overridden') else ''
+    # Multi-round runs: which round, whether the sampler ran in full for it, and
+    # whether it was the warm-up. A case of a single-round run has no round and
+    # counts as sampled. analyze.py takes KPIs from the unsampled rounds and
+    # hardware medians from the sampled ones, and drops warm-ups.
+    if case.get('round') is not None:
+        result['round'] = str(case.get('round'))
+        result['warmup'] = 'true' if case.get('warmup') else ''
+    result['sampled'] = 'false' if case.get('sampled') is False else 'true'
+    result['series'] = series_of(case_dir)
+    for name, value in (case.get('params') or {}).items():
+        result[PARAM_PREFIX + str(name)] = _param_text(value)
+    return result, case
+
+
 def summarize_case_app(case_dir: Path, detail_log_name: str, metrics_csv: Path | None) -> dict[str, str]:
     detail_log = case_dir / detail_log_name
     if not detail_log.is_file():
@@ -462,8 +594,7 @@ def summarize_case_app(case_dir: Path, detail_log_name: str, metrics_csv: Path |
     kpis = parse_benchmark_app_kpis(detail_log)
     if not kpis:
         raise ValueError(f'No benchmark_app KPIs found in {detail_log}')
-    # case_dir shows the parent directory name (second to last path component)
-    summary = catogary(case_dir)
+    summary, case = describe_case(case_dir)
     summary.update(kpis)
 
     # benchmark_app prints no window of its own, so run_with_metrics appends a
@@ -475,6 +606,7 @@ def summarize_case_app(case_dir: Path, detail_log_name: str, metrics_csv: Path |
 
     medians, _ = collect_csv_medians(metrics_csv, window_start, window_end)
     summary.update(medians)
+    summary.update(collect_pre_run(metrics_csv, (case or {}).get('launch_ts')))
     return summary
 
 
@@ -489,8 +621,7 @@ def summarize_case(
         raise FileNotFoundError(f'{detail_log_name} not found in {case_dir}')
 
     window_start, window_end = parse_detail_window(detail_log)
-    # case_dir shows the parent directory name (second to last path component)
-    summary=catogary(case_dir)
+    summary, case = describe_case(case_dir)
 
     # Extract KPIs based on mode
     if mode == 'genai':
@@ -505,6 +636,7 @@ def summarize_case(
 
     medians, _ = collect_csv_medians(metrics_csv, window_start, window_end)
     summary.update(medians)
+    summary.update(collect_pre_run(metrics_csv, (case or {}).get('launch_ts')))
     return summary
 
 
@@ -544,7 +676,8 @@ def discover_case_dirs(input_path: Path, detail_log_name: str) -> list[tuple[Pat
 
 def write_summary_csv(rows: list[dict[str, str]], output_path: Path) -> None:
     preferred = [
-        'case_name', 'model_name', 'model_source', 'platform', 'device', 'batch_size', 'precision']
+        'case_name', 'model_name', 'model_source', 'platform', 'device', 'precision',
+        'tool', 'task', 'variant_id', 'swept_keys', 'batch_size']
     fieldnames = []
     seen = set()
     for name in preferred:
@@ -556,20 +689,30 @@ def write_summary_csv(rows: list[dict[str, str]], output_path: Path) -> None:
             if key not in seen:
                 fieldnames.append(key)
                 seen.add(key)
+    # A preferred column no row has (batch_size, once every case has case.json)
+    # is not written as an empty column.
+    fieldnames = [f for f in fieldnames if f not in preferred or any(f in r for r in rows)]
 
-    # Group all kpi_* columns immediately after the preferred block, preserving
-    # their discovery order. Otherwise kpi_ fields first introduced by a later
-    # case (e.g. a text_generation run appearing after embedding runs, which
-    # exposes ttft/decode kpis the earlier rows lacked) get appended after the
-    # monitoring columns and drift to the far right of the table.
+    # Group the parameter columns right after the identity block, then all kpi_*
+    # columns, preserving their discovery order. Otherwise columns first
+    # introduced by a later case (e.g. a text_generation run appearing after
+    # embedding runs, which exposes ttft/decode kpis the earlier rows lacked) get
+    # appended after the monitoring columns and drift to the far right of the
+    # table. The pre-run snapshot sits after the KPIs, before the window medians.
     def _column_group(name: str) -> int:
         if name in preferred:
             return 0
-        if name.startswith('kpi_'):
+        if name.startswith(PARAM_PREFIX):
             return 1
-        if name.startswith('kpis_'):
+        if name in ('case_status', 'overridden', 'series', 'round', 'warmup', 'sampled'):
             return 2
-        return 3
+        if name.startswith('kpi_'):
+            return 3
+        if name.startswith('kpis_'):
+            return 4
+        if name.startswith('pre_'):
+            return 5
+        return 6
     fieldnames.sort(key=_column_group)  # stable sort keeps within-group order
 
     # Always keep case_dir as the very last column.
@@ -627,7 +770,7 @@ def main() -> int:
             skipped_cases.append((case_dir, str(exc)))
             # Still emit a minimal row (category info + case_dir, but no KPIs) so
             # downstream reports can flag the case as an Error and link to detail.log.
-            error_row = catogary(case_dir)
+            error_row, _ = describe_case(case_dir)
             error_row['case_dir'] = str(case_dir)
             rows.append(error_row)
 

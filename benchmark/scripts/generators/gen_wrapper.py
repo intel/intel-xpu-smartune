@@ -2,26 +2,6 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Common wrapper generator - Generate executable wrapper scripts from routing
-results for every stage (build / benchmark).
-
-This reads the unified flat `routes` list emitted by route.py, selects the
-routes for the requested (stage, strategy) via a small registry, and dispatches
-to a per-strategy command builder.
-
-  - build merges the former convert and quantize stages: every requested weight
-    format (fp16/fp32/int8/int4 ...) is produced from a single stage, reading
-    the route's `build` field. All build strategies share one shell wrapper
-    template (common_command_wrapper.sh.j2). optimum/download handle base and
-    quantization precisions with the same command builder; notebook branches
-    internally and, for quantization precisions, converts a base IR first if it
-    is missing (dependency resolved inside the wrapper itself); ovc/mv produce
-    base IR only and nncf quantizes from it.
-  - benchmark uses benchmark_command_wrapper.sh.j2.
-
-All GenAI task maps and shared helpers live in task_maps.py.
-"""
 
 import argparse
 import json
@@ -41,6 +21,7 @@ from utils.global_vars import (
 from utils.python_env_selector import select_venv_for_route
 import task_maps as tm
 from model_precision_check import probe_candidate_precision
+from params import bench_params as bp
 
 GLOBAL_VARS = load_global_vars()
 
@@ -411,23 +392,22 @@ def _quantized_path(route) -> str:
     return route.get('quantized_path', route.get('parameters', {}).get('quantized_path', ''))
 
 
-def _extra_case_args(route) -> str:
-    """User-supplied extra run_case arguments for this route, as a shell suffix.
+def _extra_case_tokens(route) -> List[str]:
+    """User-supplied free-form extra arguments for this route, as argv tokens.
 
     route.py passes the page's `args` field (already shlex-split into a token list
-    by runner.py) straight through onto the route. Each token is re-quoted with
-    shlex.quote so it reaches the benchmark as exactly one literal argument, with
+    by runner.py) straight through onto the route. The tokens are appended after
+    the rendered parameters and re-quoted with shlex.quote on the way into the
+    script, so each reaches the benchmark as exactly one literal argument, with
     no shell interpretation -- that is why a quoted prompt like -p "what is
-    openvino" survives as a single argument. Returns a leading-space-prefixed
-    string, or '' when nothing was requested.
+    openvino" survives as a single argument.
     """
     extra = route.get('args') or []
     # Tolerate a plain string too (a hand-written route, or an older payload):
-    # split it the same way runner.py would before re-quoting.
+    # split it the same way runner.py would.
     if isinstance(extra, str):
         extra = shlex.split(extra)
-    tokens = [shlex.quote(str(t)) for t in extra if str(t)]
-    return f" {' '.join(tokens)}" if tokens else ''
+    return [str(t) for t in extra if str(t)]
 
 
 # Every device a benchmark case can be run on, in the order the report reads
@@ -460,12 +440,72 @@ def _device_loop(body: str, route=None) -> str:
     """A shell loop that runs `body` once per requested device, with DEVICE set.
 
     One idiom for all four backends, so adding or dropping a device is a
-    single edit.
+    single edit. `body` may be several lines -- one run_case per variant.
     """
+    body = '\n        '.join(body.splitlines())
     return (f'    for device in {" ".join(_route_devices(route))}; do\n'
             f'        DEVICE=$device\n'
-            f'    {body}\n'
+            f'        {body}\n'
             f'    done\n')
+
+
+def _bench_variants(route, tool: str, task: Optional[str], task_defaults: Dict,
+                    meta_dir: Path) -> List[Dict]:
+    """Expand this route's `bench.<tool>` sweep into one entry per case.
+
+    The configuration came through models_input.json -> route passthrough, already
+    validated by runner.py against the tool's schema. What only becomes checkable
+    here is the routed task: a parameter that does not apply to it, or a
+    combination that contradicts itself, is recorded as an error on the variant
+    rather than aborting the model. The plan review shows it, and run_case skips
+    the case unless the operator rewrites its command.
+
+    Each variant's description is written to <meta_dir>/<variant_id>.json, which
+    run_case copies into the case directory as case.json -- the one place the
+    analysis reads a case's configuration from.
+    """
+    cfg = ((route.get('bench') or {}).get(tool)) or None
+    schema = bp.schema_from_extra(tool, (cfg or {}).get('extra_specs'))
+    extra = _extra_case_tokens(route)
+    clashing = sorted(set(extra) & bp.managed_flags(schema))
+
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    variants = []
+    for values, swept in bp.expand(cfg):
+        user_set = set(values)
+        params = bp.resolve(tool, schema, task_defaults, values)
+        errors, warnings = bp.validate_variant(tool, task, schema, params, user_set)
+        if tool == 'benchmark_app':
+            fitted = bp.fit_auto_shape(params, user_set)
+            if fitted:
+                warnings.append(fitted)
+        if clashing:
+            warnings.append(f"extra args repeat {', '.join(clashing)}; the extra value is the one the tool sees")
+        argv = bp.render_args(schema, params) + extra
+        vid = bp.variant_id(schema, swept, params, extra)
+        meta = {
+            'tool': tool, 'task': task, 'variant_id': vid,
+            'params': params, 'swept': swept, 'swept_keys': list(swept),
+            'user_set': sorted(user_set), 'extra_args': extra,
+            'errors': errors, 'warnings': warnings,
+        }
+        meta_path = meta_dir / f'{vid}.json'
+        meta_path.write_text(json.dumps(meta, indent=2, default=str))
+        variants.append({**meta, 'argv': argv, 'meta_path': str(meta_path)})
+    return variants
+
+
+def _variant_case_lines(variants: List[Dict], run_case_prefix: str) -> str:
+    """One run_case per variant, its identity passed as prefix assignments."""
+    lines = []
+    for v in variants:
+        env = (f'BENCH_VARIANT={shlex.quote(v["variant_id"])} '
+               f'BENCH_VARIANT_META={shlex.quote(v["meta_path"])} ')
+        if v['errors']:
+            env += 'BENCH_VARIANT_INVALID=1 '
+        args = ' '.join(shlex.quote(a) for a in v['argv'])
+        lines.append(f'{env}{run_case_prefix} {args}'.rstrip())
+    return '\n'.join(lines)
 
 
 def build_genai_benchmark(route, stage, weight_format, env, notebook_inputs):
@@ -473,21 +513,24 @@ def build_genai_benchmark(route, stage, weight_format, env, notebook_inputs):
     quantized_path = _quantized_path(route)
     quant = quantized_path.split('/')[-1] if quantized_path else 'unknown_quantized_model'
     task = tm.to_genai_task(route['parameters'].get('task', 'text-generation-with-past'), route['model'])
-    opts = tm.genai_task_specific_opt(task, route['parameters'])
+    defaults = tm.genai_task_defaults(task, route['parameters'])
 
-    # Free-form extra arguments the user attached to this model on the page, passed
-    # through models_input.json -> route parameters. Appended verbatim after the
-    # fixed run_case arguments; genai's run_case forwards everything past its first
-    # four positionals to the llm_bench command, so these reach the benchmark.
-    extra_args = _extra_case_args(route)
-    case_command = f'run_case "{model_safe_name}" "{quant}" "{task}" "{quantized_path}" {opts}{extra_args}'
+    # One run_case per variant of the model's genai sweep (a single "default"
+    # variant when it configured nothing). Each carries the fully rendered
+    # parameters: task defaults overridden by the user's configuration, then any
+    # free-form extra arguments, which genai's run_case forwards to llm_bench
+    # after its first four positionals.
+    variants = _bench_variants(route, 'genai', task, defaults,
+                               _bench_scripts_dir('genai') / 'variants' / f'{model_safe_name}_{quant}')
+    case_lines = _variant_case_lines(
+        variants, f'run_case "{model_safe_name}" "{quant}" "{task}" "{quantized_path}"')
     benchmark_command = f"""
     . {GLOBAL_VARS['DIR_TEMPLATES_ROOT']}/benchmark_genai_common.sh
-{_device_loop(case_command, route)}"""
+{_device_loop(case_lines, route)}"""
     context = {'tool': 'openvino_genai', 'benchmark_command': benchmark_command,
                'hf_home': GLOBAL_VARS['HF_HOME']}
     meta = {'metrics_file': str(_bench_scripts_dir('genai') / f"metrics_{model_safe_name}.json"),
-            'strategy': 'genai'}
+            'strategy': 'genai', 'variants': len(variants)}
     return _build_result('', quantized_path, BENCH_TEMPLATE, context, meta)
 
 
@@ -518,20 +561,26 @@ def build_benchmark_app(route, stage, weight_format, env, notebook_inputs):
         model_xml = str(qp / 'openvino_model.xml') if (qp / 'openvino_model.xml').exists() \
             else f"{quantized_path}/openvino_model.xml"
 
-    shape_param = ""
+    # The detected shape is only a default: a shape the user configured replaces
+    # it, and a batch size they configured is written into its batch dimension.
+    defaults = {}
     if Path(model_xml).exists():
         shape_spec = analyze_model_input_shapes(model_xml)
         if shape_spec:
-            shape_param = f' {shape_spec}'
-            print(f"  {route['model']}: Detected dynamic shapes, adding: {shape_spec}")
+            defaults['shape'] = shape_spec[len('-shape '):] if shape_spec.startswith('-shape ') else shape_spec
+            print(f"  {route['model']}: Detected dynamic shapes, default: {shape_spec}")
 
-    case_command = f'run_case "{quantized_path}"{shape_param}'
+    quant = Path(quantized_path).name or 'unknown_quantized_model'
+    model_safe_name = tm.get_model_safe_name(route['model'])
+    variants = _bench_variants(route, 'benchmark_app', None, defaults,
+                               _bench_scripts_dir('benchmark_app') / 'variants' / f'{model_safe_name}_{quant}')
+    case_lines = _variant_case_lines(variants, f'run_case "{quantized_path}"')
     benchmark_command = f"""
     . {GLOBAL_VARS['DIR_TEMPLATES_ROOT']}/benchmark_app_common.sh
-{_device_loop(case_command, route)}"""
+{_device_loop(case_lines, route)}"""
     context = {'tool': 'benchmark_app', 'benchmark_command': benchmark_command,
                'hf_home': GLOBAL_VARS['HF_HOME']}
-    meta = {'strategy': 'benchmark_app', 'model_xml': model_xml}
+    meta = {'strategy': 'benchmark_app', 'model_xml': model_xml, 'variants': len(variants)}
     return _build_result('', quantized_path, BENCH_TEMPLATE, context, meta)
 
 

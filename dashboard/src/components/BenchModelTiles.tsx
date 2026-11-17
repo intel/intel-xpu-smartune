@@ -18,6 +18,7 @@ import {
 import type { BenchModel, BenchPrecision } from '../api/types'
 import { COLORS } from '../styles/theme'
 import { applicablePrecisions, missingPrecisions, type ModelParams } from './BenchModelDetail'
+import { countVariants, sweepSummary } from './BenchParamsEditor'
 
 const { Text } = Typography
 
@@ -207,6 +208,30 @@ function ModelTile({
             </Text>
           </Tooltip>
         )}
+
+        {/* The parameter sweep, per tool, when there is one: how many cases each
+            precision and device will become. */}
+        {(['genai', 'benchmark_app'] as const).map((tool) => {
+          const cfg = params.bench?.[tool]
+          const n = countVariants(cfg)
+          const summary = sweepSummary(cfg)
+          const set = Object.keys(cfg?.params ?? {}).length
+          if (!set) return null
+          return (
+            <Tooltip
+              key={tool}
+              title={Object.entries(cfg!.params)
+                .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join('; ') : v}`)
+                .join('\n')}
+              overlayStyle={{ whiteSpace: 'pre-line' }}
+            >
+              <Text type="secondary" ellipsis style={{ fontSize: 11, width: '100%' }}>
+                {tool}: {summary || `${set} set`}
+                {n > 1 ? ` → ${n} cases` : ''}
+              </Text>
+            </Tooltip>
+          )
+        })}
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <Tooltip title={blocked ? `Cannot be benchmarked yet: ${blocked}` : 'Ready to benchmark'}>

@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +20,23 @@ SUPPORTED_OPTIMUM_LIBRARIES = {
     "kokoro",
 }
 
-# Per-model-directory cache of the optimum probe result, so repeated routing
-# runs do not pay the multi-second `import optimum` cost again.
+# Per-model cache of the optimum probe result, so repeated routing runs do not
+# pay the multi-second `import optimum` cost again.
+#
+# One file per MODEL: <DIR_IR>/<model>/model_routing.json, shared by all of its
+# precision directories (int4_ov, int8_ov, ...) -- they are exports of one model
+# and probe to the same library and task. Schema 1 kept a copy in every
+# precision directory; one found there is moved up on first read.
+#
+# It holds what optimum says about the model and nothing about the environment
+# reading it: library, task, the transformers bounds of its export config and
+# the tasks it supports. Whether the installed transformers falls inside those
+# bounds is decided by whoever needs to know (python_env_selector), against the
+# venv it is choosing -- so a different environment does not invalidate it.
 ROUTING_CACHE_FILENAME = "model_routing.json"
-ROUTING_CACHE_SCHEMA_VERSION = 1
+ROUTING_CACHE_SCHEMA_VERSION = 2
+# The environment-independent part of a probe's version_info.
+_MODEL_VERSION_KEYS = ("min_transformers_version", "max_transformers_version", "tasks")
 
 
 def _normalize_library_name(library_name: str | None) -> str | None:
@@ -135,9 +149,40 @@ def _run_optimum_task_probe(model_name_or_path: str) -> tuple[str | None, str | 
             "transformers_version_compatible": None,
         }, f"Failed to import optimum/transformers APIs: {exc}"
 
-    def _task_from_model_type(path: str, library: str | None) -> str | None:
-        if library != "transformers":
+    def _task_from_non_transformers(path: str, library: str | None) -> tuple[str | None, list[str] | None]:
+        """kokoro/open_clip/diffusers/timm: same auto-resolution as main_export, plus
+        registry fallbacks for local dirs that optimum's infer_task cannot handle."""
+        try:
+            task = ov_infer_task("auto", path, library_name=library)
+            return task, [task]
+        except Exception:
+            pass
+
+        if library == "diffusers":
+            model_index = Path(path) / "model_index.json"
+            try:
+                class_name = json.loads(model_index.read_text(encoding="utf-8")).get("_class_name")
+            except Exception:
+                return None, None
+            for task, mapping in TasksManager._DIFFUSERS_TASKS_TO_MODEL_MAPPINGS.items():
+                if class_name in mapping.values():
+                    return task, [task]
             return None, None
+
+        if library == "timm":
+            default_model_type = TasksManager._MODEL_TYPE_FOR_DEFAULT_CONFIG.get("timm")
+            try:
+                tasks = list(TasksManager.get_supported_tasks_for_model_type(
+                    default_model_type, exporter="openvino", library_name="timm").keys())
+            except Exception:
+                return None, None
+            return (tasks[0], tasks) if tasks else (None, None)
+
+        return None, None
+
+    def _task_from_model_type(path: str, library: str | None) -> tuple[str | None, list[str] | None]:
+        if library != "transformers":
+            return _task_from_non_transformers(path, library)
 
         try:
             config = AutoConfig.from_pretrained(path, trust_remote_code=True)
@@ -197,6 +242,7 @@ def _run_optimum_task_probe(model_name_or_path: str) -> tuple[str | None, str | 
         }, f"Failed to infer library for {model_name_or_path}: {exc}"
 
     task_name: str | None = None
+    tasks: list[str] | None = None
     try:
         task_name, tasks = _task_from_model_type(model_name_or_path, library_name)
     except Exception:
@@ -231,28 +277,39 @@ def infer_task(model_name_or_path: str) -> str | None:
     return task_name
 
 
-def _installed_transformers_version() -> str | None:
-    """Read the installed transformers version without importing the package."""
-    try:
-        from importlib.metadata import version
+def _routing_cache_paths(model_id: Any) -> tuple[Path | None, Path | None]:
+    """(cache file, schema-1 per-precision file) for a local model directory.
 
-        return version("transformers")
-    except Exception:
-        return None
-
-
-def _routing_cache_path(model_id: Any) -> Path | None:
-    """Cache file inside a local model directory; None for HF model IDs."""
+    A directory inside DIR_IR maps to its top-level model directory, whichever
+    precision directory it is. One outside DIR_IR keeps the cache in itself. A
+    hub id has no directory and is not cached.
+    """
     try:
         candidate = Path(model_id).expanduser()
     except Exception:
-        return None
+        return None, None
     if not candidate.is_dir():
-        return None
-    return candidate / ROUTING_CACHE_FILENAME
+        return None, None
+    root = os.environ.get("DIR_IR")
+    if root:
+        try:
+            rel = candidate.resolve().relative_to(Path(root).expanduser().resolve()).parts
+        except (OSError, ValueError):
+            rel = ()
+        if rel:
+            model_dir = Path(root).expanduser() / rel[0]
+            legacy = candidate / ROUTING_CACHE_FILENAME if len(rel) > 1 else None
+            return model_dir / ROUTING_CACHE_FILENAME, legacy
+    return candidate / ROUTING_CACHE_FILENAME, None
 
 
-def _load_routing_cache(cache_file: Path | None) -> tuple[str, str, dict[str, Any]] | None:
+def _model_facts(version_info: Any) -> dict[str, Any]:
+    """The environment-independent part of a probe's version_info."""
+    info = version_info if isinstance(version_info, dict) else {}
+    return {key: info.get(key) for key in _MODEL_VERSION_KEYS}
+
+
+def _read_routing_cache(cache_file: Path | None) -> tuple[str, str, dict[str, Any]] | None:
     if cache_file is None or not cache_file.is_file():
         return None
 
@@ -263,22 +320,38 @@ def _load_routing_cache(cache_file: Path | None) -> tuple[str, str, dict[str, An
 
     if not isinstance(payload, dict):
         return None
-    if payload.get("schema_version") != ROUTING_CACHE_SCHEMA_VERSION:
-        return None
-    # Version bounds/compatibility are relative to the installed transformers,
-    # so a different environment must re-probe.
-    if payload.get("transformers_version") != _installed_transformers_version():
+    # Schema 1 also recorded the transformers it was probed under and was
+    # discarded when that changed; its model facts are as good as schema 2's.
+    if payload.get("schema_version") not in (1, ROUTING_CACHE_SCHEMA_VERSION):
         return None
 
     library_name = payload.get("library")
     task_name = payload.get("task")
-    version_info = payload.get("version_info")
     if not isinstance(library_name, str) or not isinstance(task_name, str):
         return None
-    if not isinstance(version_info, dict):
-        return None
 
-    return library_name, task_name, version_info
+    return library_name, task_name, _model_facts(payload.get("version_info"))
+
+
+def _load_routing_cache(
+    cache_file: Path | None, legacy_file: Path | None,
+) -> tuple[str, str, dict[str, Any]] | None:
+    """The model's cache, or a schema-1 per-precision copy moved up to it.
+
+    A per-precision copy is removed once the model-level file exists, so each
+    model ends up with exactly one.
+    """
+    cached = _read_routing_cache(cache_file)
+    if cached is None and legacy_file is not None:
+        cached = _read_routing_cache(legacy_file)
+        if cached is not None and not _store_routing_cache(cache_file, *cached):
+            return cached
+    if cached is not None and legacy_file is not None and legacy_file.is_file():
+        try:
+            legacy_file.unlink()
+        except OSError:
+            pass
+    return cached
 
 
 def _store_routing_cache(
@@ -286,43 +359,48 @@ def _store_routing_cache(
     library_name: str,
     task_name: str,
     version_info: dict[str, Any],
-) -> None:
+) -> bool:
     if cache_file is None:
-        return
+        return False
 
     payload = {
         "schema_version": ROUTING_CACHE_SCHEMA_VERSION,
-        "transformers_version": _installed_transformers_version(),
         "library": library_name,
         "task": task_name,
-        "version_info": version_info,
+        "version_info": _model_facts(version_info),
     }
 
     tmp_file = cache_file.with_name(f"{cache_file.name}.{os.getpid()}.tmp")
     try:
         tmp_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp_file.replace(cache_file)
+        return True
     except Exception:
         # A read-only model directory must not break routing.
         try:
             tmp_file.unlink()
         except Exception:
             pass
+        return False
 
 
 def analyze_model_id(model_id: str) -> tuple[str | None, str | None, bool | None, dict[str, Any]]:
     """Infer (library, task, supported) from model_id via optimum behavior.
 
-    For local model directories the probe result is cached in
-    `<model_dir>/model_routing.json` and reused on later calls, which avoids the
-    expensive optimum import.
+    For a local model directory the probe result is cached once per model in
+    `<DIR_IR>/<model>/model_routing.json` (see ROUTING_CACHE_FILENAME) and reused
+    by every precision, which avoids the expensive optimum import.
+
+    version_info carries only the model's transformers bounds and supported
+    tasks, cached or not; comparing them with an installed transformers is the
+    caller's job (python_env_selector.select_venv_for_route).
 
     Returns:
     - (library_name, task_name, True, version_info) when both can be inferred and supported
     - (None, None, False, version_info) otherwise
     """
-    cache_file = _routing_cache_path(model_id)
-    cached = _load_routing_cache(cache_file)
+    cache_file, legacy_file = _routing_cache_paths(model_id)
+    cached = _load_routing_cache(cache_file, legacy_file)
     if cached is not None:
         library_name, task_name, version_info = cached
         if library_name not in SUPPORTED_OPTIMUM_LIBRARIES:
@@ -331,7 +409,7 @@ def analyze_model_id(model_id: str) -> tuple[str | None, str | None, bool | None
 
     library_name, task_name, version_info, error = _run_optimum_task_probe(str(model_id))
     if error is not None:
-        print(f"ERROR: {error}")
+        print(f"ERROR: {error}", file=sys.stderr)
         return None, None, False, {}
 
     if library_name is None or task_name is None:
@@ -340,6 +418,7 @@ def analyze_model_id(model_id: str) -> tuple[str | None, str | None, bool | None
     if library_name not in SUPPORTED_OPTIMUM_LIBRARIES:
         return None, None, False, {}
 
+    version_info = _model_facts(version_info)
     _store_routing_cache(cache_file, library_name, task_name, version_info)
 
     return library_name, task_name, True, version_info

@@ -91,16 +91,6 @@ def _median(vals):
     return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
 
 
-def _geomean(vals):
-    v = [x for x in vals if x is not None and x > 0]
-    if not v:
-        return None
-    p = 1.0
-    for x in v:
-        p *= x
-    return p ** (1.0 / len(v))
-
-
 def _parse(v):
     try:
         return float(v) if v not in ("", None) else None
@@ -339,14 +329,6 @@ def add_derived(records, profile, dims, varying):
     return derived
 
 
-def _vals(records, dim):
-    seen = []
-    for r in records:
-        if r.get(dim) not in seen:
-            seen.append(r.get(dim))
-    return seen
-
-
 def _max_none(xs):
     xs = [x for x in xs if x is not None]
     return max(xs) if xs else None
@@ -391,132 +373,15 @@ def build_conclusions(records, metrics, profile, n_raw, dims=None):
     def add(cid, cat, sev, title, detail, panels):
         C.append({"id": cid, "category": cat, "severity": sev,
                   "title": title, "detail": detail, "panels": panels})
-    '''
-    # ---- L0 coverage & credibility ----
-    failed = [r for r in records if r.get(tp) is None]
-    total = len(records)
-    if failed:
-        by_dev = _count(failed, "device")
-        by_prec = _count(failed, "precision")
-        add("L0-coverage", "L0 Coverage", "warn" if failed else "good",
-            "%d/%d configs did not complete (no primary KPI)" % (len(failed), total),
-            "by device: %s ; by precision: %s" % (by_dev, by_prec),
-            [panel(["model_name", "precision"], ["device", BATCH], tp, "count",
-                   title="Coverage matrix (has value=1, empty=not completed)")])
-    else:
-        add("L0-coverage", "L0 Coverage", "good", "All %d configs completed" % total, "", [])
-
-    shaky = [r for r in records if (r.get("d_cv_throughput_pct") or 0) > 5]
-    if shaky:
-        worst = max(shaky, key=lambda r: r["d_cv_throughput_pct"])
-        add("L0-stability", "L0 Coverage", "warn",
-            "%d configs show repeated-test jitter >5%% (use data with caution)" % len(shaky),
-            "most jittery: %s CV=%s" % (cfg_label(worst), _fmt(worst["d_cv_throughput_pct"], "%")),
-            [panel(["model_name", "precision"], ["device", BATCH],
-                   "d_cv_throughput_pct", "max", title="Repeated-test CV% (lower is more stable)", highlight="max")])
-    else:
-        add("L0-stability", "L0 Coverage", "good", "All configs have repeated-test CV <=5%, data is stable", "", [])
-
-    # ---- L1 primary KPI ranking (profile-driven, one per KPI + efficiency) ----
-    kpi_specs = [k for k in profile["kpis"] if k["col"] in metrics] + \
-                [{"col": "d_perf_per_watt", "label": "Efficiency", "unit": "fps/W", "goal": "max"}]
-    for k in kpi_specs:
-        col, goal, unit = k["col"], k["goal"], k["unit"]
-        cand = [r for r in records if r.get(col) is not None]
-        if not cand:
-            continue
-        best = (max if goal == "max" else min)(cand, key=lambda r: r[col])
-        add("L1-best-" + col, "L1 Ranking", "good",
-            "「%s」 best: %s = %s" % (k["label"], cfg_label(best), _fmt(best[col], unit)),
-            "goal=%s (%s)" % (goal, "higher is better" if goal == "max" else "lower is better"),
-            [panel(["model_name", "precision"], ["device", BATCH], col, "median",
-                   title="%s overview (highlight %s)" % (k["label"], "best"),
-                   highlight="max" if goal == "max" else "min")])
-
-    # best primary-throughput config per model (one conclusion, multiple panels)
-    models = _vals(records, "model_name")
-    lines, pans = [], []
-    for mdl in models:
-        cand = [r for r in records if r.get("model_name") == mdl and r.get(tp) is not None]
-        if not cand:
-            continue
-        b = max(cand, key=lambda r: r[tp])
-        lines.append("%s->%s/%s/%s(%s)" % (mdl, b["device"], b["precision"], b[BATCH], _fmt(b[tp])))
-        pans.append(panel(["device", "precision"], [BATCH], tp, "median",
-                          filters={"model_name": mdl}, title="%s best throughput config" % mdl, highlight="max"))
-    if pans:
-        add("L1-best-per-model", "L1 Ranking", "info",
-            "Best throughput config per model", " ; ".join(lines), pans)
-
-    # device ranking (by how many (model,precision,batch) combos each device wins on primary throughput)
-    wins = _device_wins(records, tp)
-    if wins:
-        rank = " > ".join("%s(%d wins)" % (d, n) for d, n in wins)
-        add("L1-device-rank", "L1 Ranking", "info",
-            "Device throughput ranking: %s" % rank, "counts how many combos each device tops in throughput",
-            [panel(["model_name", "precision"], ["device"], tp, "median",
-                   title="Device x model/precision throughput", highlight="max")])
-    '''
     # ---- L2 precision/quantization ----
     add("L2-quant-overall", "L2 Precision", "info", "Quantization precision/speedup overview", "",
         [panel(["model_name", "device"], ["precision"], tp, "median", title="Throughput x precision"),
          panel(["model_name", "device"], ["precision"], "d_rel_best_prec", "median", title="Rel. best precision (0-1)")] )
-    '''
-    for prec in [p for p in _vals(records, "precision") if p != "fp32"]:
-        pairs = [r["d_speedup_vs_fp32"] for r in records
-                 if r.get("precision") == prec and r.get("d_speedup_vs_fp32") is not None]
-        denom = sum(1 for r in records if r.get("precision") == prec and r.get(tp) is not None)
-        gm = _geomean(pairs)
-        if gm is None:
-            continue
-        sev = "good" if gm > 1.05 else "warn" if gm < 0.95 else "info"
-        add("L2-quant-" + prec, "L2 Precision", "info",
-            "%s geometric mean vs fp32 %s (based on %d/%d groups with both ends present)" % (prec, _fmt(gm, "x"), len(pairs), denom),
-            "groups missing the fp32 baseline are dropped, no cross-contamination",
-            [panel(["model_name", "device"], ["precision"], tp, "median",
-                   title="Throughput x precision"),
-             panel(["model_name", "device"], ["precision"], "d_speedup_vs_fp32", "median",
-                   title="Speedup vs fp32 x", highlight="max"),
-             panel(["model_name", "device"], ["precision"], "d_rel_best_prec", "median",
-                   title="Rel. best precision (0-1)", highlight="max")])
-    
-    # quantization gain sorted by device
-    dev_gain = []
-    for dev in _vals(records, "device"):
-        pr = [r["d_speedup_vs_fp32"] for r in records
-              if r.get("device") == dev and r.get("precision") == "int8" and r.get("d_speedup_vs_fp32") is not None]
-        gm = _geomean(pr)
-        if gm is not None:
-            dev_gain.append((dev, gm))
-    if len(dev_gain) >= 2:
-        dev_gain.sort(key=lambda x: -x[1])
-        txt = " > ".join("%s %s" % (d, _fmt(g, "x")) for d, g in dev_gain)
-        add("L2-quant-by-device", "L2 Precision", "info",
-            "int8 quantization gain by device: %s" % txt, "geometric mean int8 speedup vs fp32 per device",
-            [panel(["device"], ["model_name"], "d_speedup_vs_fp32", "median",
-                   filters={"precision": "int8"}, title="int8 speedup x device", highlight="max")])
-    '''
     # ---- L3 device comparison (vs cpu) ----
     add("L3-dev-overall", "L3 Device", "info", "Device comparison overview", "",
         [panel(["model_name", "precision"], ["device"], tp, "median", title="Throughput x device"),
          panel(["model_name", "precision"], ["device"], "d_rel_best_device", "median",
                title="Rel. best device (0-1)", highlight="max")])
-    '''
-    for dev in [d for d in _vals(records, "device") if d != "cpu"]:
-        sp = [r["d_speedup_vs_cpu"] for r in records
-              if r.get("device") == dev and r.get("precision") == "int8" and r.get("d_speedup_vs_cpu") is not None]
-        gm = _geomean(sp)
-        if gm is None:
-            continue
-        add("L3-dev-" + dev, "L3 Device", "good" if gm > 1 else "info",
-            "%s averages %s vs CPU (int8, based on %d groups)" % (dev.upper(), _fmt(gm, "x"), len(sp)),
-            "compared within the same (model,precision,batch)",
-            [panel(["model_name", "precision"], ["device"], tp, "median", title="Throughput x device"),
-             panel(["model_name", "precision"], ["device"], "d_speedup_vs_cpu", "median",
-                   filters={"precision": "int8"}, title="Speedup vs CPU x", highlight="max"),
-             panel(["model_name", "precision"], ["device"], "d_rel_best_device", "median",
-                   title="Rel. best device (0-1)", highlight="max")])
-    '''
     # ---- L4 parameter sweeps (one per parameter the sweep varied) ----
     lat = next((k["col"] for k in profile["kpis"] if k["goal"] == "min"), None)
     for d in [d for d in dims if d.startswith(PARAM_PREFIX)]:
@@ -538,26 +403,6 @@ def build_conclusions(records, metrics, profile, n_raw, dims=None):
         add("L4-sweep-" + label, "L4 Parameter sweep", "info",
             "%s sweep: %s" % (label, ", ".join(str(v) for v in values)), detail, pans)
 
-    '''    # ---- L5 efficiency ----
-    eff = [r for r in records if r.get("d_perf_per_watt") is not None]
-    if eff:
-        be = max(eff, key=lambda r: r["d_perf_per_watt"])
-        dev_eff = []
-        for dev in _vals(records, "device"):
-            gm = _geomean([r["d_perf_per_watt"] for r in eff if r.get("device") == dev])
-            if gm:
-                dev_eff.append((dev, gm))
-        dev_eff.sort(key=lambda x: -x[1])
-        lead = ""
-        if len(dev_eff) >= 2 and dev_eff[-1][1] > 0:
-            lead = "; %s leads %s in efficiency by %s" % (dev_eff[0][0].upper(), dev_eff[-1][0].upper(),
-                                        _fmt(dev_eff[0][1] / dev_eff[-1][1], "x"))
-        add("L5-efficiency", "L5 Efficiency", "good",
-            "Most power-efficient: %s = %s" % (cfg_label(be), _fmt(be["d_perf_per_watt"], "fps/W")) + lead,
-            "efficiency = primary throughput / whole-package power (W)",
-            [panel(["model_name", "device"], ["precision"], "d_perf_per_watt", "median",
-                   title="Efficiency fps/W (highlight best)", highlight="max")])
-    '''
     # ---- L6 hardware bottleneck signals (threshold-triggered) ----
     _signal(records, C, add, "d_temp_headroom_c", lambda r: r.get("d_temp_headroom_c") is not None and r["d_temp_headroom_c"] < 5,
             "L6 Bottleneck", "warn", "Hitting the thermal wall", "temp headroom <5℃, likely throttling",
@@ -590,27 +435,6 @@ def _signal(records, C, add, cid, pred, cat, sev, title, detail, pan):
     examples = ", ".join(cfg_label(r, varying) for r in hit[:4]) + (" …" if len(hit) > 4 else "")
     add("L6-" + cid, cat, sev, "%s (%d configs)" % (title, len(hit)),
         detail + " | e.g.: " + examples, [pan])
-
-
-def _count(recs, dim):
-    c = {}
-    for r in recs:
-        c[r.get(dim)] = c.get(r.get(dim), 0) + 1
-    return ", ".join("%s×%d" % (k, v) for k, v in sorted(c.items(), key=lambda x: -x[1]))
-
-
-def _device_wins(records, tp, dims=None):
-    combos = {}
-    for r in records:
-        if r.get(tp) is None:
-            continue
-        key = tuple(r.get(d) for d in (dims or DIMS) if d != "device")
-        combos.setdefault(key, []).append((r.get("device"), r[tp]))
-    wins = {}
-    for key, lst in combos.items():
-        d, _ = max(lst, key=lambda x: x[1])
-        wins[d] = wins.get(d, 0) + 1
-    return sorted(wins.items(), key=lambda x: -x[1])
 
 
 # ---------------- Public main entry ----------------

@@ -253,6 +253,52 @@ Limits decide *how much* an app may use; CPU affinity decides *where* it runs, e
 
 <sub>Code: `balancer.py#get_resource_limit_profile`, `balancer.py#_get_limit_rate_bounds`, `balancer.py#_install_resource_limit`, `balancer.py#set_freeze`, `controller/freeze.py`, `balancer.py#set_cpu_affinity`, `balancer.py#_reap_closed_affinity`, `controller/cpu.py`</sub>
 
+#### Device frequency limits
+
+CPU and GPU minimum / maximum frequency is limited per **device**, not per app, and is manual only: no pressure trigger, not part of the limit registry, and not affected by the Auto control switch. It has its own tab, Device Control, next to App Control in the Control Center.
+
+- Mechanism: sysfs writes. CPU: `scaling_min_freq` / `scaling_max_freq` of each cpufreq policy (kHz; cores that share a policy move together, so the unit is the policy, not the cpu). GPU: Xe `tile*/gt*/freq0/{min,max}_freq`, or i915 `gt/gt*/rps_{min,max}_freq_mhz` (and the legacy single-GT `gt_*_freq_mhz`), per gt. The hardware range is `cpuinfo_{min,max}_freq`, or `rpn_freq` / `rp0_freq` on the GPU. A request outside it is refused; a group request (a core class) is clamped per unit instead, because P cores on one part can top out at different clocks.
+- The unit list is discovered from sysfs on every call. A client-supplied unit id is only a lookup key into that list and is never turned into a path.
+- A write never leaves `min > max` in between: it writes min first unless the new min is above the current max, in which case max goes first. If the second write fails, the first is rolled back and nothing is recorded as limited.
+- The `(min, max)` seen before the first write is recorded and written back on restore; a second set keeps the first original. A write is confirmed by reading the files back (1 MHz tolerance).
+- Restore leaves a value somebody else changed after our write, and forgets a unit whose device has gone away (a CPU taken offline).
+- Release: the user's restore, and service shutdown (`restore_all`, after CPU affinity). There is no per-app reaper because nothing is tied to an app. The service stop confirmation does not list frequency limits, as it does for limits and pins. After `kill -9` or a crash the limits stay until restored or until reboot.
+- The CPU frequency governor (scenario 7) is independent: it picks a clock inside the range set here.
+- NPU is not covered. On the Intel `intel_vpu` driver the frequency is chosen by firmware DVFS and sysfs only exposes it read-only (`npu_current_frequency_mhz`, `npu_max_frequency_mhz`). The `pll_min_ratio` / `pll_max_ratio` module parameters are writable at runtime but had no effect when changed while the NPU ran or while it was suspended (probably read at module load only, not confirmed), and debugfs `dvfs_mode=1` only pins the clock to its maximum. None gives a runtime min/max, so there is no NPU unit.
+- API: `GET /device/freq/status`, `POST /device/freq/set` (`units`, `min_mhz`, `max_mhz`), `POST /device/freq/restore` (`units`, empty = all). Set and restore run under one lock.
+
+<sub>Code: `controller/freq.py`, `balancer.py#get_freq`, `balancer.py#set_freq`, `balancer.py#restore_freq`, `balance_service.py#device_freq_set`</sub>
+
+#### Self-protection: never limit SmarTune's own cgroup
+
+Limits, freeze, core pinning and `memory.reclaim` act on a cgroup and everything below it. A service started from a terminal sits in that terminal's `vte-spawn-*.scope`, and so does anything else started there without a scope of its own, so limiting such an app writes `cpu.max` / `memory.high` / `io.max` on the cgroup the service runs in: the service throttles itself and the dashboard hangs. A freeze is worse, since nothing is left to thaw it. The same applies to every *ancestor* of the service's cgroup (`app.slice`, `user@N.service`, ...).
+
+- Mechanism: `utils/self_guard.py` reads the service's own cgroup path once and keeps the unit names from the root down. Unit names are unique in the tree, so "is this the service's own cgroup or an ancestor of it" is a membership test on the name, which every limit key here already is. No directory lookup is needed.
+- Refused, not skipped, and with no override: the cases it guards against are the ones that hang or unrecoverably stop the service, so there is no "force". The message names the cgroup and says to start the app in its own cgroup.
+- Where it is enforced: at the write points (`Controller.set_all_resources`, `IOController.set_disk_io_throttle`, `ControlManager.freeze_cgroup`, `CPUController.set_cpus`), so no caller, present or future, can bypass it; and at the user-facing entries (manual limit, CPU affinity) so the user gets the reason rather than a generic failure. The manual limit returns `refused`, which the API reports as an error; the auto limit logs a warning and skips the target.
+- Only *applying* is refused. Restoring and thawing are never blocked, so a limit installed before this guard existed stays removable.
+- It is a guard, not the fix: the cure is for the app to have a cgroup of its own. The benchmark runs get one (below).
+
+#### Benchmark runs in their own cgroup
+
+A child inherits its parent's cgroup, so a benchmark the service starts used to land in the service's own cgroup, which is exactly what the guard above refuses to limit. A `run` job is therefore started as `systemd-run --scope --unit=smartune-bench-<job id> ...`, which registers a transient scope, moves the process into it and execs the command in place: same pid, process group, environment and stdio, so waiting, cancelling and logging are unchanged. Setup jobs (clone, `uv`, downloads) are not isolated.
+
+- Placement follows the service's own cgroup, so the scope lands next to it and where the limit code already reaches (`benchmark/service/isolation.py#placement_for`):
+
+  | Service runs under | Scope goes to | Created by |
+  |---|---|---|
+  | `user@N.service/.../<slice>/x.scope` (a terminal, tmux) | the same `<slice>` | the user's manager (`systemd-run --user`); limited with `systemctl --user set-property` |
+  | `user-N.slice/session-X.scope` (ssh) | `user-N.slice` | the root manager, privileges dropped inside the scope with `setpriv` and the user's full group list (a child without `render` cannot open the GPU) |
+  | `system.slice/x.service` | `system.slice` | the root manager, as above |
+  | anything else, or another user's manager | none | |
+
+- No limits are set on the scope. It is accounting only, so the benchmark runs as it would without one and the user decides, after leaving quiet mode, whether to limit it. In a 3 s CPU spin, 5 runs inside and outside a scope were indistinguishable.
+- A scope is only used after a no-op `systemd-run` of the same shape has succeeded once (cached per placement). If it cannot be made (no systemd, no user bus, an unlisted layout) the command is run as before and the reason is logged once; the benchmark never fails because of it. The guard then still refuses to limit it.
+- Cancel signals the process group as before; if it ignores SIGTERM, the SIGKILL escalation is followed by `systemctl [--user] kill` on the scope, which also reaches processes that left the group with `setsid`.
+- The scope disappears with its last process (`--collect`). The job log starts with a line saying which scope it is in.
+
+<sub>Code: `utils/self_guard.py`, `benchmark/service/isolation.py`, `benchmark/service/jobs.py#JobManager.start`</sub>
+
 ### Taking over from Auto
 
 This is the only path between auto and manual, and it is designed to leave no release window:
@@ -439,6 +485,9 @@ The "Where" column has three values:
 | Main decision loop, auto limit/restore, manual limit API implementation | [balancer/balancer/balancer.py](../../balancer/balancer/balancer.py) |
 | REST / SSE endpoints | [balancer/balance_service.py](../../balancer/balance_service.py) |
 | cgroup writes (CPU/memory/IO) | [balancer/controller/controller.py](../../balancer/controller/controller.py) |
+| Self-protection (never limit the service's own cgroup) | [utils/self_guard.py](../../utils/self_guard.py) |
+| Benchmark run in its own cgroup scope | [benchmark/service/isolation.py](../../benchmark/service/isolation.py) |
+| Device frequency limits (CPU / GPU min and max) | [balancer/controller/freq.py](../../balancer/controller/freq.py) |
 | Governor, swap, reclaim scheduling | [balancer/controller/control_manager.py](../../balancer/controller/control_manager.py) |
 | eBPF launch interception | [balancer/controller/app_intercept.py](../../balancer/controller/app_intercept.py) |
 | Network tc / iptables | [balancer/controller/network.py](../../balancer/controller/network.py) |

@@ -17,7 +17,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
-from benchmark.service import privilege
+from benchmark.service import isolation, privilege
 
 # Terminated jobs kept for status/log lookup after they finish. Logs stay on disk
 # regardless; this only bounds the in-memory index.
@@ -55,6 +55,7 @@ class Job:
         self.started_at = time.time()
         self.finished_at: Optional[float] = None
         self._proc: Optional[subprocess.Popen] = None
+        self._scope: Optional[isolation.Scope] = None   # the run's own cgroup, when it got one
         self._cancelled = False
         self._on_finish: Optional[Callable[["Job"], None]] = None
 
@@ -181,6 +182,16 @@ class JobManager:
             if header:
                 log_f.write(header if header.endswith("\n") else header + "\n")
                 log_f.flush()
+            # A run gets a cgroup of its own, so limiting or freezing it cannot reach
+            # SmarTune, which the child would otherwise share a cgroup with. Setup
+            # (clone, uv, downloads) is not something anyone limits, and stays put.
+            if kind == "run":
+                argv, env, spawn_kw, job._scope = isolation.wrap(
+                    list(argv), dict(env), unit=f"smartune-bench-{job.id}")
+                if job._scope is not None:
+                    log_f.write(f"[smartune] running in {job._scope.describe()}\n")
+            else:
+                spawn_kw = privilege.spawn_kwargs()
             job._proc = subprocess.Popen(
                 list(argv),
                 cwd=cwd,
@@ -195,7 +206,7 @@ class JobManager:
                 # both come through here, so neither can be added later without
                 # inheriting the drop. cancel() is unaffected -- the parent is
                 # still root, and root may signal any process group.
-                **privilege.spawn_kwargs(),
+                **spawn_kw,
             )
         except Exception:
             with self._lock:
@@ -268,6 +279,8 @@ class JobManager:
                                    f"process group {pgid}")
                 except ProcessLookupError:
                     pass
+                # Whatever left the process group (setsid) is still in the scope.
+                isolation.kill(job._scope)
 
         threading.Thread(target=_escalate, daemon=True).start()
         return True

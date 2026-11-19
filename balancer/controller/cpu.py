@@ -21,6 +21,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from utils.logger import get_logger
 logger = get_logger(__name__)
+from utils import self_guard
 from utils.app_utils import write_cgroup_file
 
 CORE_CLASSES = ("p", "e", "lpe")
@@ -198,6 +199,8 @@ class CPUController:
     # -- actions ---------------------------------------------------------
     def set_cpus(self, directory: str, cpus: str) -> Tuple[bool, str]:
         directory = os.path.realpath(directory)
+        if self_guard.is_protected(directory):
+            return False, self_guard.refusal([directory])
         if not os.path.isdir(directory):
             return False, f"cgroup {os.path.basename(directory)} no longer exists"
         if not self.enable_for(directory):

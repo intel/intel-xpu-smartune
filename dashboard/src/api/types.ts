@@ -460,6 +460,39 @@ export interface CpuAffinityStatus {
   last: { class: string; cpus: string } | null
 }
 
+// Device-level frequency limits (Control Center / Device Control).  Per device, not per app.
+// One unit is a cpufreq policy (cores sharing a policy move together) or a GPU gt; every
+// frequency is in MHz.  min/max are what the device is limited to now; original_* is what
+// Restore puts back, null when SmarTune has not limited the unit.
+export interface FreqUnit {
+  id: string
+  kind: 'cpu' | 'gpu'
+  label: string
+  group: string
+  hw_min_mhz: number
+  hw_max_mhz: number
+  min_mhz: number
+  max_mhz: number
+  cur_mhz: number | null
+  limited: boolean
+  original_min_mhz: number | null
+  original_max_mhz: number | null
+  driver: string | null
+  // CPU only: the cpus of this policy and their core class ('p' | 'e' | 'lpe' | 'mixed' | '').
+  cpus?: number[]
+  core_class?: string
+}
+
+export interface FreqStatus {
+  units: FreqUnit[]
+}
+
+export interface FreqSetPayload {
+  units: string[]
+  min_mhz: number
+  max_mhz: number
+}
+
 export interface LimitSnapshotData {
   limited: boolean
   source: 'auto' | 'manual' | null

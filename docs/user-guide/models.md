@@ -46,6 +46,17 @@ Start a benchmark job for the selected model. A job typically has two phases:
 Progress and live output are shown while the job runs; you'll also get a
 notification when a job finishes.
 
+**Managing a running benchmark.** While a benchmark runs, SmarTune is in
+quiet mode (the [balancer guide](../design/balancer.md) explains it) and applies no automatic control, so measurements
+stay clean. If you leave quiet mode and limit or freeze the benchmark from the
+[Control center](control-center.md), the limit applies to the benchmark alone:
+the run is started in a cgroup scope of its own (named
+`smartune-bench-<job id>.scope`, next to the one SmarTune runs in). The scope
+sets no limits itself, so the benchmark runs as it would without one. The job
+log's first line says which scope it is in. If a scope cannot be created on
+your system, the log says why, the benchmark still runs, and limiting it is
+refused because it would also limit SmarTune.
+
 <!-- Screenshot: a benchmark job running, with its live output. -->
 ![Benchmark job running](images/models-run.png)
 

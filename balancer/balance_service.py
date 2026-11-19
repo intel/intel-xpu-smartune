@@ -142,6 +142,15 @@ class DynamicService:
     def release_cpu_affinity(self, app_id):
         return self.balancer.release_cpu_affinity(app_id)
 
+    def freq_status(self):
+        return self.balancer.get_freq()
+
+    def freq_set(self, units, min_mhz, max_mhz):
+        return self.balancer.set_freq(units, min_mhz, max_mhz)
+
+    def freq_restore(self, units=None):
+        return self.balancer.restore_freq(units)
+
     def cpu_affinity(self, app_id, app_name, cpu_class, cpus=None, target_cgroups=None):
         if cpu_class == "status":
             return True, self.balancer.get_cpu_affinity(app_id, app_name)
@@ -1752,6 +1761,12 @@ def app_resource_limit():
         # retmsg so the UI can show one notification and close the limit dialog,
         # instead of falling through to the OPERATING_ERROR branch (which would also
         # trigger a duplicate SSE 'limit_skipped' toast).
+        if isinstance(result, dict) and "refused" in result:
+            return construct_response(
+                data={},
+                retcode=RetCode.OPERATING_ERROR,
+                retmsg=result["refused"],
+            )
         if isinstance(result, dict) and "skipped" in result:
             return construct_response(
                 data={"skipped": True},
@@ -1906,6 +1921,70 @@ def app_cpu_affinity():
             retmsg=result)
     except Exception as e:
         logger.error(f"CPU affinity failed: {e}")
+        return construct_response(
+            data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
+
+
+@app.route('/device/freq/status', methods=['GET', 'POST'])
+def device_freq_status():
+    """CPU policies and GPU gts with their hardware range, current min/max and live clock."""
+    try:
+        return construct_response(data=_service.freq_status(), retmsg="ok")
+    except Exception as e:
+        logger.error(f"Frequency status failed: {e}")
+        return construct_response(
+            data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
+
+
+def _freq_units_arg(data):
+    """A list of unit-id strings from the request, or None when malformed."""
+    units = data.get('units')
+    if units is None:
+        return []
+    if isinstance(units, list) and all(isinstance(u, str) for u in units):
+        return units
+    return None
+
+
+@app.route('/device/freq/set', methods=['POST'])
+def device_freq_set():
+    """Limit CPU policies / GPU gts to [min_mhz, max_mhz], each clamped to its hardware range."""
+    try:
+        data = request.get_json() or {}
+        units = _freq_units_arg(data)
+        try:
+            min_mhz, max_mhz = float(data.get('min_mhz')), float(data.get('max_mhz'))
+        except (TypeError, ValueError):
+            min_mhz = max_mhz = None
+        if not units or min_mhz is None:
+            return construct_response(
+                data={}, retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="units (non-empty list), min_mhz and max_mhz must be provided")
+        ok, msg, results = _service.freq_set(units, min_mhz, max_mhz)
+        return construct_response(
+            data={"results": results},
+            retcode=RetCode.SUCCESS if ok else RetCode.OPERATING_ERROR,
+            retmsg=msg)
+    except Exception as e:
+        logger.error(f"Frequency set failed: {e}")
+        return construct_response(
+            data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
+
+
+@app.route('/device/freq/restore', methods=['POST'])
+def device_freq_restore():
+    """Restore the given units, or every limited unit when ``units`` is omitted or empty."""
+    try:
+        data = request.get_json() or {}
+        units = _freq_units_arg(data)
+        if units is None:
+            return construct_response(
+                data={}, retcode=RetCode.ARGUMENT_ERROR, retmsg="units must be a list of strings")
+        ok, msg = _service.freq_restore(units)
+        return construct_response(
+            data={}, retcode=RetCode.SUCCESS if ok else RetCode.OPERATING_ERROR, retmsg=msg)
+    except Exception as e:
+        logger.error(f"Frequency restore failed: {e}")
         return construct_response(
             data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
 

@@ -20,7 +20,7 @@ Using the dashboard, one tab at a time. Start with *Getting started*.
 1. [Getting started](user-guide/getting-started.md) — requirements, the three ways to start, log in, and a tour of the dashboard
 2. [Home](user-guide/home.md) — the live platform overview and Pressure Overview (system, disk I/O, network)
 3. [Applications](user-guide/applications.md) — resource consumers, processes, and adding an app to be controlled
-4. [Control center](user-guide/control-center.md) — priority, resource limits, keep-alive, the launch queue, and restoring limits
+4. [Control center](user-guide/control-center.md) — priority, resource limits, keep-alive, the launch queue, restoring limits, and device frequency limits
 5. [Models (Benchmark)](user-guide/models.md) — download and benchmark AI models and compare results
 6. [System diagnostics](user-guide/diagnostics.md) — the event timeline, alerts, logs, and advice
 7. [History](user-guide/history.md) — long-term pressure and utilization trends

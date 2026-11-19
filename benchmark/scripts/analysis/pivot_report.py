@@ -2,89 +2,10 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Pivot report generator
-Reads windowed_metric_medians.csv and outputs a self-contained interactive HTML.
 
-Each "panel" = one pivot table + its bar chart, and on the page you can:
-  - Row header / column header are each an "add/remove-able dimension list" -> supports multi-level (nested) headers
-  - Select the value metric (any kpi / metric)
-  - Add filters on dimensions not used as rows/cols (default: all -> aggregate)
-  - Choose aggregation (median/mean/min/max/count)
-  - Click "+ Add panel" to clone more panels and compare different metrics side by side
-
-Data processing: repeated test rows of the same config (model x device x batch x precision)
-are folded to median per metric at generation time, so each config keeps a single row.
-
-Usage:
-  python pivot_report.py [input_csv] [output_html]
-  Default: windowed_metric_medians.csv -> pivot_report.html
-"""
-import csv, json, sys, os
-from collections import OrderedDict
+import json, os
 import argparse
 from pathlib import Path
-
-# Candidate config dimensions (DIMS): extend here as needed, e.g. platform / model_source.
-# The dimensions that actually reach the pivot table / HTML are decided by the data: dimensions whose column is missing from the CSV, or whose entire column is empty, are automatically dropped.
-DIMS = ["model_name", "model_source", "platform", "device", "batch_size", "precision"]
-EXCLUDE = set(DIMS + ["case_name", "case_dir"])
-
-
-def _median(vals):
-    v = sorted(x for x in vals if x is not None)
-    if not v:
-        return None
-    n = len(v)
-    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
-
-
-def load(csv_path):
-    with open(csv_path, newline="") as f:
-        rows = list(csv.DictReader(f))
-    if not rows:
-        raise SystemExit("CSV is empty")
-    cols = list(rows[0].keys())
-    dims = [d for d in DIMS if d in cols]          # keep only candidate dimensions present in the CSV
-    metrics = [c for c in cols if c not in EXCLUDE]
-
-    def parse(v):
-        try:
-            return float(v) if v not in ("", None) else None
-        except ValueError:
-            return None
-
-    # repeated test rows of the same config, folded to median per metric -> one row per config
-    buckets = OrderedDict()
-    for r in rows:
-        key = tuple(r.get(d, "") for d in dims)
-        b = buckets.setdefault(key, {m: [] for m in metrics})
-        for m in metrics:
-            b[m].append(parse(r.get(m, "")))
-    data = []
-    n_raw = len(rows)
-    for key, b in buckets.items():
-        rec = dict(zip(dims, key))
-        for m in metrics:
-            rec[m] = _median(b[m])
-        data.append(rec)
-
-    # group metrics by prefix, convenient for dropdown optgroup
-    groups = {}
-    labels = {
-        "kpi": "KPI Performance", "cpu": "CPU Power/Freq/Thermal", "gpu": "GPU Monitoring",
-        "npu": "NPU", "memory": "Memory",
-    }
-    for m in metrics:
-        pre = m.split("_")[0]
-        groups.setdefault(labels.get(pre, pre), []).append(m)
-    # drop all-empty dimensions: only dimensions with at least one non-empty value reach the pivot / HTML
-    effective_dims = [d for d in dims if any(r.get(d) not in (None, "") for r in data)]
-    dim_values = {d: sorted({r[d] for r in data if r.get(d) not in (None, "")})
-                  for d in effective_dims}
-    print("Repeated-test folding: %d raw rows -> %d configs (median per metric)" % (n_raw, len(data)))
-    return data, metrics, groups, dim_values, effective_dims
-
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -172,12 +93,17 @@ const DIMV = /*__DIMV__*/{};
 const DIMS = /*__DIMS__*/[];
 const UNITS = /*__UNITS__*/{};
 const CONCLUSIONS = /*__CONCLUSIONS__*/[];
+const FIXED = /*__FIXED__*/{};
+// A swept benchmark parameter is the dimension "param_<name>"; show the name.
+function dl(d){ return d.startsWith("param_") ? d.slice(6) : d; }
 const COLORS = ["#4da3ff","#3ecf8e","#ff9f43","#c17bff","#ff6b6b","#5ad1e0","#f7c948","#a0d468",
                 "#ff8fb1","#7ec8ff","#b5e48c","#e0aaff"];
 const SEP = "";
 
+const fixedTxt = Object.keys(FIXED).map(k=>k+"="+FIXED[k]).join(", ");
 document.getElementById("sub").textContent =
-  DATA.length + " config · " + DIMS.length + " dims · " + METRICS.length + " metrics";
+  DATA.length + " config · " + DIMS.length + " dims · " + METRICS.length + " metrics"
+  + (fixedTxt ? " · fixed: " + fixedTxt : "");
 
 let uid = 0;
 function agg(vals, how){
@@ -291,11 +217,11 @@ function makePanel(cfg){
       const wrap = el.querySelector('.dimrow[data-axis="'+axis+'"]');
       const label = axis==="rows" ? "Row header (rows)" : "Column header (cols)";
       const chips = state[axis].map((d,i)=>
-        '<span class="chip">'+d+'<b data-rm="'+axis+'|'+i+'" title="remove">×</b></span>').join("");
+        '<span class="chip">'+dl(d)+'<b data-rm="'+axis+'|'+i+'" title="remove">×</b></span>').join("");
       const avail = DIMS.filter(d=>!usedDims().has(d));
       const add = avail.length
         ? '<select class="addsel" data-add="'+axis+'"><option value="">+ dim</option>'
-          + avail.map(d=>'<option value="'+d+'">'+d+'</option>').join("") + '</select>'
+          + avail.map(d=>'<option value="'+d+'">'+dl(d)+'</option>').join("") + '</select>'
         : '';
       wrap.innerHTML = '<span class="axl">'+label+'</span>'+chips+add;
     });
@@ -317,7 +243,7 @@ function makePanel(cfg){
       const cur = state.filters[d]||"__all__";
       const opts = ['<option value="__all__">all (aggregate)</option>']
         .concat(DIMV[d].map(v=>'<option value="'+v+'"'+(v===cur?" selected":"")+'>'+v+'</option>')).join("");
-      return '<label>'+d+' filter<select data-flt="'+d+'">'+opts+'</select></label>';
+      return '<label>'+dl(d)+' filter<select data-flt="'+d+'">'+opts+'</select></label>';
     }).join("") : '<span class="meta">all dimensions are used as row/col headers</span>';
     wrap.querySelectorAll("select").forEach(s=>s.onchange=()=>{
       const d=s.dataset.flt;
@@ -360,8 +286,8 @@ function makePanel(cfg){
     const best = highlight==="max" ? mx : highlight==="min" ? mn : null;
     if(!rowKeys.length || !colKeys.length) return '<div class="meta">no data under current filters</div>';
     const rLev = Math.max(rowDims.length,1);
-    const cornerLbl = (rowDims.join(" / ")||'row')
-                    + ' \\ ' + (colDims.join(" / ")||'col');
+    const cornerLbl = (rowDims.map(dl).join(" / ")||'row')
+                    + ' \\ ' + (colDims.map(dl).join(" / ")||'col');
     // collect visible cell values for the three coloring maps
     const vals=[];
     for(const rw of rowKeys)for(const ck of colKeys){const a=val(rw,ck); if(a!=null) vals.push(a);}
@@ -531,7 +457,8 @@ def build(csv_path, out_path, profile=None, json_path=None):
             .replace("/*__DIMV__*/{}", json.dumps(res["dim_values"], ensure_ascii=False))
             .replace("/*__DIMS__*/[]", json.dumps(res["dims"], ensure_ascii=False))
             .replace("/*__UNITS__*/{}", json.dumps(res["units"], ensure_ascii=False))
-            .replace("/*__CONCLUSIONS__*/[]", json.dumps(res["conclusions"], ensure_ascii=False)))
+            .replace("/*__CONCLUSIONS__*/[]", json.dumps(res["conclusions"], ensure_ascii=False))
+            .replace("/*__FIXED__*/{}", json.dumps(res.get("fixed_params") or {}, ensure_ascii=False)))
     with open(out_path, "w") as f:
         f.write(html)
     print("Generated:", out_path, "(", len(html), "bytes )")

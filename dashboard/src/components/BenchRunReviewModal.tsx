@@ -3,10 +3,24 @@
 // Pre-run review for per-model memory estimates and editable planned commands.
 
 import React, { useEffect, useMemo, useState } from 'react'
-import { Alert, Button, Input, Modal, Space, Spin, Tabs, Tag, Tooltip, Typography } from 'antd'
+import {
+  Alert,
+  Button,
+  Checkbox,
+  Input,
+  InputNumber,
+  Modal,
+  Select,
+  Space,
+  Spin,
+  Tabs,
+  Tag,
+  Tooltip,
+  Typography,
+} from 'antd'
 import { WarningTwoTone } from '@ant-design/icons'
 
-import type { BenchPlanCommand, DynamicInfoData, StaticInfoData } from '../api/types'
+import type { BenchPlanCommand, BenchRounds, DynamicInfoData, StaticInfoData } from '../api/types'
 import BenchMemoryFitPanel, {
   DEFAULT_FIT_CHOICE,
   hasOverBudget,
@@ -22,6 +36,10 @@ const { Text } = Typography
 // should land here -- every ticked model gets a tab -- but a command that did
 // would otherwise be invisible while still running, so it gets the last tab.
 const OTHER_KEY = '__other__'
+
+// Mirrors benchmark/service/runner.py _MAX_ROUNDS / _MAX_CASES.
+const MAX_ROUNDS = 10
+const MAX_CASES = 1024
 
 // How tall a page may get before it scrolls itself. Bounded by the viewport as
 // well as by a figure, so the footer stays reachable on a short screen.
@@ -43,8 +61,10 @@ interface Props {
   commands: BenchPlanCommand[]
   /** True while the run is being started. */
   working: boolean
-  /** Start the run. `edits` maps case_key -> command, changed cases only. */
-  onRun: (edits: Record<string, string>) => void
+  /** Start the run. `edits` maps case_key -> command, changed cases only;
+   *  `skip` lists the case_keys left unticked; `rounds` is how many times each
+   *  case is measured and in which rounds the hardware sampler runs in full. */
+  onRun: (edits: Record<string, string>, skip: string[], rounds: BenchRounds) => void
   onCancel: () => void
 }
 
@@ -64,6 +84,21 @@ function groupByPrecision(cases: BenchPlanCommand[]) {
   return groups
 }
 
+/** The parameters a case's sweep varied, as tags: which combination it is. */
+function SweptTags({ cmd }: { cmd: BenchPlanCommand }) {
+  const swept = Object.entries(cmd.swept ?? {})
+  if (!swept.length) return null
+  return (
+    <>
+      {swept.map(([k, v]) => (
+        <Tag key={k} color="geekblue" style={{ marginInlineEnd: 0 }}>
+          {k}={String(v)}
+        </Tag>
+      ))}
+    </>
+  )
+}
+
 /** The commands of one page: one editable box per case, grouped by precision. */
 function CommandList({
   cases,
@@ -72,6 +107,8 @@ function CommandList({
   editing,
   working,
   onEdit,
+  excluded,
+  onToggle,
 }: {
   cases: BenchPlanCommand[]
   drafts: Record<string, string>
@@ -79,6 +116,8 @@ function CommandList({
   editing: boolean
   working: boolean
   onEdit: (caseKey: string, value: string) => void
+  excluded: Set<string>
+  onToggle: (caseKey: string, include: boolean) => void
 }) {
   const groups = useMemo(() => groupByPrecision(cases), [cases])
   if (!cases.length) {
@@ -102,13 +141,36 @@ function CommandList({
             const edited =
               (drafts[cmd.case_key] ?? '').trim() !== (defaults[cmd.case_key] ?? '').trim()
             return (
-              <div key={cmd.case_key} style={{ marginBottom: 8 }}>
-                <Space size={6} style={{ marginBottom: 2 }}>
+              <div
+                key={cmd.case_key}
+                style={{ marginBottom: 8, opacity: excluded.has(cmd.case_key) ? 0.5 : 1 }}
+              >
+                <Space size={6} style={{ marginBottom: 2 }} wrap>
+                  {/* Unticked cases are neither run nor recorded. A case whose
+                      configuration is invalid starts unticked. */}
+                  <Checkbox
+                    checked={!excluded.has(cmd.case_key)}
+                    disabled={working}
+                    onChange={(e) => onToggle(cmd.case_key, e.target.checked)}
+                  />
                   {/* Case identity: where this measurement is filed, regardless
                       of what the command below is edited to. */}
                   <Tag style={{ marginInlineEnd: 0 }}>{deviceLabel(cmd.device)}</Tag>
+                  <SweptTags cmd={cmd} />
                   {edited && <Tag color="orange">changed</Tag>}
                 </Space>
+                {(cmd.errors ?? []).map((e) => (
+                  <div key={e}>
+                    <Text type="danger" style={{ fontSize: 12 }}>
+                      {e}{edited ? '' : ' — not run unless the command is edited'}
+                    </Text>
+                  </div>
+                ))}
+                {(cmd.warnings ?? []).map((w) => (
+                  <div key={w}>
+                    <Text type="warning" style={{ fontSize: 12 }}>{w}</Text>
+                  </div>
+                ))}
                 <Input.TextArea
                   value={drafts[cmd.case_key] ?? ''}
                   onChange={(e) => onEdit(cmd.case_key, e.target.value)}
@@ -154,6 +216,20 @@ export default function BenchRunReviewModal({
   // so a page keeps its context and streams while another page is on screen.
   const [fit, setFit] = useState<Record<string, FitChoice>>({})
   const [activeKey, setActiveKey] = useState<string>('')
+  // Cases the operator unticked. Seeded with the invalid ones as the plan
+  // delivers them; a case the operator has ticked or unticked is left alone.
+  const [excluded, setExcluded] = useState<Set<string>>(new Set())
+  const [touched, setTouched] = useState<Set<string>>(new Set())
+  // Repetitions. Round 1 sampled by default, which for one round is exactly
+  // what a run always did.
+  const [rounds, setRounds] = useState<BenchRounds>({ rounds: 1, sample_rounds: [1], warmup: false })
+  const changeRoundCount = (count: number | null) => {
+    const n = Math.max(1, Math.min(MAX_ROUNDS, Math.round(count ?? 1)))
+    setRounds((prev) => {
+      const kept = prev.sample_rounds.filter((r) => r <= n)
+      return { ...prev, rounds: n, sample_rounds: kept.length || !prev.sample_rounds.length ? kept : [1] }
+    })
+  }
 
   // Seed a box per case as the plan delivers them. An edit already in progress
   // for a case that is still present is kept, so a poll that re-delivers the
@@ -170,7 +246,25 @@ export default function BenchRunReviewModal({
       for (const cmd of commands) next[cmd.case_key] = prev[cmd.case_key] ?? cmd.command
       return next
     })
-  }, [commands])
+    setExcluded((prev) => {
+      const next = new Set<string>()
+      for (const cmd of commands) {
+        const keep = touched.has(cmd.case_key) ? prev.has(cmd.case_key) : !!cmd.errors?.length
+        if (keep) next.add(cmd.case_key)
+      }
+      return next
+    })
+  }, [commands, touched])
+
+  const toggle = (key: string, include: boolean) => {
+    setTouched((prev) => new Set(prev).add(key))
+    setExcluded((prev) => {
+      const next = new Set(prev)
+      if (include) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
 
   // The commands of each page, and the ones that matched no page. The plan
   // names a model the way the pipeline does (a directory-safe form), not by its
@@ -218,9 +312,12 @@ export default function BenchRunReviewModal({
 
   const submit = () => {
     const edits: Record<string, string> = {}
-    for (const key of changed) edits[key] = drafts[key]
-    onRun(edits)
+    for (const key of changed) if (!excluded.has(key)) edits[key] = drafts[key]
+    onRun(edits, commands.map((c) => c.case_key).filter((k) => excluded.has(k)), rounds)
   }
+  const included = commands.length - commands.filter((c) => excluded.has(c.case_key)).length
+  const totalCases = included * (rounds.rounds + (rounds.warmup ? 1 : 0))
+  const invalid = commands.filter((c) => c.errors?.length).length
 
   const pages = [
     ...items.map((item) => {
@@ -295,6 +392,8 @@ export default function BenchRunReviewModal({
                     editing={editing}
                     working={working}
                     onEdit={(key, value) => setDrafts((prev) => ({ ...prev, [key]: value }))}
+                    excluded={excluded}
+                    onToggle={toggle}
                   />
                 )}
               </div>
@@ -326,6 +425,8 @@ export default function BenchRunReviewModal({
                   editing={editing}
                   working={working}
                   onEdit={(key, value) => setDrafts((prev) => ({ ...prev, [key]: value }))}
+                  excluded={excluded}
+                  onToggle={toggle}
                 />
               </Space>
             ),
@@ -340,7 +441,7 @@ export default function BenchRunReviewModal({
     ? activeKey
     : (pages[0]?.key ?? '')
 
-  const noCommands = !planLoading && !planError && commands.length === 0
+  const noCommands = !planLoading && !planError && (commands.length === 0 || included === 0)
 
   return (
     <Modal
@@ -374,14 +475,15 @@ export default function BenchRunReviewModal({
               type="primary"
               onClick={submit}
               loading={working}
-              disabled={planLoading || !!planError || noCommands}
+              disabled={planLoading || !!planError || noCommands || totalCases > MAX_CASES}
               danger={overBudget.size > 0}
             >
               {planLoading
                 ? 'Composing commands…'
-                : changed.length
-                  ? `Run with ${changed.length} edited command${changed.length === 1 ? '' : 's'}`
-                  : 'Run'}
+                : `Run ${totalCases} case${totalCases === 1 ? '' : 's'}` +
+                  (changed.length
+                    ? `, ${changed.length} edited`
+                    : '')}
             </Button>
           </Tooltip>
         </Space>
@@ -400,6 +502,71 @@ export default function BenchRunReviewModal({
             }
             description="Their tabs are marked. The check is an estimate, not a gate — you can still run."
           />
+        )}
+
+        {invalid > 0 && !planLoading && (
+          <Alert
+            type="warning"
+            showIcon
+            message={`${invalid} case${invalid === 1 ? ' has' : 's have'} a configuration that cannot run as set`}
+            description="They are unticked and say why. Fix the model's parameters and run again, or edit the command and tick the case."
+          />
+        )}
+
+        {/* Repetitions: the same cases, measured again, each round into its own
+            results directory -- the report takes the median across them. The
+            sampler's own load can sway a KPI, so it can be left to run in full
+            for only some rounds: KPIs then come from the others, hardware
+            figures from those. */}
+        <Space size={12} wrap align="center">
+          <Text strong style={{ fontSize: 13 }}>Rounds</Text>
+          <InputNumber
+            size="small"
+            min={1}
+            max={MAX_ROUNDS}
+            value={rounds.rounds}
+            onChange={changeRoundCount}
+            disabled={working}
+            style={{ width: 70 }}
+          />
+          <Tooltip title="Run every case once more before round 1 and leave it out of the medians: the first load of a model reads it from disk, later ones from the page cache.">
+            <Checkbox
+              checked={rounds.warmup}
+              disabled={working}
+              onChange={(e) => setRounds((prev) => ({ ...prev, warmup: e.target.checked }))}
+            >
+              warm-up round
+            </Checkbox>
+          </Tooltip>
+          <Tooltip title="Rounds the hardware sampler runs in full for (power, utilisation, bandwidth). The others record only memory and temperature, and their KPIs are the ones reported.">
+            <Space size={6}>
+              <Text type="secondary" style={{ fontSize: 12 }}>hardware metrics in</Text>
+              <Select
+                size="small"
+                mode="multiple"
+                style={{ minWidth: 160 }}
+                placeholder="no round"
+                disabled={working}
+                value={rounds.sample_rounds}
+                onChange={(value: number[]) => setRounds((prev) => ({ ...prev, sample_rounds: [...value].sort((a, b) => a - b) }))}
+                options={Array.from({ length: rounds.rounds }, (_, i) => ({ value: i + 1, label: `round ${i + 1}` }))}
+              />
+            </Space>
+          </Tooltip>
+          {!planLoading && (
+            <Text type={totalCases > MAX_CASES ? 'danger' : 'secondary'} style={{ fontSize: 12 }}>
+              {included} case{included === 1 ? '' : 's'}
+              {rounds.rounds > 1 || rounds.warmup
+                ? ` × ${rounds.rounds + (rounds.warmup ? 1 : 0)} rounds = ${totalCases}`
+                : ''}
+              {totalCases > MAX_CASES ? ` — over the limit of ${MAX_CASES}` : ''}
+            </Text>
+          )}
+        </Space>
+        {rounds.rounds > 1 && rounds.sample_rounds.length === rounds.rounds && (
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            Every round is sampled, so the KPIs include the sampler's load. Leave a round unsampled to measure without it.
+          </Text>
         )}
 
         <Text type="secondary" style={{ fontSize: 12 }}>

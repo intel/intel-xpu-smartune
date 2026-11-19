@@ -116,103 +116,64 @@ def to_genai_task(task: str, model: str = '') -> str:
 
 
 # --------------------------------------------------------------------------- #
-# GenAI benchmark: task-specific command-line options
+# GenAI benchmark: task-specific defaults
 # --------------------------------------------------------------------------- #
-def genai_task_specific_opt(task: str, route_params: Dict = None) -> str:
-    """
-    Build task-specific options for the GenAI benchmark.py command.
+# Bare prompt-file names; bench_params.render_args prefixes the prompts/ directory
+# llm_bench resolves them from.
+DEFAULT_PROMPT_FILE = 'llama-2-7b-chat_l.jsonl'
+DEFAULT_RERANK_TEXTS = 'texts_for_rerank.jsonl'
 
+
+def genai_task_defaults(task: str, route_params: Dict = None) -> Dict:
+    """
+    Task-specific default parameters for the GenAI benchmark.py command.
+
+    Keyed by bench_params canonical names (not CLI flags), so the user's own
+    configuration can override any of them before the command is rendered once.
     See tools/llm_bench/benchmark.py for the per-task argument requirements.
-    Returns a backslash-newline joined option string ready to append.
     """
     route_params = route_params or {}
-    opts: List[str] = []
-
-    num_iters = route_params.get('num_iters', 2)
-    default_prompt_file = 'prompts/llama-2-7b-chat_l.jsonl'
+    get = route_params.get
 
     if task in ['text_gen', 'code_gen']:
-        prompt_file = route_params.get('prompt_file', default_prompt_file)
-        infer_count = route_params.get('max_new_tokens', 128)
-        opts.append(f'-pf "{prompt_file}"')
-        opts.append(f'-ic {infer_count}')
-        opts.append(f'--embedding_max_length 512')
-
-    elif task == 'visual_text_gen':
-        prompt = route_params.get('prompt', 'Describe this image in detail.')
-        images = route_params.get('images', 'dog.jpg')
-        infer_count = route_params.get('max_new_tokens', 128)
-        opts.append(f'-p "{prompt}"')
-        opts.append(f'-i "{images}"')
-        opts.append(f'-ic {infer_count}')
-
-    elif task == 'speech_to_text':
-        media = route_params.get('media', 'test_audio.wav')
-        opts.append(f'--media "{media}"')
-
-    elif task == 'image_gen':
-        prompt = route_params.get('prompt', 'A beautiful sunset over mountains')
-        num_steps = route_params.get('num_steps', 20)
-        height = route_params.get('height', 512)
-        width = route_params.get('width', 512)
-        opts.append(f'-p "{prompt}"')
-        opts.append(f'--num_steps {num_steps}')
-        opts.append(f'--height {height}')
-        opts.append(f'--width {width}')
-
-    elif task == 'image-to-image':
-        prompt = route_params.get('prompt', 'Transform this image')
-        images = route_params.get('images', 'input_image.jpg')
-        num_steps = route_params.get('num_steps', 20)
-        opts.append(f'-p "{prompt}"')
-        opts.append(f'-i "{images}"')
-        opts.append(f'--num_steps {num_steps}')
-
-    elif task == 'text-to-video':
-        prompt = route_params.get('prompt', 'A car driving through a city')
-        num_steps = route_params.get('num_steps', 30)
-        num_frames = route_params.get('num_frames', 24)
-        frame_rate = route_params.get('frame_rate', 8.0)
-        opts.append(f'-p "{prompt}"')
-        opts.append(f'--num_steps {num_steps}')
-        opts.append(f'--num_frames {num_frames}')
-        opts.append(f'--frame_rate {frame_rate}')
-
-    elif task == 'inpainting':
-        prompt = route_params.get('prompt', 'Fill the masked area')
-        images = route_params.get('images', 'input_image.jpg')
-        mask_image = route_params.get('mask_image', 'mask.jpg')
-        num_steps = route_params.get('num_steps', 20)
-        opts.append(f'-p "{prompt}"')
-        opts.append(f'-i "{images}"')
-        opts.append(f'-mi "{mask_image}"')
-        opts.append(f'--num_steps {num_steps}')
-
-    elif task == 'text_embed':
-        prompt_file = route_params.get('prompt_file', default_prompt_file)
-        opts.append(f'-pf "{prompt_file}"')
-
-    elif task == 'text_to_speech':
-        prompt = route_params.get('prompt', 'Hello, this is a test.')
-        opts.append(f'-p "{prompt}"')
-
-    elif task == 'image_cls':
-        images = route_params.get('images', 'test_image.jpg')
-        opts.append(f'-i "{images}"')
-
-    elif task == 'text_rerank':
-        text_file = route_params.get('text_file', 'prompts/texts_for_rerank.jsonl')
-        opts.append(f'--texts_file "{text_file}"')
-        prompt = route_params.get('prompt', 'what is the Intel Core Ultra AI Ability?')
-        opts.append(f'-p "{prompt}"')
-
-    elif task == 'ldm_super_resolution':
-        images = route_params.get('images', 'low_res_image.jpg')
-        num_steps = route_params.get('num_steps', 20)
-        opts.append(f'-i "{images}"')
-        opts.append(f'--num_steps {num_steps}')
-
-    else:
-        opts.append(f'-n {num_iters}')
-
-    return ' \\\n        '.join(opts)
+        return {'prompt_file': get('prompt_file', DEFAULT_PROMPT_FILE),
+                'infer_count': get('max_new_tokens', 128),
+                'embedding_max_length': 512}
+    if task == 'visual_text_gen':
+        return {'prompt': get('prompt', 'Describe this image in detail.'),
+                'images': get('images', 'dog.jpg'),
+                'infer_count': get('max_new_tokens', 128)}
+    if task == 'speech_to_text':
+        return {'media': get('media', 'test_audio.wav')}
+    if task == 'image_gen':
+        return {'prompt': get('prompt', 'A beautiful sunset over mountains'),
+                'num_steps': get('num_steps', 20),
+                'height': get('height', 512),
+                'width': get('width', 512)}
+    if task == 'image-to-image':
+        return {'prompt': get('prompt', 'Transform this image'),
+                'images': get('images', 'input_image.jpg'),
+                'num_steps': get('num_steps', 20)}
+    if task == 'text-to-video':
+        return {'prompt': get('prompt', 'A car driving through a city'),
+                'num_steps': get('num_steps', 30),
+                'num_frames': get('num_frames', 24),
+                'frame_rate': get('frame_rate', 8.0)}
+    if task == 'inpainting':
+        return {'prompt': get('prompt', 'Fill the masked area'),
+                'images': get('images', 'input_image.jpg'),
+                'mask_image': get('mask_image', 'mask.jpg'),
+                'num_steps': get('num_steps', 20)}
+    if task == 'text_embed':
+        return {'prompt_file': get('prompt_file', DEFAULT_PROMPT_FILE)}
+    if task == 'text_to_speech':
+        return {'prompt': get('prompt', 'Hello, this is a test.')}
+    if task == 'image_cls':
+        return {'images': get('images', 'test_image.jpg')}
+    if task == 'text_rerank':
+        return {'texts_file': get('text_file', DEFAULT_RERANK_TEXTS),
+                'prompt': get('prompt', 'what is the Intel Core Ultra AI Ability?')}
+    if task == 'ldm_super_resolution':
+        return {'images': get('images', 'low_res_image.jpg'),
+                'num_steps': get('num_steps', 20)}
+    return {'num_iters': get('num_iters', 2)}

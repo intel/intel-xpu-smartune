@@ -49,6 +49,13 @@ import type {
   BenchPrecision,
   BenchMatrixData,
   BenchPlanData,
+  BenchConfig,
+  BenchParamSchema,
+  BenchParamValidation,
+  BenchRounds,
+  BenchTool,
+  BenchToolConfig,
+  BenchToolPrediction,
   BenchResultsData,
   BenchTimelineData,
   BenchRunsData,
@@ -690,11 +697,18 @@ export const api = {
       args?: string
       devices?: BenchDevice[]
       ov?: string
+      // Per-tool benchmark parameters, swept where a value is a list.
+      bench?: BenchConfig
     }[],
     opt: BenchStage,
     devices?: BenchDevice[],
     ov?: string,
-  ) => postBench<BenchJob>('/bench/run', { models, opt, devices, ov }),
+    // Repetitions: every case measured this many times in one job.
+    rounds?: BenchRounds,
+    // The plan job the run was reviewed from: the server counts the case cap off
+    // what it listed, as the review did, rather than an upper bound.
+    plan?: string,
+  ) => postBench<BenchJob>('/bench/run', { models, opt, devices, ov, ...(rounds ?? {}), plan }),
 
   // Advanced run, phase 1: a print-only pass that lists the exact benchmark
   // commands this request would run, without measuring or writing anything. Send
@@ -707,6 +721,8 @@ export const api = {
       args?: string
       devices?: BenchDevice[]
       ov?: string
+      // Per-tool benchmark parameters, swept where a value is a list.
+      bench?: BenchConfig
     }[],
     opt: BenchStage,
     devices?: BenchDevice[],
@@ -729,11 +745,18 @@ export const api = {
       args?: string
       devices?: BenchDevice[]
       ov?: string
+      // Per-tool benchmark parameters, swept where a value is a list.
+      bench?: BenchConfig
     }[],
     opt: BenchStage,
     commands: Record<string, string>,
     devices?: BenchDevice[],
     ov?: string,
+    // case_keys the operator unticked in the review: not run, not recorded.
+    skip: string[] = [],
+    rounds?: BenchRounds,
+    // The plan job the commands came from; see startBenchRun.
+    plan?: string,
   ) =>
     postBench<BenchJob>('/bench/run/advanced', {
       models,
@@ -741,7 +764,25 @@ export const api = {
       devices,
       ov,
       commands,
+      skip,
+      ...(rounds ?? {}),
+      plan,
     }),
+
+  // The parameter form for one tool on one OpenVINO version: the hand-written
+  // schema merged with what that version's tool accepts (benchmark/service/params.py).
+  getBenchParamSchema: (tool: BenchTool, ov: string) =>
+    get<BenchParamSchema>(
+      `/bench/params/schema?tool=${encodeURIComponent(tool)}&ov=${encodeURIComponent(ov)}`,
+    ),
+  // Check one tool's configuration exactly as a run would, and count its cases.
+  validateBenchParams: (tool: BenchTool, ov: string, config: BenchToolConfig) =>
+    post<BenchParamValidation>('/bench/params/validate', { tool, ov, config }),
+  // Which benchmark tool the router will give a model.
+  predictBenchTool: (model: string, ov: string) =>
+    get<BenchToolPrediction>(
+      `/bench/params/predict?model=${encodeURIComponent(model)}&ov=${encodeURIComponent(ov)}`,
+    ),
   getBenchRuns: () => get<BenchRunsData>('/bench/run'),
   getBenchRun: (runId: string, offset?: number) =>
     get<BenchJob>(

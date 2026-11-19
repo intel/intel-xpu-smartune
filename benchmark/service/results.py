@@ -7,7 +7,11 @@
 # summary.tsv per run directory:
 #
 #   <benchmarks>/<backend>/<RUN_NAME>_<DEVICE>/summary.tsv
-#   <benchmarks>/<backend>/<RUN_NAME>_<DEVICE>/<model>_<quant>/benchmark.log
+#   <benchmarks>/<backend>/<RUN_NAME>_<DEVICE>/<model>_<quant>/<variant>/benchmark.log
+#
+# <variant> is one combination of the model's parameter sweep (gen_wrapper.py);
+# its case.json records the parameters, which the aggregator turns into
+# `param_<name>` columns. Runs from before sweeps existed have no <variant> level.
 #
 # summary.tsv says whether each case ran; it carries no numbers. Those come from
 # windowed_metric_medians.csv, which the pipeline's aggregation step writes by
@@ -81,7 +85,17 @@ _PIVOT_JSON_NAME = "pivot_report.json"
 _MEDIANS_DIMENSION_COLUMNS = frozenset({
     "case_name", "case_dir", "model_name", "model_source",
     "platform", "device", "batch_size", "precision", "mode",
+    "tool", "task", "variant_id", "swept_keys", "case_status", "overridden",
+    "series", "round", "warmup", "sampled",
 })
+
+# Every benchmark parameter a case ran with is a `param_<name>` column. They are
+# dimensions -- what the case was -- not measurements, even when numeric.
+_PARAM_PREFIX = "param_"
+
+
+def _is_dimension(column: str) -> bool:
+    return column in _MEDIANS_DIMENSION_COLUMNS or column.startswith(_PARAM_PREFIX)
 
 
 # metric metadata
@@ -106,6 +120,7 @@ _METRIC_GROUPS = (
     ("memory", "Memory"),
     ("gpu", "GPU"),
     ("npu", "NPU"),
+    ("pre", "Before the run"),
 )
 
 # Only where the derived form below would be wrong or clumsy.
@@ -121,6 +136,15 @@ _METRIC_LABELS = {
     "kpi_second_latency_ms": "TPOT",
     "kpi_throughput_tokens_s": "throughput",
     "kpi_input_token_size": "input length",
+    # benchmark_app's. Same lowercase "throughput" as GenAI's: the unit beside it
+    # (FPS against tok/s) already says which tool measured it.
+    "kpi_throughput_fps": "throughput",
+    "kpi_latency_median_ms": "latency P50",
+    "kpi_latency_average_ms": "latency mean",
+    "kpi_latency_min_ms": "latency min",
+    "kpi_latency_max_ms": "latency max",
+    "kpi_count_iterations": "iterations",
+    "kpi_duration_ms": "duration",
     "cpu_usage_percent_median": "CPU usage",
     "cpu_p_core_usage_percent_median": "P-core usage",
     "cpu_e_core_usage_percent_median": "E-core usage",
@@ -161,7 +185,42 @@ _METRIC_LABELS = {
     "d_bs_lat_cost_pct": "batching latency cost",
     "d_perf_per_watt": "performance per watt",
     "d_temp_headroom_c": "temperature headroom",
+    "d_model_mem_gb": "memory added by the run",
+    "d_n_runs": "repetitions",
+    "d_sampling_overhead_pct": "sampling overhead",
+    "memory_cached_gb_median": "page cache",
+    "swap_used_gb_median": "swap used",
+    "pre_memory_used_gb": "memory used before",
+    "pre_memory_used_percent": "memory used before, share",
+    "pre_memory_available_gb": "memory free before",
+    "pre_memory_cached_gb": "page cache before",
+    "pre_swap_used_gb": "swap used before",
+    "pre_cpu_package_temp_c": "CPU package temp before",
+    "pre_npu_temperature_c": "NPU temp before",
 }
+
+# Per-parameter comparisons analyze.py derives for every parameter a sweep
+# varied: d_rel_best_<param>, d_<param>_tp_gain_pct, d_<param>_lat_cost_pct.
+# Named by pattern because the parameters are whatever the operator swept.
+_PARAM_DERIVED = (
+    (re.compile(r"^d_rel_best_(.+)$"), "vs best {}", "×", True,
+     "Throughput relative to the best {} for this model, precision, device and "
+     "every other setting. 1.00× throughout when the sweep used a single value."),
+    (re.compile(r"^d_(.+)_tp_gain_pct$"), "{} throughput gain", "%", True,
+     "Throughput gained against the smallest {} measured, all else equal."),
+    (re.compile(r"^d_(.+)_lat_cost_pct$"), "{} latency cost", "%", False,
+     "Latency added against the smallest {} measured, all else equal."),
+)
+
+
+def _param_derived(key: str):
+    """(label, unit, higher_is_better, note) for a per-parameter comparison."""
+    for pattern, label, unit, better, note in _PARAM_DERIVED:
+        match = pattern.match(key)
+        if match:
+            name = match.group(1).replace("_", " ")
+            return label.format(name), unit, better, note.format(name)
+    return None
 
 # Suffix -> unit. Longest match wins, so "_gb_s_median" beats "_gb_median".
 _METRIC_UNITS = (
@@ -173,7 +232,9 @@ _METRIC_UNITS = (
     ("_gb_median", "GB"),
     ("_w_median", "W"),
     ("_c_median", "°C"),
+    ("_percent", "%"),
     ("_pct", "%"),
+    ("_gb", "GB"),
     ("_ms", "ms"),
     ("_c", "°C"),
 )
@@ -183,6 +244,11 @@ _HIGHER_IS_BETTER = {
     "kpi_throughput_tokens_s": True,
     "kpi_first_latency_ms": False,
     "kpi_second_latency_ms": False,
+    "kpi_throughput_fps": True,
+    "kpi_latency_median_ms": False,
+    "kpi_latency_average_ms": False,
+    "kpi_latency_min_ms": False,
+    "kpi_latency_max_ms": False,
     "cpu_package_power_w_median": False,
     "cpu_package_temp_c_median": False,
     "gpu_power_w_median": False,
@@ -200,6 +266,8 @@ _HIGHER_IS_BETTER = {
     "d_bs_tp_gain_pct": True,
     "d_bs_lat_cost_pct": False,
     "d_cv_throughput_pct": False,
+    "swap_used_gb_median": False,
+    "d_sampling_overhead_pct": None,
 }
 
 # Units the suffix rules cannot see, because they are not in the name. The pivot
@@ -212,7 +280,9 @@ _METRIC_UNIT_OVERRIDES = {
     "d_rel_best_device": "×",
     "d_rel_best_batch": "×",
     "d_perf_per_watt": "tok/s/W",
+    "d_n_runs": "",
     "kpi_input_token_size": "tokens",
+    "kpi_throughput_fps": "FPS",
 }
 
 # What a number actually means, where the name does not say and the answer
@@ -236,6 +306,11 @@ _METRIC_NOTES = {
     ),
     "kpi_throughput_tokens_s": "Generated tokens per second, over the whole generation.",
     "kpi_input_token_size": "Length of the prompt the case was run with.",
+    "kpi_throughput_fps": "Inferences per second across every stream, as benchmark_app reports it.",
+    "kpi_latency_median_ms": (
+        "Median time of one inference request. With several streams in flight "
+        "this is per request, not the reciprocal of throughput."
+    ),
     "d_speedup_vs_cpu": (
         "Throughput relative to the CPU running the same model at the same "
         "precision. CPU rows are 1.00× by definition -- they are the baseline."
@@ -289,6 +364,38 @@ _METRIC_NOTES = {
     ),
     "npu_power_w_median": "Absent on drivers that do not expose an NPU power rail.",
     "npu_temperature_c_median": "Absent on drivers that do not expose an NPU temperature sensor.",
+    "d_n_runs": (
+        "How many repetitions of this configuration the KPI median was taken "
+        "over -- the rounds of a multi-round run without full sampling, or all "
+        "of them when every round was sampled. Warm-up rounds are not counted."
+    ),
+    "d_sampling_overhead_pct": (
+        "Primary KPI of the rounds measured with full hardware sampling against "
+        "the rounds without it. Near zero means the sampler did not disturb the "
+        "measurement; the KPI columns come from the unsampled rounds either way."
+    ),
+    "d_model_mem_gb": (
+        "Median memory in use during the measurement minus what was in use just "
+        "before the case's process launched: roughly what loading and running the "
+        "model took. Other programs starting or stopping meanwhile skew it."
+    ),
+    "memory_cached_gb_median": (
+        "Page cache and buffers. Model weights read from disk stay here until "
+        "evicted, so a second run of the same weights may load faster."
+    ),
+    "pre_memory_used_gb": (
+        "Memory in use in the last sample before the case's process launched -- "
+        "what other programs held before this case loaded anything."
+    ),
+    "pre_memory_cached_gb": "Page cache in the last sample before the case launched.",
+    "pre_swap_used_gb": (
+        "Swap in use before the case launched. Non-zero means the run started "
+        "under memory pressure it did not cause."
+    ),
+    "pre_cpu_package_temp_c": (
+        "CPU package temperature before the case launched. A case that starts hot "
+        "throttles sooner than one that starts cool."
+    ),
 }
 
 
@@ -296,6 +403,8 @@ def _metric_group(key: str) -> str:
     if key.startswith("d_"):
         return "derived"
     prefix = key.split("_", 1)[0]
+    if prefix == "swap":
+        return "memory"
     return prefix if prefix in {g for g, _ in _METRIC_GROUPS} else "other"
 
 
@@ -303,6 +412,9 @@ def _metric_unit(key: str) -> Optional[str]:
     override = _METRIC_UNIT_OVERRIDES.get(key)
     if override:
         return override
+    derived = _param_derived(key) if key not in _METRIC_LABELS else None
+    if derived:
+        return derived[1]
     for suffix, unit in _METRIC_UNITS:
         if key.endswith(suffix):
             return unit
@@ -318,6 +430,9 @@ def _metric_label(key: str) -> str:
     label = _METRIC_LABELS.get(key)
     if label:
         return label
+    derived = _param_derived(key)
+    if derived:
+        return derived[0]
     stem = re.sub(r"_median$", "", key)
     stem = re.sub(r"^(kpis?|d)_", "", stem)
     return stem.replace("_", " ").strip() or key
@@ -325,14 +440,15 @@ def _metric_label(key: str) -> str:
 
 def metric_meta(key: str) -> dict:
     group = _metric_group(key)
+    derived = _param_derived(key) if key not in _METRIC_LABELS else None
     return {
         "key": key,
         "label": _metric_label(key),
         "unit": _metric_unit(key),
-        "higher_is_better": _HIGHER_IS_BETTER.get(key),
+        "higher_is_better": _HIGHER_IS_BETTER.get(key, derived[2] if derived else None),
         "group": group,
         "group_label": dict(_METRIC_GROUPS).get(group, "Other"),
-        "description": _METRIC_NOTES.get(key),
+        "description": _METRIC_NOTES.get(key) or (derived[3] if derived else None),
     }
 
 
@@ -428,7 +544,7 @@ def _read_medians(run_dir: Path) -> Dict[str, Dict[str, float]]:
     for row in _medians_rows(run_dir):
         metrics: Dict[str, float] = {}
         for key, raw in row.items():
-            if not key or key in _MEDIANS_DIMENSION_COLUMNS:
+            if not key or _is_dimension(key):
                 continue
             try:
                 metrics[key] = float(raw)
@@ -446,10 +562,14 @@ def _read_dimensions(run_dir: Path) -> Dict[str, Dict[str, str]]:
     quant "int4_ov" against precision "int4" -- and those spellings are what a
     comparison view has to group by. Taking them from the aggregator instead of
     re-deriving them keeps the dashboard's axes identical to the report's.
+
+    The `param_<name>` columns come along: they are what distinguishes the cases
+    of one parameter sweep.
     """
-    keys = _MEDIANS_DIMENSION_COLUMNS - {"case_name", "case_dir"}
     return _index_by_case([
-        (row, {key: (row.get(key) or "").strip() for key in keys if row.get(key)})
+        (row, {key: (value or "").strip() for key, value in row.items()
+               if key and _is_dimension(key) and key not in ("case_name", "case_dir")
+               and (value or "").strip()})
         for row in _medians_rows(run_dir)
     ])
 
@@ -639,21 +759,39 @@ def _find_report(run_dir: Path) -> Optional[str]:
 _JOB_STARTED_RE = re.compile(r"^(\d{8}_\d{6})")
 
 
+_ROUND_SUFFIX_RE = re.compile(r"_r(\d+)$")
+
+
 def _job_name(run_dir_name: str, devices: Iterable[str]) -> str:
-    """The run directory name with its device suffix removed.
+    """The run directory name with its device and round suffixes removed.
 
     Longest suffix first, so a device whose name contains another ("GPU" inside
     a hypothetical "DGPU") cannot strip the wrong number of characters. A
     directory that ends in no known device -- a tree assembled by hand, or the
     legacy "TEST" one -- is its own job, which is the honest answer.
+
+    Every round of a multi-round run ("<name>_r<k>_<DEVICE>") is the same job:
+    one press of Run, measured several times.
     """
     candidates = {str(d).strip() for d in devices if str(d).strip()}
     candidates.update(("CPU", "GPU", "NPU"))
+    name = run_dir_name
     for device in sorted(candidates, key=len, reverse=True):
         suffix = f"_{device}"
         if run_dir_name.lower().endswith(suffix.lower()):
-            return run_dir_name[: -len(suffix)] or run_dir_name
-    return run_dir_name
+            name = run_dir_name[: -len(suffix)] or run_dir_name
+            break
+    return _ROUND_SUFFIX_RE.sub("", name) or name
+
+
+def _run_round(run_dir_name: str, devices: Iterable[str]) -> Optional[int]:
+    """Which round of a multi-round run a directory holds, or None."""
+    candidates = {str(d).strip() for d in devices if str(d).strip()} | {"CPU", "GPU", "NPU"}
+    for device in sorted(candidates, key=len, reverse=True):
+        if run_dir_name.lower().endswith(f"_{device}".lower()):
+            match = _ROUND_SUFFIX_RE.search(run_dir_name[: -len(device) - 1])
+            return int(match.group(1)) if match else None
+    return None
 
 
 def _job_started_at(job: str) -> Optional[float]:
@@ -715,7 +853,7 @@ def collect(backend: Optional[str] = None) -> dict:
                     if key in dimensions:
                         row["dimensions"] = dimensions[key]
                         break
-                if row.get("status", "").startswith("failed"):
+                if row.get("status", "").startswith(("failed", "invalid")):
                     log_file = (row.get("log_file") or "").strip()
                     if log_file:
                         reason = _failure_reason(Path(log_file).parent)
@@ -734,6 +872,9 @@ def collect(backend: Optional[str] = None) -> dict:
                 (r.get("dimensions", {}).get("device") or r.get("device") or "" for r in rows),
             )
             meta = _run_meta(run_dir)
+            device_names = [r.get("dimensions", {}).get("device") or r.get("device") or "" for r in rows]
+            run_round = meta.get("round") if isinstance(meta.get("round"), int) \
+                else _run_round(run_dir.name, device_names)
             runs.append({
                 "backend": name,
                 "run": run_dir.name,
@@ -749,6 +890,13 @@ def collect(backend: Optional[str] = None) -> dict:
                 # directories -- one per device -- share one job.
                 "job": job,
                 "job_started_at": _job_started_at(job),
+                # Multi-round runs: which round this directory is (0 = warm-up),
+                # of how many, and whether the sampler ran in full for it.
+                # None / True for a single-round run.
+                "round": run_round,
+                "rounds": meta.get("rounds") if isinstance(meta.get("rounds"), int) else None,
+                "sampled": meta.get("sampled") is not False,
+                "warmup": run_round == 0,
                 "dir": str(run_dir),
                 "updated_at": mtime,
                 "report": _find_report(run_dir),
@@ -756,6 +904,8 @@ def collect(backend: Optional[str] = None) -> dict:
                 "metric_columns": metric_columns,
                 "ok": sum(1 for r in rows if r.get("status") == "ok"),
                 "failed": sum(1 for r in rows if r.get("status", "").startswith("failed")),
+                # Sweep combinations the generator rejected before they ran.
+                "invalid": sum(1 for r in rows if r.get("status") == "invalid"),
             })
 
     runs.sort(key=lambda r: r["updated_at"], reverse=True)
@@ -788,6 +938,22 @@ def _precision_of(quant: str) -> str:
     """
     parts = [p for p in quant.split("_") if p]
     return parts[0] if parts else quant
+
+
+def _param_axes(rows: List[dict]) -> Dict[str, List[str]]:
+    values: Dict[str, Set[str]] = {}
+    for row in rows:
+        for key, value in (row.get("params") or {}).items():
+            if value:
+                values.setdefault(key, set()).add(value)
+
+    def order(value: str):
+        try:
+            return (0, float(value), "")
+        except ValueError:
+            return (1, 0.0, value)
+
+    return {key: sorted(vals, key=order) for key, vals in sorted(values.items())}
 
 
 def matrix(backend: Optional[str] = None) -> dict:
@@ -825,6 +991,10 @@ def matrix(backend: Optional[str] = None) -> dict:
                 # folds by; `run` remains the directory, i.e. one device of it.
                 "job": run["job"],
                 "job_started_at": run["job_started_at"],
+                "round": run["round"],
+                "rounds": run["rounds"],
+                "sampled": run["sampled"],
+                "warmup": run["warmup"],
                 # The OpenVINO version this case was measured against, or null
                 # for a run made before run_meta.json was written. Null is shown
                 # as unknown rather than guessed: the tree holds no other trace
@@ -844,7 +1014,16 @@ def matrix(backend: Optional[str] = None) -> dict:
                 "precision": dims.get("precision") or _precision_of(quant),
                 "quant": quant,
                 "mode": dims.get("mode") or run["backend"],
-                "batch_size": dims.get("batch_size") or "",
+                "batch_size": dims.get(_PARAM_PREFIX + "batch_size") or dims.get("batch_size") or "",
+                # Every parameter the case ran with, and the sweep combination it
+                # was. `swept` names the parameters its sweep varied, which are the
+                # ones worth a column; the rest were the same for every case.
+                "variant": dims.get("variant_id") or source.get("variant") or "",
+                "params": {
+                    key[len(_PARAM_PREFIX):]: value for key, value in dims.items()
+                    if key.startswith(_PARAM_PREFIX)
+                },
+                "swept": [k for k in (dims.get("swept_keys") or "").split(";") if k],
                 "status": source.get("status") or "",
                 "task": source.get("task") or "",
                 "case_dir": str(Path(log_file).parent) if log_file else "",
@@ -881,6 +1060,9 @@ def matrix(backend: Optional[str] = None) -> dict:
             # before run_meta.json existed offers no choice here rather than an
             # "unknown" one -- there is nothing to narrow to.
             "ovs": sorted({r["ov"] for r in rows if r["ov"]}),
+            # Every parameter any case ran with, and the values it took. A
+            # parameter with one value is a setting of every case, not an axis.
+            "params": _param_axes(rows),
         },
         "metrics": _sorted_metric_meta(metric_keys),
         "primary_metric": data["primary_metric"],
@@ -927,7 +1109,7 @@ def result_snapshot(run_name: Optional[str]) -> Optional[dict]:
     devices: Set[str] = set()
     backends: Set[str] = set()
     for run in data["runs"]:
-        # A run directory is "<run_name>[_g<n>]_<DEVICE>"; the job's run_name is
+        # A run directory is "<run_name>[_g<n>][_r<k>]_<DEVICE>"; the job's run_name is
         # the prefix every device and group share. Match on that prefix rather
         # than the folded job name so a build-split run (one group per OpenVINO
         # version) still collapses into a single summary.
@@ -1043,10 +1225,11 @@ _TIMELINE_MAX_POINTS = 1500
 # The group suffix has to be optional rather than ignored: all of a run's groups
 # share one run id and therefore one sampling CSV, which is correct -- they run
 # in sequence under a single sampler thread, and each case is sliced out of it by
-# timestamp. Without the "_g<n>" branch every multi-group run looked like it had
+# timestamp. The same goes for the "_r<k>" of a multi-round run's rounds.
+# Without the "_g<n>" branch every multi-group run looked like it had
 # no samples at all, while its medians -- aggregated in-run from the same CSV,
 # passed by path rather than looked up -- were there the whole time.
-_RUN_ID_RE = re.compile(r"^\d{8}_\d{6}_([0-9a-f]+)(?:_g\d+)?_[A-Za-z]+$")
+_RUN_ID_RE = re.compile(r"^\d{8}_\d{6}_([0-9a-f]+)(?:_g\d+)?(?:_r\d+)?_[A-Za-z]+$")
 
 _aggregator = None
 
@@ -1104,7 +1287,11 @@ def timeline(case_dir: str) -> Optional[dict]:
     detail = resolved / "detail.log"
     if not detail.is_file():
         return None
-    csv_path = _run_metrics_csv(resolved.parent)
+    # A sweep case sits one level deeper (<run>/<model>_<quant>/<variant>) than a
+    # case from before sweeps (<run>/<model>_<quant>).
+    run_dir = next((d for d in (resolved.parent, resolved.parent.parent)
+                    if _RUN_ID_RE.match(d.name)), None)
+    csv_path = _run_metrics_csv(run_dir) if run_dir is not None else None
     if csv_path is None:
         return None
 
@@ -1232,6 +1419,11 @@ def delete_cases(case_dirs: Sequence[str]) -> dict:
             logger.warning(f"Refused to delete a non-case benchmark path: {case_dir}")
             skipped.append(str(raw))
             continue
+        # The run directory is the nearest ancestor holding summary.tsv: the
+        # parent for a case from before parameter sweeps, the grandparent for a
+        # sweep variant (<run>/<model>_<quant>/<variant>).
+        run_dir = next((d for d in case_dir.parents
+                        if d != root and (d / "summary.tsv").is_file()), case_dir.parent)
         if case_dir.is_dir():
             try:
                 shutil.rmtree(case_dir)
@@ -1239,9 +1431,16 @@ def delete_cases(case_dirs: Sequence[str]) -> dict:
                 logger.warning(f"Could not remove benchmark case {case_dir}: {exc}")
                 skipped.append(str(raw))
                 continue
+        # The model directory a variant lived in, once its last variant is gone.
+        parent = case_dir.parent
+        if parent != run_dir and parent.is_dir() and not any(parent.iterdir()):
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
         # Recorded even when the directory was already gone: the summary row
         # naming it is exactly what has to go too.
-        removed.setdefault(case_dir.parent, set()).add(str(case_dir))
+        removed.setdefault(run_dir, set()).add(str(case_dir))
 
     runs_removed = 0
     for run_dir, cases in removed.items():

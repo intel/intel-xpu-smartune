@@ -8,6 +8,7 @@ Unified wrapper executor - Execute wrapper scripts with timeout, logging, and va
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -47,7 +48,10 @@ def execute_single_wrapper(
     # Determine log file path
     logs_dir = get_logs_dir()
     logs_dir.mkdir(parents=True, exist_ok=True)
-    log_base = logs_dir / script_path_obj.stem
+    # One pair of logs per round of a multi-round run (run_template.sh exports
+    # BENCH_ROUND), so a later round does not overwrite an earlier one's.
+    round_suffix = f"_r{os.environ['BENCH_ROUND']}" if os.environ.get('BENCH_ROUND') else ''
+    log_base = logs_dir / f"{script_path_obj.stem}{round_suffix}"
 
     stdout_log = f"{log_base}.stdout.log"
     stderr_log = f"{log_base}.stderr.log"

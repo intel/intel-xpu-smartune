@@ -10,13 +10,14 @@ import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from utils import quiet_mode
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
-from benchmark.service import env, jobs, privilege, sampler
+from benchmark.service import env, jobs, params, privilege, sampler
+from benchmark.scripts.params import bench_params
 
 # Pipeline stages accepted by run_template.sh's `opt` switch.
 VALID_STAGES = ("build", "benchmark", "all")
@@ -55,17 +56,25 @@ _MAX_ARGS_LEN = 512
 # Guards a single request from queueing an unbounded amount of GPU-hours.
 _MAX_MODELS = 32
 
+# Rounds: the same set of cases measured again, each round into its own run
+# directories ("<run_name>_r<k>_<DEVICE>"), so the report can take a median and a
+# spread across processes rather than trust one. Bounded per request, and so is
+# what they multiply out to -- see _estimate_cases.
+_MAX_ROUNDS = 10
+_MAX_CASES = 1024
+
 # Advanced run: the operator reviews the plan's commands and may edit them, then
 # each edited command is written to a per-case file the commons run verbatim.
 #
 # The case_key is the identity the commons stamp on every case
-# ("<safe_name>__<quant>__<DEVICE>", see benchmark/templates/bench_advanced_common.sh)
-# and the plan manifest reports back. It becomes a filename under the overrides
-# directory, so it is validated against exactly that shape -- this is the boundary
-# that stops a crafted key ("../../etc/x") from escaping the directory. The three
-# fields themselves are model_safe_name / a directory basename / a device, none of
-# which can contain a slash.
-_CASE_KEY_RE = re.compile(r"^[A-Za-z0-9][\w.+-]*__[\w.+-]+__[A-Za-z0-9]+$")
+# ("<safe_name>__<quant>__<DEVICE>[__<variant_id>]", see
+# benchmark/templates/bench_advanced_common.sh) and the plan manifest reports
+# back. It becomes a filename under the overrides directory, so it is validated
+# against exactly that shape -- this is the boundary that stops a crafted key
+# ("../../etc/x") from escaping the directory. The fields themselves are
+# model_safe_name / a directory basename / a device / a variant id, none of which
+# can contain a slash.
+_CASE_KEY_RE = re.compile(r"^[A-Za-z0-9][\w.+-]*__[\w.+-]+__[A-Za-z0-9]+(__[\w.+-]+)?$")
 
 # A single override command is a benchmark invocation, not a program. Bounds one
 # request; the command still runs as the same unprivileged pipeline user as every
@@ -158,6 +167,96 @@ def normalize_ov(ov: Optional[str], stage: str) -> Optional[str]:
     if not _OV_VERSION_RE.match(version):
         raise InvalidRunRequest(f"invalid OpenVINO version: {version!r} (expected X.Y.Z)")
     return version
+
+
+def normalize_rounds(rounds=None, sample_rounds=None, warmup=False) -> dict:
+    """A run's repetition settings, validated.
+
+    ``rounds`` is how many times every case is measured (1 = as before).
+    ``sample_rounds`` lists the 1-based rounds the hardware sampler runs in full
+    for; the others record only light memory/temperature rows, so the
+    collectors' own load stays out of their KPIs. "all" and "none" are accepted.
+    Default: round 1 -- which for a single-round run is every round, so a plain
+    run is sampled exactly as it always was.
+    ``warmup`` adds an unmeasured round 0 ahead of them, recorded but left out of
+    the report's medians: the first load of a model reads it from disk, the
+    rounds after it from the page cache.
+    """
+    try:
+        count = int(rounds if rounds not in (None, "") else 1)
+    except (TypeError, ValueError):
+        raise InvalidRunRequest(f"rounds must be a whole number, got {rounds!r}")
+    if not 1 <= count <= _MAX_ROUNDS:
+        raise InvalidRunRequest(f"rounds must be between 1 and {_MAX_ROUNDS}")
+
+    if sample_rounds in (None, ""):
+        sampled = [1]
+    elif sample_rounds == "all":
+        sampled = list(range(1, count + 1))
+    elif sample_rounds == "none":
+        sampled = []
+    else:
+        if not isinstance(sample_rounds, (list, tuple)):
+            raise InvalidRunRequest("sample_rounds must be a list of round numbers, 'all' or 'none'")
+        try:
+            sampled = sorted({int(r) for r in sample_rounds})
+        except (TypeError, ValueError):
+            raise InvalidRunRequest("sample_rounds must be round numbers")
+        bad = [r for r in sampled if not 1 <= r <= count]
+        if bad:
+            raise InvalidRunRequest(f"sample_rounds {bad} outside 1..{count}")
+    return {"rounds": count, "sample_rounds": sampled, "warmup": bool(warmup)}
+
+
+def _estimate_cases(entries: Sequence[dict], rounds: dict) -> int:
+    """Upper bound on the cases a request runs: precisions x devices x the larger
+    tool sweep x rounds, summed over models. The router has not picked the tool
+    yet, so the larger of the two sweeps is what it might be."""
+    total = 0
+    for entry in entries:
+        precisions = len([p for p in str(entry.get("build") or "").split(",") if p]) or 1
+        devices = len(entry.get("device") or []) or 1
+        sweep = max([bench_params.count_variants(cfg)
+                     for cfg in (entry.get("bench") or {}).values()] or [1])
+        total += precisions * devices * sweep
+    return total * _round_count(rounds)
+
+
+def _round_count(rounds: dict) -> int:
+    """How many times each case runs: every round, plus the warm-up if asked for."""
+    return rounds["rounds"] + (1 if rounds["warmup"] else 0)
+
+
+def _plan_cases(plan_id: str, entries: Sequence[dict], devices: Sequence[str],
+                ov: Optional[str], skip: Sequence[str]) -> int:
+    """The cases one round of this request runs, read off the plan it was reviewed from.
+
+    The plan ran the same route -> gen_wrapper -> run_case path the run will, so its
+    manifest lists exactly the cases the router picked -- the count the review
+    showed -- where _estimate_cases has to assume the larger sweep. Only a skip key
+    the plan has a case under takes one off: any other key never fires, so it must
+    not buy room under the cap either."""
+    plan = jobs.manager.get(str(plan_id))
+    if plan is None or not (plan.meta or {}).get("plan") or plan.status != jobs.STATUS_DONE:
+        raise InvalidRunRequest(
+            "the plan this run was reviewed from is not available; review the run again"
+        )
+    # The manifest only describes this run if it was rendered from the same request.
+    if (plan.meta.get("models") != [_pipeline_entry(entry) for entry in entries]
+            or plan.meta.get("devices") != list(devices) or plan.meta.get("ov") != ov):
+        raise InvalidRunRequest("this run does not match the plan it was reviewed from")
+    skipped = {str(key) for key in skip}
+    return sum(1 for record in plan_manifest(plan)["commands"]
+               if record.get("case_key") not in skipped)
+
+
+def _rounds_env(rounds: dict) -> Dict[str, str]:
+    """What run_template.sh's round loop reads."""
+    return {
+        "BENCH_ROUNDS": str(rounds["rounds"]),
+        "BENCH_SAMPLE_ROUNDS": " ".join(str(r) for r in rounds["sample_rounds"]),
+        "BENCH_WARMUP_ROUND": "1" if rounds["warmup"] else "0",
+    }
 
 
 def normalize_request(
@@ -258,6 +357,23 @@ def normalize_request(
             if tokens:
                 entry["args"] = tokens
 
+        # The model's benchmark parameters, one section per tool (genai /
+        # benchmark_app), validated against the schema of the OpenVINO version it
+        # runs on. Carried on the entry like `args`: route.py passes every
+        # non-id/type field onto the route, and gen_wrapper.py expands the
+        # section for whichever tool the router picked into one case per
+        # combination. Whether a parameter suits the model's task is checked
+        # there, once the task is known, and shown in the plan review.
+        model_ov = (normalize_ov(item.get("ov"), stage)
+                    if item.get("ov") is not None else picked_ov)
+        if item.get("bench") and stage in _MEASURED_STAGES:
+            try:
+                bench = params.normalize(item.get("bench"), model_ov)
+            except bench_params.ParamError as e:
+                raise InvalidRunRequest(f"{model_id}: {e}")
+            if bench:
+                entry["bench"] = bench
+
         # How to split the run: this model's devices -- the same selection
         # stamped above, never a second reading of the request -- and its
         # OpenVINO version, defaulting to the request's. Only the benchmark
@@ -265,10 +381,7 @@ def normalize_request(
         # whatever runs them, so the request carries no devices for it and the
         # grouping below collapses to one group regardless.
         entry["_devices"] = list(model_devices)
-        entry["_ov"] = (
-            normalize_ov(item.get("ov"), stage)
-            if item.get("ov") is not None else picked_ov
-        )
+        entry["_ov"] = model_ov
         entries.append(entry)
 
     if stage in ("build", "all") and not any("build" in e for e in entries):
@@ -420,8 +533,27 @@ def render_driver(scripts: Sequence[Tuple[Path, dict]], run_id: str) -> Path:
     return driver_path
 
 
-def _write_cmd_overrides(run_id: str, commands: dict) -> Path:
-    """Write an advanced run's per-case command overrides, return their directory.
+def _check_cmd_overrides(commands: dict, skip: Sequence[str] = ()) -> None:
+    """Raise InvalidRunRequest for any override _write_cmd_overrides would refuse.
+
+    start_run calls this with the rest of the request's validation, before quiet
+    mode and the sampler are taken: the write itself only happens once both are
+    held, and a rejection there would leave them held with no job to release them.
+    """
+    for case_key in [*commands, *skip]:
+        if not _CASE_KEY_RE.match(str(case_key)):
+            raise InvalidRunRequest(f"invalid case identifier: {case_key!r}")
+    for case_key, command in commands.items():
+        text = str(command or "")
+        if text.strip() and len(text) > _MAX_OVERRIDE_LEN:
+            raise InvalidRunRequest(
+                f"command for {case_key} is too long ({len(text)} > {_MAX_OVERRIDE_LEN} chars)"
+            )
+
+
+def _write_cmd_overrides(run_id: str, commands: dict,
+                         skip: Sequence[str] = ()) -> Path:
+    """Write an advanced run's per-case overrides, return their directory.
 
     ``commands`` maps a case_key (as the plan manifest reported it) to the full
     command the operator wants that case to run. Each non-empty command is written
@@ -430,34 +562,40 @@ def _write_cmd_overrides(run_id: str, commands: dict) -> Path:
     with no entry here keeps its built command, so the operator only has to submit
     what they changed.
 
+    ``skip`` lists the case_keys the operator unticked; each gets an empty
+    ``<case_key>.skip`` and run_case returns without running or recording it.
+
     The key becomes a filename, so it is validated against the exact shape the
     commons produce before it is joined to a path -- the security boundary for a
     value that came back from the browser.
     """
+    _check_cmd_overrides(commands, skip)
     overrides_dir = privilege.ensure_dir(env.paths()["runs"] / f"overrides_{run_id}")
     for case_key, command in commands.items():
         key = str(case_key)
-        if not _CASE_KEY_RE.match(key):
-            raise InvalidRunRequest(f"invalid case identifier: {case_key!r}")
         text = str(command or "")
         if not text.strip():
             # An emptied command means "run this case as planned", not "run
             # nothing": leaving no file makes run_case fall back to its default.
             continue
-        if len(text) > _MAX_OVERRIDE_LEN:
-            raise InvalidRunRequest(
-                f"command for {key} is too long ({len(text)} > {_MAX_OVERRIDE_LEN} chars)"
-            )
         cmd_file = overrides_dir / f"{key}.cmd"
         cmd_file.write_text(text if text.endswith("\n") else text + "\n")
         cmd_file.chmod(0o644)
         privilege.chown(cmd_file)
+    for case_key in skip:
+        key = str(case_key)
+        skip_file = overrides_dir / f"{key}.skip"
+        skip_file.write_text("")
+        skip_file.chmod(0o644)
+        privilege.chown(skip_file)
     return overrides_dir
 
 
 def start_run(
     models: Sequence[dict], stage: str, devices: Optional[Sequence[str]] = None,
     ov: Optional[str] = None, cmd_overrides: Optional[dict] = None,
+    skip_cases: Optional[Sequence[str]] = None,
+    rounds: Optional[dict] = None, plan_id: Optional[str] = None,
 ) -> jobs.Job:
     """Validate, render and launch a pipeline run. Raises InvalidRunRequest,
     jobs.BenchBusy, QuietModeBlocked, or RuntimeError when the environment is
@@ -465,13 +603,36 @@ def start_run(
 
     ``cmd_overrides`` (an advanced run) maps a case_key to a command the operator
     edited in the plan review; the commons run each in place of the one they would
-    have built. Everything else is a normal measured run -- same rendering, sampler,
-    quiet mode and results -- so the override only changes what each case executes,
-    never how the run is set up or recorded."""
+    have built; ``skip_cases`` lists the case_keys the operator unticked. Everything
+    else is a normal measured run -- same rendering, sampler, quiet mode and
+    results -- so the override only changes what each case executes, never how the
+    run is set up or recorded.
+
+    ``rounds`` is normalize_rounds()'s input as a dict (rounds, sample_rounds,
+    warmup): every case measured that many times in one job, under one
+    quiet-mode window, each round into its own run directories.
+
+    ``plan_id`` is the plan job the run was reviewed from. With it the case cap
+    counts what the plan listed, less the cases skipped, as the review did; without
+    it (an older client, a build) it falls back to _estimate_cases' upper bound."""
     # Validate the request before probing the environment: a malformed request is
     # malformed regardless of environment state, and reporting *that* is more
     # useful than telling the user to spend an hour on setup first.
     entries, stage, devices, ov = normalize_request(models, stage, devices, ov)
+    rounds = normalize_rounds(**(rounds or {}))
+    if stage == "build":
+        rounds = normalize_rounds()
+    _check_cmd_overrides(cmd_overrides or {}, skip_cases or ())
+    if stage in _MEASURED_STAGES and plan_id:
+        planned_cases = _plan_cases(plan_id, entries, devices, ov,
+                                    skip_cases or ()) * _round_count(rounds)
+    else:
+        planned_cases = _estimate_cases(entries, rounds)
+    if stage in _MEASURED_STAGES and planned_cases > _MAX_CASES:
+        raise InvalidRunRequest(
+            f"this run would measure up to {planned_cases} cases (at most {_MAX_CASES}); "
+            "fewer rounds, devices, precisions or sweep values"
+        )
 
     status = env.probe()
     if not status["enabled"]:
@@ -576,6 +737,10 @@ def start_run(
         f"=== benchmark run ===\n"
         f"stage  : {stage}\n"
         f"script : {script_path}\n"
+        + (f"rounds : {rounds['rounds']}"
+           f"{' + warm-up' if rounds['warmup'] else ''}, full sampling in "
+           f"{', '.join(map(str, rounds['sample_rounds'])) or 'none'}\n"
+           if stage in _MEASURED_STAGES else "")
         + "".join(f"{line}\n" for line in privilege.describe())
         + "".join(
             f"group {position}/{len(groups)}: ov={group['ov'] or '-'} "
@@ -604,9 +769,15 @@ def start_run(
 
     metrics_csv: Optional[Path] = None
     run_sampler: Optional[sampler.RunSampler] = None
+    # The file run_template.sh creates to pause full sampling for a round that is
+    # not to be measured with metrics on, and removes for one that is. Removed up
+    # front so a stale one cannot start this run paused.
+    sampler_control = env.paths()["runs"] / f"run_{run_id}.nosample"
+    sampler_control.unlink(missing_ok=True)
     if stage in _MEASURED_STAGES:
         candidate = env.paths()["runs"] / f"run_{run_id}_metrics.csv"
-        run_sampler = sampler.RunSampler(candidate, quiet_owner=quiet_owner)
+        run_sampler = sampler.RunSampler(candidate, quiet_owner=quiet_owner,
+                                         control_path=sampler_control)
         if run_sampler.start():
             metrics_csv = candidate
         else:
@@ -646,14 +817,17 @@ def start_run(
         )
     if metrics_csv:
         extra_env["BENCH_METRICS_CSV"] = str(metrics_csv)
+        extra_env["BENCH_SAMPLER_CONTROL"] = str(sampler_control)
+    if stage in _MEASURED_STAGES:
+        extra_env.update(_rounds_env(rounds))
 
     # Advanced run: point the commons at the operator's edited commands. Written
     # after the request validated and the slot was reserved, so a rejected run
     # leaves no override files, and under the same run id as the scripts so the
     # cleanup below can find them.
     overrides_dir: Optional[Path] = None
-    if cmd_overrides:
-        overrides_dir = _write_cmd_overrides(run_id, cmd_overrides)
+    if cmd_overrides or skip_cases:
+        overrides_dir = _write_cmd_overrides(run_id, cmd_overrides or {}, skip_cases or ())
         extra_env["BENCH_CMD_OVERRIDES"] = str(overrides_dir)
 
     global _live_sampler
@@ -663,6 +837,7 @@ def start_run(
         global _live_sampler
         _live_sampler = None
         run_sampler.stop()
+        sampler_control.unlink(missing_ok=True)
 
     try:
         return jobs.manager.start(
@@ -685,6 +860,10 @@ def start_run(
                       for group in groups
                   ],
                   "metrics_csv": str(metrics_csv) if metrics_csv else None,
+                  # How many times each case is measured, and in which rounds
+                  # the sampler ran in full.
+                  "rounds": rounds,
+                  "planned_cases": planned_cases,
                   # Which run this job's quiet-mode hold belongs to, so the
                   # listener below can release exactly that hold and not one
                   # taken by a later run.
@@ -858,7 +1037,8 @@ def plan_manifest(job: Optional[jobs.Job]) -> dict:
     Returns ``{"ready": bool, "commands": [...]}``: ``ready`` is True once the job
     has left RUNNING (so the browser knows the list is complete), and each command
     is one manifest record (case_key, model, quant, task, device, model_dir,
-    command). An absent manifest -- the job has not written it yet, or produced no
+    command, and the variant's tool / variant_id / params / swept / errors /
+    warnings). An absent manifest -- the job has not written it yet, or produced no
     cases -- reads as an empty list rather than an error.
     """
     if job is None:

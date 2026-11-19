@@ -19,6 +19,13 @@
 // pipeline -- is one click away in the case drawer, and a table wide enough to
 // hold all of it is a table nobody reads across.
 //
+// Within a job, one table per tool. One press of Run can drive both GenAI and
+// benchmark_app, and their KPIs share nothing: TTFT and tok/s against FPS and
+// per-request latency. In one table every row was blank under half the KPI
+// columns, and only one tool's KPIs could be among the headline ones -- the
+// other's were hidden behind "All metrics". Split by tool, each table shows its
+// own KPIs by default, under the same columns in every job.
+//
 // The two selectors above the tables are a search, not a view setting: each one
 // narrows the tree by one axis, an empty one says nothing about that axis, and
 // together they mean both at once. That is why they do not share the Analysis
@@ -52,12 +59,16 @@ import {
 import { DeleteOutlined, ReloadOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 
-import type { BenchMatrixData, BenchMatrixRow } from '../api/types'
+import type { BenchMatrixData, BenchMatrixRow, BenchMetricMeta } from '../api/types'
 import {
   deviceLabel,
   formatMetric,
   indexMetrics,
+  foldRounds,
+  hasRounds,
   jobLabels,
+  paramsLabel,
+  type RoundGroup,
   metricTitle,
   type JobLabel,
   type MetricIndex,
@@ -65,9 +76,36 @@ import {
 
 const { Text } = Typography
 
-// What a benchmark run is usually being read for: how much was asked of it, how
-// long the first and each subsequent token took, what came out per second, and
-// how hard the part of the machine that ran it was working.
+// What a benchmark run is usually being read for: the tool's own KPIs, then how
+// hard the part of the machine that ran it was working.
+//
+// The KPIs are per tool, keyed by the results directory the tool writes under
+// (benchmark/service/results.py BACKENDS). GenAI: how much was asked of it, how
+// long the first and each subsequent token took, and what came out per second.
+// benchmark_app: inferences per second and how long one request took. A tool
+// not listed here shows every KPI it recorded, rather than none.
+const KEY_KPIS: Record<string, string[]> = {
+  genai: [
+    'kpi_input_token_size',
+    'kpi_first_latency_ms',
+    'kpi_second_latency_ms',
+    'kpi_throughput_tokens_s',
+  ],
+  app: ['kpi_throughput_fps', 'kpi_latency_median_ms', 'kpi_latency_average_ms'],
+}
+
+// In BACKENDS order, so GenAI comes first in a job that ran both.
+const TOOLS: { backend: string; label: string }[] = [
+  { backend: 'genai', label: 'GenAI (llm_bench)' },
+  { backend: 'ovms', label: 'OVMS' },
+  { backend: 'app', label: 'benchmark_app' },
+]
+
+function toolLabel(backend: string): string {
+  return TOOLS.find((tool) => tool.backend === backend)?.label ?? backend
+}
+
+// The machine, whichever tool was driving it.
 //
 // The accelerator columns are occupancy, not clocks: a GPU clock of 2500 MHz is
 // the same number whether the device is saturated or idle at its boost point,
@@ -76,11 +114,7 @@ const { Text } = Typography
 // denominator of performance-per-watt, which is worth checking but not worth a
 // column in the table everyone reads first; it is one click away in the case
 // drawer, and under "All metrics" here.
-const KEY_METRICS = [
-  'kpi_input_token_size',
-  'kpi_first_latency_ms',
-  'kpi_second_latency_ms',
-  'kpi_throughput_tokens_s',
+const KEY_SYSTEM_METRICS = [
   'memory_used_gb_median',
   'memory_bandwidth_gb_s_median',
   'cpu_usage_percent_median',
@@ -111,15 +145,40 @@ function metricColumns(
   }))
 }
 
+/**
+ * The metric columns of one tool's table.
+ *
+ * Only columns something in that table actually measured -- worked out from its
+ * own rows, not the whole job's, or benchmark_app's table would inherit GenAI's
+ * empty TTFT column. A run with no GPU sampling likewise gets no GPU column just
+ * because the schema has one.
+ */
+function metricKeysOf(
+  backend: string,
+  rows: BenchMatrixRow[],
+  metrics: BenchMetricMeta[],
+  showAll: boolean,
+): string[] {
+  const present = new Set(rows.flatMap((row) => Object.keys(row.metrics)))
+  const kpis =
+    KEY_KPIS[backend] ?? metrics.filter((m) => m.group === 'kpi').map((m) => m.key)
+  const wanted = showAll ? metrics.map((m) => m.key) : [...kpis, ...KEY_SYSTEM_METRICS]
+  return wanted.filter((key) => present.has(key))
+}
+
 function StatusTag({ row }: { row: BenchMatrixRow }) {
   const tag = (
-    <Tag color={row.status === 'ok' ? 'success' : 'error'} style={{ marginInlineEnd: 0 }}>
+    <Tag
+      color={row.status === 'ok' ? 'success' : row.status === 'invalid' ? 'warning' : 'error'}
+      style={{ marginInlineEnd: 0 }}
+    >
       {row.status || 'unknown'}
     </Tag>
   )
   // A failed case says why on hover. "failed" alone leaves the reader to open a
   // log to find out whether the device was busy or the model was never
-  // supported there.
+  // supported there. "invalid" is a sweep combination that was never run because
+  // its configuration contradicted itself; the reason says which part.
   return row.failure_reason ? <Tooltip title={row.failure_reason}>{tag}</Tooltip> : tag
 }
 
@@ -132,11 +191,16 @@ interface JobGroup {
   /** Whether `at` is the start or that fallback, which changes how it reads. */
   exact: boolean
   rows: BenchMatrixRow[]
+  /** The same rows, one entry per tool that produced any -- one table each. */
+  tools: { backend: string; rows: BenchMatrixRow[] }[]
   devices: string[]
   /** The OpenVINO versions its cases recorded; empty for a run that recorded none. */
   ovs: string[]
   ok: number
   failed: number
+  /** Multi-round runs: how many rounds, with a warm-up or not, and which ran
+   *  with full hardware sampling. null for a single-round job. */
+  rounds: { count: number; warmup: boolean; sampled: number[] } | null
 }
 
 function jobGroupsOf(rows: BenchMatrixRow[], labels: Map<string, JobLabel>): JobGroup[] {
@@ -145,31 +209,56 @@ function jobGroupsOf(rows: BenchMatrixRow[], labels: Map<string, JobLabel>): Job
     const job = row.job || row.run
     byJob.set(job, [...(byJob.get(job) ?? []), row])
   }
-  const groups = [...byJob.entries()].map(([job, jobRows]) => ({
-    job,
-    // Numbered over every job on disk, not over the filtered ones: a job's
-    // number must not change when the selection above does.
-    name: labels.get(job)?.short ?? job,
-    // A job's own timestamp when it has one. The fallback is the newest of its
-    // run directories, not the oldest: a job is placed by when it was last
-    // heard from, which is the only thing an unnamed tree records.
-    at: jobRows[0].job_started_at ?? Math.max(...jobRows.map((row) => row.updated_at)),
-    exact: jobRows[0].job_started_at != null,
-    rows: [...jobRows].sort(
+  const groups = [...byJob.entries()].map(([job, jobRows]) => {
+    const rows = [...jobRows].sort(
       (a, b) =>
         a.model.localeCompare(b.model) ||
         a.precision.localeCompare(b.precision) ||
         a.device.localeCompare(b.device),
-    ),
-    devices: [...new Set(jobRows.map((row) => row.device).filter(Boolean))].sort(),
-    // Normally one: a job used to be one OpenVINO version by construction, and
-    // still is unless a request asked for several -- in which case each group
-    // is its own job. Read as a set anyway, so a tree assembled by hand cannot
-    // make this claim something it is not.
-    ovs: [...new Set(jobRows.map((row) => row.ov).filter(Boolean) as string[])].sort(),
-    ok: jobRows.filter((row) => row.status === 'ok').length,
-    failed: jobRows.filter((row) => row.status !== 'ok').length,
-  }))
+    )
+    // Known tools in a fixed order, so GenAI's table is first in every job that
+    // has one; anything else after them, by name.
+    const rank = (backend: string) => {
+      const at = TOOLS.findIndex((tool) => tool.backend === backend)
+      return at < 0 ? TOOLS.length : at
+    }
+    const backends = [...new Set(rows.map((row) => row.backend))].sort(
+      (a, b) => rank(a) - rank(b) || a.localeCompare(b),
+    )
+    return {
+      job,
+      // Numbered over every job on disk, not over the filtered ones: a job's
+      // number must not change when the selection above does.
+      name: labels.get(job)?.short ?? job,
+      // A job's own timestamp when it has one. The fallback is the newest of its
+      // run directories, not the oldest: a job is placed by when it was last
+      // heard from, which is the only thing an unnamed tree records.
+      at: jobRows[0].job_started_at ?? Math.max(...jobRows.map((row) => row.updated_at)),
+      exact: jobRows[0].job_started_at != null,
+      rows,
+      tools: backends.map((backend) => ({
+        backend,
+        rows: rows.filter((row) => row.backend === backend),
+      })),
+      devices: [...new Set(jobRows.map((row) => row.device).filter(Boolean))].sort(),
+      // Normally one: a job used to be one OpenVINO version by construction, and
+      // still is unless a request asked for several -- in which case each group
+      // is its own job. Read as a set anyway, so a tree assembled by hand cannot
+      // make this claim something it is not.
+      ovs: [...new Set(jobRows.map((row) => row.ov).filter(Boolean) as string[])].sort(),
+      ok: jobRows.filter((row) => row.status === 'ok').length,
+      failed: jobRows.filter((row) => row.status !== 'ok').length,
+      rounds: hasRounds(jobRows)
+        ? {
+            count: Math.max(...jobRows.map((row) => row.rounds ?? row.round ?? 0)),
+            warmup: jobRows.some((row) => row.warmup),
+            sampled: [...new Set(jobRows
+              .filter((row) => !row.warmup && row.sampled !== false && row.round != null)
+              .map((row) => row.round as number))].sort((a, b) => a - b),
+          }
+        : null,
+    }
+  })
   // Newest first: the job a reader is looking for is almost always the last one
   // they started.
   return groups.sort((a, b) => b.at - a.at)
@@ -194,6 +283,15 @@ function JobHeader({ group, onDelete }: { group: JobGroup; onDelete: () => void 
           </Tag>
         ))}
       </Space>
+      {/* Which tools ran: a collapsed job otherwise does not say whether it
+          has one table inside or two. */}
+      <Space size={4}>
+        {group.tools.map((tool) => (
+          <Tag key={tool.backend} style={{ marginInlineEnd: 0 }}>
+            {toolLabel(tool.backend)}
+          </Tag>
+        ))}
+      </Space>
       {/* Which runtime produced these numbers. One press of Run can now sweep
           several OpenVINO versions -- one per model -- so this is no longer
           implied by "the version the tab was set to", and two jobs are not
@@ -202,6 +300,16 @@ function JobHeader({ group, onDelete }: { group: JobGroup; onDelete: () => void 
         <Tooltip title="The OpenVINO runtime this job was benchmarked against">
           <Tag color="geekblue" style={{ marginInlineEnd: 0 }}>
             OV {group.ovs.join(', ')}
+          </Tag>
+        </Tooltip>
+      )}
+      {group.rounds && (
+        <Tooltip title="Every case was measured this many times; the table shows the median per configuration and expands to the rounds">
+          <Tag color="purple" style={{ marginInlineEnd: 0 }}>
+            {group.rounds.count} round{group.rounds.count === 1 ? '' : 's'}
+            {group.rounds.warmup ? ' + warm-up' : ''}
+            {' · metrics in '}
+            {group.rounds.sampled.length ? `r${group.rounds.sampled.join(', r')}` : 'none'}
           </Tag>
         </Tooltip>
       )}
@@ -233,25 +341,9 @@ function caseKey(row: BenchMatrixRow): string {
   return row.case_dir || `${row.run}-${row.model}-${row.quant}`
 }
 
-/** The cases one job produced, in one table. */
-function JobCases({
-  group,
-  keys,
-  index,
-  onOpenCase,
-  selected,
-  onSelectedChange,
-  onDeleteSelected,
-}: {
-  group: JobGroup
-  keys: string[]
-  index: MetricIndex
-  onOpenCase: (row: BenchMatrixRow) => void
-  selected: string[]
-  onSelectedChange: (keys: string[]) => void
-  onDeleteSelected: () => void
-}) {
-  const columns: ColumnsType<BenchMatrixRow> = [
+/** Which case a row is: model, precision, device, and -- for a sweep -- its config. */
+function identityColumns(rows: BenchMatrixRow[]): ColumnsType<BenchMatrixRow> {
+  return [
     {
       title: 'Model',
       dataIndex: 'model',
@@ -272,7 +364,67 @@ function JobCases({
       width: 90,
       render: (_: unknown, row: BenchMatrixRow) => deviceLabel(row.device),
     },
-    {
+    // Only for a tool that swept parameters: which combination each row is.
+    ...(rows.some((row) => row.swept?.length)
+      ? [
+          {
+            title: 'Config',
+            key: 'config',
+            width: 220,
+            render: (_: unknown, row: BenchMatrixRow) => {
+              const label = paramsLabel(row)
+              return label ? (
+                <Tooltip
+                  title={Object.entries(row.params ?? {})
+                    .map(([k, v]) => `${k}=${v}`)
+                    .join('\n')}
+                  overlayStyle={{ whiteSpace: 'pre-line' }}
+                >
+                  <Text style={{ fontSize: 12 }}>{label}</Text>
+                </Tooltip>
+              ) : (
+                <Text type="secondary">-</Text>
+              )
+            },
+          },
+        ]
+      : []),
+  ]
+}
+
+/** The cases one tool produced within a job, in one table. */
+function ToolCases({
+  rows,
+  keys,
+  index,
+  primaryMetric,
+  onOpenCase,
+  selected,
+  onSelectedChange,
+}: {
+  rows: BenchMatrixRow[]
+  keys: string[]
+  index: MetricIndex
+  primaryMetric: string | null
+  onOpenCase: (row: BenchMatrixRow) => void
+  selected: string[]
+  onSelectedChange: (keys: string[]) => void
+}) {
+  if (hasRounds(rows)) {
+    return (
+      <RoundCases
+        rows={rows}
+        keys={keys}
+        index={index}
+        primaryMetric={primaryMetric}
+        onOpenCase={onOpenCase}
+        selected={selected}
+        onSelectedChange={onSelectedChange}
+      />
+    )
+  }
+  const columns: ColumnsType<BenchMatrixRow> = [
+    ...identityColumns(rows),    {
       title: 'Status',
       key: 'status',
       width: 110,
@@ -280,10 +432,219 @@ function JobCases({
     },
     ...metricColumns(keys, index),
   ]
+  // The selection is the job's, shared by its tool tables: this table reports
+  // only its own rows, so the other tables' ticks are carried through.
+  const own = new Set(rows.map(caseKey))
+  return (
+    <Table
+      size="small"
+      rowKey={caseKey}
+      columns={columns}
+      dataSource={rows}
+      pagination={false}
+      scroll={{ x: 'max-content' }}
+      rowSelection={{
+        selectedRowKeys: selected.filter((key) => own.has(key)),
+        onChange: (keys) =>
+          onSelectedChange([...selected.filter((key) => !own.has(key)), ...keys.map(String)]),
+        // A row with no case directory is a summary row whose case never
+        // wrote a log: there is nothing on disk to name, so it cannot be
+        // deleted on its own. Deleting the whole job does take it.
+        getCheckboxProps: (row) => ({ disabled: !row.case_dir }),
+      }}
+      onRow={(row) => ({
+        onClick: (event) => {
+          // Ticking a box is not a request to read the case. Without this the
+          // checkbox column's clicks bubble out to the row and open the
+          // drawer on top of the selection the user was making.
+          if ((event.target as HTMLElement).closest('.ant-table-selection-column')) return
+          onOpenCase(row)
+        },
+        style: { cursor: 'pointer' },
+      })}
+    />
+  )
+}
+
+/** A round's place in its run: its number, and how it was measured. */
+function RoundTag({ row }: { row: BenchMatrixRow }) {
+  if (row.warmup) {
+    return (
+      <Tooltip title="Warm-up round: recorded, but left out of every median">
+        <Tag style={{ marginInlineEnd: 0 }}>warm-up</Tag>
+      </Tooltip>
+    )
+  }
+  return (
+    <Space size={4}>
+      <Text>{row.round}</Text>
+      {row.sampled !== false && (
+        <Tooltip title="The hardware sampler ran in full for this round: its hardware columns come from here, its KPIs only if no round ran without it">
+          <Tag color="purple" style={{ marginInlineEnd: 0 }}>metrics</Tag>
+        </Tooltip>
+      )}
+    </Space>
+  )
+}
+
+/**
+ * A multi-round job's cases: one row per configuration, its numbers folded over
+ * the rounds (see foldRounds), expanding to the rounds themselves. Ticking a
+ * configuration ticks every round of it.
+ */
+function RoundCases({
+  rows,
+  keys,
+  index,
+  primaryMetric,
+  onOpenCase,
+  selected,
+  onSelectedChange,
+}: {
+  rows: BenchMatrixRow[]
+  keys: string[]
+  index: MetricIndex
+  primaryMetric: string | null
+  onOpenCase: (row: BenchMatrixRow) => void
+  selected: string[]
+  onSelectedChange: (keys: string[]) => void
+}) {
+  const primary = primaryMetric && keys.includes(primaryMetric)
+    ? primaryMetric
+    : keys.find((k) => k.startsWith('kpi_throughput')) ?? null
+  const groups = useMemo(() => foldRounds(rows, primary), [rows, primary])
+  const byKey = useMemo(() => new Map(groups.map((g) => [g.key, g])), [groups])
+  const own = new Set(rows.map(caseKey))
+  const picked = new Set(selected)
+
+  const columns: ColumnsType<RoundGroup> = [
+    // The same identity columns as a single-round table, reading the
+    // configuration's representative row.
+    ...identityColumns(rows).map((col) => {
+      const render = 'render' in col ? col.render : undefined
+      const { dataIndex: _drop, ...rest } = col as typeof col & { dataIndex?: unknown }
+      return {
+        ...rest,
+        render: (_: unknown, g: RoundGroup, i: number) =>
+          render ? render(undefined, g.row, i) : g.row.model,
+      }
+    }) as ColumnsType<RoundGroup>,
+    {
+      title: (
+        <Tooltip title="Repetitions the KPI median was taken over, their spread (coefficient of variation) and range. The warm-up round is not counted.">
+          Rounds
+        </Tooltip>
+      ),
+      key: 'rounds',
+      width: 150,
+      render: (_: unknown, g: RoundGroup) =>
+        g.primary ? (
+          <Tooltip title={`${metricTitle(primary!, index)}: ${formatMetric(g.primary.min)} – ${formatMetric(g.primary.max)}`}>
+            <Text style={{ fontSize: 12 }}>
+              n={g.primary.n}
+              {g.primary.cv !== undefined && (
+                <Text type={g.primary.cv > 5 ? 'warning' : 'secondary'} style={{ fontSize: 12 }}>
+                  {' '}· CV {g.primary.cv.toFixed(1)}%
+                </Text>
+              )}
+            </Text>
+          </Tooltip>
+        ) : (
+          <Text type="secondary">n={g.measured.length}</Text>
+        ),
+    },
+    {
+      title: 'Status',
+      key: 'status',
+      width: 110,
+      render: (_: unknown, g: RoundGroup) => <StatusTag row={g.row} />,
+    },
+    ...metricColumns(keys, index).map((col) => ({
+      ...col,
+      render: (_: unknown, g: RoundGroup) => formatMetric(g.row.metrics?.[String(col.key)]),
+    })) as ColumnsType<RoundGroup>,
+  ]
+
+  const roundColumns: ColumnsType<BenchMatrixRow> = [
+    { title: 'Round', key: 'round', width: 130, render: (_: unknown, row) => <RoundTag row={row} /> },
+    { title: 'Status', key: 'status', width: 110, render: (_: unknown, row) => <StatusTag row={row} /> },
+    ...metricColumns(keys, index),
+  ]
+
+  return (
+    <Table<RoundGroup>
+      size="small"
+      rowKey="key"
+      columns={columns}
+      dataSource={groups}
+      pagination={false}
+      scroll={{ x: 'max-content' }}
+      rowSelection={{
+        selectedRowKeys: groups
+          .filter((g) => g.rounds.every((row) => !row.case_dir || picked.has(caseKey(row))))
+          .filter((g) => g.rounds.some((row) => row.case_dir))
+          .map((g) => g.key),
+        onChange: (chosen) => {
+          const cases = chosen.flatMap((key) =>
+            (byKey.get(String(key))?.rounds ?? []).filter((row) => row.case_dir).map(caseKey))
+          onSelectedChange([...selected.filter((key) => !own.has(key)), ...cases])
+        },
+        getCheckboxProps: (g) => ({ disabled: !g.rounds.some((row) => row.case_dir) }),
+      }}
+      expandable={{
+        expandedRowRender: (g) => (
+          <Table
+            size="small"
+            rowKey={caseKey}
+            columns={roundColumns}
+            dataSource={g.rounds}
+            pagination={false}
+            onRow={(row) => ({ onClick: () => onOpenCase(row), style: { cursor: 'pointer' } })}
+          />
+        ),
+      }}
+      onRow={(g) => ({
+        onClick: (event) => {
+          const target = event.target as HTMLElement
+          if (target.closest('.ant-table-selection-column') || target.closest('.ant-table-row-expand-icon-cell')) return
+          onOpenCase(g.row)
+        },
+        style: { cursor: 'pointer' },
+      })}
+    />
+  )
+}
+
+/** The cases one job produced: one table per tool that ran in it. */
+function JobCases({
+  group,
+  metrics,
+  showAll,
+  index,
+  primaryMetric,
+  onOpenCase,
+  selected,
+  onSelectedChange,
+  onDeleteSelected,
+}: {
+  group: JobGroup
+  metrics: BenchMetricMeta[]
+  showAll: boolean
+  index: MetricIndex
+  primaryMetric: string | null
+  onOpenCase: (row: BenchMatrixRow) => void
+  selected: string[]
+  onSelectedChange: (keys: string[]) => void
+  onDeleteSelected: () => void
+}) {
+  // A heading per table only when there is more than one: a job that ran one
+  // tool reads as it always did, and says which in its own heading.
+  const titled = group.tools.length > 1
   return (
     <Space direction="vertical" size={8} style={{ width: '100%' }}>
       {/* Only once something is ticked. A disabled button above every table is
-          a permanent reminder of an operation nobody has asked for. */}
+          a permanent reminder of an operation nobody has asked for. Once per
+          job, not per tool: ticks in either table are one selection. */}
       {selected.length > 0 && (
         <Space size={8}>
           <Button size="small" danger icon={<DeleteOutlined />} onClick={onDeleteSelected}>
@@ -294,32 +655,27 @@ function JobCases({
           </Button>
         </Space>
       )}
-      <Table
-        size="small"
-        rowKey={caseKey}
-        columns={columns}
-        dataSource={group.rows}
-        pagination={false}
-        scroll={{ x: 'max-content' }}
-        rowSelection={{
-          selectedRowKeys: selected,
-          onChange: (keys) => onSelectedChange(keys.map(String)),
-          // A row with no case directory is a summary row whose case never
-          // wrote a log: there is nothing on disk to name, so it cannot be
-          // deleted on its own. Deleting the whole job does take it.
-          getCheckboxProps: (row) => ({ disabled: !row.case_dir }),
-        }}
-        onRow={(row) => ({
-          onClick: (event) => {
-            // Ticking a box is not a request to read the case. Without this the
-            // checkbox column's clicks bubble out to the row and open the
-            // drawer on top of the selection the user was making.
-            if ((event.target as HTMLElement).closest('.ant-table-selection-column')) return
-            onOpenCase(row)
-          },
-          style: { cursor: 'pointer' },
-        })}
-      />
+      {group.tools.map((tool) => (
+        <Space key={tool.backend} direction="vertical" size={4} style={{ width: '100%' }}>
+          {titled && (
+            <Space size={8}>
+              <Text strong>{toolLabel(tool.backend)}</Text>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {tool.rows.length} case{tool.rows.length === 1 ? '' : 's'}
+              </Text>
+            </Space>
+          )}
+          <ToolCases
+            rows={tool.rows}
+            keys={metricKeysOf(tool.backend, tool.rows, metrics, showAll)}
+            index={index}
+            primaryMetric={primaryMetric}
+            onOpenCase={onOpenCase}
+            selected={selected}
+            onSelectedChange={onSelectedChange}
+          />
+        </Space>
+      ))}
     </Space>
   )
 }
@@ -379,14 +735,6 @@ export default function BenchResults({
   const labels = useMemo(() => jobLabels(matrix?.rows ?? []), [matrix?.rows])
 
   const jobGroups = useMemo(() => jobGroupsOf(rows, labels), [rows, labels])
-
-  // Only columns something actually measured. A run with no GPU sampling should
-  // not get an empty GPU column just because the schema has one.
-  const keys = useMemo(() => {
-    const present = new Set(rows.flatMap((row) => Object.keys(row.metrics)))
-    const wanted = showAll ? (matrix?.metrics ?? []).map((m) => m.key) : KEY_METRICS
-    return wanted.filter((key) => present.has(key))
-  }, [rows, showAll, matrix?.metrics])
 
   // What the reader opened, of what the search left standing. Their choice is
   // remembered, but a job they opened before narrowing the search is not among
@@ -548,8 +896,10 @@ export default function BenchResults({
             children: (
               <JobCases
                 group={group}
-                keys={keys}
+                metrics={matrix?.metrics ?? []}
+                showAll={showAll}
                 index={index}
+                primaryMetric={matrix?.primary_metric ?? null}
                 onOpenCase={onOpenCase}
                 selected={ticked[group.job] ?? []}
                 onSelectedChange={(next) =>

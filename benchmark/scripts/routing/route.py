@@ -90,11 +90,6 @@ def _is_openvino_ir_xml(xml_path: Path) -> bool:
     return False  # <net> with no children at all
 
 
-def _count_ir_xml(model_dir: Path) -> int:
-    """Return the number of valid OpenVINO IR xml files directly in model_dir."""
-    return sum(1 for xml in model_dir.glob('*.xml') if _is_openvino_ir_xml(xml))
-
-
 def _find_single_openvino_ir_pair(quantized_path: str) -> Optional[Path]:
     """Return the single OpenVINO IR xml path when the dir has exactly one xml/bin pair."""
     if not quantized_path:
@@ -130,7 +125,9 @@ def _iter_model_units(models_dir: Path,
                       allowed_safe_names: Optional[set] = None) -> List[Tuple[Path, str, str]]:
     """
     Discover units under a models tree laid out as <model_name>/<precision>/<files>.
-    A unit is a leaf directory directly containing at least one valid IR xml.
+    A unit is a leaf directory directly containing at least one valid IR xml, except
+    that components of a diffusers pipeline (<unit>/model_index.json +
+    <unit>/<component>/*.xml) collapse into the pipeline dir as a single unit.
     Returns sorted (leaf_dir, model_name, precision) tuples.
 
     allowed_safe_names restricts the walk to those models. Filtering here rather
@@ -148,7 +145,10 @@ def _iter_model_units(models_dir: Path,
         if allowed_safe_names is not None and _model_safe_name(named[0]) not in allowed_safe_names:
             continue
         if _is_openvino_ir_xml(xml):
-            leaf_dirs.add(xml.parent)
+            leaf = xml.parent
+            if leaf != models_dir and (leaf.parent / 'model_index.json').is_file():
+                leaf = leaf.parent
+            leaf_dirs.add(leaf)
 
     units: List[Tuple[Path, str, str]] = []
     for leaf_dir in leaf_dirs:
@@ -484,33 +484,11 @@ def route_benchmark_from_dir(models_dir: str,
         model_label = f"{model_name}/{precision}"
         leaf_str = str(leaf_dir)
 
-        # Rule 1: single OpenVINO IR xml/bin pair -> benchmark_app
-        ir_xml_file = _find_single_openvino_ir_pair(leaf_str)
-        if ir_xml_file is not None:
-            route = BenchmarkRoute(
-                model=model_name, strategy='benchmark_app', tool='benchmark_app',
-                command_template='benchmark_app -m {model_xml}',
-                parameters={'model_xml': str(ir_xml_file), 'quantized_path': leaf_str, 'precision': precision},
-                reason='single OpenVINO IR xml/bin pair -> benchmark_app', quantized_path=leaf_str)
-            result['routes'].append(_benchmark_route_to_flat(route))
-            continue
-
-        if _count_ir_xml(leaf_dir) >= 1:
-            # Rule 2: extracted notebook infer.py -> notebook
-            infer_script = _notebook_infer_script_for(model_safe_name)
-            if infer_script is not None:
-                route = BenchmarkRoute(
-                    model=model_name, strategy='notebook_infer', tool='notebook',
-                    command_template='bash {env_setup} && python {infer_script}',
-                    parameters={'quantized_path': leaf_str, 'infer_script': infer_script,
-                                'model_safe_name': model_safe_name, 'precision': precision},
-                    reason='multi-xml model with extracted notebook infer.py, use notebook infer script',
-                    quantized_path=leaf_str, notebook_infer_script=infer_script)
-                result['routes'].append(_benchmark_route_to_flat(route))
-                continue
-
-            # Rule 3: config.json present -> genai with derived task
-            library, task, success, version_info = analyze_model_id(leaf_dir)
+        # Rule 1: optimum-exported model (library + task inferable from
+        # config.json / model_index.json) -> genai. Checked before the xml count
+        # so single-xml optimum models (e.g. kokoro) are not sent to benchmark_app.
+        if (leaf_dir / 'config.json').is_file() or (leaf_dir / 'model_index.json').is_file():
+            library, task, success, version_info = analyze_model_id(leaf_str)
             if success:
                 route = BenchmarkRoute(
                     model=model_name, strategy='genai', tool='openvino_genai',
@@ -518,19 +496,39 @@ def route_benchmark_from_dir(models_dir: str,
                     parameters={'model_path': leaf_str, 'prompt': 'What is OpenVINO?',
                                 'max_new_tokens': 128, 'task': task, 'library': library,
                                 'precision': precision, 'version_info': version_info},
-                    reason=f'multi-xml, no notebook script; task inferred from config.json -> {task}',
+                    reason=f'optimum model ({library}); task inferred -> {task}',
                     quantized_path=leaf_str)
                 result['routes'].append(_benchmark_route_to_flat(route))
                 continue
 
-            result['failed_models'].append({
-                'model': model_label,
-                'reason': 'multi-xml model, no extracted notebook infer.py and no config.json -> skipped'})
+        # Rule 2: single OpenVINO IR xml/bin pair -> benchmark_app
+        ir_xml_file = _find_single_openvino_ir_pair(leaf_str)
+        if ir_xml_file is not None:
+            route = BenchmarkRoute(
+                model=model_name, strategy='benchmark_app', tool='benchmark_app',
+                command_template='benchmark_app -m {model_xml}',
+                parameters={'model_xml': str(ir_xml_file), 'quantized_path': leaf_str, 'precision': precision},
+                reason='single OpenVINO IR xml/bin pair, not an optimum model -> benchmark_app',
+                quantized_path=leaf_str)
+            result['routes'].append(_benchmark_route_to_flat(route))
+            continue
+
+        # Rule 3: extracted notebook infer.py -> notebook
+        infer_script = _notebook_infer_script_for(model_safe_name)
+        if infer_script is not None:
+            route = BenchmarkRoute(
+                model=model_name, strategy='notebook_infer', tool='notebook',
+                command_template='bash {env_setup} && python {infer_script}',
+                parameters={'quantized_path': leaf_str, 'infer_script': infer_script,
+                            'model_safe_name': model_safe_name, 'precision': precision},
+                reason='multi-xml model with extracted notebook infer.py, use notebook infer script',
+                quantized_path=leaf_str, notebook_infer_script=infer_script)
+            result['routes'].append(_benchmark_route_to_flat(route))
             continue
 
         result['failed_models'].append({
             'model': model_label,
-            'reason': f'No valid OpenVINO IR xml found in {leaf_str} -> skipped'})
+            'reason': 'multi-xml model, not an optimum model and no extracted notebook infer.py -> skipped'})
 
     return result
 
@@ -553,6 +551,18 @@ def route_benchmark_batch(quantize_results: List[Dict]) -> Dict:
         quantized_path = model_result.get('quantized_path') or model_result.get('ir_path', '')
         task = model_result.get('task', '')
 
+        # optimum-cli output goes to genai first, even when it is a single xml/bin pair (e.g. kokoro)
+        if quantize_tool == 'optimum-cli':
+            route = BenchmarkRoute(
+                model=model_id, strategy='genai', tool='openvino_genai',
+                command_template='python -c "import openvino_genai as ov_genai; ..."',
+                parameters={'model_path': quantized_path, 'prompt': 'What is OpenVINO?',
+                            'max_new_tokens': 128, 'task': task},
+                reason='Model quantized with optimum-cli, use OpenVINO GenAI for text generation benchmark',
+                quantized_path=quantized_path)
+            result['routes'].append(_benchmark_route_to_flat(route))
+            continue
+
         ir_xml_file = _find_single_openvino_ir_pair(quantized_path)
         if ir_xml_file is not None:
             route = BenchmarkRoute(
@@ -564,17 +574,7 @@ def route_benchmark_batch(quantize_results: List[Dict]) -> Dict:
             result['routes'].append(_benchmark_route_to_flat(route))
             continue
 
-        if quantize_tool == 'optimum-cli':
-            route = BenchmarkRoute(
-                model=model_id, strategy='genai', tool='openvino_genai',
-                command_template='python -c "import openvino_genai as ov_genai; ..."',
-                parameters={'model_path': quantized_path, 'prompt': 'What is OpenVINO?',
-                            'max_new_tokens': 128, 'task': task},
-                reason='Model quantized with optimum-cli, use OpenVINO GenAI for text generation benchmark',
-                quantized_path=quantized_path)
-            result['routes'].append(_benchmark_route_to_flat(route))
-
-        elif quantize_tool == 'notebook' or quantize_strategy == 'notebook_quantize':
+        if quantize_tool == 'notebook' or quantize_strategy == 'notebook_quantize':
             model_safe_name = model_id.replace('/', '_').replace('.', '_')
             notebook_infer_script = model_result.get('infer_script', '')
             if not notebook_infer_script:

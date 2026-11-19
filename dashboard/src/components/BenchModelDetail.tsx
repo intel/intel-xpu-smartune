@@ -6,8 +6,9 @@ import React from 'react'
 import { Alert, Button, Card, Checkbox, Descriptions, Divider, Empty, Input, Select, Space, Tag, Tooltip, Typography } from 'antd'
 import { DeleteOutlined, ToolOutlined } from '@ant-design/icons'
 
-import type { BenchDevice, BenchModel, BenchPrecision } from '../api/types'
+import type { BenchConfig, BenchDevice, BenchModel, BenchPrecision } from '../api/types'
 import { formatBytes } from '../utils/benchMetrics'
+import BenchParamsEditor, { NotDownloaded } from './BenchParamsEditor'
 
 const { Text, Link } = Typography
 
@@ -67,11 +68,11 @@ export function applicablePrecisions(
 /**
  * One model's run settings.
  *
- * All four are per model. `precisions` and `args` reach the pipeline on that
- * model's own entry in the run request; `devices` and `ov` are process-wide in
- * the pipeline, so the server splits a request whose models disagree about them
- * into groups and runs the groups in sequence (benchmark/service/runner.py,
- * run_groups).
+ * All of them are per model. `precisions`, `args` and `bench` reach the pipeline
+ * on that model's own entry in the run request; `devices` and `ov` are
+ * process-wide in the pipeline, so the server splits a request whose models
+ * disagree about them into groups and runs the groups in sequence
+ * (benchmark/service/runner.py, run_groups).
  */
 export interface ModelParams {
   precisions: BenchPrecision[]
@@ -82,6 +83,9 @@ export interface ModelParams {
   // Free-form extra CLI arguments appended to every benchmark run_case for this
   // model; a download ignores them.
   args: string
+  // Benchmark parameters per tool, a list of values meaning a sweep
+  // (benchmark/scripts/params/bench_params.py). A download ignores them.
+  bench: BenchConfig
 }
 
 interface Props {
@@ -138,13 +142,14 @@ export default function BenchModelDetail({
   onOpenEnv,
   onDeleteLocal,
 }: Props) {
-  const { precisions, devices, ov, args } = params
+  const { precisions, devices, ov, args, bench } = params
   const onPrecisionsChange = (value: BenchPrecision[]) =>
     onParamsChange({ ...params, precisions: value })
   const onDevicesChange = (value: BenchDevice[]) =>
     onParamsChange({ ...params, devices: value })
   const onOvChange = (value: string) => onParamsChange({ ...params, ov: value })
   const onArgsChange = (value: string) => onParamsChange({ ...params, args: value })
+  const onBenchChange = (value: BenchConfig) => onParamsChange({ ...params, bench: value })
 
   if (!model) {
     return (
@@ -328,11 +333,21 @@ export default function BenchModelDetail({
             style={{ width: 240 }}
             value={args}
             onChange={(e) => onArgsChange(e.target.value)}
-            placeholder="e.g. --num-warmup 2"
+            placeholder="flags the form below does not offer"
             allowClear
           />
         </Descriptions.Item>
       </Descriptions>
+
+      {/* What each case is measured with. Kept with the model, so every press of
+          Run uses it -- the run review shows the commands it produced, it is
+          not where they are configured. */}
+      <SectionHead>Benchmark parameters</SectionHead>
+      {model.downloaded ? (
+        <BenchParamsEditor modelId={model.id} ov={ov.trim()} value={bench} onChange={onBenchChange} />
+      ) : (
+        <NotDownloaded />
+      )}
 
       {/* No Download or Run here.
           This pane used to be the only place either could be pressed, and it

@@ -90,7 +90,7 @@ they are combined with AND.
 | Query | resource_type | No | string | `cpu` / `memory` / `disk_io` / … |
 | Query | protection_id | No | string | Scope to one control lifecycle |
 | Query | episode_id | No | string | Scope to one pressure episode |
-| Query | boot_id | No | string | Scope to one boot session |
+| Query | boot_id | No | string | Scope to one boot session (32 hex digits, from `/diag/boots`) |
 | Query | keyword | No | string | Free-text match |
 | Query | alertable | No | bool | `true` keeps only event types that have an alert policy (default `false`) |
 | Query | from | No | int | Window start (epoch seconds) |
@@ -394,7 +394,7 @@ are redacted before they are returned.
 | Query | to | No | int | Window end (epoch seconds) |
 | Query | level | No | string | Minimum log level |
 | Query | job_id | No | string | Scope to one benchmark job |
-| Query | boot_id | No | string | Scope to one boot session |
+| Query | boot_id | No | string | Scope to one boot session (32 hex digits, from `/diag/boots`) |
 | Query | keyword | No | string | Free-text match |
 | Query | limit | No | int | Max lines (default `500`) |
 
@@ -438,7 +438,7 @@ GET /diag/logs?source=smartune,journald&level=error&from=1755760000&to=175577000
   "data": {
     "boots": [
       {
-        "boot_id": "3f2a...",
+        "boot_id": "ddd13f42d69b45df847e0f43688a536a",
         "index": 0,
         "first_ts": 1755700000,
         "last_ts": 1755770000,
@@ -453,6 +453,8 @@ GET /diag/logs?source=smartune,journald&level=error&from=1755760000&to=175577000
 **Notes:**
 - Returns an empty list when no boot-aware source (journald) is present. That is a normal
   state, not an error.
+- `boot_id` is the value events carry in `boot_id`, so it can be passed to `/diag/events`,
+  `/diag/logs` and `/diag/digest?period=boot`.
 
 ---
 
@@ -552,7 +554,7 @@ an explicit range.
 |------|-----------|----------|--------|-------------|
 | Query | period | No | string | `day` (default) / `week` / `boot` / `range` |
 | Query | date | Conditional | string | `YYYY-MM-DD` in the server's local time zone; required for `day` and `week` |
-| Query | boot_id | Conditional | string | Required for `boot` |
+| Query | boot_id | Conditional | string | Required for `boot`; a `boot_id` from `/diag/boots` |
 | Query | from | Conditional | int | Range start (epoch seconds) |
 | Query | to | Conditional | int | Range end (epoch seconds) |
 

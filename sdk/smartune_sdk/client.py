@@ -47,9 +47,12 @@ EXIT_REFUSED = 7  # a control action cannot be applied in the app's current stat
 # hostname check even with SMARTUNE_CACERT set correctly.
 # Pinning (pinned_fingerprint) avoids this for the server's own certificate; the
 # hint applies when pinning is off or SMARTUNE_CACERT is not that certificate.
+# How hints name the per-user setup script: the deb puts it on PATH, the source code has it in skills/.
+INSTALL_CMD = "smartune-agent-install (skills/install.sh when run from the source code)"
+
 ADDRESS_MISMATCH_HINT = (
     "The SmarTune certificate only covers localhost and 127.0.0.1. Set SMARTUNE_CACERT to the "
-    "server's own key/b_server.crt (skills/install.sh --remote copies it), which pins it and accepts "
+    "server's own key/b_server.crt (the installer's --remote option copies it), which pins it and accepts "
     "any address, and leave SMARTUNE_PIN_CERT unset. Do not disable certificate verification.")
 
 # REST surface versions (/smartune/capabilities -> api_level) this SDK was built
@@ -266,7 +269,7 @@ def _read_token():
             raise SmartuneError(
                 f"Cannot read token file {token_file}: {exc.strerror}",
                 hint="Point SMARTUNE_TOKEN_FILE at a token file readable by this user, "
-                     "or run skills/install.sh to copy the server's token for this user.",
+                     f"or run {INSTALL_CMD} to copy the server's token for this user.",
                 exit_code=EXIT_AUTH,
             ) from None
     return ""
@@ -311,7 +314,7 @@ class SmartuneClient:
                 raise self.token_error
             raise SmartuneError(
                 "No API token configured",
-                hint="Run skills/install.sh once to copy the server's token for this user, or set "
+                hint=f"Run {INSTALL_CMD} once to copy the server's token for this user, or set "
                      "SMARTUNE_TOKEN_FILE (or SMARTUNE_TOKEN) in the environment that runs this command.",
                 exit_code=EXIT_AUTH,
             )
@@ -342,7 +345,7 @@ class SmartuneClient:
                 raise SmartuneError(
                     f"TLS verification failed for {self.url}: the server did not present the pinned certificate",
                     hint="The server certificate differs from SMARTUNE_CACERT (it may have been regenerated): "
-                         "copy key/b_server.crt again (skills/install.sh). If SMARTUNE_CACERT is a CA "
+                         f"copy key/b_server.crt again ({INSTALL_CMD}). If SMARTUNE_CACERT is a CA "
                          "certificate rather than the server's own, set SMARTUNE_PIN_CERT=0.",
                     exit_code=EXIT_CONNECTION,
                 ) from None

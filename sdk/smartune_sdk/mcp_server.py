@@ -18,7 +18,7 @@
 # gets a refusal, never a silent apply. How far this protects depends on the
 # client showing the form to a person: an agent-only client could answer it
 # itself, so writes are off unless the server is started with --allow-control
-# (skills/install.sh --mcp prints it unless --no-control), and should only be enabled for clients
+# (skills/install.sh prints it unless --control no), and should only be enabled for clients
 # that show forms to a person.
 #
 # Server instructions are composed from agent/policy/*.md and agent/content/*.md

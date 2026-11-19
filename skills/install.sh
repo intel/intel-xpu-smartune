@@ -5,37 +5,45 @@
 # One-step setup of the SmarTune agent integration for the current user:
 #
 #   1. the `smartune` CLI and the MCP server `smartune-mcp` in ~/.local/bin (MCP is skipped
-#      with --no-mcp, or with a warning when Python < 3.10 or PyPI cannot be reached)
+#      with --mcp no, or with a warning when Python < 3.10 or PyPI cannot be reached)
 #   2. a copy of the running instance's API token and TLS certificate in
 #      ~/.config/smartune/, where the CLI finds them without any variable set
 #   3. the shared agent rules and references (agent/) in ~/.local/share/smartune/
-#   4. the skills, for OpenClaw and/or Claude Code (all four; --no-control leaves out
+#   4. the skills, for OpenClaw and/or Claude Code (all four; --control no leaves out
 #      smartune-control)
 #   5. a final `smartune doctor` run
 #
-# Works with both a deb install (/opt/intel/smartune) and a source checkout run
+# Works with both a deb install (/opt/intel/smartune) and the source code run
 # with start_smartune.sh: only where the instance keeps key/ differs. Run it as
 # the user the agent runs as, not as root; it calls sudo only to copy the two
 # root-only key files. Running it again updates everything in place.
 #
 #   skills/install.sh                     detect the instance and the agents
 #   skills/install.sh --target openclaw   only OpenClaw
-#   skills/install.sh --source            use the key/ of this checkout
-#   skills/install.sh --no-mcp            CLI and skills only, no MCP server
-#   skills/install.sh --no-control        read-only skills only (no smartune-control)
+#   skills/install.sh --instance source   use the key/ of this source code directory
+#   skills/install.sh --mcp no            CLI and skills only, no MCP server
+#   skills/install.sh --control no        read-only skills only (no smartune-control)
 #   skills/install.sh --remote user@host  use SmarTune on another machine (run it there first)
 #   skills/install.sh --uninstall         remove what this script installed
+#
+# In the deb package this script is /usr/bin/smartune-agent-install.
 
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 SDK_SRC="$REPO/sdk"
 AGENT_SRC="$REPO/agent"
 READ_SKILLS=(smartune-status smartune-diagnose smartune-bench)
-CONTROL_SKILL=smartune-control                            # writes: opt out with --no-control
+CONTROL_SKILL=smartune-control                            # writes: opt out with --control no
 ALL_SKILLS=("${READ_SKILLS[@]}" "$CONTROL_SKILL")
 DEB_DIR="/opt/intel/smartune"
+AGENT_WHEELS="$REPO/wheels/agent"                         # bundled by packaging/deb/build_deb.sh
+if [[ "$REPO" == "$DEB_DIR" ]]; then
+    SELF_CMD="smartune-agent-install"                     # how to name this script in messages
+else
+    SELF_CMD="skills/install.sh"
+fi
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/smartune"   # same rule as sdk client.config_dir()
 DATA_DIR="$HOME/.local/share/smartune"                    # an agent/ candidate in sdk mcp_server.py
@@ -55,44 +63,82 @@ OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
 OPENCLAW_WORKSPACE=""
 CLAUDE_HOME="$HOME/.claude"
 
+tildify() { printf '%s' "${1/#$HOME/\~}"; }  # shorten paths under $HOME for display
+
+# -- what a plain run would do here (shown by --help and in the plan) -------------
+
+default_instance() {  # where the key files come from with --instance auto (the default)
+    if [[ -d "$DEB_DIR" ]]; then echo "$DEB_DIR"; else echo "$REPO"; fi
+}
+
+instance_label() {  # instance_label DIR
+    case "$1" in
+        "$DEB_DIR") echo "deb install" ;;
+        "$REPO")    echo "source code" ;;
+        *)          echo "instance at $1" ;;
+    esac
+}
+
+python_version() { python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "none"; }
+
+bundled_wheels_fit() {  # the deb's wheels/agent/ was built for this CPython (native deps)
+    [[ -f "$AGENT_WHEELS/.python_version" ]] || return 1
+    [[ "$(cat "$AGENT_WHEELS/.python_version")" == "$(python_version)" ]]
+}
+
+mcp_source() {  # how the MCP server would be installed here
+    if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+        echo "skipped: needs Python >= 3.10 (this is $(python_version))"
+    elif bundled_wheels_fit; then
+        echo "from the bundled wheels (no network)"
+    else
+        echo "from PyPI (needs network; set HTTPS_PROXY behind a proxy)"
+    fi
+}
+
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [OPTIONS]
+Usage: $SELF_CMD [OPTIONS]
 
 Set up the SmarTune CLI, credentials and agent skills for the current user.
 
 Options:
   --target LIST          openclaw, claude, both (openclaw,claude) or none.
                          Default: every agent found (~/.openclaw, ~/.claude).
-  --deb                  Use the deb install's key/ ($DEB_DIR). Default when it exists.
-  --source               Use the key/ of this checkout ($REPO), for start_smartune.sh.
-  --smartune-dir DIR     Use DIR/key/ (an instance installed elsewhere).
-  --no-mcp               Do not install the MCP server (smartune-mcp), which is installed by
-                         default and registered with OpenClaw (read-only tools) when its
-                         'openclaw mcp' command is available. It needs Python >= 3.10,
-                         python3-venv and network access to PyPI; without them the script
-                         warns and continues without MCP. Rerunning with --no-mcp removes it.
-  --mcp                  Require the MCP server: fail instead of skipping it.
-  --no-control           Leave out the smartune-control skill, which is installed by default
-                         and lets the agent register apps and change limits, priorities,
-                         freeze state and core binding -- each change shown as a plan and
-                         applied only after the user agrees. Rerunning with --no-control
-                         removes it again. Without this option, the printed Claude Code MCP
-                         command also enables the write tools, which ask the user in a
-                         form (smartune-mcp --allow-control). The token it uses can call
-                         every endpoint (no read-only token yet), so install control only
-                         for an agent you trust on this machine.
-  --control              Install smartune-control (the default; kept for older scripts).
+  --instance auto|deb|source|DIR
+                         The SmarTune instance whose key/ (token and certificate) is copied.
+                         Default: auto.
+                         auto:   deb when $DEB_DIR exists, otherwise source.
+                         deb:    the deb install, $DEB_DIR/key.
+                         source: this source code directory, for start_smartune.sh:
+                                 $(tildify "$REPO")/key.
+                         DIR:    DIR/key, for an instance installed elsewhere (for example
+                                 the source code directory when this script comes from the deb).
+  --mcp auto|yes|no      The MCP server (smartune-mcp). Default: auto.
+                         auto: install it; when it cannot be (it needs Python >= 3.10 and
+                               python3-venv), warn and go on without it.
+                         yes:  install it, and stop with an error when that fails.
+                         no:   do not install it; removes one installed earlier.
+                         When installed, it is also registered with OpenClaw (read-only
+                         tools) if its 'openclaw mcp' command is available.
+  --control yes|no       The smartune-control skill. Default: yes (not shipped in the
+                         monitor-only deb). It lets the agent register apps and change
+                         limits, priorities, freeze state and core binding, each change
+                         applied only after the user agrees to a plan. The token it uses
+                         can call every endpoint, so install it only for an agent you trust.
+                         no: leave it out; removes one installed earlier.
   --skip-credentials     Do not copy the token and certificate.
+                         Default: copy them to ~/.config/smartune/.
   --remote USER@HOST     SmarTune runs on another machine: copy the token and certificate
                          from HOST (where this script must have run first, as USER) with
-                         scp, and use https://HOST:PORT. The certificate is pinned, so the
-                         address need not appear in it. The server must listen on the
-                         network (deb default; SMARTUNE_LISTEN in /etc/default/intel-smartune).
-  --port PORT            SmarTune port for --remote (default 9001).
-  --openclaw-workspace D OpenClaw agent workspace (default: $OPENCLAW_HOME/workspace).
+                         scp, and use https://HOST:PORT. The server must listen on the
+                         network (SMARTUNE_LISTEN in /etc/default/intel-smartune).
+                         Default: off (SmarTune on this machine, https://127.0.0.1:9001).
+  --port PORT            SmarTune port for --remote. Default: 9001.
+  --openclaw-workspace D OpenClaw agent workspace. Default: $OPENCLAW_HOME/workspace.
   --uninstall            Remove everything this script installed.
   -h, --help             Show this help.
+
 EOF
 }
 
@@ -100,18 +146,49 @@ say()  { printf '==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+# copy_tree SRC DST: cp -r, with the copy writable for this user
+copy_tree() { cp -r "$1" "$2" && chmod -R u+w "$2"; }
 shq()  { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }  # single-quote for sh
+
+set_instance() {  # set_instance auto|deb|source|DIR -> SMARTUNE_DIR ("" = auto)
+    case "$1" in
+        auto)   SMARTUNE_DIR="" ;;
+        deb)    SMARTUNE_DIR="$DEB_DIR" ;;
+        source)
+            [[ "$REPO" != "$DEB_DIR" ]] || die "--instance source: this script comes from the deb package, not the source code; give the source code directory instead: --instance /path/to/source"
+            SMARTUNE_DIR="$REPO" ;;
+        *)
+            [[ -d "$1" ]] || die "--instance takes auto, deb, source or an existing directory (got '$1')"
+            SMARTUNE_DIR="$(cd "$1" && pwd)" ;;
+    esac
+}
+
+set_mcp() {  # set_mcp auto|yes|no
+    case "$1" in
+        auto) WITH_MCP=1; MCP_REQUIRED=0 ;;
+        yes)  WITH_MCP=1; MCP_REQUIRED=1 ;;
+        no)   WITH_MCP=0; MCP_REQUIRED=0 ;;
+        *)    die "--mcp takes auto, yes or no (got '$1')" ;;
+    esac
+}
+
+set_control() {  # set_control yes|no
+    case "$1" in
+        yes) WITH_CONTROL=1 ;;
+        no)  WITH_CONTROL=0 ;;
+        *)   die "--control takes yes or no (got '$1')" ;;
+    esac
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --target)             TARGETS="${2:?--target needs a value}"; shift 2 ;;
-        --deb)                SMARTUNE_DIR="$DEB_DIR"; shift ;;
-        --source)             SMARTUNE_DIR="$REPO"; shift ;;
-        --smartune-dir)       SMARTUNE_DIR="${2:?--smartune-dir needs a value}"; shift 2 ;;
-        --mcp)                WITH_MCP=1; MCP_REQUIRED=1; shift ;;
-        --no-mcp)             WITH_MCP=0; MCP_REQUIRED=0; shift ;;
-        --control)            WITH_CONTROL=1; shift ;;
-        --no-control)         WITH_CONTROL=0; shift ;;
+        --instance)           [[ $# -ge 2 ]] || die "--instance needs a value: auto, deb, source or a directory"
+                              set_instance "$2"; shift 2 ;;
+        --mcp)                [[ $# -ge 2 ]] || die "--mcp needs a value: auto, yes or no"
+                              set_mcp "$2"; shift 2 ;;
+        --control)            [[ $# -ge 2 ]] || die "--control needs a value: yes or no"
+                              set_control "$2"; shift 2 ;;
         --skip-credentials)   SKIP_CREDENTIALS=1; shift ;;
         --remote)             REMOTE="${2:?--remote needs USER@HOST}"; shift 2 ;;
         --port)               REMOTE_PORT="${2:?--port needs a value}"; shift 2 ;;
@@ -122,6 +199,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 OPENCLAW_WORKSPACE="${OPENCLAW_WORKSPACE:-$OPENCLAW_HOME/workspace}"
+# The monitor-only deb (smartune-monitor) has no balancer and ships without smartune-control.
+CONTROL_SHIPPED=1
+[[ -d "$HERE/$CONTROL_SKILL" ]] || CONTROL_SHIPPED=0
+[[ $CONTROL_SHIPPED -eq 1 ]] || WITH_CONTROL=0  # the plan below says so
 SKILLS=("${READ_SKILLS[@]}")
 [[ $WITH_CONTROL -eq 1 ]] && SKILLS+=("$CONTROL_SKILL")
 
@@ -151,6 +232,41 @@ case "$TARGETS" in
         done
         ;;
 esac
+[[ -n "$SMARTUNE_DIR" ]] || SMARTUNE_DIR="$(default_instance)"
+
+# -- plan: say up front what this run does and where it puts things ----------------
+
+if [[ $UNINSTALL -eq 0 ]]; then
+    agents=()
+    [[ $want_claude -eq 1 ]] && agents+=("Claude Code -> $(tildify "$CLAUDE_HOME")/skills/")
+    [[ $want_openclaw -eq 1 ]] && agents+=("OpenClaw -> $(tildify "$OPENCLAW_WORKSPACE")/skills/")
+    [[ ${#agents[@]} -gt 0 ]] || agents=("none (no skills installed)")
+    if [[ "$TARGETS" == auto ]]; then agents_how="found on this machine; --target to choose"; else agents_how="--target $TARGETS"; fi
+    if [[ -n "$REMOTE" ]]; then
+        keys="from $REMOTE with scp, server https://${REMOTE##*@}:$REMOTE_PORT"
+    elif [[ $SKIP_CREDENTIALS -eq 1 ]]; then
+        keys="keep the ones in $(tildify "$CONFIG_DIR")/ (--skip-credentials)"
+    else
+        keys="$SMARTUNE_DIR/key ($(instance_label "$SMARTUNE_DIR")) -> $(tildify "$CONFIG_DIR")/"
+    fi
+    if [[ $WITH_MCP -eq 1 ]]; then mcp_plan="$(tildify "$BIN_DIR")/smartune-mcp, $(mcp_source)"; else mcp_plan="not installed (--mcp no)"; fi
+    if [[ $WITH_CONTROL -eq 1 ]]; then
+        control_plan="included (--control no to leave it out)"
+    elif [[ $CONTROL_SHIPPED -eq 0 ]]; then
+        control_plan="not in this package (monitor only, no balancer)"
+    else
+        control_plan="left out (--control no)"
+    fi
+    say "Plan for $(id -un) (all options and defaults: $SELF_CMD --help)"
+    for a in "${agents[@]}"; do note "agent        $a"; done
+    note "             ($agents_how)"
+    note "skills       ${SKILLS[*]}"
+    note "control      smartune-control $control_plan"
+    note "key files    $keys"
+    note "CLI          $(tildify "$BIN_DIR")/smartune"
+    note "MCP server   $mcp_plan"
+    note "agent rules  $(tildify "$DATA_DIR")/agent/"
+fi
 
 # -- helpers -----------------------------------------------------------------------
 
@@ -314,27 +430,48 @@ fi
 
 # -- 1. CLI ------------------------------------------------------------------------
 
-[[ -d "$SDK_SRC/smartune_sdk" ]] || die "cannot find the SDK at $SDK_SRC (run this script from a SmarTune checkout)"
+[[ -d "$SDK_SRC/smartune_sdk" ]] || die "cannot find the SDK at $SDK_SRC (run this script from the SmarTune source code, or use smartune-agent-install from the deb package)"
 mkdir -p "$BIN_DIR" "$DATA_DIR"
 
 skip_mcp() {  # skip_mcp REASON: fatal with --mcp, otherwise continue without MCP
-    [[ $MCP_REQUIRED -eq 0 ]] || die "--mcp: $1"
-    warn "$1; continuing without the MCP server (the CLI and skills work without it). Fix it and rerun to add MCP, or pass --no-mcp to silence this."
+    [[ $MCP_REQUIRED -eq 0 ]] || die "--mcp yes: $1"
+    warn "$1; continuing without the MCP server (the CLI and skills work without it). Fix it and rerun to add MCP, or pass --mcp no to silence this."
     WITH_MCP=0
 }
 
-install_venv() {  # install_venv SPEC: the SDK in a private venv; returns pip's status
-    say "Installing the CLI$([[ $WITH_MCP -eq 1 ]] && echo ' and the MCP server') into a private venv ($DATA_DIR/venv)"
-    "$PYTHON" -m venv --clear "$DATA_DIR/venv" >/dev/null 2>&1 \
-        || die "could not create a venv; install it with: sudo apt install python3-venv"
-    note "pip install $1 (needs PyPI; set HTTPS_PROXY behind a proxy)"
+pip_install() {  # pip_install ARGS...: into the private venv, quiet; returns pip's status
     # Show what pip fetches, so a blocked network reads as slow progress, not a hang.
     set +e
     "$DATA_DIR/venv/bin/pip" install --progress-bar off --disable-pip-version-check \
-        --timeout 20 --retries 2 "$1" 2>&1 \
+        --timeout 20 --retries 2 "$@" 2>&1 \
         | grep -E --line-buffered '^(Successfully|ERROR|WARNING: Retrying)' | sed -u 's/^/    /'
     local status=${PIPESTATUS[0]}
     set -e
+    return "$status"
+}
+
+install_venv() {  # install_venv EXTRAS ("" or "[mcp]"): the SDK in a private venv; returns pip's status
+    say "Installing the CLI$([[ $WITH_MCP -eq 1 ]] && echo ' and the MCP server') into a private venv ($DATA_DIR/venv)"
+    "$PYTHON" -m venv --clear "$DATA_DIR/venv" >/dev/null 2>&1 \
+        || die "could not create a venv; install it with: sudo apt install python3-venv"
+    local status=1
+    if bundled_wheels_fit; then
+        note "pip install smartune-sdk$1 from the bundled wheels ($AGENT_WHEELS, no network)"
+        pip_install --no-index --find-links "$AGENT_WHEELS" "smartune-sdk$1" && status=0
+        [[ $status -eq 0 ]] || note "the bundled wheels did not install; trying PyPI instead"
+    elif [[ -d "$AGENT_WHEELS" ]]; then
+        note "the bundled wheels ($AGENT_WHEELS) are for another Python version; using PyPI instead"
+    fi
+    if [[ $status -ne 0 ]]; then
+        # pip writes build/ into the source tree: build from a copy.
+        local src
+        src="$(mktemp -d)"
+        copy_tree "$SDK_SRC/." "$src/"
+        rm -rf "$src/build" "$src"/*.egg-info
+        note "pip install $SDK_SRC$1 (needs PyPI; set HTTPS_PROXY behind a proxy)"
+        pip_install "$src$1" && status=0
+        rm -rf "$src"
+    fi
     [[ $status -eq 0 ]] || return "$status"
     rm -rf "$DATA_DIR/lib"
     local names=(smartune)
@@ -349,28 +486,28 @@ install_venv() {  # install_venv SPEC: the SDK in a private venv; returns pip's 
 if [[ $WITH_MCP -eq 1 ]] && ! "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
     skip_mcp "the MCP server needs Python >= 3.10 (MCP SDK 2.x); this is $("$PYTHON" -V 2>&1)"
 fi
-if [[ $WITH_MCP -eq 1 ]] && ! install_venv "$SDK_SRC[mcp]"; then
+if [[ $WITH_MCP -eq 1 ]] && ! install_venv "[mcp]"; then
     skip_mcp "pip could not install the MCP SDK (it needs network access to PyPI; check HTTPS_PROXY)"
 fi
 if [[ $WITH_MCP -eq 1 ]]; then
     :  # installed above
 elif ! "$PYTHON" -I -c 'import requests' 2>/dev/null; then
     # The system Python has no requests: a private venv with just the SDK.
-    install_venv "$SDK_SRC" || die "pip install failed (it needs network access to PyPI; check HTTPS_PROXY)"
+    install_venv "" || die "pip install failed (it needs network access to PyPI; check HTTPS_PROXY)"
 else
     # The system Python already has requests, the only dependency: copy the
     # package and write a launcher. No pip, no network.
     say "Installing the CLI ($DATA_DIR/lib, using $PYTHON)"
     rm -rf "$DATA_DIR/lib" "$DATA_DIR/venv"
     mkdir -p "$DATA_DIR/lib"
-    cp -r "$SDK_SRC/smartune_sdk" "$DATA_DIR/lib/"
+    copy_tree "$SDK_SRC/smartune_sdk" "$DATA_DIR/lib/smartune_sdk"
     find "$DATA_DIR/lib" -name __pycache__ -type d -prune -exec rm -rf {} +
     claim_launcher smartune
     # -I: ignore PYTHON* variables, user site-packages and the current directory,
     # so nothing in the agent's working directory can shadow the SDK's imports.
     cat > "$BIN_DIR/smartune" <<EOF
 #!/bin/sh
-$MARKER: launcher written by skills/install.sh; remove with skills/install.sh --uninstall
+$MARKER: launcher written by $SELF_CMD; remove with $SELF_CMD --uninstall
 SMARTUNE_SDK_LIB=$(shq "$DATA_DIR/lib") exec $(shq "$PYTHON") -I -c 'import os, sys; sys.path.insert(0, os.environ.pop("SMARTUNE_SDK_LIB")); from smartune_sdk.cli import main; sys.exit(main())' "\$@"
 EOF
     chmod 755 "$BIN_DIR/smartune"
@@ -393,13 +530,13 @@ if [[ -n "$REMOTE" ]]; then
     remote_host="${REMOTE##*@}"
     [[ -n "$remote_host" && "$REMOTE_PORT" =~ ^[0-9]+$ ]] || die "--remote needs USER@HOST and --port a number"
     say "Copying the API token and certificate from $REMOTE (scp)"
-    note "They come from ~/.config/smartune/ on $remote_host, put there by skills/install.sh on that machine."
+    note "They come from ~/.config/smartune/ on $remote_host, put there by skills/install.sh (smartune-agent-install with the deb) on that machine."
     mkdir -p "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
     tmp_keys="$(mktemp -d)"
     if ! scp -q "$REMOTE:.config/smartune/api_token" "$REMOTE:.config/smartune/b_server.crt" "$tmp_keys/"; then
         rm -rf "$tmp_keys"
-        die "could not copy them from $REMOTE. Run skills/install.sh on $remote_host first (as that user), and check that \`ssh $REMOTE\` works"
+        die "could not copy them from $REMOTE. Run skills/install.sh (smartune-agent-install with the deb) on $remote_host first (as that user), and check that \`ssh $REMOTE\` works"
     fi
     install -m 600 "$tmp_keys/api_token" "$CONFIG_DIR/api_token"
     install -m 644 "$tmp_keys/b_server.crt" "$CONFIG_DIR/b_server.crt"
@@ -410,20 +547,12 @@ if [[ -n "$REMOTE" ]]; then
     note "This token can call every SmarTune endpoint and now lives on this machine too; the CLI only sends read requests."
 elif [[ $SKIP_CREDENTIALS -eq 0 ]]; then
     rm -f "$CONFIG_DIR/url"  # local instance: the default https://127.0.0.1:9001
-    if [[ -z "$SMARTUNE_DIR" ]]; then
-        if [[ -d "$DEB_DIR" ]]; then SMARTUNE_DIR="$DEB_DIR"; else SMARTUNE_DIR="$REPO"; fi
-    fi
     KEY_DIR="$SMARTUNE_DIR/key"
-    case "$SMARTUNE_DIR" in
-        "$DEB_DIR") kind="deb install" ;;
-        "$REPO")    kind="source checkout" ;;
-        *)          kind="instance at $SMARTUNE_DIR" ;;
-    esac
-    say "Copying the API token and certificate from $KEY_DIR ($kind)"
+    say "Copying the API token and certificate from $KEY_DIR ($(instance_label "$SMARTUNE_DIR"))"
 
     exists() { [[ -e "$1" ]] || sudo test -e "$1"; }
     if ! exists "$KEY_DIR/api_token" || ! exists "$KEY_DIR/b_server.crt"; then
-        die "$KEY_DIR/api_token or b_server.crt is missing. Start SmarTune once first (it creates them), or pick the right instance with --deb / --source / --smartune-dir"
+        die "$KEY_DIR/api_token or b_server.crt is missing. Start SmarTune once first (it creates them), or pick the right instance with --instance deb|source|DIR"
     fi
     mkdir -p "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
@@ -445,20 +574,29 @@ fi
 
 say "Installing agent rules and references ($DATA_DIR/agent)"
 rm -rf "$DATA_DIR/agent"
-cp -r "$AGENT_SRC" "$DATA_DIR/agent"
+copy_tree "$AGENT_SRC" "$DATA_DIR/agent"
 
 # -- 4. skills -------------------------------------------------------------------------
 
+# Each SKILL.md names the shared rules and references as `agent/policy/...` and
+# `agent/content/...`. Clients resolve such paths against the skill's own directory, so every
+# installed skill gets its own copy of agent/. The repository keeps the single source; these
+# copies are regenerated on every install, and --uninstall removes them with the skill.
 install_skills_into() {  # install_skills_into DIR: returns 0 when it removed the control skill
     mkdir -p "$1"
     for s in "${SKILLS[@]}"; do
         rm -rf "${1:?}/$s"
-        cp -r "$HERE/$s" "$1/$s"
+        copy_tree "$HERE/$s" "$1/$s"
+        copy_tree "$AGENT_SRC" "$1/$s/agent"
     done
-    note "copied ${SKILLS[*]} to $1"
+    note "copied ${SKILLS[*]} to $1 (each with its own agent/)"
     if [[ $WITH_CONTROL -eq 0 && -d "$1/$CONTROL_SKILL" ]]; then
         rm -rf "${1:?}/$CONTROL_SKILL"
-        note "removed $1/$CONTROL_SKILL (rerun without --no-control to install it again)"
+        if [[ $CONTROL_SHIPPED -eq 1 ]]; then
+            note "removed $1/$CONTROL_SKILL (rerun with --control yes to install it again)"
+        else
+            note "removed $1/$CONTROL_SKILL (this package has no balancer to control)"
+        fi
         return 0
     fi
     return 1
@@ -510,6 +648,21 @@ for check in report.get("checks", []):
         print("          -> " + check["hint"])
 PY
 
+echo
+say "Installed for $(id -un)"
+note "CLI          $(tildify "$BIN_DIR")/smartune"
+if [[ $WITH_MCP -eq 1 ]]; then
+    note "MCP server   $(tildify "$BIN_DIR")/smartune-mcp"
+else
+    note "MCP server   not installed"
+fi
+if [[ -n "$REMOTE" || $SKIP_CREDENTIALS -eq 0 ]]; then
+    note "key files    $(tildify "$CONFIG_DIR")/ (api_token, b_server.crt)"
+fi
+note "agent rules  $(tildify "$DATA_DIR")/agent/"
+[[ $want_claude -eq 1 ]] && note "Claude Code  $(tildify "$CLAUDE_HOME")/skills/: ${SKILLS[*]}"
+[[ $want_openclaw -eq 1 ]] && note "OpenClaw     $(tildify "$OPENCLAW_WORKSPACE")/skills/: ${SKILLS[*]}"
+note "uninstall    $SELF_CMD --uninstall"
 echo
 if [[ $doctor_ok -eq 1 ]]; then
     say "Done."

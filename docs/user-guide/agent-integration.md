@@ -6,29 +6,25 @@ This page sets up SmarTune for an AI agent (OpenClaw or Claude Code) on a machin
 runs SmarTune, so the agent can answer questions such as "who is using the GPU?" or "why was
 ollama limited?" and, if you allow it, change limits after the user confirms each change.
 
-Everything is done by one script, [`skills/install.sh`](../../skills/install.sh). For what the
-skills can do once installed, see [`skills/README.md`](../../skills/README.md); for the CLI and
-MCP server in detail, see [`sdk/README.md`](../../sdk/README.md).
-
-> [!NOTE]
-> The deb package does not include the skills or the CLI yet, and there is no
-> `smartune agent install-skills` command. Use `skills/install.sh` from a SmarTune checkout as
-> described here. For other features agents do not have yet, see
-> [Not yet supported](../../skills/README.md#not-yet-supported).
+Everything is done by one script, [`skills/install.sh`](../../skills/install.sh). The deb package
+ships it as the command `smartune-agent-install`; from the source code run `skills/install.sh`.
+Both take the same options, and the examples below use `skills/install.sh`. For what the skills
+can do once installed, see [`skills/README.md`](../../skills/README.md); for the CLI and MCP server
+in detail, see [`sdk/README.md`](../../sdk/README.md).
 
 ## 1. What gets installed, and where
 
 The script works for the user who runs it. Nothing is installed system-wide and the SmarTune
 service itself is not touched.
 
-| What | Copied from (repository) | Installed to |
+| What | Copied from (`/opt/intel/smartune/` for the deb, else the source code directory) | Installed to |
 |---|---|---|
-| `smartune` CLI and MCP server `smartune-mcp` (left out with `--no-mcp`) | `sdk/` | `~/.local/bin/` (launchers), `~/.local/share/smartune/venv/` (or `.../lib/` without MCP) |
+| `smartune` CLI and MCP server `smartune-mcp` (left out with `--mcp no`) | `sdk/` | `~/.local/bin/` (launchers), `~/.local/share/smartune/venv/` (or `.../lib/` without MCP) |
 | API token | `<instance>/key/api_token` (root-only) | `~/.config/smartune/api_token` (mode 600) |
 | TLS certificate | `<instance>/key/b_server.crt` | `~/.config/smartune/b_server.crt` (mode 644) |
-| Shared agent rules and references | `agent/` | `~/.local/share/smartune/agent/` |
-| Read-only skills: `smartune-status`, `smartune-diagnose`, `smartune-bench` | `skills/<name>/` | OpenClaw: `~/.openclaw/workspace/skills/<name>/`<br>Claude Code: `~/.claude/skills/<name>/` |
-| `smartune-control` skill (left out with `--no-control`) | `skills/smartune-control/` | same as above |
+| Shared agent rules and references | `agent/` | `~/.local/share/smartune/agent/` (read by `smartune-mcp`), plus a copy in each installed skill (`<skill>/agent/`) |
+| Read-only skills: `smartune-status`, `smartune-diagnose`, `smartune-bench` | `skills/<name>/` and `agent/` | OpenClaw: `~/.openclaw/workspace/skills/<name>/`<br>Claude Code: `~/.claude/skills/<name>/` |
+| `smartune-control` skill (left out with `--control no`; not in the monitor-only deb `smartune-monitor`, which has no balancer) | `skills/smartune-control/` | same as above |
 | OpenClaw settings | — | `~/.openclaw/openclaw.json` (`skills.entries`, and `mcp.servers.smartune` when OpenClaw has the `openclaw mcp` command; backup `openclaw.json.bak-smartune`) and `~/.openclaw/.env` (`SMARTUNE_*` lines) |
 
 `~/.config` is `$XDG_CONFIG_HOME` when that is set, and `~/.openclaw` is `$OPENCLAW_HOME`.
@@ -40,9 +36,9 @@ directory the first time it starts. Which `key/` the script reads depends on how
 
 | SmarTune runs as | `key/` directory | Script option |
 |---|---|---|
-| Debian package | `/opt/intel/smartune/key/` | `--deb` (default when `/opt/intel/smartune` exists) |
-| Source checkout (`start_smartune.sh`) | `<checkout>/key/` | `--source` (default when there is no deb install) |
-| Anywhere else | `<DIR>/key/` | `--smartune-dir DIR` |
+| Debian package | `/opt/intel/smartune/key/` | `--instance deb` |
+| Source code (`start_smartune.sh`) | `<source dir>/key/` | `--instance source` (from the deb's `smartune-agent-install`: `--instance <source dir>`) |
+| Anywhere else | `<DIR>/key/` | `--instance DIR` |
 | Another machine | that machine's `~/.config/smartune/` | `--remote user@host` (see [section 6](#6-agent-on-another-machine)) |
 
 Only root can read `api_token`, so copying it is the one step that calls `sudo`
@@ -61,12 +57,14 @@ the certificate expires), run the script again.
 - **SmarTune is running.** Deb: start it from the application menu or with
   `sudo systemctl start intel-smartune.service` (it does not start on boot by default). Source:
   `bash start_smartune.sh`. The dashboard does not need to be open.
-- **A checkout of this repository on the machine.** The skills, `agent/` and the SDK are not in
-  the deb package yet, so the script must run from a checkout. A deb install plus a checkout of
-  the same version is fine.
-- **Python 3.8 or later.** The MCP server, installed by default, also needs Python 3.10 or later,
-  `python3-venv` and access to PyPI (set `HTTPS_PROXY` behind a proxy). Without them the script
-  warns, skips MCP and installs everything else; the skills work without MCP.
+- **The script.** With the deb package it is the command `smartune-agent-install` (in
+  `/opt/intel/smartune/skills/`, with the skills, `agent/` and the SDK). Without it, use
+  `skills/install.sh` in the SmarTune source code.
+- **Python 3.8 or later.** The MCP server, installed by default, also needs Python 3.10 or later
+  and `python3-venv`. The deb package bundles the SDK and MCP wheels, so no network is needed when
+  the system Python is the version the package was built for; otherwise (and from the source code) pip
+  needs access to PyPI (set `HTTPS_PROXY` behind a proxy). Without them the script warns, skips
+  MCP and installs everything else; the skills work without MCP.
 - **The agent is installed for the same user.** OpenClaw: run `openclaw onboard` once so that
   `~/.openclaw/openclaw.json` exists. Claude Code: `~/.claude` exists.
 - **Run as the user the agent runs as, not as root.** The script refuses to run as root and asks
@@ -74,7 +72,9 @@ the certificate expires), run the script again.
 
 ## 3. Install
 
-From the repository root (the script finds its own files, so any working directory works):
+With the deb package, use `smartune-agent-install` in place of `skills/install.sh` below. From the
+source code, run it from the repository root (the script finds its own files, so any working
+directory works):
 
 ```bash
 skills/install.sh --target openclaw            # OpenClaw only
@@ -87,10 +87,9 @@ Add options as needed:
 | Option | Effect |
 |---|---|
 | `--target openclaw\|claude\|both\|none` | Which agents get the skills. Default: every agent found |
-| `--deb` / `--source` / `--smartune-dir DIR` | Which SmarTune instance to take the key files from ([section 1](#where-the-token-and-certificate-come-from)) |
-| `--no-control` | Leave out `smartune-control`. It is installed by default and lets the agent register apps, limit, restore, freeze, set priority and core binding, each only after the user confirms a plan. Rerunning **with** `--no-control` removes it |
-| `--no-mcp` | Do not install the MCP server. By default `smartune-mcp` is installed, registered with OpenClaw (read-only, see [section 4](#openclaw)) and, for Claude Code, the command that registers it is printed. Rerunning **with** `--no-mcp` removes it |
-| `--mcp` | Require the MCP server: stop with an error instead of skipping it when Python or PyPI is missing |
+| `--instance auto\|deb\|source\|DIR` | Which SmarTune instance to take the key files from. Default `auto`: `deb` when `/opt/intel/smartune` exists, else `source` ([section 1](#where-the-token-and-certificate-come-from)) |
+| `--control yes\|no` | Default `yes`: install `smartune-control`, which lets the agent register apps, limit, restore, freeze, set priority and core binding, each only after the user confirms a plan. `no` leaves it out, and rerunning with `no` removes it |
+| `--mcp auto\|yes\|no` | The MCP server `smartune-mcp`. Default `auto`: install it, register it with OpenClaw (read-only, see [section 4](#openclaw)) and, for Claude Code, print the command that registers it; when Python or PyPI is missing, warn and skip it. `yes`: the same, but stop with an error instead of skipping. `no`: do not install it, and rerunning with `no` removes it |
 | `--openclaw-workspace DIR` | OpenClaw workspace, when it is not `~/.openclaw/workspace` |
 | `--skip-credentials` | Keep the key files already in `~/.config/smartune/` |
 | `--remote USER@HOST [--port N]` | SmarTune runs on another machine ([section 6](#6-agent-on-another-machine)) |
@@ -102,7 +101,7 @@ A typical OpenClaw install, with all four skills:
 skills/install.sh --target openclaw
 ```
 
-For an agent that should only read, add `--no-control`.
+For an agent that should only read, add `--control no`.
 
 Run it as your normal user, **without** `sudo`. This one command does every step; there is no
 separate step for the key files:
@@ -112,7 +111,7 @@ separate step for the key files:
 | 1. CLI and MCP | Installs `smartune` and `smartune-mcp` into `~/.local/bin` (MCP skipped with a warning if Python < 3.10 or PyPI is unreachable) | No |
 | 2. Key files | Copies `api_token` and `b_server.crt` from the instance's `key/` directory to `~/.config/smartune/` | **Yes, for `api_token` only**: the script calls `sudo` itself and asks for your password once. `b_server.crt` is world-readable and is copied without it |
 | 3. Agent rules | Copies `agent/` to `~/.local/share/smartune/agent/` | No |
-| 4. Skills | Copies the skills into the agent's skill directory and, for OpenClaw, updates `openclaw.json` (skills and MCP server) and `.env` | No |
+| 4. Skills | Copies the skills, each with its own copy of `agent/`, into the agent's skill directory and, for OpenClaw, updates `openclaw.json` (skills and MCP server) and `.env` | No |
 | 5. Check | Runs `smartune doctor` | No |
 
 You therefore need `sudo` rights, but you do not prefix the command with `sudo`; the script
@@ -131,7 +130,7 @@ The script prints each step and ends with a `smartune doctor` report:
 ==> Copying the API token and certificate from /opt/intel/smartune/key (deb install)
 ==> Installing agent rules and references (~/.local/share/smartune/agent)
 ==> Installing the skills for OpenClaw
-    copied smartune-status smartune-diagnose smartune-bench smartune-control to ~/.openclaw/workspace/skills
+    copied smartune-status smartune-diagnose smartune-bench smartune-control to ~/.openclaw/workspace/skills (each with its own agent/)
     enabled smartune-status, ... in ~/.openclaw/openclaw.json (backup: ~/.openclaw/openclaw.json.bak-smartune)
     wrote SMARTUNE_TOKEN_FILE, SMARTUNE_CACERT, SMARTUNE_AGENT_ID in ~/.openclaw/.env
     registered the smartune MCP server (mcp.servers.smartune, read-only) in ~/.openclaw/openclaw.json (...)
@@ -195,13 +194,13 @@ smartune-status / smartune-diagnose / smartune-bench skills."
 ### Claude Code
 
 The skills are picked up by new sessions. The script does not change Claude Code's MCP settings;
-it prints the command that registers the MCP server (unless `--no-mcp`), for example:
+it prints the command that registers the MCP server (unless `--mcp no`), for example:
 
 ```bash
 claude mcp add smartune --scope user --transport stdio --env SMARTUNE_AGENT_ID=claude-code -- ~/.local/bin/smartune-mcp
 ```
 
-It adds `--allow-control` unless you passed `--no-control`. That turns on the MCP write tools,
+It adds `--allow-control` unless you passed `--control no`. That turns on the MCP write tools,
 which ask the user to approve each change in a form shown by the client.
 
 > [!IMPORTANT]
@@ -215,10 +214,10 @@ which ask the user to approve each change in a form shown by the client.
 
 ## 5. Install skills from another directory, or by hand
 
-The script always copies the skills that sit next to it (`skills/` of the same checkout) and
-`agent/` from the same checkout. To deploy skills from a different directory:
+The script always copies the skills that sit next to it (`skills/` of the same source code directory)
+and `agent/` from the same directory. To deploy skills from a different directory:
 
-- **A different checkout or a modified copy:** run the `install.sh` inside that copy. It installs
+- **A different source code directory or a modified copy:** run the `install.sh` inside that copy. It installs
   that copy's `skills/`, `agent/` and `sdk/`.
 - **A different destination:** use `--openclaw-workspace DIR` for OpenClaw, or set
   `OPENCLAW_HOME`. Claude Code always uses `~/.claude/skills/`.
@@ -228,12 +227,16 @@ The script always copies the skills that sit next to it (`skills/` of the same c
   ```bash
   skills/install.sh --target none                 # CLI, key files, agent/, doctor; no skills
   mkdir -p <dest>/skills
-  cp -r skills/smartune-status skills/smartune-diagnose skills/smartune-bench <dest>/skills/
-  cp -r skills/smartune-control <dest>/skills/    # only if the agent may make changes
+  for s in smartune-status smartune-diagnose smartune-bench \
+           smartune-control; do                   # leave out smartune-control unless the agent may make changes
+      cp -r "skills/$s" <dest>/skills/
+      cp -r agent "<dest>/skills/$s/agent"        # the rules and references SKILL.md points to
+  done
   ```
 
-  Each `SKILL.md` carries a summary of the shared rules, so the skill directories alone are
-  enough; the full rules in `~/.local/share/smartune/agent/` are used when present. For OpenClaw,
+  Each `SKILL.md` carries a summary of the shared rules, so a skill still works without its
+  `agent/` copy, but then the agent cannot read the full rules, the field meanings
+  (`metrics.md`) or the reference thresholds (`methodology.md`). For OpenClaw,
   also enable the entries in `openclaw.json` and add the `.env` lines yourself:
 
   ```bash
@@ -253,7 +256,7 @@ install -m 644 /opt/intel/smartune/key/b_server.crt ~/.config/smartune/b_server.
 ```
 
 Only `api_token` needs `sudo`; the certificate is world-readable. For a source run, replace
-`/opt/intel/smartune` with the checkout directory.
+`/opt/intel/smartune` with the source code directory.
 
 ## 6. Agent on another machine
 
@@ -274,25 +277,24 @@ Only `api_token` needs `sudo`; the certificate is world-readable. For a source r
 The server's certificate names only `localhost` and `127.0.0.1`. The CLI pins that exact
 certificate (by SHA-256 fingerprint) and skips only the hostname comparison, so any address
 works and verification stays on. Remote access puts the admin token on the agent machine; use it
-only between trusted machines. To keep the token on the SmarTune machine, run the MCP server over
-SSH instead:
-
-```bash
-claude mcp add smartune --transport stdio -- ssh -T user@smartune-host /home/user/.local/bin/smartune-mcp
-```
+only between trusted machines.
 
 ## 7. Update and uninstall
 
-- **Update** (new checkout, new skills, regenerated key files): run the same command again. It
-  replaces everything in place.
-- **Remove only the control skill:** rerun with `--no-control`.
-- **Remove only the MCP server:** rerun with `--no-mcp` (also removes the OpenClaw entry).
+- **Update** (new deb version or source code, new skills, regenerated key files): run the same
+  command again. It replaces everything in place. Upgrading the deb package does not update what
+  users already installed; each user reruns `smartune-agent-install`.
+- **Remove only the control skill:** rerun with `--control no`.
+- **Remove only the MCP server:** rerun with `--mcp no` (also removes the OpenClaw entry).
 - **Uninstall:**
 
   ```bash
   skills/install.sh --uninstall
   openclaw gateway restart        # OpenClaw only
   ```
+
+  With the deb package, run `smartune-agent-install --uninstall` **before** removing the package:
+  the skills live in each user's home and stay there when the package goes.
 
   This removes the launchers, `~/.local/share/smartune/`, the key files and URL in
   `~/.config/smartune/`, the four skills from OpenClaw and Claude Code, and for OpenClaw the
@@ -307,14 +309,14 @@ and telemetry in order, and prints a hint for the first problem.
 
 | Symptom | Cause and fix |
 |---|---|
-| `key/api_token or b_server.crt is missing` | SmarTune has not started yet with this `key/` directory. Start it once, or choose the right instance with `--deb`, `--source` or `--smartune-dir` |
+| `key/api_token or b_server.crt is missing` | SmarTune has not started yet with this `key/` directory. Start it once, or choose the right instance with `--instance deb\|source\|DIR` |
 | `doctor`: `connect` fails (exit code 3) | The service is not running, or listens on another address or port. Start it; for remote use check `SMARTUNE_LISTEN` / `BALANCER_HOST` and the firewall |
 | `doctor`: `connect` and `tls` pass but `auth` says "Cannot connect" | An HTTP(S) proxy in the environment (`HTTPS_PROXY`, `ALL_PROXY`) without `127.0.0.1` in `NO_PROXY`. SDKs before this fix sent local requests through the proxy; update with `skills/install.sh`, or add `127.0.0.1,localhost` to `NO_PROXY` and `no_proxy`. For a remote SmarTune, add its host to `NO_PROXY` |
 | `doctor`: `tls` fails | The certificate was regenerated after you copied it. Run the script again |
-| `doctor`: `auth` fails (exit code 4) | The token was regenerated, or the wrong instance's token was copied. Run the script again with the right `--deb` / `--source` |
+| `doctor`: `auth` fails (exit code 4) | The token was regenerated, or the wrong instance's token was copied. Run the script again with the right `--instance` |
 | `~/.local/bin is not on PATH` | Add it in `~/.profile`, and to the OpenClaw gateway's environment |
 | `... exists and was not installed by this script` | Another `smartune` is already in `~/.local/bin` (for example from pipx). Remove it (`pipx uninstall smartune-sdk`) and run again |
-| `WARNING: pip could not install the MCP SDK ... continuing without the MCP server` | No access to PyPI. Everything else is installed; the skills work through the CLI. Set `HTTPS_PROXY` and rerun to add MCP, or pass `--no-mcp` to stop the warning |
+| `WARNING: pip could not install the MCP SDK ... continuing without the MCP server` | No access to PyPI. Everything else is installed; the skills work through the CLI. Set `HTTPS_PROXY` and rerun to add MCP, or pass `--mcp no` to stop the warning |
 | `WARNING: the MCP server needs Python >= 3.10` | The system Python is older. Same as above: MCP is skipped, the rest works |
 | `pip install failed` | No access to PyPI and the system Python has no `requests`, so even the CLI cannot be installed. Set `HTTPS_PROXY`, or `sudo apt install python3-requests` and rerun |
 | OpenClaw does not list the smartune MCP tools | The script printed "MCP not registered with OpenClaw" (no `openclaw mcp` command): update OpenClaw or merge the printed entry by hand, then restart the gateway |

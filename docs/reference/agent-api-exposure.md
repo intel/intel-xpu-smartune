@@ -12,7 +12,7 @@ Categories:
 | Category | Meaning |
 |---|---|
 | **Read-only** | Allowed by the `READ_ROUTES` allow-list in `sdk/smartune_sdk/client.py` |
-| **Control** | Changes system state. Listed in `CONTROL_ROUTES` in `client.py` and reachable only through `smartune control ...`: without `--yes` the command only prints a plan, and it runs only after the user agrees (`agent/policy/consent.md`). These checks run on the client, so install the control skill only in trusted environments until the server has scoped tokens (`skills/install.sh --no-control` leaves it out). Over MCP these actions are the write tools of `smartune-mcp --allow-control`, and the user confirms each change in an elicitation form |
+| **Control** | Changes system state. Listed in `CONTROL_ROUTES` in `client.py` and reachable only through `smartune control ...`: without `--yes` the command only prints a plan, and it runs only after the user agrees (`agent/policy/consent.md`). These checks run on the client, so install the control skill only in trusted environments until the server has scoped tokens (`skills/install.sh --control no` leaves it out). Over MCP these actions are the write tools of `smartune-mcp --allow-control`, and the user confirms each change in an elicitation form |
 | **Control (not exposed)** | Changes system state and is not offered yet. If it is ever exposed, it must go through the same plan-then-confirm flow |
 | **Internal** | Used only by the dashboard or the service, of no value to an agent, or has side effects. Not exposed |
 | **Forbidden** | Destructive. Agents never get it |

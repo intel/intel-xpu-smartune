@@ -150,6 +150,17 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 copy_tree() { cp -r "$1" "$2" && chmod -R u+w "$2"; }
 shq()  { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }  # single-quote for sh
 
+ensure_dir() {  # ensure_dir DIR...: create each DIR; stop unless this user can write to it
+    local dir top
+    for dir in "$@"; do
+        mkdir -p "$dir" 2>/dev/null || true
+        [[ -d "$dir" && -w "$dir" ]] && continue
+        top="$dir"
+        while [[ ! -e "$top" ]]; do top="$(dirname "$top")"; done
+        die "$(id -un) cannot write to $dir ($top is owned by $(stat -c %U "$top")). Fix the owner, then rerun: sudo chown -R $(id -un): $(shq "$top")"
+    done
+}
+
 set_instance() {  # set_instance auto|deb|source|DIR -> SMARTUNE_DIR ("" = auto)
     case "$1" in
         auto)   SMARTUNE_DIR="" ;;
@@ -431,7 +442,7 @@ fi
 # -- 1. CLI ------------------------------------------------------------------------
 
 [[ -d "$SDK_SRC/smartune_sdk" ]] || die "cannot find the SDK at $SDK_SRC (run this script from the SmarTune source code, or use smartune-agent-install from the deb package)"
-mkdir -p "$BIN_DIR" "$DATA_DIR"
+ensure_dir "$BIN_DIR" "$DATA_DIR"
 
 skip_mcp() {  # skip_mcp REASON: fatal with --mcp, otherwise continue without MCP
     [[ $MCP_REQUIRED -eq 0 ]] || die "--mcp yes: $1"
@@ -478,7 +489,7 @@ install_venv() {  # install_venv EXTRAS ("" or "[mcp]"): the SDK in a private ve
     [[ $WITH_MCP -eq 1 ]] && names+=(smartune-mcp)  # the entry point exists even without the MCP SDK
     for name in "${names[@]}"; do
         claim_launcher "$name"
-        ln -s "$DATA_DIR/venv/bin/$name" "$BIN_DIR/$name"
+        ln -s "$DATA_DIR/venv/bin/$name" "$BIN_DIR/$name" || die "could not create $BIN_DIR/$name"
         note "$BIN_DIR/$name -> $DATA_DIR/venv/bin/$name"
     done
 }
@@ -531,7 +542,7 @@ if [[ -n "$REMOTE" ]]; then
     [[ -n "$remote_host" && "$REMOTE_PORT" =~ ^[0-9]+$ ]] || die "--remote needs USER@HOST and --port a number"
     say "Copying the API token and certificate from $REMOTE (scp)"
     note "They come from ~/.config/smartune/ on $remote_host, put there by skills/install.sh (smartune-agent-install with the deb) on that machine."
-    mkdir -p "$CONFIG_DIR"
+    ensure_dir "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
     tmp_keys="$(mktemp -d)"
     if ! scp -q "$REMOTE:.config/smartune/api_token" "$REMOTE:.config/smartune/b_server.crt" "$tmp_keys/"; then
@@ -554,7 +565,7 @@ elif [[ $SKIP_CREDENTIALS -eq 0 ]]; then
     if ! exists "$KEY_DIR/api_token" || ! exists "$KEY_DIR/b_server.crt"; then
         die "$KEY_DIR/api_token or b_server.crt is missing. Start SmarTune once first (it creates them), or pick the right instance with --instance deb|source|DIR"
     fi
-    mkdir -p "$CONFIG_DIR"
+    ensure_dir "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
     copy_key() {  # copy_key NAME MODE: plain copy when readable, else through sudo
         local src="$KEY_DIR/$1" dst="$CONFIG_DIR/$1"
@@ -583,7 +594,7 @@ copy_tree "$AGENT_SRC" "$DATA_DIR/agent"
 # installed skill gets its own copy of agent/. The repository keeps the single source; these
 # copies are regenerated on every install, and --uninstall removes them with the skill.
 install_skills_into() {  # install_skills_into DIR: returns 0 when it removed the control skill
-    mkdir -p "$1"
+    ensure_dir "$1"
     for s in "${SKILLS[@]}"; do
         rm -rf "${1:?}/$s"
         copy_tree "$HERE/$s" "$1/$s"

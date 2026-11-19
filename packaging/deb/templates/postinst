@@ -9,7 +9,7 @@ DESKTOP_FILE="/usr/share/applications/smartune-monitor.desktop"
 case "$1" in
     configure)
         # Executables (git archive preserves mode bits, but be explicit).
-        chmod 0755 "$INSTALL_DIR"/*.sh 2>/dev/null || true
+        chmod 0755 "$INSTALL_DIR"/*.sh "$INSTALL_DIR/skills/install.sh" 2>/dev/null || true
         mkdir -p "$INSTALL_DIR/logs"
         # dpkg keeps an edited conffile's old mode on upgrade, so tighten it here:
         # it may now carry a proxy password or HF_TOKEN. Only root reads it.
@@ -53,6 +53,9 @@ case "$1" in
                  "other machines while it runs (sign in with: sudo cat $INSTALL_DIR/key/api_token)."
             echo "[smartune] For this machine only, set SMARTUNE_LISTEN=127.0.0.1 in /etc/default/intel-smartune."
         fi
+        # Agent skills are per user (~/.claude, ~/.openclaw), so they are not set up here.
+        echo "[smartune] AI agent skills (Claude Code, OpenClaw): run 'smartune-agent-install' as each user" \
+             "who uses an agent, after starting SmarTune once."
         ;;
 esac
 

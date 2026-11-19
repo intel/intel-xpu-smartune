@@ -83,7 +83,7 @@ start; read it with `sudo cat key/api_token` and paste it into the sign-in scree
 
 ## Run as a systemd service
 
-Runs the source checkout as a managed service that starts on boot and restarts
+Runs the source code as a managed service that starts on boot and restarts
 on failure. Complete [step 1](#1-install-dependencies) of *Run from source*
 first; the service replaces step 2, and the dashboard still comes from the
 [dev server](#3-run-the-dashboard-dev-server).
@@ -172,6 +172,10 @@ supported) and `intel-smartune.service`. The launcher is named
 for the monitor-only package.
 The service is not enabled at boot; the launcher starts it on demand via
 `pkexec systemctl start intel-smartune.service`.
+
+To let an AI agent (Claude Code, OpenClaw) use SmarTune, each user who runs an agent then runs
+`smartune-agent-install` (no `sudo`; it asks for the password once to copy the token). See the
+[agent integration guide](user-guide/agent-integration.md).
 
 ### Launch
 

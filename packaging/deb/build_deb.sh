@@ -67,6 +67,9 @@ done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$HERE" rev-parse --show-toplevel)"
 
+# Agent skills, their rules and the SDK; users install them with smartune-agent-install.
+AGENT_PATHS=(skills agent sdk)
+
 # Two mutually-exclusive package variants sharing the install dir and service
 # name (see --full). The flag switches only: package name, launcher name,
 # staged source paths, control template, install-time run script, and the venv
@@ -84,6 +87,8 @@ if [ "$FULL" -eq 1 ]; then
     # only ~800 KB of scripts once its generated runtime/ is excluded (see
     # STAGE_EXCLUDES); the monitor-only variant ships without it and hides the tab.
     SRC_PATHS=(smartune.py smartune_api.py features.py requirements.txt monitor utils db config diagnostics balancer benchmark)
+    SRC_PATHS+=("${AGENT_PATHS[@]}")
+    VARIANT_EXCLUDES=()
     echo "==> Building FULL package (balancer + monitor): $PKG_NAME"
 else
     PKG_NAME="smartune-monitor"
@@ -94,6 +99,9 @@ else
     # diagnostics/ is required in both variants: monitor_api, monitor_service and
     # smartune_api import it unconditionally (scrub_text / emit_event).
     SRC_PATHS=(smartune.py smartune_api.py features.py requirements.txt monitor utils db config diagnostics)
+    SRC_PATHS+=("${AGENT_PATHS[@]}")
+    # No balancer: no smartune-control skill.
+    VARIANT_EXCLUDES=(--exclude='skills/smartune-control')
     echo "==> Building monitor-only package: $PKG_NAME"
 fi
 STAGE="$REPO_ROOT/build/${PKG_NAME}_${VERSION}_${ARCH}"
@@ -144,12 +152,17 @@ STAGE_EXCLUDES=(
     # Dev-only: eBPF experiments and unit tests.
     --exclude='balancer/test'
     --exclude='config/runtime_state.json'
+    # SDK development leftovers: tests and local build output.
+    --exclude='sdk/tests'
+    --exclude='sdk/build'
+    --exclude='*.egg-info'
+    --exclude='.pytest_cache'
 )
 for p in "${SRC_PATHS[@]}"; do
     [ -e "$REPO_ROOT/$p" ] || { echo "ERROR: missing $p" >&2; exit 1; }
 done
 # pipefail (set at the top) makes a failure in either half abort the build.
-tar -C "$REPO_ROOT" "${STAGE_EXCLUDES[@]}" -cf - "${SRC_PATHS[@]}" | tar -C "$APP_DIR" -xf -
+tar -C "$REPO_ROOT" "${STAGE_EXCLUDES[@]}" "${VARIANT_EXCLUDES[@]}" -cf - "${SRC_PATHS[@]}" | tar -C "$APP_DIR" -xf -
 
 # Read-only copy of the shipped config. Settings' "Restore factory defaults" and the
 # pressure relax/tighten bounds read it, because config.yaml itself is edited in place.
@@ -157,7 +170,7 @@ tar -C "$REPO_ROOT" "${STAGE_EXCLUDES[@]}" -cf - "${SRC_PATHS[@]}" | tar -C "$AP
 install -m 0444 "$APP_DIR/config/config.yaml" "$APP_DIR/config/config.factory.yaml"
 
 # /smartune/capabilities reports the package version (agents check it via
-# `smartune doctor`), so stamp it into the staged copy, not the checkout.
+# `smartune doctor`), so stamp it into the staged copy, not the source tree.
 sed -i "s/^SMARTUNE_VERSION = \".*\"$/SMARTUNE_VERSION = \"$VERSION\"/" "$APP_DIR/smartune_api.py"
 grep -q "^SMARTUNE_VERSION = \"$VERSION\"$" "$APP_DIR/smartune_api.py" \
     || { echo "ERROR: could not stamp SMARTUNE_VERSION into smartune_api.py" >&2; exit 1; }
@@ -193,6 +206,19 @@ echo "$PY_TAG" > "$APP_DIR/wheels/.python_version"
 # --system-site-packages venv so the apt-installed bcc binding is importable.
 echo "$VENV_MODE" > "$APP_DIR/wheels/.venv_mode"
 
+# SDK + MCP wheels for smartune-agent-install (offline). Kept in a subdirectory so the
+# service venv (ensure_venv.sh) does not pick them up.
+echo "==> Building the SDK wheel and downloading its MCP dependencies (agent integration)"
+AGENT_WHEELS="$WHEELS_DIR/agent"
+mkdir -p "$AGENT_WHEELS"
+SDK_BUILD="$(mktemp -d)"
+cp -r "$APP_DIR/sdk/." "$SDK_BUILD/"     # a copy: building writes build/ and *.egg-info in place
+python3 -m pip wheel --no-deps -w "$AGENT_WHEELS" "$SDK_BUILD"
+rm -rf "$SDK_BUILD"
+SDK_WHEEL="$(ls "$AGENT_WHEELS"/smartune_sdk-*.whl)"
+python3 -m pip download --only-binary=:all: --prefer-binary -d "$AGENT_WHEELS" "${SDK_WHEEL}[mcp]"
+echo "$PY_TAG" > "$AGENT_WHEELS/.python_version"
+
 # Runtime launchers (kept under packaging/, installed alongside the app). Only
 # the run script the service references is installed ($RUN_SCRIPT); the venv is
 # built at install time by ensure_venv.sh.
@@ -202,6 +228,10 @@ install -m 0755 "$HERE/app/start_gui.sh"        "$APP_DIR/start_gui.sh"
 # Privileged helper elevated by start_gui.sh via pkexec. Its polkit action
 # (installed below) is matched by this exact path, so it must not move.
 install -m 0755 "$HERE/app/smartune-authhelper" "$APP_DIR/smartune-authhelper"
+# Agent setup on PATH. Each user runs it for their own agents (it refuses root).
+chmod 0755 "$APP_DIR/skills/install.sh"
+mkdir -p "$STAGE/usr/bin"
+ln -s /opt/intel/smartune/skills/install.sh "$STAGE/usr/bin/smartune-agent-install"
 
 # --- 3. systemd unit, desktop entry, icon -----------------------------------
 # Both variants install the same unit, intel-smartune.service (authhelper /

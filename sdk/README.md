@@ -7,19 +7,18 @@ default. Every command is read-only except `smartune control`, which changes how
 treats an app and only prints a plan unless given `--yes`.
 
 The [API exposure table](../docs/reference/agent-api-exposure.md) lists which endpoints the CLI
-uses and why the others are left out; [`../skills/README.md`](../skills/README.md#not-yet-supported)
-lists what agents cannot do yet.
+uses and why the others are left out.
 
 ## Install
 
 The quickest way is the one-step script, run as the user the agent runs as (not root). It works
-with both a deb install and a source checkout started with `start_smartune.sh`:
+with both a deb install and the source code started with `start_smartune.sh`:
 
 ```bash
 skills/install.sh                  # CLI + MCP server + credentials + skills for every agent found
-skills/install.sh --no-mcp         # without the MCP server (by default skipped with a warning
-                                   # when Python < 3.10 or PyPI is unreachable; --mcp makes it required)
-skills/install.sh --no-control     # without the smartune-control skill (installed by default)
+skills/install.sh --mcp no         # without the MCP server (default --mcp auto: skipped with a warning
+                                   # when Python < 3.10 or PyPI is unreachable; --mcp yes makes it required)
+skills/install.sh --control no     # without the smartune-control skill (default --control yes)
 skills/install.sh --uninstall      # remove all of it again
 ```
 
@@ -32,7 +31,7 @@ the `openclaw mcp` command; for Claude Code it prints the `claude mcp add` comma
 runs `smartune doctor`. Run `skills/install.sh --help` for every option.
 
 With MCP (the default) the SDK goes into a private venv under `~/.local/share/smartune/venv`.
-With `--no-mcp`, or when MCP was skipped, and if the system Python already has `requests` (the
+With `--mcp no`, or when MCP was skipped, and if the system Python already has `requests` (the
 only dependency), the CLI is installed by copying the package and writing a small launcher: no
 pip and no network.
 
@@ -43,7 +42,7 @@ pipx install ./sdk                  # or './sdk[mcp]' for the MCP server (Python
 smartune doctor
 ```
 
-To run from a checkout without installing it, use `python3 -m smartune_sdk` from this directory.
+To run from the source code without installing it, use `python3 -m smartune_sdk` from this directory.
 
 ## Configure
 
@@ -61,7 +60,7 @@ To run from a checkout without installing it, use `python3 -m smartune_sdk` from
 place, which `skills/install.sh` does, no variable is needed.
 
 The token and certificate are created by the server under its `key/` directory, which only root
-can read: `/opt/intel/smartune/key/` for the deb, `<checkout>/key/` for a source run. To copy them
+can read: `/opt/intel/smartune/key/` for the deb, `<source dir>/key/` for a source run. To copy them
 by hand:
 
 ```bash
@@ -181,7 +180,7 @@ command return the same JSON and hit the same allow-list and size cap. The serve
 put together from [`../agent/policy`](../agent/policy). The files in
 [`../agent/content`](../agent/content) are served as resources: `smartune://metrics`,
 `smartune://methodology` and `smartune://workloads`. If `agent/` is not found (checked in this
-order: `SMARTUNE_AGENT_DIR`, the repository checkout, `~/.local/share/smartune/agent` (where
+order: `SMARTUNE_AGENT_DIR`, the source code directory, `~/.local/share/smartune/agent` (where
 `skills/install.sh` puts it), `/usr/share/smartune/agent`, `/opt/intel/smartune/agent`), a short built-in summary of the rules is used.
 
 Claude Code:
@@ -237,9 +236,7 @@ Certificate verification is never turned off.
 > [!WARNING]
 > Remote access puts the server's single token, which also allows every write endpoint, on the
 > agent machine and sends it over the network (encrypted). Use it only between trusted machines
-> until the server has a read-only token. As an alternative that keeps the token on the SmarTune
-> machine, run the MCP server over SSH:
-> `claude mcp add smartune --transport stdio -- ssh -T user@smartune-host /home/user/.local/bin/smartune-mcp`.
+> until the server has a read-only token.
 
 ## Tests
 
@@ -256,4 +253,4 @@ runs only where `mcp` 2.x is installed.
 `tests/test_parity.py` also checks the SDK against the rest of the repository: every
 `READ_ROUTES` entry must match a route the server defines, the allow-list may reach no write
 endpoint, and every `smartune ...` command quoted in `skills/` or `agent/` must parse. These
-checks read the server source without importing it, and are skipped outside a repository checkout.
+checks read the server source without importing it, and are skipped outside the source code directory.

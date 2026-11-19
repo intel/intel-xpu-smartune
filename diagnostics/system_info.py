@@ -10,9 +10,9 @@ from here instead of each re-opening ``/proc``.
 
 
 def read_boot_id():
-    """Return the current boot id, or None when it cannot be read."""
+    """Return the current boot id in journald's form (32 hex digits), or None."""
     try:
         with open("/proc/sys/kernel/random/boot_id", "r", encoding="utf-8") as handle:
-            return handle.read().strip() or None
+            return handle.read().strip().replace("-", "").lower() or None
     except OSError:
         return None

@@ -20,7 +20,7 @@ import ssl
 from urllib.parse import urlsplit
 
 from . import __version__
-from .client import (ADDRESS_MISMATCH_HINT, EXIT_AUTH, EXIT_CONNECTION, SUPPORTED_API_LEVELS,
+from .client import (ADDRESS_MISMATCH_HINT, INSTALL_CMD, EXIT_AUTH, EXIT_CONNECTION, SUPPORTED_API_LEVELS,
                      SmartuneError, token_source)
 
 OK, WARN, FAIL, SKIP = "ok", "warn", "fail", "skip"
@@ -59,7 +59,7 @@ def _config(client):
         problems.append((client.token_error.message, client.token_error.hint, EXIT_AUTH))
     elif not has_token:
         problems.append(("no API token configured",
-                         "Run skills/install.sh once (it copies key/api_token to ~/.config/smartune/), "
+                         f"Run {INSTALL_CMD} once (it copies key/api_token to ~/.config/smartune/), "
                          "or set SMARTUNE_TOKEN_FILE to a readable copy of it.",
                          EXIT_AUTH))
     else:
@@ -74,7 +74,7 @@ def _config(client):
             detail.append(f"CA certificate {client.cacert}")
     elif urlsplit(client.url).scheme == "https":
         warnings.append(("SMARTUNE_CACERT is not set, so the system CA store is used",
-                         "SmarTune uses a self-signed certificate: run skills/install.sh (it copies key/b_server.crt "
+                         f"SmarTune uses a self-signed certificate: run {INSTALL_CMD} (it copies key/b_server.crt "
                          "to ~/.config/smartune/), or set SMARTUNE_CACERT to it."))
 
     if problems:

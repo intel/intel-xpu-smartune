@@ -34,16 +34,24 @@ _FORM_VIEWS = {
         "mem_gate_steepness": 8,
         "memory_busy_threshold": 80,
         "cpu_busy_threshold": 90,
+        "system_score_ewma_alpha": 0.3,
     },
     "disk_pressure": {
         "disk_thresholds": {"low": 0.4, "medium": 0.6, "high": 0.8, "critical": 1.0},
         "sub_weights": {"latency": 0.55, "queue": 0.35, "util": 0.1},
         "sigmoid_k": 8.0,
         "max_p_weight": 0.8,
+        "half_point_scale": 1.0,
+        "disk_psi_weights": {"some": 0.5, "full": 3.0},
+        "disk_score_ewma_alpha": 0.3,
     },
     "network_pressure": {
         "network_thresholds": {"low": 0.3, "medium": 0.5, "high": 0.7, "critical": 0.9},
         "network_pressure_model_rx_drop_weight": 0.3,
+        "network_pressure_model_util_sat_half": 0.96,
+        "network_pressure_model_util_sat_k": 120.0,
+        "network_pressure_model_ema_alpha": 0.3,
+        "network_pressure_model_decay_rate": 0.7,
     },
     "limit_policy": {
         "cpu": {"rate": {p: 0.5 for p in ("high", "medium", "low", "undefined")}},
@@ -144,7 +152,7 @@ class StartupDefaultsTest(unittest.TestCase):
 
     def test_hints_endpoint_shape(self):
         data = self.client.get("/monitor/config-hints").get_json()["data"]
-        self.assertEqual(set(data), {"fields", "sections", "startup_defaults"})
+        self.assertEqual(set(data), {"fields", "sections", "startup_defaults", "factory_available"})
         self.assertEqual(data["startup_defaults"]["system_pressure"]["regular_update_sys_pressure_time"], 5)
         self.assertNotIn("diagnostic_rules", data["startup_defaults"])
 

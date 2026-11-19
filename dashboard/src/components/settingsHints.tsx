@@ -165,11 +165,24 @@ function PresetControl({ hint, value, onChange, disabled, min, max, step }: Pres
   )
 }
 
+// A tooltip plus a final line naming the config.yaml key behind the field.
+export function withYamlKey(text: string | undefined, yamlKey: string | undefined): React.ReactNode {
+  if (!yamlKey) return text
+  return (
+    <>
+      {text}
+      <div style={{ marginTop: 6, opacity: 0.8 }}>config.yaml: <code>{yamlKey}</code></div>
+    </>
+  )
+}
+
 interface HintedItemProps {
   name: string | string[]
   label?: React.ReactNode
   // The field's own description (what it is); what up/down does comes from the hint.
   tooltip?: string
+  // The key in config.yaml, appended to the tooltip so a value seen here can be found there.
+  yamlKey?: string
   rules?: React.ComponentProps<typeof Form.Item>['rules']
   // Used when the hints are unavailable, and for the range checks the form rules also enforce.
   min?: number
@@ -187,7 +200,7 @@ interface HintedItemProps {
 // suggested step, then what raising or lowering the value does.
 // Fields whose hint is a preset render as a level dropdown instead of a bare number.
 export function HintedItem({
-  name, label, tooltip, rules, min, max, step, addonAfter, disabled, dependencies, compact,
+  name, label, tooltip, yamlKey, rules, min, max, step, addonAfter, disabled, dependencies, compact,
 }: HintedItemProps) {
   const scope = useContext(HintScopeContext)
   const path = Array.isArray(name) ? name : [name]
@@ -221,7 +234,7 @@ export function HintedItem({
     <Form.Item
       label={label}
       name={name}
-      tooltip={tooltip}
+      tooltip={withYamlKey(tooltip, yamlKey)}
       extra={infoParts.length > 0 || (hint && !compact) ? <HintLines info={infoParts.join(' · ')} hint={compact ? undefined : hint} /> : undefined}
       required={false}
       rules={rules}
@@ -236,7 +249,7 @@ export function HintedItem({
 // with just the startup default under it.  The table's guidance is stated once, in a HintNote.
 export function HintedCell({
   name, rules, min, max, step, addonAfter, disabled,
-}: Omit<HintedItemProps, 'label' | 'tooltip' | 'dependencies' | 'compact'>) {
+}: Omit<HintedItemProps, 'label' | 'tooltip' | 'yamlKey' | 'dependencies' | 'compact'>) {
   const scope = useContext(HintScopeContext)
   const path = Array.isArray(name) ? name : [name]
   const hint = findHint(scope?.hints, scope?.section ?? '', path)

@@ -26,6 +26,20 @@ const sliderTheme = () => ({
   },
 })
 
+// Per-core rows sit under their class row; green keeps them from reading as the same
+// control as the class total.
+const childAccent = () => COLORS.green
+const childSliderTheme = () => ({
+  components: {
+    Slider: {
+      trackBg: childAccent(),
+      trackHoverBg: childAccent(),
+      handleColor: childAccent(),
+      handleActiveColor: childAccent(),
+    },
+  },
+})
+
 const POLL_MS = 3000
 const SLIDER_STEP_MHZ = 50
 
@@ -156,17 +170,19 @@ function FreqRow({
         </div>
       </div>
       <div>
-        <Slider
-          range
-          min={hwMin}
-          max={hwMax}
-          step={SLIDER_STEP_MHZ}
-          value={value}
-          disabled={busy}
-          tooltip={{ formatter: (v) => (v === undefined ? '' : formatMhz(v)) }}
-          onChange={(next) => onDraft(row.key, next as Range)}
-          style={{ margin: '4px 6px' }}
-        />
+        <ConfigProvider theme={indent ? childSliderTheme() : undefined}>
+          <Slider
+            range
+            min={hwMin}
+            max={hwMax}
+            step={SLIDER_STEP_MHZ}
+            value={value}
+            disabled={busy}
+            tooltip={{ formatter: (v) => (v === undefined ? '' : formatMhz(v)) }}
+            onChange={(next) => onDraft(row.key, next as Range)}
+            style={{ margin: '4px 6px' }}
+          />
+        </ConfigProvider>
         <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
           {formatMhz(value[0])} – {formatMhz(value[1])}
           <span style={{ color: COLORS.textTertiary }}> (hardware {formatMhz(hwMin)} – {formatMhz(hwMax)})</span>

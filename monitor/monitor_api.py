@@ -8,6 +8,8 @@ import os
 import re
 import threading
 import time
+import types
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, Optional
 from flask import Blueprint, request
 
@@ -2076,10 +2078,37 @@ _PSI_WEIGHT_KEYS = ("cpu", "memory", "io")
 _NETWORK_PRIORITIES = ("system", "critical", "high", "low")
 
 
+# While set, _cfg() answers with this config instead of the live one. Used to read the
+# settings views of the packaged factory config with the very same getters the UI uses;
+# thread-local so a concurrent request never sees it.
+_cfg_override = threading.local()
+
+
 def _cfg():
     """Fetch the live global config (local import matches the rest of this module)."""
+    override = getattr(_cfg_override, "cfg", None)
+    if override is not None:
+        return override
     from config.config import b_config
     return b_config
+
+
+@contextmanager
+def _using_config(cfg):
+    previous = getattr(_cfg_override, "cfg", None)
+    _cfg_override.cfg = cfg
+    try:
+        yield
+    finally:
+        _cfg_override.cfg = previous
+
+
+def _disk_model_view():
+    """Effective disk-pressure model of the config in force (live, or the override)."""
+    if getattr(_cfg_override, "cfg", None) is not None:
+        from monitor.disk_pressure import DiskIOMonitor
+        return DiskIOMonitor._model(types.SimpleNamespace(config=_cfg()))
+    return _get_resource_monitor().get_disk_pressure_model()
 
 
 # --- system_pressure: update interval + level cut-offs + weights + factor -----
@@ -2092,6 +2121,7 @@ def _get_system_pressure_config():
         "mem_gate_steepness": getattr(cfg, "mem_gate_steepness", None),
         "memory_busy_threshold": getattr(cfg, "memory_busy_threshold", None),
         "cpu_busy_threshold": getattr(cfg, "cpu_busy_threshold", None),
+        "system_score_ewma_alpha": getattr(cfg, "system_score_ewma_alpha", 0.3),
     }
 
 
@@ -2150,6 +2180,12 @@ def _validate_system_pressure_config(body):
             raise ValueError("cpu_busy_threshold must be within [0, 100]")
         updates["cpu_busy_threshold"] = val
 
+    if body.get("system_score_ewma_alpha") is not None:
+        val = float(body["system_score_ewma_alpha"])
+        if not (0 < val <= 1):
+            raise ValueError("system_score_ewma_alpha must be within (0, 1]")
+        updates["system_score_ewma_alpha"] = val
+
     if not updates:
         raise ValueError("No valid system_pressure updates provided")
     return updates
@@ -2168,6 +2204,7 @@ def _write_system_pressure_config(updates):
             "memory_busy_threshold",
             "cpu_busy_threshold",
             "regular_update_sys_pressure_time",
+            "system_score_ewma_alpha",
         )
         if k in updates
     }
@@ -2177,13 +2214,25 @@ def _write_system_pressure_config(updates):
 
 
 # --- disk_pressure: disk-IO channel bands + USE-model calibration -------------
-# Exposed: the four bands and the four knobs that reshape P_disk regardless of hardware.
-# The per-media half-point tables and disk_psi_weights stay config-only: those are
-# calibrated against measurements of a specific device class, not steered from a dialog.
+# Exposed: the four bands, the knobs that reshape P_disk regardless of hardware, the io
+# PSI stall weights and the score smoothing. The per-media half-point tables, util half
+# and idle gate stay config-only: those are calibrated against measurements of a specific
+# device class, not steered from a dialog (half_point_scale is the one-click lever).
+def _effective_disk_psi_weights():
+    from monitor.pressure import PressureAnalyzer
+    cfg = getattr(_cfg(), "disk_psi_weights", None) or {}
+    some = cfg.get("some")
+    full = cfg.get("full")
+    return {
+        "some": float(some) if isinstance(some, (int, float)) else PressureAnalyzer._PSI_IO_SOME_W,
+        "full": float(full) if isinstance(full, (int, float)) else PressureAnalyzer._PSI_IO_FULL_W,
+    }
+
+
 def _get_disk_pressure_config():
     # Effective values, i.e. config merged over the defaults in disk_pressure.py, so a knob
     # omitted from config.yaml shows what the model actually uses instead of a blank field.
-    model = _get_resource_monitor().get_disk_pressure_model()
+    model = _disk_model_view()
     return {
         "disk_thresholds": dict(_cfg().disk_thresholds or {}),
         "disk_pressure_model": {
@@ -2194,7 +2243,10 @@ def _get_disk_pressure_config():
             },
             "sigmoid_k": model["sigmoid_k"],
             "max_p_weight": model["max_p_weight"],
+            "half_point_scale": model["half_point_scale"],
         },
+        "disk_psi_weights": _effective_disk_psi_weights(),
+        "disk_score_ewma_alpha": getattr(_cfg(), "disk_score_ewma_alpha", 0.3),
     }
 
 
@@ -2253,8 +2305,33 @@ def _validate_disk_pressure_config(body):
                 raise ValueError("max_p_weight must be within [0, 1]")
             model["max_p_weight"] = val
 
+        if model_body.get("half_point_scale") is not None:
+            val = float(model_body["half_point_scale"])
+            if not (0.1 <= val <= 10):
+                raise ValueError("half_point_scale must be within [0.1, 10]")
+            model["half_point_scale"] = val
+
         if model:
             updates["disk_pressure_model"] = model
+
+    psi_body = body.get("disk_psi_weights")
+    if isinstance(psi_body, dict):
+        psi = {}
+        for key in ("some", "full"):
+            if psi_body.get(key) is None:
+                continue
+            val = float(psi_body[key])
+            if not (0 <= val <= 20):
+                raise ValueError(f"disk_psi_weights.{key} must be within [0, 20]")
+            psi[key] = val
+        if psi:
+            updates["disk_psi_weights"] = psi
+
+    if body.get("disk_score_ewma_alpha") is not None:
+        val = float(body["disk_score_ewma_alpha"])
+        if not (0 < val <= 1):
+            raise ValueError("disk_score_ewma_alpha must be within (0, 1]")
+        updates["disk_score_ewma_alpha"] = val
 
     if not updates:
         raise ValueError("No valid disk_pressure updates provided")
@@ -2268,10 +2345,35 @@ def _write_disk_pressure_config(updates):
         modified = cfg.update_config_section("disk_thresholds", updates["disk_thresholds"]) or modified
     if "disk_pressure_model" in updates:
         modified = cfg.set_disk_pressure_model(updates["disk_pressure_model"]) or modified
+    if "disk_psi_weights" in updates:
+        modified = cfg.update_config_section("disk_psi_weights", updates["disk_psi_weights"]) or modified
+    if "disk_score_ewma_alpha" in updates:
+        modified = cfg.update_top_level_scalars(
+            {"disk_score_ewma_alpha": updates["disk_score_ewma_alpha"]}) or modified
     return modified
 
 
 # --- network_pressure: network utilisation level cut-offs --------------------
+# Model knobs shown in Settings besides rx_drop_weight; the rest of the NIC model (loss
+# half-points, activity gate, per-core budget) stays in code.
+_NETWORK_MODEL_RANGES = {
+    "util_sat_half": (0.5, 1.0),
+    "util_sat_k": (1.0, 1000.0),
+    "ema_alpha": (0.01, 1.0),
+    "decay_rate": (0.0, 0.99),
+}
+
+
+def _network_model_defaults():
+    from monitor.network import NetworkMonitor
+    return {
+        "util_sat_half": NetworkMonitor._UTIL_SAT_HALF,
+        "util_sat_k": NetworkMonitor._UTIL_SAT_K,
+        "ema_alpha": NetworkMonitor._EMA_ALPHA,
+        "decay_rate": NetworkMonitor._DECAY_RATE,
+    }
+
+
 def _get_network_pressure_config():
     model = getattr(_cfg(), "network_pressure_model", None)
     model_dict = model if isinstance(model, dict) else {}
@@ -2279,6 +2381,8 @@ def _get_network_pressure_config():
         "network_thresholds": dict(_cfg().network_thresholds or {}),
         "network_pressure_model": {
             "rx_drop_weight": float(model_dict.get("rx_drop_weight", 0.5)),
+            **{key: float(model_dict.get(key, default))
+               for key, default in _network_model_defaults().items()},
         },
     }
 
@@ -2315,6 +2419,13 @@ def _validate_network_pressure_config(body):
             if not (0 <= value <= 1):
                 raise ValueError("network_pressure_model.rx_drop_weight must be within [0, 1]")
             model_updates["rx_drop_weight"] = value
+        for key, (low, high) in _NETWORK_MODEL_RANGES.items():
+            if model_body.get(key) is None:
+                continue
+            value = float(model_body[key])
+            if not (low <= value <= high):
+                raise ValueError(f"network_pressure_model.{key} must be within [{low:g}, {high:g}]")
+            model_updates[key] = value
         if model_updates:
             updates["network_pressure_model"] = model_updates
 
@@ -2831,10 +2942,200 @@ def get_config_hints():
                 if snapshot is not None:
                     defaults[section] = snapshot
         return construct_response(
-            data={"fields": FIELD_HINTS, "sections": SECTION_HINTS, "startup_defaults": defaults},
+            data={"fields": FIELD_HINTS, "sections": SECTION_HINTS, "startup_defaults": defaults,
+                  "factory_available": _factory_config() is not None},
             retmsg="Successfully retrieved config hints")
     except Exception as e:
         logger.error(f"get_config_hints failed: {str(e)}")
+        return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
+
+
+def _factory_config():
+    """The packaged, read-only copy of the shipped config, or None when not packaged.
+
+    Only the .deb carries config/config.factory.yaml (see packaging/deb/build_deb.sh); a
+    source checkout has none, and the factory-restore feature is simply unavailable there.
+    """
+    from config.config import Config
+    from monitor.pressure_tuning import factory_config_path
+    path = factory_config_path()
+    if not os.path.isfile(path):
+        return None
+    try:
+        return Config.from_file(path)
+    except Exception as exc:
+        logger.warning("factory config %s unreadable: %s", path, exc)
+        return None
+
+
+def _restorable_sections():
+    from config.field_hints import SECTION_HINTS
+    return [name for name, hint in SECTION_HINTS.items()
+            if hint.get("restorable") and name in _CONFIG_SPECS]
+
+
+@monitor_bp.route('/config-restore', methods=['POST'])
+def restore_config_defaults():
+    """Write startup or factory values straight back (no Save step in the UI).
+
+    Body: ``{"kind": "startup" | "factory", "sections": [...]}``.  ``sections`` defaults to
+    every restorable section; sections the Settings page keeps (``keep`` fields such as the
+    selected NICs) and non-restorable ones are left alone.  Sections are written one by one
+    and each reports its own outcome, so a failure in one does not undo the others.
+    """
+    try:
+        from config.field_hints import SECTION_HINTS
+
+        body = request.get_json(silent=True) or {}
+        kind = body.get("kind")
+        restorable = _restorable_sections()
+        targets = body.get("sections") or restorable
+        if kind not in ("startup", "factory"):
+            return construct_response(data={}, retcode=RetCode.ARGUMENT_ERROR,
+                                      retmsg="kind must be 'startup' or 'factory'")
+        if not isinstance(targets, list) or any(t not in restorable for t in targets):
+            return construct_response(data={}, retcode=RetCode.ARGUMENT_ERROR,
+                                      retmsg=f"sections must be among: {', '.join(restorable)}")
+
+        # Must run before the first write: this is what makes the startup snapshot "as started".
+        snapshots = {name: _capture_startup_default(name) for name in targets}
+
+        if kind == "factory":
+            factory = _factory_config()
+            if factory is None:
+                return construct_response(
+                    data={}, retcode=RetCode.ARGUMENT_ERROR,
+                    retmsg="Factory defaults are only available in the installed package")
+            with _using_config(factory):
+                views = {name: dict(_CONFIG_SPECS[name]["get"]()) for name in targets}
+        else:
+            views = snapshots
+
+        results = {}
+        for name in targets:
+            view = copy.deepcopy(views.get(name))
+            if view is None:
+                results[name] = {"ok": False, "error": "no values available"}
+                continue
+            for key in SECTION_HINTS.get(name, {}).get("keep", []):
+                view.pop(key, None)
+            if name == "network_control" and isinstance(view.get("config_network_bw"), dict):
+                # The reserved system class is shown but cannot be written; the form never sends it.
+                view["config_network_bw"].pop("system", None)
+            try:
+                updates = _CONFIG_SPECS[name]["validate"](view)
+                logger.info("Restoring %s values of config '%s' from %s",
+                            kind, name, request.remote_addr)
+                _CONFIG_SPECS[name]["write"](updates)
+                if name == "network_control" and callable(_network_config_reload_notifier):
+                    try:
+                        _network_config_reload_notifier()
+                    except Exception as exc:
+                        logger.warning("network_control reload notification failed: %s", exc)
+                results[name] = {"ok": True, "updated_at": _bump_config_updated_at(name)}
+            except Exception as exc:
+                logger.warning("restore %s of '%s' failed: %s", kind, name, exc)
+                results[name] = {"ok": False, "error": str(exc)}
+
+        failed = [name for name, r in results.items() if not r["ok"]]
+        return construct_response(
+            data={"results": results, "success": not failed},
+            retcode=RetCode.SUCCESS if not failed else RetCode.EXCEPTION_ERROR,
+            retmsg=("Restored %s values" % kind) if not failed
+            else "Could not restore: " + ", ".join(failed))
+    except Exception as e:
+        logger.error(f"restore_config_defaults failed: {str(e)}")
+        return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
+
+
+# group -> Settings section it tunes
+_TUNING_SECTIONS = {"system": "system_pressure", "disk": "disk_pressure", "network": "network_pressure"}
+
+
+def _tuning_reference(group: str):
+    """Factory values of the group's tuned parameters, and where they came from.
+
+    The packaged factory config when there is one; otherwise the values this run started
+    with (a source checkout has no factory copy).
+    """
+    from monitor import pressure_tuning
+    section = _TUNING_SECTIONS[group]
+    factory = _factory_config()
+    if factory is not None:
+        with _using_config(factory):
+            view = dict(_CONFIG_SPECS[section]["get"]())
+        source = "factory"
+    else:
+        view = _capture_startup_default(section) or {}
+        source = "startup"
+    return pressure_tuning.flatten(view, pressure_tuning.tuned_paths(group)), source
+
+
+@monitor_bp.route('/pressure-tuning/<group>', methods=['GET'])
+def get_pressure_tuning(group):
+    """Where a pressure group sits relative to factory, for the relax/tighten bar."""
+    try:
+        from monitor import pressure_tuning
+        if group not in _TUNING_SECTIONS:
+            return construct_response(data={}, retcode=RetCode.ARGUMENT_ERROR,
+                                      retmsg=f"group must be one of: {', '.join(_TUNING_SECTIONS)}")
+        reference, source = _tuning_reference(group)
+        current = pressure_tuning.flatten(
+            _CONFIG_SPECS[_TUNING_SECTIONS[group]]["get"](), pressure_tuning.tuned_paths(group))
+        return construct_response(data={
+            "paths": pressure_tuning.tuned_paths(group),
+            "reference": reference,
+            "reference_source": source,
+            "current": current,
+            "state": pressure_tuning.state(group, reference, current),
+            "offsets": pressure_tuning.offsets(group, reference, current),
+        }, retmsg="Successfully retrieved pressure tuning state")
+    except Exception as e:
+        logger.error(f"get_pressure_tuning({group}) failed: {str(e)}")
+        return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
+
+
+@monitor_bp.route('/pressure-tuning/<group>', methods=['POST'])
+def preview_pressure_tuning(group):
+    """Propose the next relax/tighten step. Computes only; nothing is written.
+
+    Body: ``{"direction": "relax" | "tighten", "current": {<dotted config path>: number}}``
+    where ``current`` is the form's (possibly unsaved) values for the tuned parameters.
+    Without ``direction`` only the position (``state``, ``offsets``) is returned.
+    """
+    try:
+        from monitor import pressure_tuning
+        if group not in _TUNING_SECTIONS:
+            return construct_response(data={}, retcode=RetCode.ARGUMENT_ERROR,
+                                      retmsg=f"group must be one of: {', '.join(_TUNING_SECTIONS)}")
+        body = request.get_json(silent=True) or {}
+        sent = body.get("current")
+        if not isinstance(sent, dict):
+            return construct_response(data={}, retcode=RetCode.ARGUMENT_ERROR,
+                                      retmsg="current must be an object of config path -> number")
+        paths = set(pressure_tuning.tuned_paths(group))
+        current = {}
+        for path, value in sent.items():
+            if path not in paths:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return construct_response(data={}, retcode=RetCode.ARGUMENT_ERROR,
+                                          retmsg=f"{path} must be a number")
+            current[path] = float(value)
+        reference, source = _tuning_reference(group)
+        try:
+            direction = body.get("direction")
+            if direction is None:
+                # No step requested: just say where the (possibly unsaved) values sit.
+                result = pressure_tuning.describe(group, reference, current)
+            else:
+                result = pressure_tuning.preview(group, reference, current, direction)
+        except ValueError as ve:
+            return construct_response(data={}, retcode=RetCode.ARGUMENT_ERROR, retmsg=str(ve))
+        result["reference_source"] = source
+        return construct_response(data=result, retmsg="Computed pressure tuning step")
+    except Exception as e:
+        logger.error(f"preview_pressure_tuning({group}) failed: {str(e)}")
         return construct_response(data={}, retcode=RetCode.EXCEPTION_ERROR, retmsg=str(e))
 
 

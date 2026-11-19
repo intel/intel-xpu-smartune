@@ -14,7 +14,7 @@ class PressureAnalyzer:
     # --- Level-decision smoothing / hysteresis -------------------------------
     # Smooth non-critical levels and add hysteresis; critical uses the raw score
     # for immediate response.
-    _SCORE_EWMA_ALPHA = 0.3   # same first-order-IIR family as PSIMonitor._FRAC_EWMA_ALPHA
+    _SCORE_EWMA_ALPHA = 0.3   # default; overridable per channel via config.{system,disk}_score_ewma_alpha
     _LEVEL_HYSTERESIS = 0.05  # score must fall this far below a level's entry before downgrading
     # Ascending severity order, used only for hysteresis comparisons.
     _LEVEL_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
@@ -45,6 +45,17 @@ class PressureAnalyzer:
         self._disk_last_level = None
         # Score breakdown included in the pressure-level log.
         self._score_parts = ""
+
+    def _ewma_alpha(self, channel: str) -> float:
+        """EWMA coefficient for ``channel`` ("system" or "disk"), read live from config.
+
+        Falls back to the in-code default when the key is absent or not a number in (0, 1],
+        so a bad edit can never freeze (alpha 0) or invert the smoothing.
+        """
+        value = getattr(self.config, f'{channel}_score_ewma_alpha', None)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return self._SCORE_EWMA_ALPHA
+        return float(value) if 0.0 < value <= 1.0 else self._SCORE_EWMA_ALPHA
 
     def _mem_scarcity_gate(self, mem_avail: float) -> float:
         """Return a smooth memory-scarcity weight based on the free-memory ratio.
@@ -139,7 +150,7 @@ class PressureAnalyzer:
             smoothed = raw_score
             level = "critical"
         else:
-            alpha = self._SCORE_EWMA_ALPHA
+            alpha = self._ewma_alpha('system')
             prev = self._score_smoothed
             smoothed = raw_score if prev is None else alpha * raw_score + (1.0 - alpha) * prev
             candidate = self.get_pressure_level(smoothed, thresholds)
@@ -203,7 +214,7 @@ class PressureAnalyzer:
             smoothed = raw
             level = "critical"
         else:
-            alpha = self._SCORE_EWMA_ALPHA
+            alpha = self._ewma_alpha('disk')
             prev = self._disk_score_smoothed
             smoothed = raw if prev is None else alpha * raw + (1.0 - alpha) * prev
             candidate = self.get_pressure_level(smoothed, thresholds)

@@ -59,7 +59,8 @@ import type {
 import { COLORS } from '../styles/theme'
 import { useGlobalConfigNotices } from '../hooks/useGlobalConfigNotices'
 import { NetworkTestAlert, PROXY_SCHEME_WARNING } from './BenchNetworkShared'
-import { HintNote, HintScopeContext, HintedCell, HintedItem, useConfigHints } from './settingsHints'
+import PressureTuningBar from './PressureTuningBar'
+import { HintNote, HintScopeContext, HintedCell, HintedItem, useConfigHints, withYamlKey } from './settingsHints'
 import type { HintScope } from './settingsHints'
 
 const { Text } = Typography
@@ -164,11 +165,11 @@ const ADVANCED_COLOR = '#faad14'
 // this dialog already has a value loaded from the server, so a red asterisk marks
 // nothing the user has to supply — the field rules still reject empty/out-of-range
 // input on save.
-function SectionLabel({ text, tip }: { text: string; tip: string }) {
+function SectionLabel({ text, tip, yamlKey }: { text: string; tip: string; yamlKey?: string }) {
   return (
     <span>
       {text}
-      <Tooltip title={tip}>
+      <Tooltip title={withYamlKey(tip, yamlKey)}>
         <QuestionCircleOutlined style={{ color: COLORS.textMuted, fontSize: 12, marginLeft: 6 }} />
       </Tooltip>
     </span>
@@ -222,10 +223,11 @@ interface SaveHandle {
   // in-progress edit conflict for no reason).
   isDirty?: () => boolean
   save: () => Promise<SaveOutcome>
-  // Page-footer actions. Reset drops unsaved edits; restore fills the startup defaults and is
-  // left undefined where the card has none, so the footer only offers it when it can act.
+  // Page-footer actions. Reset drops unsaved edits; restore writes the startup values back
+  // straight away (no Save needed) and is left undefined where the card has none, so the
+  // footer only offers it when it can act.
   reset?: () => void
-  restore?: () => void
+  restore?: () => void | Promise<void>
   // Set by the registration wrapper: whether the card currently offers the action above.
   canReset?: () => boolean
   canRestore?: () => boolean
@@ -344,15 +346,12 @@ function FormCard({ title, description, scope, load, save, currentToValues, chil
     [scope, hints, startupDefaults, markDirty],
   )
 
-  // Fills the form only; Save still goes through the usual validation and conflict check.
-  const restoreStartupDefaults = () => {
-    if (!startupDefaults) return
-    const values = { ...startupDefaults }
-    // Hardware-derived or user-picked fields (e.g. which NICs are controlled) are not defaults.
-    for (const key of sectionHint?.keep ?? []) delete values[key]
-    form.setFieldsValue(values)
-    markDirty()
-    message.info(`${title}: startup defaults filled in. Save to apply them.`)
+  // Writes the startup values back and reloads the card, so nothing is left unsaved. The
+  // backend leaves hardware-derived or user-picked fields (e.g. which NICs are controlled)
+  // alone, and bumps the section's stamp so another client's open edit is flagged.
+  const restoreStartupDefaults = async () => {
+    await api.restoreConfig('startup', [scope])
+    await doLoad()
   }
 
   const doLoad = useCallback(async () => {
@@ -848,7 +847,10 @@ interface DiskPressureConfig {
     sub_weights: Record<string, number>
     sigmoid_k: number
     max_p_weight: number
+    half_point_scale: number
   }
+  disk_psi_weights: Record<string, number>
+  disk_score_ewma_alpha: number
   updated_at?: number
 }
 
@@ -863,6 +865,9 @@ const diskPressureToValues = (d: DiskPressureConfig) => ({
   sub_weights: d.disk_pressure_model?.sub_weights,
   sigmoid_k: d.disk_pressure_model?.sigmoid_k,
   max_p_weight: d.disk_pressure_model?.max_p_weight,
+  half_point_scale: d.disk_pressure_model?.half_point_scale,
+  disk_psi_weights: d.disk_psi_weights,
+  disk_score_ewma_alpha: d.disk_score_ewma_alpha,
 })
 
 // ---------------------------------------------------------------------------
@@ -883,6 +888,7 @@ function SystemPressurePanel() {
             mem_gate_steepness: number
             memory_busy_threshold: number
             cpu_busy_threshold: number
+            system_score_ewma_alpha: number
             updated_at?: number
           }>('system_pressure')
           return {
@@ -893,6 +899,7 @@ function SystemPressurePanel() {
               mem_gate_steepness: d.mem_gate_steepness,
               memory_busy_threshold: d.memory_busy_threshold,
               cpu_busy_threshold: d.cpu_busy_threshold,
+              system_score_ewma_alpha: d.system_score_ewma_alpha,
             },
             updatedAt: d.updated_at,
           }
@@ -908,6 +915,7 @@ function SystemPressurePanel() {
           mem_gate_steepness: c.mem_gate_steepness,
           memory_busy_threshold: c.memory_busy_threshold,
           cpu_busy_threshold: c.cpu_busy_threshold,
+          system_score_ewma_alpha: c.system_score_ewma_alpha,
         })}
       >
         <Row gutter={16}>
@@ -915,6 +923,7 @@ function SystemPressurePanel() {
             <HintedItem
               label="Update interval (s)"
               name="regular_update_sys_pressure_time"
+              yamlKey="regular_update_sys_pressure_time"
               tooltip="How often the system-pressure level is recomputed. Lower reacts faster but costs more CPU."
               rules={[{ required: true, type: 'number', min: 1, max: 3600 }]}
               min={1}
@@ -927,6 +936,7 @@ function SystemPressurePanel() {
         <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
           <SectionLabel
             text="Level thresholds (%, ordered)"
+            yamlKey="thresholds.{low,medium,high,critical}"
             tip="Maps the system pressure score to a level. Each threshold is the lower bound of that level and they must increase in order (low < medium < high < critical)."
           />
         </Divider>
@@ -947,9 +957,11 @@ function SystemPressurePanel() {
         </Row>
 
         <AdvancedSection>
+          <PressureTuningBar group="system" />
           <Divider orientation="left" orientationMargin={0} plain style={{ margin: '0 0 12px' }}>
             <SectionLabel
               text="Resource weights"
+              yamlKey="weights.{cpu,memory,io}"
               tip="Relative importance of each resource when combining them into the overall pressure score. Larger weight means that resource contributes more; the values are normalised against their sum."
             />
           </Divider>
@@ -972,6 +984,7 @@ function SystemPressurePanel() {
               <HintedItem
                 label="Memory gate steepness"
                 name="mem_gate_steepness"
+                yamlKey="mem_gate_steepness"
                 tooltip="Steepness of the memory-discount sigmoid gate: larger makes the transition around the memory busy point sharper."
                 rules={[{ required: true, type: 'number', min: 1, max: 50 }]}
                 min={1}
@@ -983,6 +996,7 @@ function SystemPressurePanel() {
               <HintedItem
                 label="Memory busy threshold (%)"
                 name="memory_busy_threshold"
+                yamlKey="memory_busy_threshold"
                 tooltip="Memory usage percentage where memory pressure starts to be treated as busy."
                 rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
                 min={0}
@@ -994,11 +1008,24 @@ function SystemPressurePanel() {
               <HintedItem
                 label="CPU busy threshold (%)"
                 name="cpu_busy_threshold"
+                yamlKey="cpu_busy_threshold"
                 tooltip="CPU usage percentage where CPU pressure starts to be treated as busy."
                 rules={[{ required: true, type: 'number', min: 0, max: 100 }]}
                 min={0}
                 max={100}
                 step={5}
+              />
+            </Col>
+            <Col xs={24} sm={12} md={8}>
+              <HintedItem
+                label="Score smoothing"
+                name="system_score_ewma_alpha"
+                yamlKey="system_score_ewma_alpha"
+                tooltip="Weight given to the newest score when smoothing the low / medium / high level: larger reacts faster, smaller is smoother. Critical always uses the raw score."
+                rules={[{ required: true, type: 'number', min: 0.05, max: 1 }]}
+                min={0.05}
+                max={1}
+                step={0.05}
               />
             </Col>
           </Row>
@@ -1029,7 +1056,10 @@ function DiskPressurePanel() {
               sub_weights: values.sub_weights,
               sigmoid_k: Number(values.sigmoid_k),
               max_p_weight: Number(values.max_p_weight),
+              half_point_scale: Number(values.half_point_scale),
             },
+            disk_psi_weights: values.disk_psi_weights,
+            disk_score_ewma_alpha: Number(values.disk_score_ewma_alpha),
           }, ts)
         }
         currentToValues={(c) => diskPressureToValues(c as unknown as DiskPressureConfig)}
@@ -1037,6 +1067,7 @@ function DiskPressurePanel() {
         <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
           <SectionLabel
             text="Level thresholds (%, ordered)"
+            yamlKey="disk_thresholds.{low,medium,high,critical}"
             tip="Bands of the disk-IO score, separate from the system ones. Low/high are also the ends of the ramp that decides how much of an I/O stall is blamed on the local disk; medium marks a disk busy in the UI; critical triggers throttling."
           />
         </Divider>
@@ -1057,9 +1088,11 @@ function DiskPressurePanel() {
         </Row>
 
         <AdvancedSection>
+          <PressureTuningBar group="disk" />
           <Divider orientation="left" orientationMargin={0} plain style={{ margin: '0 0 12px' }}>
             <SectionLabel
               text="Per-disk sub-signal weights (sum ≤ 1)"
+              yamlKey="disk_pressure_model.sub_weights.{latency,queue,util}"
               tip="How much each USE sub-signal contributes to a single disk's pressure. Latency dominates because it is what users feel; utilisation is only a tie-breaker, since a parallel device sits at 100% with headroom to spare."
             />
           </Divider>
@@ -1087,6 +1120,7 @@ function DiskPressurePanel() {
               <HintedItem
                 label="Sigmoid steepness"
                 name="sigmoid_k"
+                yamlKey="disk_pressure_model.sigmoid_k"
                 tooltip="Steepness of the curve that squashes each sub-signal around its media-specific half-point: larger is more switch-like, smaller is a gentler ramp."
                 rules={[{ required: true, type: 'number', min: 1, max: 50 }]}
                 min={1}
@@ -1098,6 +1132,7 @@ function DiskPressurePanel() {
               <HintedItem
                 label="Worst-disk weight"
                 name="max_p_weight"
+                yamlKey="disk_pressure_model.max_p_weight"
                 tooltip="How strongly the single busiest disk carries the aggregate: 0 is a plain mean (one hammered disk among many is averaged away), 1 lets the worst disk decide on its own."
                 rules={[{ required: true, type: 'number', min: 0, max: 1 }]}
                 min={0}
@@ -1105,6 +1140,52 @@ function DiskPressurePanel() {
                 step={0.05}
               />
             </Col>
+            <Col xs={24} sm={12} md={8}>
+              <HintedItem
+                label="Half-point scale"
+                name="half_point_scale"
+                yamlKey="disk_pressure_model.half_point_scale"
+                tooltip="One factor on every per-media latency and queue half-point (the values in config.yaml). Larger makes disks read calmer at the same latency and queue depth; smaller makes them read more pressured."
+                rules={[{ required: true, type: 'number', min: 0.1, max: 10 }]}
+                min={0.1}
+                max={10}
+                step={0.1}
+              />
+            </Col>
+            <Col xs={24} sm={12} md={8}>
+              <HintedItem
+                label="Score smoothing"
+                name="disk_score_ewma_alpha"
+                yamlKey="disk_score_ewma_alpha"
+                tooltip="Weight given to the newest score when smoothing the disk low / medium / high level: larger reacts faster, smaller is smoother. Critical always uses the raw score."
+                rules={[{ required: true, type: 'number', min: 0.05, max: 1 }]}
+                min={0.05}
+                max={1}
+                step={0.05}
+              />
+            </Col>
+          </Row>
+
+          <Divider orientation="left" orientationMargin={0} plain style={{ margin: '0 0 12px' }}>
+            <SectionLabel
+              text="I/O stall weights"
+              yamlKey="disk_psi_weights.{some,full}"
+              tip="How the io PSI is turned into a stall severity that gates the disk score: 'full' means every task is blocked on IO (strong but rare), 'some' means at least one is (common under real disk load). Raising them lets critical, which authorises an io.max cap, be reached sooner."
+            />
+          </Divider>
+          <Row gutter={16}>
+            {([['some', 'Some'], ['full', 'Full']] as const).map(([key, label]) => (
+              <Col xs={24} sm={12} md={8} key={key}>
+                <HintedItem
+                  label={label}
+                  name={['disk_psi_weights', key]}
+                  rules={[{ required: true, type: 'number', min: 0, max: 20 }]}
+                  min={0}
+                  max={20}
+                  step={0.1}
+                />
+              </Col>
+            ))}
           </Row>
         </AdvancedSection>
       </FormCard>
@@ -1115,6 +1196,15 @@ function DiskPressurePanel() {
 // ---------------------------------------------------------------------------
 // Network I/O pressure tab: utilisation bands for the network channel.
 // ---------------------------------------------------------------------------
+const NETWORK_MODEL_KEYS = ['rx_drop_weight', 'util_sat_half', 'util_sat_k', 'ema_alpha', 'decay_rate'] as const
+const NETWORK_MODEL_DEFAULTS: Record<(typeof NETWORK_MODEL_KEYS)[number], number> = {
+  rx_drop_weight: 0.3, util_sat_half: 0.96, util_sat_k: 120, ema_alpha: 0.3, decay_rate: 0.7,
+}
+const networkModelToValues = (model?: Record<string, number>) =>
+  Object.fromEntries(
+    NETWORK_MODEL_KEYS.map((key) => [`network_pressure_model_${key}`, Number(model?.[key] ?? NETWORK_MODEL_DEFAULTS[key])]),
+  )
+
 function NetworkPressurePanel() {
   return (
     <>
@@ -1125,33 +1215,32 @@ function NetworkPressurePanel() {
         load={async () => {
           const d = await api.getConfig<{
             network_thresholds: Record<string, number>
-            network_pressure_model?: { rx_drop_weight?: number }
+            network_pressure_model?: Record<string, number>
             updated_at?: number
           }>('network_pressure')
           return {
             values: {
               network_thresholds: toPercentageThresholds(d.network_thresholds),
-              network_pressure_model_rx_drop_weight: Number(d.network_pressure_model?.rx_drop_weight ?? 0.3),
+              ...networkModelToValues(d.network_pressure_model),
             },
             updatedAt: d.updated_at,
           }
         }}
         save={(values, ts) => api.updateConfig('network_pressure', {
           network_thresholds: toRatioThresholds(values.network_thresholds as Record<string, number>),
-          network_pressure_model: {
-            rx_drop_weight: Number(values.network_pressure_model_rx_drop_weight),
-          },
+          network_pressure_model: Object.fromEntries(
+            NETWORK_MODEL_KEYS.map((key) => [key, Number(values[`network_pressure_model_${key}`])]),
+          ),
         }, ts)}
         currentToValues={(c) => ({
           network_thresholds: toPercentageThresholds(c.network_thresholds as Record<string, number>),
-          network_pressure_model_rx_drop_weight: Number(
-            ((c.network_pressure_model as { rx_drop_weight?: number } | undefined)?.rx_drop_weight) ?? 0.3,
-          ),
+          ...networkModelToValues(c.network_pressure_model as Record<string, number> | undefined),
         })}
       >
         <Divider orientation="left" orientationMargin={0} plain style={{ margin: '4px 0 12px' }}>
           <SectionLabel
             text="Network pressure thresholds (%, ordered)"
+            yamlKey="network_thresholds.{low,medium,high,critical}"
             tip="Maps the fused network pressure score to low, medium, high, and critical. The score combines near-saturation utilisation with congestion distress such as drops, FIFO overflow, and softnet pressure. Thresholds must increase in that order."
           />
         </Divider>
@@ -1172,15 +1261,65 @@ function NetworkPressurePanel() {
         </Row>
 
         <AdvancedSection>
+          <PressureTuningBar group="network" />
           <Row gutter={16}>
             <Col xs={24} sm={12} md={8}>
               <HintedItem
                 label="RX drop weight"
                 name="network_pressure_model_rx_drop_weight"
+                yamlKey="network_pressure_model.rx_drop_weight"
                 tooltip="Weight of generic rx_dropped distress in RX pressure scoring. Lower values make RX drops contribute less to pressure; valid range is 0 to 1."
                 rules={[{ required: true, type: 'number', min: 0, max: 1 }]}
                 min={0}
                 max={1}
+                step={0.05}
+              />
+            </Col>
+            <Col xs={24} sm={12} md={8}>
+              <HintedItem
+                label="Link utilisation half-point"
+                name="network_pressure_model_util_sat_half"
+                yamlKey="network_pressure_model.util_sat_half"
+                tooltip="Link utilisation (0 to 1) at which utilisation counts as half-saturated. Larger means a link must be closer to line rate before it reads as pressure."
+                rules={[{ required: true, type: 'number', min: 0.5, max: 1 }]}
+                min={0.5}
+                max={1}
+                step={0.005}
+              />
+            </Col>
+            <Col xs={24} sm={12} md={8}>
+              <HintedItem
+                label="Utilisation steepness"
+                name="network_pressure_model_util_sat_k"
+                yamlKey="network_pressure_model.util_sat_k"
+                tooltip="Steepness of the utilisation gate around the half-point: larger is more switch-like, smaller is a gentler ramp."
+                rules={[{ required: true, type: 'number', min: 1, max: 1000 }]}
+                min={1}
+                max={1000}
+                step={10}
+              />
+            </Col>
+            <Col xs={24} sm={12} md={8}>
+              <HintedItem
+                label="Utilisation smoothing"
+                name="network_pressure_model_ema_alpha"
+                yamlKey="network_pressure_model.ema_alpha"
+                tooltip="Weight given to the newest per-second utilisation sample: larger follows the link faster, smaller is smoother."
+                rules={[{ required: true, type: 'number', min: 0.01, max: 1 }]}
+                min={0.01}
+                max={1}
+                step={0.05}
+              />
+            </Col>
+            <Col xs={24} sm={12} md={8}>
+              <HintedItem
+                label="Distress retention"
+                name="network_pressure_model_decay_rate"
+                yamlKey="network_pressure_model.decay_rate"
+                tooltip="Fraction of congestion distress kept from one second to the next: larger remembers a burst longer, smaller forgets it faster."
+                rules={[{ required: true, type: 'number', min: 0, max: 0.99 }]}
+                min={0}
+                max={0.99}
                 step={0.05}
               />
             </Col>
@@ -1422,12 +1561,10 @@ function AutoControlPanel() {
     () => ({ section: 'limit_policy', hints, defaults: startupDefaults, markDirty }),
     [hints, startupDefaults, markDirty],
   )
-  // Fills the form only; Save still validates and checks for a conflicting edit.
-  const restoreStartupDefaults = () => {
-    if (!startupDefaults) return
-    form.setFieldsValue(startupDefaults)
-    markDirty()
-    message.info('Smartune control: startup defaults filled in. Save to apply them.')
+  // Writes the startup values back and reloads the card, so nothing is left unsaved.
+  const restoreStartupDefaults = async () => {
+    await api.restoreConfig('startup', ['limit_policy'])
+    await load()
   }
   useEffect(() => {
     notifyCapabilities()
@@ -2597,8 +2734,50 @@ export default function SettingsModal({
   const resetPage = () => {
     pageHandles().forEach(({ handle }) => handle.reset?.())
   }
+  // Writes straight away, so it asks first; unsaved edits on the page are discarded by it.
   const restorePage = () => {
-    pageHandles().forEach(({ handle }) => handle.restore?.())
+    Modal.confirm({
+      title: 'Restore startup values?',
+      content: 'The settings on this page go back to the values the service started with and are saved right away. Unsaved edits on this page are discarded.',
+      okText: 'Restore',
+      cancelText: 'Cancel',
+      onOk: async () => {
+        try {
+          await Promise.all(pageHandles().map(({ handle }) => handle.restore?.()))
+          message.success('Startup values restored')
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : 'Could not restore the startup values')
+        } finally {
+          refreshDirty()
+        }
+      },
+    })
+  }
+
+  // Every restorable page at once, from the package's factory copy of config.yaml. Only
+  // offered when the backend has one (the installed package, not a source checkout).
+  const hints = useConfigHints()
+  const factoryAvailable = !!hints?.factory_available
+  const restoreFactory = () => {
+    Modal.confirm({
+      title: 'Restore factory defaults?',
+      content: 'Every setting that can be restored goes back to the value this package shipped with and is saved right away. Unsaved edits are discarded. Apps, network interfaces and diagnostic rules are kept.',
+      okText: 'Restore factory defaults',
+      okButtonProps: { danger: true },
+      cancelText: 'Cancel',
+      onOk: async () => {
+        try {
+          await api.restoreConfig('factory')
+          // Pages not opened yet load the new values when they mount.
+          Array.from(handles.current.values()).forEach(({ handle }) => handle.reset?.())
+          message.success('Factory defaults restored')
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : 'Could not restore the factory defaults')
+        } finally {
+          refreshDirty()
+        }
+      },
+    })
   }
 
   const titleFor = (key: string) => tabs.find((tab) => tab.key === key)?.title ?? key
@@ -2655,6 +2834,13 @@ export default function SettingsModal({
           <span>Settings</span>
         </Space>
         <Space>
+          {factoryAvailable && (
+            <Tooltip title="Put every setting back to the value this package shipped with. Saved right away.">
+              <Button icon={<UndoOutlined />} onClick={restoreFactory} disabled={saving}>
+                Restore factory defaults
+              </Button>
+            </Tooltip>
+          )}
           <Tooltip
             title={dirtyTabs.length === 0
               ? 'Nothing to save'

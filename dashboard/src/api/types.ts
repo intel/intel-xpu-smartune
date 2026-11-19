@@ -83,6 +83,35 @@ export interface ConfigHintsData {
   sections: Record<string, { restorable: boolean; keep?: string[] }>
   // API-shaped values from when the backend started, per restorable section.
   startup_defaults: Record<string, Record<string, unknown>>
+  // True only in the installed package, which ships the factory copy of config.yaml.
+  factory_available?: boolean
+}
+
+export type PressureGroup = 'system' | 'disk' | 'network'
+
+export interface PressureTuningState {
+  n: number
+  can_relax: boolean
+  can_tighten: boolean
+}
+
+export interface PressureTuningResult {
+  group: PressureGroup
+  state: PressureTuningState
+  // Parameters whose value differs from the reference (factory), as a fraction.
+  details: Array<{ path: string; label: string; offset: number }>
+  // Every parameter the group's buttons control.
+  controls: Array<{ path: string; label: string }>
+  // Present when a step was requested: the proposed values by config path, and why a
+  // parameter that could not move did not.
+  values?: Record<string, number>
+  notes?: string[]
+  reference_source?: 'factory' | 'startup'
+}
+
+export interface ConfigRestoreResult {
+  success: boolean
+  results: Record<string, { ok: boolean; error?: string }>
 }
 
 export interface DiagEventCatalogData {

@@ -42,10 +42,15 @@ that matches no level is shown as Custom rather than snapped to the nearest one.
 - **Reset**, **Restore startup defaults** and **Save page** sit at the bottom right
   and act on the page in view.
 - **Reset** discards unsaved edits and reloads the saved values.
-- **Restore startup defaults** fills the form with the values the backend started
-  with. Nothing is saved until you press **Save page**. It does not touch network
-  interface selection, controlled system ports, the Auto control master switch, or
-  diagnostic rules.
+- **Restore startup defaults** puts the page back to the values the backend started
+  with and **saves them right away**; you do not need to press Save. It asks first,
+  and discards any unsaved edits on the page. It does not touch network interface
+  selection, controlled system ports, the Auto control master switch, or diagnostic
+  rules.
+- **Restore factory defaults** (page header, next to **Save all**) does the same for
+  every restorable page, using the values this package shipped with. It is only
+  offered in the installed package. The **Save** buttons light up only while there
+  are unsaved edits, so they stay quiet after a reset or a restore.
 
 Saved changes take effect immediately, are written to `config.yaml`, and are
 visible to every connected client. After the backend restarts, the saved values
@@ -56,6 +61,26 @@ become the new startup defaults.
 Choose which resource cards appear on [Home](home.md) (CPU, memory, GPU, NPU,
 disk, network). Hide what your platform doesn't have.
 
+## Sensitivity: one-click tuning of a pressure model
+
+If the pressure parameters are hard to reason about, expand a pressure's
+**Advanced** settings and use the **Sensitivity** stepper at the top instead of
+editing the parameters one by one:
+
+- **−** (towards *Sensitive*) makes the same load read as more pressure, so alerts
+  and limits start sooner. **+** (towards *Relaxed*) does the opposite.
+- Each click moves every parameter the stepper controls one small step in its own
+  direction, and fills the new values into the form. Press **Save** to keep them.
+- The number in the middle is the click counter: **+1** per Relaxed click, **−1**
+  per Sensitive click, and 0 is factory (or the startup values on a source
+  checkout). Click it to see how far each parameter is from that reference and
+  which ones the stepper controls.
+- A parameter that reaches its limit stops moving and you are told why; the others
+  keep moving, and the counter still follows the clicks. You can still type any
+  value in the field yourself.
+- The level thresholds and the resource weights are not changed by the stepper.
+  Relaxing far enough can mean a pressure never reaches *critical*.
+
 ## System pressure
 
 Tune the composite [system pressure](home.md) score:
@@ -64,6 +89,8 @@ Tune the composite [system pressure](home.md) score:
 - **CPU busy threshold (%)** and **Memory busy threshold (%)** — when each input
   starts contributing to pressure.
 - **Memory gate steepness** — how sharply memory scarcity ramps the score.
+- **Score smoothing** — how quickly the low / medium / high level follows the
+  score. Critical always uses the raw score.
 - **Level thresholds** — step 5; they must stay in increasing order.
 - **Resource weights** (advanced) — plain numbers for CPU, memory and I/O; only
   the ratio between them matters.
@@ -74,10 +101,17 @@ Tune the independent disk channel:
 
 - **Sigmoid steepness** — how sharply disk saturation ramps its score.
 - **Worst-disk weight** — how much the busiest disk dominates the score.
+- **Half-point scale** — one factor on every per-media latency and queue half-point
+  in `config.yaml`; larger makes disks read calmer.
+- **I/O stall weights** (*some* / *full*) — how much the io PSI raises the disk
+  score; this is what lets the channel reach critical.
+- **Score smoothing** — as for system pressure, for the disk level.
 
 ## Network I/O pressure
 
-Tune network pressure inputs such as the **RX drop weight**.
+Tune network pressure inputs: the **RX drop weight**, the **link utilisation
+half-point** and **steepness**, the **utilisation smoothing** and the **distress
+retention**.
 
 > The math behind all three channels is documented in the
 > [Pressure algorithm deep dive](../design/pressure-algorithm.md).

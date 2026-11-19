@@ -99,6 +99,12 @@ FIELD_HINTS: Dict[str, Dict[str, Any]] = {
         up="Higher: memory is treated as busy later, so memory pressure and limits start later.",
         down="Lower: memory is treated as busy earlier, so memory pressure and limits start sooner.",
     ),
+    "system_pressure.system_score_ewma_alpha": _num(
+        min=0.05, max=1, step=0.05,
+        up="Higher: the level follows the score faster, so brief spikes can change it.",
+        down="Lower: the level is smoother and slower to react to a rising score.",
+        note="Only affects low / medium / high; critical is entered from the raw score at once.",
+    ),
     "system_pressure.cpu_busy_threshold": _num(
         min=0, max=100, step=5, unit="%",
         up="Higher: CPU is treated as busy later, so CPU pressure builds later.",
@@ -138,6 +144,25 @@ FIELD_HINTS: Dict[str, Dict[str, Any]] = {
         note="Below about 0.8, machines with several disks may never reach critical, so io.max never triggers.",
     ),
 
+    "disk_pressure.half_point_scale": _num(
+        min=0.1, max=10, step=0.1,
+        up="Higher: latency and queue depth must be larger before a disk reads as pressured.",
+        down="Lower: the same latency and queue depth read as more pressure.",
+        note="One factor on every per-media latency and queue half-point in config.yaml.",
+    ),
+    "disk_pressure.disk_psi_weights.*": _num(
+        min=0, max=20, step=0.1,
+        up="Higher: I/O stalls raise the disk score more, so critical is reached sooner.",
+        down="Lower: I/O stalls count for less; critical needs heavier stalls.",
+        note="'full' (every task blocked on IO) is the strong signal; 'some' (at least one blocked) is the common one.",
+    ),
+    "disk_pressure.disk_score_ewma_alpha": _num(
+        min=0.05, max=1, step=0.05,
+        up="Higher: the disk level follows the score faster, so brief spikes can change it.",
+        down="Lower: the disk level is smoother and slower to react.",
+        note="Only affects low / medium / high; critical is entered from the raw score at once.",
+    ),
+
     # ---- network_pressure ---------------------------------------------------------------
     **_level_thresholds(
         "network_pressure.network_thresholds", "network pressure",
@@ -148,6 +173,27 @@ FIELD_HINTS: Dict[str, Dict[str, Any]] = {
         up="Higher: dropped received packets push network pressure up more.",
         down="Lower: dropped received packets matter less; 0 ignores them.",
         note="Generic rx_dropped is driver-specific, which is why it counts at reduced strength.",
+    ),
+
+    "network_pressure.network_pressure_model_util_sat_half": _num(
+        min=0.5, max=1, step=0.005,
+        up="Higher: a link must be closer to line rate before it reads as saturated.",
+        down="Lower: a link reads as saturated at lower utilisation.",
+    ),
+    "network_pressure.network_pressure_model_util_sat_k": _num(
+        min=1, max=1000, step=10,
+        up="Higher: utilisation flips to pressure more abruptly around the half-point.",
+        down="Lower: utilisation raises pressure more gradually.",
+    ),
+    "network_pressure.network_pressure_model_ema_alpha": _num(
+        min=0.01, max=1, step=0.05,
+        up="Higher: the utilisation reading follows the link faster, so brief bursts count more.",
+        down="Lower: the utilisation reading is smoother and slower to react.",
+    ),
+    "network_pressure.network_pressure_model_decay_rate": _num(
+        min=0, max=0.99, step=0.05,
+        up="Higher: network distress is remembered longer after it stops.",
+        down="Lower: network distress is forgotten faster between samples.",
     ),
 
     # ---- limit_policy -------------------------------------------------------------------

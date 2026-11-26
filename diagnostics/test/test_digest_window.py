@@ -79,7 +79,8 @@ class DigestWindowTest(unittest.TestCase):
         self.assertEqual(_local(end), "2026-11-13 00:00")
 
         generator = digest.DigestGenerator()
-        with mock.patch.object(generator, "_summary_for_window", return_value={}) as previous, \
+        with mock.patch.object(digest, "_retained_from", return_value=0), \
+                mock.patch.object(generator, "_summary_for_window", return_value={}) as previous, \
                 mock.patch.object(generator, "_generate", return_value=None) as generate:
             generator.generate_weekly("2026-11-12")
         prev_start, prev_end = previous.call_args[0]

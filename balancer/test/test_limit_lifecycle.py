@@ -26,6 +26,7 @@ Run:  python3 balancer/test/test_limit_lifecycle.py
 """
 
 import os
+import queue
 import sys
 import threading
 import time
@@ -2047,6 +2048,62 @@ class AffinityReaperTests(unittest.TestCase):
         self.assertEqual(b._affinity_apps, {})
 
 
+class FreqEventTests(unittest.TestCase):
+    """Device frequency changes are recorded, per device rather than per app."""
+
+    def _balancer(self):
+        b = _balancer()
+        b._freq_op_lock = threading.Lock()
+        b.control_manager.freq = mock.Mock()
+        return b
+
+    def _changes(self, record):
+        return [(call.args[1], call.kwargs["facts"]) for call in record.call_args_list]
+
+    def test_limit_records_the_applied_range(self):
+        b = self._balancer()
+        b.control_manager.freq.set_range.return_value = (True, "ok", {"min_mhz": 300, "max_mhz": 800})
+        with mock.patch.object(balancer_mod, "record_control_change") as record:
+            ok, _, _ = b.set_freq(["gt0"], 300, 800)
+        self.assertTrue(ok)
+        (action, facts), = self._changes(record)
+        self.assertEqual(action, "LIMITED")
+        self.assertEqual((facts["units"], facts["range"]), ("gt0", "300-800 MHz"))
+        self.assertEqual(facts["applied"], {"gt0": {"min_mhz": 300, "max_mhz": 800}})
+        self.assertIsNone(record.call_args.kwargs["app_id"])
+
+    def test_partial_failure_records_both_outcomes(self):
+        b = self._balancer()
+        b.control_manager.freq.set_range.side_effect = lambda uid, *a, **k: (
+            (True, "ok", {"min_mhz": 400, "max_mhz": 1000}) if uid == "policy0"
+            else (False, "write failed: Permission denied", None))
+        with mock.patch.object(balancer_mod, "record_control_change") as record:
+            ok, _, _ = b.set_freq(["policy0", "policy1"], 400, 1000)
+        self.assertFalse(ok)
+        changes = dict(self._changes(record))
+        self.assertEqual(changes["LIMITED"]["units"], "policy0")
+        self.assertEqual(changes["LIMIT_FAILED"]["units"], "policy1")
+        self.assertIn("Permission denied", changes["LIMIT_FAILED"]["error"])
+
+    def test_restoring_an_untouched_unit_records_nothing(self):
+        b = self._balancer()
+        b.control_manager.freq.limited_units.return_value = []
+        b.control_manager.freq.restore.return_value = (True, "not limited by SmarTune")
+        with mock.patch.object(balancer_mod, "record_control_change") as record:
+            self.assertEqual(b.restore_freq(["gt0"]), (True, "ok"))
+        record.assert_not_called()
+
+    def test_failed_restore_is_recorded(self):
+        b = self._balancer()
+        b.control_manager.freq.limited_units.return_value = ["gt0"]
+        b.control_manager.freq.restore.return_value = (False, "restore failed: busy")
+        with mock.patch.object(balancer_mod, "record_control_change") as record:
+            ok, _ = b.restore_freq()
+        self.assertFalse(ok)
+        (action, facts), = self._changes(record)
+        self.assertEqual((action, facts["units"]), ("RESTORE_FAILED", "gt0"))
+
+
 class SwapHandbackTests(unittest.TestCase):
     """Stopping smartune undoes what smartune did -- swap included.
 
@@ -2060,6 +2117,15 @@ class SwapHandbackTests(unittest.TestCase):
         b = _balancer()
         b.control_manager.release_swap = mock.Mock(return_value=[])
         b.control_manager.cpu = mock.Mock()
+        b.control_manager.cpu.restore.return_value = (True, "ok")
+        b.control_manager.freq = mock.Mock()
+        b.control_manager.freq.limited_units.return_value = []
+        b._affinity_apps = {}
+        b._affinity_lock = threading.Lock()
+        b._affinity_op_lock = threading.RLock()
+        b._freq_op_lock = threading.Lock()
+        b.bpf_monitor = types.SimpleNamespace(app_pending_queue=queue.Queue())
+        b.app_priority_queue = queue.PriorityQueue()
         b.restore_all_limited_apps_resources = mock.Mock()
         b.network_controller = mock.Mock()
         return b
@@ -2068,6 +2134,32 @@ class SwapHandbackTests(unittest.TestCase):
         b = self._balancer()
         b.shutdown()
         b.control_manager.cpu.restore_all.assert_called_once_with()
+
+    def test_shutdown_records_each_unpinned_app(self):
+        b = self._balancer()
+        b._affinity_apps = {"app1": {"app_name": "App", "dirs": {"/cg/a.scope"}}}
+        with mock.patch.object(balancer_mod, "record_control_change") as record:
+            b.shutdown()
+        b.control_manager.cpu.restore.assert_called_once_with("/cg/a.scope")
+        record.assert_called_once()
+        args, kwargs = record.call_args
+        self.assertEqual(args, ("affinity", "RESTORED"))
+        self.assertEqual((kwargs["app_id"], kwargs["trigger"], kwargs["cgroups"]),
+                         ("app1", "shutdown", ["a.scope"]))
+        self.assertEqual(b._affinity_apps, {})
+
+    def test_shutdown_restores_device_frequencies(self):
+        b = self._balancer()
+        b.control_manager.freq.limited_units.return_value = ["gt0"]
+        b.control_manager.freq.restore.return_value = (True, "300-2400 MHz")
+        with mock.patch.object(balancer_mod, "record_control_change") as record:
+            b.shutdown()
+        b.control_manager.freq.restore.assert_called_once_with("gt0")
+        b.control_manager.freq.restore_all.assert_called_once_with()
+        args, kwargs = record.call_args
+        self.assertEqual(args, ("freq", "RESTORED"))
+        self.assertEqual(kwargs["trigger"], "shutdown")
+        self.assertEqual(kwargs["facts"]["units"], "gt0")
 
     def test_shutdown_hands_back_only_the_files_holding_nothing(self):
         b = self._balancer()

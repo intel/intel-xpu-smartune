@@ -175,8 +175,22 @@ def test_diag_events_passes_window_and_filters(capsys):
                              ["diag", "events", "--since", "2h", "--app", "a", "--severity", "warning"], capsys)
     params = session.calls[0]["params"]
     assert code == 0 and params["to"] - params["from"] == 7200
-    assert params["app_id"] == "a" and params["severity"] == "warning" and "category" not in params
+    assert params["app_id"] == "a" and params["min_severity"] == "warning" and "category" not in params
+    assert params["keep_important"] == "true" and "severity" not in params
     assert out["count"] == 1 and isinstance(out["events"][0]["ts"], str)
+    assert out["truncated_by_server"] is False
+
+
+def test_diag_events_reports_server_truncation(capsys):
+    code, out, _ = run({("GET", "/diag/events"): {"events": [], "count": 0, "truncated": True}},
+                       ["diag", "events"], capsys)
+    assert code == 0 and out["truncated_by_server"] is True
+
+
+def test_diag_events_rejects_unknown_severity(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.build_parser().parse_args(["diag", "events", "--severity", "warn"])
+    assert exc.value.code == 2
 
 
 def test_diag_why_survives_partial_failure(capsys):
@@ -190,6 +204,31 @@ def test_diag_why_survives_partial_failure(capsys):
     assert code == 0
     assert "error" in out["current_limit"]
     assert out["context"] == {"window": {}, "findings": ["f"], "control_actions": []}
+
+
+def test_diag_context_bounds_app_scope_by_since(capsys):
+    routes = {("GET", "/diag/context"): {"window": {}, "findings": []}}
+    code, _, session = run(routes, ["diag", "context", "--app", "a", "--since", "6h"], capsys)
+    params = session.calls[0]["params"]
+    assert code == 0 and params["app_id"] == "a" and params["to"] - params["from"] == 6 * 3600
+
+
+def test_diag_context_job_scope_uses_job_span(capsys):
+    routes = {("GET", "/diag/context"): {"window": {}, "findings": []}}
+    code, _, session = run(routes, ["diag", "context", "--job", "j", "--since", "6h"], capsys)
+    params = session.calls[0]["params"]
+    assert code == 0 and params["job_id"] == "j" and "from" not in params and "to" not in params
+
+
+def test_diag_why_context_uses_since_window(capsys):
+    routes = {
+        ("GET", "/diag/control-lifecycles"): {"lifecycles": []},
+        ("GET", "/diag/events"): {"events": []},
+        ("GET", "/diag/context"): {"window": {}, "findings": [], "control_actions": []},
+    }
+    code, _, session = run(routes, ["diag", "why", "com.example", "--since", "2h"], capsys)
+    context_call = next(c for c in session.calls if c["path"] == "/diag/context")
+    assert code == 0 and context_call["params"]["to"] - context_call["params"]["from"] == 7200
 
 
 def test_digest_defaults_to_today(capsys):
@@ -301,9 +340,17 @@ def test_digest_and_logs_times_are_localized(capsys):
               "generated_at": "2026-11-12T03:19:55+00:00"}
     _, out, _ = run({("GET", "/diag/digest"): digest}, ["diag", "digest"], capsys)
     assert LOCAL_TIME.fullmatch(out["period"]["from"]) and LOCAL_TIME.fullmatch(out["generated_at"])
-    logs = {"lines": [{"ts_epoch": 1_794_453_557.6, "ts_iso": "2026-11-12T03:19:17+00:00", "message": "m"}]}
+    logs = {"records": [{"ts_epoch": 1_794_453_557.6, "ts_iso": "2026-11-12T03:19:17+00:00", "message": "m"}]}
     _, out, _ = run({("GET", "/diag/logs"): logs}, ["diag", "logs"], capsys)
     assert out["lines"][0]["ts_iso"] == out["lines"][0]["ts_epoch"] == iso(1_794_453_557)
+
+
+def test_logs_reads_server_records(capsys):
+    logs = {"records": [{"ts_epoch": 1_794_453_557.0, "message": "boom"}], "truncated": False}
+    _, out, session = run({("GET", "/diag/logs"): logs},
+                          ["diag", "logs", "--source", "journal", "--all-journal"], capsys)
+    assert [line["message"] for line in out["lines"]] == ["boom"]
+    assert session.calls[0]["params"]["kernel_only"] == "false"
 
 
 def test_raw_output_keeps_api_times(capsys):
@@ -341,9 +388,10 @@ def test_apps_shows_cpu_affinity_only_when_pinned(capsys):
 
 
 def test_logs_source_is_validated(capsys):
-    _, _, session = run({("GET", "/diag/logs"): {"lines": []}},
+    _, _, session = run({("GET", "/diag/logs"): {"records": []}},
                         ["diag", "logs", "--source", "smartune, journal"], capsys)
     assert session.calls[0]["params"]["source"] == "smartune,journal"
+    assert "kernel_only" not in session.calls[0]["params"]
     with pytest.raises(SystemExit) as exc:  # the server would silently drop "journald"
         cli.main(["diag", "logs", "--source", "smartune,journald"], client=object())
     assert exc.value.code == EXIT_USAGE

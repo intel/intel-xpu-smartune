@@ -88,6 +88,21 @@ class WriteCgroupFileTests(unittest.TestCase):
                     mock.patch.object(app_utils.psutil, "Process", return_value=process):
                 self.assertEqual(get_pids_in_cgroup("session-7782.scope"), [101, 202])
 
+    def test_read_cgroup_pids_never_starts_a_process(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            scope = root / "user.slice" / "session-7783.scope"
+            scope.mkdir(parents=True)
+            (scope / "cgroup.procs").write_text("303\n", encoding="utf-8")
+
+            process = mock.Mock()
+            process.cmdline.return_value = ["python", "worker"]
+            with mock.patch.object(app_utils.b_config, "cgroup_mount", str(root), create=True), \
+                    mock.patch.object(app_utils.subprocess, "run") as run, \
+                    mock.patch.object(app_utils.psutil, "Process", return_value=process):
+                self.assertEqual(app_utils.read_cgroup_pids("session-7783.scope"), [303])
+            run.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

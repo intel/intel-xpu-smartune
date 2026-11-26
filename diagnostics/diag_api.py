@@ -17,19 +17,36 @@ logger = get_logger(__name__)
 diag_bp = Blueprint("diag", __name__, url_prefix="/diag")
 
 
+# Most rows one /diag/events call returns, so a request cannot serialize the whole ledger.
+_EVENTS_MAX_LIMIT = 5000
+
+
 def _int_arg(name, default=None):
+    """An integer query argument; a float (an epoch like 1700000000.5) is floored, not dropped."""
     raw = request.args.get(name)
     if raw is None or raw == "":
         return default
     try:
         return int(raw)
     except (TypeError, ValueError):
+        pass
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
         return default
+    return int(value) if value == value and abs(value) != float("inf") else default
 
 
 def _str_arg(name):
     v = request.args.get(name)
     return v or None
+
+
+def _bool_arg(name, default=False):
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.lower() in ("1", "true", "yes")
 
 
 @diag_bp.route("/event-catalog", methods=["GET"])
@@ -44,24 +61,35 @@ def get_event_catalog():
 def get_events():
     """Filtered operational-event query.
 
-    Query params: severity, category, source, event_type, app_id, job_id,
+    Query params: severity (exact), min_severity (that level and above),
+    category, source, event_type, app_id, job_id,
     impact, resource_type, protection_id, episode_id, boot_id, keyword,
     from/to (epoch seconds), limit, offset. ``alertable=true`` keeps only
     event types that have an alert policy (the alert history view).
+    ``keep_important=true`` returns every warning+ event in the range; ``limit``
+    bounds only the rest, and ``truncated`` says whether some were left out.
     """
     try:
         from diagnostics import event_store
-        from diagnostics.alerts import ALERT_POLICIES
+        from diagnostics.alerts import alertable_event_types
 
         alertable = (request.args.get("alertable") or "").lower() in ("1", "true", "yes")
+        keep_important = _bool_arg("keep_important")
+        min_severity = _str_arg("min_severity")
+        severities = event_store.severities_at_least(min_severity) if min_severity else None
+        if min_severity and severities is None:
+            return construct_response(
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg=f"min_severity must be one of {', '.join(event_store.SEVERITY_ORDER)}")
 
-        events = event_store.query_events(
+        filters = dict(
             event_id=_str_arg("event_id"),
             severity=_str_arg("severity"),
+            severities=severities,
             category=_str_arg("category"),
             source=_str_arg("source"),
             event_type=_str_arg("event_type"),
-            event_types=list(ALERT_POLICIES) if alertable else None,
+            event_types=alertable_event_types() if alertable else None,
             app_id=_str_arg("app_id"),
             job_id=_str_arg("job_id"),
             impact=_str_arg("impact"),
@@ -72,12 +100,34 @@ def get_events():
             keyword=_str_arg("keyword"),
             start_time=_int_arg("from"),
             end_time=_int_arg("to"),
-            limit=_int_arg("limit", 200),
+            limit=max(1, min(_int_arg("limit", 200), _EVENTS_MAX_LIMIT)),
             offset=_int_arg("offset", 0),
         )
+        if keep_important and not filters["event_id"]:
+            try:
+                result = event_store.query_window_events(**filters)
+            except ValueError as exc:
+                return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg=str(exc))
+            events = result["events"]
+            return construct_response(data={"events": events, "count": len(events),
+                                            "truncated": result["truncated"]})
+        events = event_store.query_events(**filters)
         return construct_response(data={"events": events, "count": len(events)})
     except Exception as exc:
         logger.error("get_events failed: %s", exc)
+        return construct_response(retcode=RetCode.EXCEPTION_ERROR, retmsg=str(exc))
+
+
+@diag_bp.route("/alert-policies", methods=["GET"])
+def get_alert_policies():
+    """Alert policies, built-in and custom: which event types alert, how each closes and escalates."""
+    try:
+        from diagnostics import alerts
+
+        return construct_response(data={"policies": alerts.policy_summaries(),
+                                        "cooldown_seconds": alerts.COOLDOWN_SECONDS})
+    except Exception as exc:
+        logger.error("get_alert_policies failed: %s", exc)
         return construct_response(retcode=RetCode.EXCEPTION_ERROR, retmsg=str(exc))
 
 
@@ -100,17 +150,71 @@ def get_alerts():
         return construct_response(retcode=RetCode.EXCEPTION_ERROR, retmsg=str(exc))
 
 
-@diag_bp.route("/alerts/<dedup_key>/acknowledge", methods=["POST"])
+@diag_bp.route("/alert-occurrences", methods=["GET"])
+def get_alert_occurrences():
+    """Each detection behind one alert. Query params: event_type and scope (the
+    alert's), from/to (its span, epoch seconds), limit."""
+    event_type, scope = _str_arg("event_type"), _str_arg("scope")
+    if not event_type or not scope:
+        return construct_response(retcode=RetCode.ARGUMENT_ERROR,
+                                  retmsg="event_type and scope are required")
+    try:
+        from diagnostics import alerts
+
+        result = alerts.occurrences(
+            event_type=event_type, scope=scope, start_time=_int_arg("from"),
+            end_time=_int_arg("to"), limit=max(1, min(_int_arg("limit", 200), 500)))
+        return construct_response(data={**result, "count": len(result["events"])})
+    except Exception as exc:
+        logger.error("get_alert_occurrences failed: %s", exc)
+        return construct_response(retcode=RetCode.EXCEPTION_ERROR, retmsg=str(exc))
+
+
+def _seen_event_id():
+    """The alert's ``last_event_id`` as the client loaded it (optional body field)."""
+    value = (request.get_json(silent=True) or {}).get("last_event_id")
+    return str(value) if value else None
+
+
+def _alert_changed(exc):
+    return construct_response(
+        retcode=RetCode.CONFLICT,
+        retmsg="The alert was detected again since it was loaded; review it and try again",
+        data={"fire_count": exc.fire_count, "last_event_id": exc.last_event_id})
+
+
+# ``path:`` because dedup keys embed scopes that contain "/", and the WSGI server
+# decodes %2F before routing.
+@diag_bp.route("/alerts/<path:dedup_key>/acknowledge", methods=["POST"])
 def acknowledge_alert(dedup_key):
+    from db.DatabaseModel import AlertChanged
     from diagnostics import alerts
 
-    found, closed = alerts.acknowledge(dedup_key)
+    try:
+        found, closed = alerts.acknowledge(dedup_key, seen_event_id=_seen_event_id())
+    except AlertChanged as exc:
+        return _alert_changed(exc)
     if not found:
         return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg="Active alert not found")
     return construct_response(data={"acknowledged": True, "closed": closed})
 
 
-@diag_bp.route("/alerts/<dedup_key>/silence", methods=["POST"])
+@diag_bp.route("/alerts/<path:dedup_key>/close", methods=["POST"])
+def close_alert(dedup_key):
+    """Close an active alert by hand, for one whose recovery will never be recorded."""
+    from db.DatabaseModel import AlertChanged
+    from diagnostics import alerts
+
+    try:
+        closed = alerts.close(dedup_key, seen_event_id=_seen_event_id())
+    except AlertChanged as exc:
+        return _alert_changed(exc)
+    if not closed:
+        return construct_response(retcode=RetCode.ARGUMENT_ERROR, retmsg="Active alert not found")
+    return construct_response(data={"closed": True})
+
+
+@diag_bp.route("/alerts/<path:dedup_key>/silence", methods=["POST"])
 def silence_alert(dedup_key):
     payload = request.get_json(silent=True) or {}
     minutes = payload.get("minutes")
@@ -163,6 +267,20 @@ def clear_control_lifecycle_without_runtime_state():
         return construct_response(retcode=RetCode.EXCEPTION_ERROR, retmsg=str(exc))
 
 
+@diag_bp.route("/sources", methods=["GET"])
+def get_sources():
+    """Diagnostics intake health: log detector sources, writer counts, failed storage writes."""
+    try:
+        from diagnostics import event_store, writer
+        from diagnostics.detectors import rules
+
+        return construct_response(data={"sources": rules.source_health(), "writer": writer.stats(),
+                                        "storage": event_store.storage_stats()})
+    except Exception as exc:
+        logger.error("get_sources failed: %s", exc)
+        return construct_response(retcode=RetCode.EXCEPTION_ERROR, retmsg=str(exc))
+
+
 @diag_bp.route("/retention", methods=["GET"])
 def get_retention():
     """Return retention coverage for diagnostics evidence sources."""
@@ -180,7 +298,8 @@ def get_logs():
     """Unified, read-only, federated log query across sources.
 
     Params: source (repeatable / comma list), from/to (epoch seconds), level,
-    job_id, keyword, limit. Values are redacted before return.
+    job_id, keyword, limit, kernel_only (default true: journald kernel ring
+    buffer only). Values are redacted before return.
     """
     try:
         from diagnostics import log_query
@@ -195,6 +314,7 @@ def get_logs():
             job_id=_str_arg("job_id"),
             boot_id=_str_arg("boot_id"),
             keyword=_str_arg("keyword"),
+            kernel_only=_bool_arg("kernel_only", True),
             limit=_int_arg("limit", 500),
         )
         return construct_response(data=result)
@@ -243,12 +363,14 @@ def get_context():
                 "findings": context.assemble_findings(start_time=start, end_time=end),
             })
 
+        # detail=full: the raw monitor snapshots, not the compact summary series.
+        full_series = (request.args.get("detail") or "").lower() == "full"
         for kind in ("job_id", "app_id"):
             value = _str_arg(kind)
             if value:
                 ctx = context.assemble_context(
                     scope_kind=kind, scope_value=value,
-                    start_time=_int_arg("from"), end_time=_int_arg("to"))
+                    start_time=_int_arg("from"), end_time=_int_arg("to"), full_series=full_series)
                 return construct_response(data=ctx)
 
         start, end = _int_arg("from"), _int_arg("to")
@@ -257,7 +379,7 @@ def get_context():
                 retcode=RetCode.ARGUMENT_ERROR,
                 retmsg="provide one of job_id/app_id, or from & to")
         ctx = context.assemble_context(scope_kind="window", scope_value=None,
-                                       start_time=start, end_time=end)
+                                       start_time=start, end_time=end, full_series=full_series)
         return construct_response(data=ctx)
     except Exception as exc:
         logger.error("get_context failed: %s", exc)

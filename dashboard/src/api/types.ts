@@ -27,6 +27,13 @@ export interface ShutdownStatus {
 
 export type DiagSeverity = 'info' | 'warning' | 'error' | 'critical'
 
+// What an event does to its protection's resource-limit lifecycle, from the
+// server's event catalog: a per-resource action, or a marker on the whole
+// lifecycle. Null for every event outside a lifecycle.
+export type DiagLifecycleAction =
+  | 'applied' | 'recovered' | 'failed'
+  | 'requires_verification' | 'cleared_by_reboot' | 'cleared_without_runtime_state'
+
 export interface DiagEvent {
   event_id: string
   ts_utc: string
@@ -42,6 +49,10 @@ export interface DiagEvent {
   resource_type?: string | null
   protection_id?: string | null
   episode_id?: string | null
+  lifecycle_action?: DiagLifecycleAction | null
+  // Dashboard domain from the server's event catalog (or the custom rule that
+  // wrote the event); null for an event type the catalog does not know.
+  domain?: DiagEventCatalogEntry['domain'] | null
   attributes?: Record<string, unknown> | null
   acknowledged_at?: string | null
 }
@@ -49,6 +60,8 @@ export interface DiagEvent {
 export interface DiagEventsData {
   events: DiagEvent[]
   count: number
+  // Set with keep_important: some lower-severity events beyond `limit` were left out.
+  truncated?: boolean
 }
 
 export interface DiagEventCatalogEntry {
@@ -58,6 +71,7 @@ export interface DiagEventCatalogEntry {
   domain: 'compute' | 'data-path' | 'services' | 'hardware' | 'platform' | 'other'
   configurable: boolean
   default_enabled: boolean
+  lifecycle_action?: DiagLifecycleAction | null
 }
 
 // Settings field guidance from GET /monitor/config-hints (config/field_hints.py).
@@ -139,6 +153,8 @@ export interface DiagEventQuery {
   to?: number
   limit?: number
   offset?: number
+  // Return every warning+ event in range; `limit` then bounds only lower severities.
+  keep_important?: boolean
 }
 
 export interface DiagLogRecord {
@@ -162,12 +178,16 @@ export interface DiagLogQuery {
   job_id?: string
   boot_id?: string
   keyword?: string
+  // journald scope: true (server default) = kernel ring buffer only.
+  kernel_only?: boolean
   limit?: number
 }
 
 export interface DiagLogsData {
   records: DiagLogRecord[]
   sources: string[]
+  // Sources that could not be read: their lack of records means nothing.
+  failed_sources?: string[]
   available_sources: string[]
   truncated: boolean
   count: number
@@ -247,7 +267,10 @@ export interface DiagContextData {
   concurrent_jobs: string[]
   alerts: DiagAlert[]
   metrics: {
-    monitor: { series: DiagMonitorSample[]; count: number }
+    // detail "summary" (default): at most 240 points with cpu / memory /
+    // pressure / disk-pressure fields, worst value per bucket; sampled_from is
+    // the raw sample count. Request detail=full for the raw snapshots.
+    monitor: { series: DiagMonitorSample[]; count: number; detail?: 'summary'; sampled_from?: number; step_seconds?: number }
     benchmark: {
       kpi: Record<string, unknown> | null
       series: unknown[]
@@ -340,15 +363,94 @@ export interface DiagAlert {
   status: 'active' | 'resolved' | string
   resolved_at: string | null
   resolved_event_id: string | null
+  // What closed the occurrence, recorded when it closed (absent while open and
+  // on occurrences closed before the server recorded it).
+  resolved_reason?: DiagAlertResolvedReason | null
   scope: string | null
   severity: DiagSeverity | string
   event_type: string
   summary: string | null
+  // How this alert closes: acknowledged, after a quiet period, or on a recovery event.
+  close_mode?: 'ack' | 'quiet' | 'recovery' | null
 }
+
+export interface DiagAlertOccurrencesData {
+  events: DiagEvent[]
+  count: number
+  // More detections matched than were returned.
+  truncated: boolean
+}
+
+// Whether the log detector can read a source; epoch seconds.
+export interface DiagSourceHealth {
+  source: 'journal' | 'smartune' | string
+  last_ok: number | null
+  failing_since: number | null
+  last_error: string | null
+  consecutive_failures: number
+}
+
+// Is the background event writer keeping up (GET /diag/sources).
+export interface DiagWriterStats {
+  mode: 'background' | 'inline'
+  queued: number
+  capacity: number | null
+  submitted: number
+  completed: number
+  failed: number
+  dropped: number
+  last_drop_at: string | null
+}
+
+// Event writes the database refused, from any producer (GET /diag/sources).
+export interface DiagStorageStats {
+  failed: number
+  last_failed_at: string | null
+  last_failed_type: string | null
+  last_status: string | null
+}
+
+export interface DiagSourcesData {
+  sources: DiagSourceHealth[]
+  writer?: DiagWriterStats
+  storage?: DiagStorageStats
+}
+
+export type DiagAlertResolvedReason =
+  | 'acknowledged' | 'recovered' | 'expired' | 'operator_closed' | 'cleared_by_reboot'
 
 export interface DiagAlertsData {
   alerts: DiagAlert[]
   count: number
+}
+
+// One alert policy from GET /diag/alert-policies: a built-in event type or a
+// custom rule whose alert is on.
+export interface DiagAlertPolicy {
+  event_type: string
+  label: string
+  source: 'builtin' | 'custom_rule'
+  severity: DiagSeverity
+  close_mode: 'ack' | 'quiet' | 'recovery' | null
+  ttl_seconds: number | null
+  resolved_by: string[]
+  escalation: {
+    escalate_to: DiagSeverity
+    threshold: number
+    window_seconds: number
+    attribute: string | null
+    attribute_threshold: number | null
+  } | null
+  description: string
+  // One line each: what will close an open alert, what closed a closed one.
+  closes_when: string
+  closed_because: string
+}
+
+export interface DiagAlertPoliciesData {
+  policies: DiagAlertPolicy[]
+  // Repeat detections of one alert notify again only after this long.
+  cooldown_seconds: number
 }
 
 export interface DiagDigest {
@@ -369,10 +471,19 @@ export interface DiagDigest {
   benchmark_regressions: unknown[]
   active_alerts: DiagAlert[]
   comparison?: {
+    // null when the previous period is older than the retention window.
     previous_period?: {
       total: number
       by_severity: Record<DiagSeverity, number>
-    }
+    } | null
+    unavailable_reason?: 'outside_retention'
+  } | null
+  // What the numbers can cover: events older than retained_from are gone.
+  coverage?: {
+    retention_days: number
+    retained_from: number
+    complete: boolean
+    alerts_truncated: boolean
   } | null
 }
 

@@ -13,6 +13,7 @@ import {
   Input,
   message,
   Modal,
+  Popconfirm,
   Popover,
   Row,
   Segmented,
@@ -50,7 +51,8 @@ import {
 import { api, getLatestServerTime } from '../api/client'
 import { MEMORY_RECOVERY_HINT } from '../utils/messages'
 import { indexMetrics, formatWithUnit, metricLabel } from '../utils/benchMetrics'
-import { createLiveDiagnosticWindow, groupDiagnosticEvents } from '../utils/diagnosticEvents'
+import { createLiveDiagnosticWindow, eventTimeMs, groupDiagnosticEvents, protectionAction } from '../utils/diagnosticEvents'
+import type { DiagnosticDisplayEvent } from '../utils/diagnosticEvents'
 import type {
   DiagBenchCase,
   DiagBoot,
@@ -66,10 +68,11 @@ import type {
   DiagPressureLevel,
   DiagResourceTrendPoint,
   DiagSeverity,
+  DiagSourceHealth,
   LimitSnapshotData,
 } from '../api/types'
 import { COLORS } from '../styles/theme'
-import { alertHandlingMark, alertLifecycleText, alertOccurrenceForEvent, isAlertableEvent, isAlertSilenced } from '../utils/alertPolicy'
+import { alertHandlingMark, alertLifecycleText, alertOccurrenceForEvent, isAlertableEvent, isAlertSilenced, useAlertPolicies } from '../utils/alertPolicy'
 import type { AlertHandlingMark } from '../utils/alertPolicy'
 import AlertPolicyList from './AlertPolicyList'
 import { useIsNarrowViewport } from '../hooks/useIsNarrowViewport'
@@ -212,6 +215,11 @@ const CATEGORY_LABELS: Record<string, string> = {
   'platform.control': 'Resource control',
   'platform.availability': 'Service health',
   'platform.observability': 'Monitoring',
+  'platform.service_log': 'Service log',
+  'platform.config': 'Configuration',
+  'platform.security': 'Security',
+  'platform.kernel': 'Kernel',
+  'platform.process': 'Process',
   'resource.system': 'System pressure',
   'resource.cpu': 'CPU',
   'resource.memory': 'Memory',
@@ -222,6 +230,8 @@ const CATEGORY_LABELS: Record<string, string> = {
   'device.pcie': 'PCIe',
   'device.gpu': 'GPU',
   'device.npu': 'NPU',
+  'device.storage': 'Storage',
+  'device.hardware': 'Hardware errors',
   'workload.benchmark': 'Benchmark',
   service: 'Service',
 }
@@ -329,17 +339,23 @@ function eventAttributeStrings(event: DiagEvent, name: string): string[] {
   return Array.isArray(value) && value.every((item) => typeof item === 'string') ? value : []
 }
 
+function isEventDomain(value: unknown): value is EventDomain {
+  return EVENT_DOMAIN_OPTIONS.some((option) => option.value === value)
+}
+
+// The server sets `domain` from its event catalog; the category guess below
+// only covers event types the catalog does not know.
 function eventDomain(event: DiagEvent): EventDomain {
+  if (isEventDomain(event.domain)) return event.domain
   const configuredDomain = eventAttributeString(event, 'domain')
-  if (EVENT_DOMAIN_OPTIONS.some((option) => option.value === configuredDomain)) return configuredDomain as EventDomain
-  const type = event.event_type.toUpperCase()
-  if (type.includes('OOM') || event.category === 'resource.memory') return 'data-path'
-  if (type.includes('KERNEL_PANIC') || event.category === 'device.thermal' || event.category === 'device.power' || event.category === 'device.pcie') return 'hardware'
-  if (event.category === 'resource.cpu' || event.category === 'device.gpu' || event.category === 'device.npu') return 'compute'
-  if (event.category === 'resource.system') return 'hardware'
-  if (event.category === 'resource.disk_io' || event.category === 'resource.network') return 'data-path'
-  if (event.category === 'workload.benchmark' || event.category === 'service') return 'services'
-  if (event.category.startsWith('platform.')) return 'platform'
+  if (isEventDomain(configuredDomain)) return configuredDomain
+  const category = event.category || ''
+  if (category === 'resource.cpu' || category === 'device.gpu' || category === 'device.npu') return 'compute'
+  if (category.startsWith('resource.') && category !== 'resource.system') return 'data-path'
+  if (category === 'device.storage' || category === 'device.network') return 'data-path'
+  if (category === 'resource.system' || category.startsWith('device.') || category === 'platform.kernel') return 'hardware'
+  if (category.startsWith('workload.') || category === 'service') return 'services'
+  if (category.startsWith('platform.')) return 'platform'
   return 'other'
 }
 
@@ -462,16 +478,7 @@ function controlLifecycleAppName(lifecycle: DiagControlLifecycle): string {
   return appNameFromEvent(lifecycle.events.find((event) => appNameFromEvent(event))) || lifecycle.app_id || '-'
 }
 
-function protectionAction(event: DiagEvent): string | null {
-  if (event.category !== 'platform.control' || !event.protection_id) return null
-  const match = event.event_type.match(/_(APPLIED|RECOVERED|FAILED)$/)
-  return match?.[1] || null
-}
-
-interface DisplayEvent {
-  event: DiagEvent
-  resources: string[]
-}
+type DisplayEvent = DiagnosticDisplayEvent
 
 function displayEventKey(item: DisplayEvent): string {
   const action = protectionAction(item.event)
@@ -495,9 +502,7 @@ function displayEventSummary(item: DisplayEvent): string {
 // per-resource events, so list every reason-code in it rather than only the
 // representative event's -- otherwise a "cpu, memory" row opens a CPU-only Type.
 function displayEventTypes(item: DisplayEvent): string {
-  const action = protectionAction(item.event)
-  if (!action || item.resources.length < 2) return item.event.event_type
-  return item.resources.map((resource) => `CONTROL_${resource.toUpperCase()}_LIMIT_${action}`).join(', ')
+  return item.eventTypes.join(', ')
 }
 
 // An auto-limit APPLIED event records the trigger the balancer acted on
@@ -861,13 +866,15 @@ function severityTag(level: string) {
   )
 }
 
-// Only control actions carry a lifecycle status; informational events (for example,
-// pressure level changes) render as plain rows without an applied/recovered state.
+// Only outcomes carry a status: a resource-limit action (its lifecycle_action,
+// from the server's event catalog) or any event whose recorded impact is a
+// failure. Informational events (for example, pressure level changes) render as
+// plain rows. Never read from the event name: a memory reclaim shares the suffix.
 function statusFromEvent(ev: DiagEvent): { label: string; color: string } | null {
-  const t = ev.event_type || ''
-  if (t.endsWith('_RECOVERED')) return { label: 'Recovered', color: COLORS.green }
-  if (t.endsWith('_APPLIED')) return { label: 'Applied', color: COLORS.accent }
-  if (t.endsWith('_FAILED')) return { label: 'Failed', color: COLORS.red }
+  const action = protectionAction(ev)
+  if (action === 'RECOVERED') return { label: 'Recovered', color: COLORS.green }
+  if (action === 'APPLIED') return { label: 'Applied', color: COLORS.accent }
+  if (action === 'FAILED' || ev.impact === 'failed') return { label: 'Failed', color: COLORS.red }
   return null
 }
 
@@ -888,6 +895,66 @@ function formatLogTs(rec: DiagLogRecord): string {
     if (d.isValid()) return d.format('MM-DD HH:mm:ss.SSS')
   }
   return dayjs.unix(Math.floor(rec.ts_epoch || 0)).format('MM-DD HH:mm:ss.SSS')
+}
+
+function logField(r: DiagLogRecord, key: string): unknown {
+  return r.fields ? (r.fields as Record<string, unknown>)[key] : undefined
+}
+
+function isKernelLog(r: DiagLogRecord): boolean {
+  return r.source === 'journal' && logField(r, 'transport') === 'kernel'
+}
+
+// Lines in a merged kernel report (journal.py / kernel_blocks.py); 1 otherwise.
+function logLineCount(r: DiagLogRecord): number {
+  const n = logField(r, 'line_count')
+  return typeof n === 'number' && n > 1 ? n : 1
+}
+
+// The line a report is known by: "INFO: task ... blocked", not "[ cut here ]".
+function logHeadline(r: DiagLogRecord): string {
+  const title = logField(r, 'block_title')
+  if (typeof title === 'string' && title) return title
+  return (r.message || '').split('\n', 1)[0]
+}
+
+const KERNEL_BLOCK_LABELS: Record<string, string> = {
+  hung_task: 'hung task', warning: 'WARN', bug: 'BUG', oops: 'Oops', gpf: 'GPF',
+  panic: 'panic', oom: 'OOM', segfault: 'segfault', trap: 'trap',
+  soft_lockup: 'soft lockup', hard_lockup: 'hard lockup', rcu_stall: 'RCU stall',
+  mce: 'MCE', stack: 'stack dump',
+}
+
+function kernelBlockLabel(r: DiagLogRecord): string | null {
+  const kind = logField(r, 'block')
+  return typeof kind === 'string' ? KERNEL_BLOCK_LABELS[kind] || kind : null
+}
+
+// dmesg-style "[5806683.977043]": seconds since boot, as the kernel stamps it.
+function formatMonotonic(r: DiagLogRecord): string | null {
+  const m = logField(r, 'monotonic_s')
+  return typeof m === 'number' && Number.isFinite(m) ? `[${m.toFixed(6)}]` : null
+}
+
+// Who emitted the line. Kernel lines have no unit; name the driver/device instead.
+function logOrigin(r: DiagLogRecord): string {
+  if (isKernelLog(r)) {
+    const driver = logField(r, 'kernel_driver')
+    const pci = logField(r, 'kernel_pci')
+    return typeof driver === 'string' && driver
+      ? `kernel · ${driver}${typeof pci === 'string' && pci ? ` ${pci}` : ''}`
+      : 'kernel'
+  }
+  return r.service || r.logger || '-'
+}
+
+function kernelCaption(r: DiagLogRecord): string {
+  const parts = [`dmesg ${formatMonotonic(r) || ''}`.trim()]
+  const lines = logLineCount(r)
+  if (lines > 1) parts.push(`${lines} lines${logField(r, 'block_truncated') ? ' (capped)' : ''}`)
+  const boot = logField(r, 'boot_id')
+  if (typeof boot === 'string' && boot) parts.push(`boot ${boot.slice(0, 12)}`)
+  return parts.join(' · ')
 }
 
 function formatActivityTime(value?: string | null): string {
@@ -1097,6 +1164,60 @@ function contextTargetLabel(target: ContextTarget): string {
   return `${noun} ${target.value}`
 }
 
+// When each detection behind an alert happened, loaded when the count is clicked.
+function AlertOccurrences({ alert, onOpenEvent }: { alert: DiagAlert; onOpenEvent: (event: DiagEvent) => void }) {
+  const [open, setOpen] = useState(false)
+  const [data, setData] = useState<{ events: DiagEvent[]; truncated: boolean } | null>(null)
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    if (!open) return undefined
+    let cancelled = false
+    setFailed(false)
+    api.getDiagAlertOccurrences(alert)
+      .then((result) => { if (!cancelled) setData({ events: result.events || [], truncated: !!result.truncated }) })
+      .catch(() => { if (!cancelled) setFailed(true) })
+    return () => { cancelled = true }
+  }, [open, alert])
+
+  if (alert.fire_count <= 1 || !alert.scope) return <>{alert.fire_count}</>
+  const shown = data?.events.length ?? 0
+  const missing = alert.fire_count - shown
+  let content: React.ReactNode
+  if (failed) content = <Text type='secondary'>Could not load the detections.</Text>
+  else if (!data) content = <Text type='secondary'>Loading...</Text>
+  else {
+    content = (
+      <Space direction='vertical' size={4} style={{ maxWidth: 520, maxHeight: 320, overflowY: 'auto' }}>
+        {data.events.map((event) => (
+          <Button
+            key={event.event_id}
+            type='text'
+            size='small'
+            style={{ height: 'auto', padding: '2px 4px', textAlign: 'left', width: '100%' }}
+            onClick={() => { setOpen(false); onOpenEvent(event) }}
+          >
+            <Space size={8} align='start'>
+              <Text type='secondary' style={{ whiteSpace: 'nowrap' }}>{formatActivityTime(event.ts_utc)}</Text>
+              <Text ellipsis style={{ maxWidth: 380 }}>{event.summary}</Text>
+            </Space>
+          </Button>
+        ))}
+        {data.truncated ? <Text type='secondary'>Showing the newest {shown}.</Text>
+          : missing > 0 ? <Text type='secondary'>{missing} older {missing === 1 ? 'detection is' : 'detections are'} no longer stored (past the retention period).</Text>
+            : null}
+      </Space>
+    )
+  }
+  return (
+    <Popover trigger='click' open={open} onOpenChange={setOpen} placement='left'
+      title={`${alert.fire_count} detections · click one for details`} content={content}>
+      <Button type='link' size='small' style={{ padding: 0 }} onClick={(event) => event.stopPropagation()}>
+        {alert.fire_count}
+      </Button>
+    </Popover>
+  )
+}
+
 function contextTargetForEvent(event: DiagEvent): ContextTarget | null {
   if (event.app_id) return { kind: 'app', value: event.app_id, label: appNameFromEvent(event) || undefined }
   if (event.job_id) return { kind: 'job', value: event.job_id }
@@ -1104,6 +1225,9 @@ function contextTargetForEvent(event: DiagEvent): ContextTarget | null {
 }
 
 export default function Diagnostics({ active, alertsRequest, currentAlerts, rangeIntent, onOpenHistory }: Props) {
+  // Alert texts and "is this event alertable" read the server's policies;
+  // subscribing re-renders them once the policies have loaded.
+  useAlertPolicies()
   // Page timelines follow the workspace; the report drawer is sized by the viewport.
   const timelineGutter = timelineGutterFor(useIsCompactWorkspace())
   const narrowViewport = useIsNarrowViewport()
@@ -1118,6 +1242,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
   // Loading / error
   const [eventsLoading, setEventsLoading] = useState(false)
   const [eventsError, setEventsError] = useState<string | null>(null)
+  const [eventsTruncated, setEventsTruncated] = useState(false)
   const [controlLifecyclesLoading, setControlLifecyclesLoading] = useState(false)
   const [logsLoading, setLogsLoading] = useState(false)
   const [controlLifecyclesError, setControlLifecyclesError] = useState<string | null>(null)
@@ -1150,6 +1275,8 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
   const [eventSource, setEventSource] = useState<string | undefined>(undefined)
   const [eventPage, setEventPage] = useState(1)
   const [timelineEventKeys, setTimelineEventKeys] = useState<string[] | null>(null)
+  // What picked the rows in timelineEventKeys: a timeline cluster or an advice.
+  const [eventSelectionLabel, setEventSelectionLabel] = useState('Timeline selection')
   const [eventBrushRange, setEventBrushRange] = useState<EventBrushRange | null>(null)
   const [eventZoomRange, setEventZoomRange] = useState<EventZoomSelection | null>(null)
   const [eventZoomSelection, setEventZoomSelection] = useState<EventZoomSelection | null>(null)
@@ -1168,6 +1295,9 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
   const [logSource, setLogSource] = useState<string | undefined>(undefined)
   const [logKeyword, setLogKeyword] = useState('')
   const [logLevel, setLogLevel] = useState<string | undefined>(undefined)
+  // journald scope: kernel ring buffer only (hardware/driver faults, merged into
+  // one row per report) or every unit (adds systemd, services, coredumps).
+  const [journalScope, setJournalScope] = useState<'kernel' | 'all'>('kernel')
   const [groupRepeats, setGroupRepeats] = useState(true)
 
   const [selectedEvent, setSelectedEvent] = useState<DisplayEvent | null>(null)
@@ -1204,6 +1334,11 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
   // found in the table after the range re-centers on it.
   const [focusedAlertKey, setFocusedAlertKey] = useState<string | null>(null)
   const [alertsLoading, setAlertsLoading] = useState(false)
+  // Bumped after an alert is closed here, to reload the range's alerts.
+  const [alertsReload, setAlertsReload] = useState(0)
+  // Log sources the detector cannot read: faults there go undetected.
+  const [failingSources, setFailingSources] = useState<DiagSourceHealth[]>([])
+  const [closingAlertKey, setClosingAlertKey] = useState<string | null>(null)
   const [insightsOpen, setInsightsOpen] = useState(false)
   const [reportOpen, setReportOpen] = useState(false)
   const [report, setReport] = useState<DiagDigest | null>(null)
@@ -1303,18 +1438,24 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
     setEventsLoading(true)
     setEventsError(null)
     try {
+      // keep_important: every warning+ event in range is returned, the limit only
+      // bounds info events -- a burst of routine events can no longer push an
+      // older OOM kill or crash off the timeline.
       const result = await api.getDiagEvents({
         job_id: jobId,
         app_id: appId,
         from: timeRange.from,
         to: timeRange.queryTo,
-        limit: 100,
+        limit: 300,
+        keep_important: true,
       })
       if (token !== eventsRefreshSeq.current) return
       setEvents(result.events || [])
+      setEventsTruncated(Boolean(result.truncated))
     } catch (error) {
       if (token !== eventsRefreshSeq.current) return
       setEvents([])
+      setEventsTruncated(false)
       setEventsError(error instanceof Error ? error.message : 'Failed to query diagnostic events')
     } finally {
       if (token === eventsRefreshSeq.current) setEventsLoading(false)
@@ -1401,6 +1542,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
         // stay scoped by the derived from/to (the contract confirmed in journal.py).
         boot_id: bootScopeEnabled ? selectedBoot?.boot_id : undefined,
         keyword: logKeywordRef.current.trim() || undefined,
+        kernel_only: journalScope === 'kernel',
         from: timeRange.from,
         to: timeRange.queryTo,
         limit: 800,
@@ -1420,7 +1562,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
     } finally {
       if (token === logSeq.current) setLogsLoading(false)
     }
-  }, [logSource, logLevel, jobId, bootScopeEnabled, selectedBoot, timeRange, updateClockSkew])
+  }, [logSource, logLevel, journalScope, jobId, bootScopeEnabled, selectedBoot, timeRange, updateClockSkew])
 
 
   // An investigation focuses on the immediate evidence surrounding its anchor;
@@ -1617,7 +1759,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
     if (!timelineEventKeys) return timelineDisplayedEvents
     const selected = new Set(timelineEventKeys)
     return timelineDisplayedEvents.filter((item) => selected.has(displayEventKey(item)))
-      .sort((left, right) => left.event.ts_utc.localeCompare(right.event.ts_utc))
+      .sort((left, right) => eventTimeMs(left.event.ts_utc) - eventTimeMs(right.event.ts_utc))
   }, [timelineDisplayedEvents, timelineEventKeys])
 
   const allDisplayedEvents = useMemo(() => displayEvents(events), [events])
@@ -1729,6 +1871,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
 
   const selectTimelineCluster = useCallback((point: EventTimelinePoint) => {
     setTimelineEventKeys(point.items.map(displayEventKey))
+    setEventSelectionLabel('Timeline selection')
     setEventPage(1)
     window.setTimeout(() => eventsTableRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0)
   }, [])
@@ -1935,6 +2078,11 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
     () => displayEvents(contextData?.control_actions ?? []),
     [contextData],
   )
+  // Events not already listed as protection actions.
+  const contextOtherEvents = useMemo(() => {
+    const listed = new Set((contextData?.control_actions ?? []).map((event) => event.event_id))
+    return (contextData?.events ?? []).filter((event) => !listed.has(event.event_id))
+  }, [contextData])
 
   const refreshAll = useCallback(() => {
     setRangeEndEpoch(Math.floor(Date.now() / 1000))
@@ -2197,6 +2345,20 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
   useEffect(() => {
     if (!active) return undefined
     let cancelled = false
+    // Two failures in a row: one can be a slow journalctl, not a blind detector.
+    api.getDiagSources()
+      .then((data) => {
+        if (!cancelled) setFailingSources((data.sources || []).filter((source) => source.consecutive_failures >= 2))
+      })
+      .catch(() => {
+        if (!cancelled) setFailingSources([])
+      })
+    return () => { cancelled = true }
+  }, [active, timeRange.from, timeRange.to, alertsReload])
+
+  useEffect(() => {
+    if (!active) return undefined
+    let cancelled = false
     setAlertsLoading(true)
     api.getDiagAlerts(false, 500, false, { from: timeRange.from, to: timeRange.to })
       .then((data) => {
@@ -2209,13 +2371,41 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
         if (!cancelled) setAlertsLoading(false)
       })
     return () => { cancelled = true }
-  }, [active, timeRange.from, timeRange.to])
+  }, [active, timeRange.from, timeRange.to, alertsReload])
 
+  // An advice's loaded related events, and the first that scopes to an app or
+  // job (its investigation context); host-level facts such as kernel faults or
+  // telemetry gaps have none.
+  const findingEvidence = useCallback((finding: DiagFinding) => {
+    const ids = new Set(finding.related_event_ids || [])
+    const related = events.filter((item) => ids.has(item.event_id))
+    return { related, contextEvent: related.find((item) => contextTargetForEvent(item)) ?? null }
+  }, [events])
+
+  // Opens the app / job context when there is one, else lists the advice's
+  // related events in the events table.
   const investigateFinding = useCallback((finding: DiagFinding) => {
-    const event = events.find((item) => finding.related_event_ids?.includes(item.event_id))
-    const target = event ? contextTargetForEvent(event) : null
-    if (event && target) openContext(target, event)
-  }, [events, openContext])
+    const { related, contextEvent } = findingEvidence(finding)
+    const target = contextEvent ? contextTargetForEvent(contextEvent) : null
+    if (contextEvent && target) {
+      openContext(target, contextEvent)
+      return
+    }
+    if (!related.length) return
+    // Table filters would hide some of the selected rows.
+    setEventKeyword('')
+    setEventSeverity(undefined)
+    setEventDomainFilter(undefined)
+    setEventKindFilter(undefined)
+    setEventFatalSignature(undefined)
+    setEventLaneFilter(undefined)
+    setEventSource(undefined)
+    setTimelineEventKeys(displayEvents(related).map(displayEventKey))
+    setEventSelectionLabel(`Advice: ${finding.title}`)
+    setEventRecordsOpen(true)
+    setEventPage(1)
+    window.setTimeout(() => eventsTableRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0)
+  }, [findingEvidence, openContext])
 
   const investigateAlert = useCallback(async (alert: DiagAlert) => {
     if (!alert.last_event_id) return
@@ -2333,6 +2523,24 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
   const focusAlertRef = useRef(focusAlert)
   focusAlertRef.current = focusAlert
 
+  // Close an open alert by hand: for one whose recovery can no longer arrive
+  // (throttling that ended while the service was down, a device that is gone).
+  const closeAlert = useCallback(async (alert: DiagAlert) => {
+    setClosingAlertKey(alert.dedup_key)
+    try {
+      await api.closeDiagAlert(alert)
+      message.success('Alert closed')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Could not close the alert')
+    } finally {
+      // Reload either way: a refused close means it was detected again.
+      setAlertsReload((value) => value + 1)
+      setClosingAlertKey(null)
+    }
+  }, [])
+  const closeAlertRef = useRef(closeAlert)
+  closeAlertRef.current = closeAlert
+
   useEffect(() => {
     if (!alertsRequest) return
     if (alertsRequest.kind === 'current') openCurrentAlerts()
@@ -2424,9 +2632,22 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
     { title: 'First detected', width: 140, render: (_: unknown, alert: DiagAlert) => formatActivityTime(alert.first_fired_at) },
     { title: 'Closed', width: 140, render: (_: unknown, alert: DiagAlert) => formatActivityTime(alert.resolved_at) },
     {
-      title: 'Duration',
+      title: (
+        <Tooltip title='How long the problem was seen. For a fault closed by acknowledgement, from its first to its last detection: the time until someone acknowledged it is not part of the fault.'>
+          <span>Duration</span>
+        </Tooltip>
+      ),
       width: 110,
       render: (_: unknown, alert: DiagAlert) => {
+        if (alert.close_mode === 'ack') {
+          const seen = formatDuration(dayjs(alert.last_fired_at).diff(dayjs(alert.first_fired_at), 'second'))
+          const text = alert.fire_count <= 1 ? 'Once' : (seen || '-')
+          return (
+            <Tooltip title={`Detected ${formatActivityTime(alert.first_fired_at)} to ${formatActivityTime(alert.last_fired_at)}`}>
+              <Text type='secondary'>{text}</Text>
+            </Tooltip>
+          )
+        }
         const end = alert.resolved_at ? dayjs(alert.resolved_at) : dayjs()
         const duration = formatDuration(end.diff(dayjs(alert.first_fired_at), 'second'))
         return <Text type='secondary'>{duration ? (alert.resolved_at ? duration : `${duration}+`) : '-'}</Text>
@@ -2434,36 +2655,69 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
     },
     {
       title: (
-        <Tooltip title='How many times this fault was detected during the alert. Repeats are grouped into one row instead of raising new alerts.'>
+        <Tooltip title='How many times this fault was detected during the alert. Repeats are grouped into one row instead of raising new alerts; click the number to see when each happened.'>
           <span>Times detected</span>
         </Tooltip>
       ),
       width: 130,
-      render: (_: unknown, alert: DiagAlert) => alert.fire_count,
+      render: (_: unknown, alert: DiagAlert) => (
+        <AlertOccurrences alert={alert} onOpenEvent={(event) => setSelectedEvent(displayEvents([event])[0])} />
+      ),
     },
     {
       title: 'Action',
-      width: 130,
+      width: 200,
       render: (_: unknown, alert: DiagAlert) => (
-        <Button
-          type='primary'
-          size='small'
-          icon={<SearchOutlined />}
-          disabled={!alert.last_event_id}
-          onClick={(event) => {
-            event.stopPropagation()
-            focusAlertRef.current(alert)
-          }}
-        >
-          Investigate
-        </Button>
+        <Space size={6}>
+          <Button
+            type='primary'
+            size='small'
+            icon={<SearchOutlined />}
+            disabled={!alert.last_event_id}
+            onClick={(event) => {
+              event.stopPropagation()
+              focusAlertRef.current(alert)
+            }}
+          >
+            Investigate
+          </Button>
+          {alert.status === 'active' ? (
+            <Popconfirm
+              title='Close this alert?'
+              description='Use this when the problem is over but its recovery was not recorded, e.g. it ended while SmarTune was restarting. It opens again if the problem recurs.'
+              okText='Close alert'
+              onConfirm={() => closeAlertRef.current(alert)}
+              onPopupClick={(event) => event.stopPropagation()}
+            >
+              <Button
+                size='small'
+                loading={closingAlertKey === alert.dedup_key}
+                onClick={(event) => event.stopPropagation()}
+              >
+                Close
+              </Button>
+            </Popconfirm>
+          ) : null}
+        </Space>
       ),
     },
-  ], [])
+  ], [closingAlertKey])
 
 
   return (
     <Card className='diagnostics-page'>
+      {failingSources.map((source) => (
+        <Alert
+          key={source.source}
+          type='warning'
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={source.source === 'journal'
+            ? 'The system journal cannot be read: kernel and service faults are not being detected.'
+            : "SmarTune's own logs cannot be read: its errors are not being detected."}
+          description={`Failing since ${formatActivityTime(source.failing_since ? dayjs.unix(source.failing_since).toISOString() : null)}${source.last_error ? ` · ${source.last_error}` : ''}`}
+        />
+      ))}
       <div className='diagnostics-toolbar'>
         <Row className='diagnostics-filter-row' gutter={[8, 8]} align='middle' justify='space-between'>
           <Col flex='auto'>
@@ -3088,6 +3342,15 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
         />
       ) : null}
 
+      {!eventsLoading && !eventsError && eventsTruncated ? (
+        <Alert
+          className='diagnostics-activity-empty'
+          type='info'
+          showIcon
+          message='Showing all warning, error and critical events in this range; older info events were left out. Narrow the time range to see them.'
+        />
+      ) : null}
+
 
       {activeControlRows.length > 0 ? (
         <section className='diagnostics-active-controls' ref={activeControlsRef}>
@@ -3297,7 +3560,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
               : `${displayedEvents.length} event ${displayedEvents.length === 1 ? 'record' : 'records'}`}
           </Text>
           {timelineEventKeys ? (
-            <Tag closable onClose={() => setTimelineEventKeys(null)} color='blue'>Timeline selection · oldest first</Tag>
+            <Tag closable onClose={() => setTimelineEventKeys(null)} color='blue'>{eventSelectionLabel} · oldest first</Tag>
           ) : null}
         </Space>
         <Table
@@ -3362,6 +3625,25 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                     onChange={(v) => setLogSource(v === ALL ? undefined : v)}
                     options={sourceOptions}
                   />
+                  <Tooltip
+                    title={logSource && logSource !== 'journal'
+                      ? 'Applies to the journal source only'
+                      : journalScope === 'kernel'
+                        ? 'Kernel ring buffer only (driver, GPU, memory and hardware faults). Multi-line kernel reports are shown as one row.'
+                        : 'Every journal unit: kernel plus systemd, services and core dumps'}
+                  >
+                    <Segmented
+                      aria-label='Journal scope'
+                      size='small'
+                      disabled={Boolean(logSource && logSource !== 'journal')}
+                      value={journalScope}
+                      onChange={(v) => setJournalScope(v === 'all' ? 'all' : 'kernel')}
+                      options={[
+                        { label: 'Kernel', value: 'kernel' },
+                        { label: 'All journal', value: 'all' },
+                      ]}
+                    />
+                  </Tooltip>
                   <Button icon={<ReloadOutlined />} onClick={loadLogs} loading={logsLoading}>Search</Button>
                   <Checkbox checked={groupRepeats} onChange={(e) => setGroupRepeats(e.target.checked)}>
                     Group repeats
@@ -3388,21 +3670,37 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                     {
                       title: 'Time',
                       width: 180,
-                      render: (_: unknown, g: LogGroup) => g.count > 1
-                        ? <Tooltip title={`${formatLogTs(g.items[g.items.length - 1])} → ${formatLogTs(g.rep)}`}><span>{formatLogTs(g.rep)}</span></Tooltip>
-                        : formatLogTs(g.rep),
+                      render: (_: unknown, g: LogGroup) => {
+                        const time = g.count > 1
+                          ? <Tooltip title={`${formatLogTs(g.items[g.items.length - 1])} → ${formatLogTs(g.rep)}`}><span>{formatLogTs(g.rep)}</span></Tooltip>
+                          : <span>{formatLogTs(g.rep)}</span>
+                        const mono = isKernelLog(g.rep) ? formatMonotonic(g.rep) : null
+                        return mono ? (
+                          <div className='diagnostics-log-time'>
+                            {time}
+                            <Text className='diagnostics-log-monotonic' type='secondary'>{mono}</Text>
+                          </div>
+                        ) : time
+                      },
                     },
                     { title: 'Level', width: 120, render: (_: unknown, g: LogGroup) => severityTag(g.rep.level) },
-                    { title: 'Service', width: 180, render: (_: unknown, g: LogGroup) => g.rep.service || g.rep.logger || '-' },
+                    { title: 'Service', width: 180, render: (_: unknown, g: LogGroup) => logOrigin(g.rep) },
                     { title: 'Source', width: 110, render: (_: unknown, g: LogGroup) => g.rep.source || '-' },
                     {
                       title: 'Message',
-                      render: (_: unknown, g: LogGroup) => (
-                        <div className='diagnostics-summary-cell'>
-                          {g.count > 1 ? <Tag className='diagnostics-trigger-tag' color={COLORS.accent}>×{g.count}</Tag> : null}
-                          <Text className='diagnostics-summary-text' style={{ color: COLORS.text }} ellipsis={{ tooltip: g.rep.message }}>{g.rep.message}</Text>
-                        </div>
-                      ),
+                      render: (_: unknown, g: LogGroup) => {
+                        const kind = kernelBlockLabel(g.rep)
+                        const lines = logLineCount(g.rep)
+                        const headline = logHeadline(g.rep)
+                        return (
+                          <div className='diagnostics-summary-cell'>
+                            {g.count > 1 ? <Tag className='diagnostics-trigger-tag' color={COLORS.accent}>×{g.count}</Tag> : null}
+                            {kind ? <Tag className='diagnostics-trigger-tag'>{kind}</Tag> : null}
+                            {lines > 1 ? <Tag className='diagnostics-trigger-tag'>{lines} lines</Tag> : null}
+                            <Text className='diagnostics-summary-text' style={{ color: COLORS.text }} ellipsis={{ tooltip: headline }}>{headline}</Text>
+                          </div>
+                        )
+                      },
                     },
                   ]}
                   expandable={{
@@ -3414,16 +3712,28 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                             <div className='diagnostics-log-excerpts'>
                               {g.items.slice(0, 50).map((r, i) => (
                                 <div className='diagnostics-log-excerpt' key={`${g.key}-${r.ts_epoch}-${i}`}>
-                                  <Text className='diagnostics-evidence-time' type='secondary'>{formatLogTs(r)}</Text>
-                                  <Text style={{ color: COLORS.text }}>{r.message}</Text>
+                                  <Text className='diagnostics-evidence-time' type='secondary'>
+                                    {formatLogTs(r)}{isKernelLog(r) && formatMonotonic(r) ? ` ${formatMonotonic(r)}` : ''}
+                                  </Text>
+                                  <Text style={{ color: COLORS.text }}>
+                                    {logLineCount(r) > 1 ? `${logHeadline(r)} (${logLineCount(r)} lines)` : r.message}
+                                  </Text>
                                 </div>
                               ))}
                               {g.items.length > 50 ? <Text type='secondary'>Showing the first 50 of {g.count} occurrences.</Text> : null}
                             </div>
                           </>
-                        ) : (
-                          <pre className='diagnostics-code-block'>{g.rep.message || ''}</pre>
-                        )}
+                        ) : null}
+                        {g.count === 1 || logLineCount(g.rep) > 1 ? (
+                          <>
+                            {isKernelLog(g.rep) ? (
+                              <Text type='secondary'>
+                                {g.count > 1 ? 'Latest occurrence · ' : ''}{kernelCaption(g.rep)}
+                              </Text>
+                            ) : null}
+                            <pre className='diagnostics-code-block diagnostics-log-block'>{g.rep.message || ''}</pre>
+                          </>
+                        ) : null}
                         {g.rep.app_id || g.rep.job_id ? (
                           <Text type='secondary'>app={g.rep.app_id || '-'} · job={g.rep.job_id || '-'}</Text>
                         ) : null}
@@ -3469,12 +3779,18 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                     <Text className='diagnostics-drawer-list-item'>{finding.validation_steps[0]}</Text>
                   </div>
                 ) : null}
-                <Button type='primary' size='small' icon={<SearchOutlined />} onClick={() => {
-                  investigateFinding(finding)
-                  setInsightsOpen(false)
-                }}>
-                  Investigate
-                </Button>
+                {(() => {
+                  const { related, contextEvent } = findingEvidence(finding)
+                  if (!related.length) return null
+                  return (
+                    <Button type='primary' size='small' icon={<SearchOutlined />} onClick={() => {
+                      investigateFinding(finding)
+                      setInsightsOpen(false)
+                    }}>
+                      {contextEvent ? 'Investigate' : 'Show related events'}
+                    </Button>
+                  )
+                })()}
               </section>
             ))}
           </Space>
@@ -3511,6 +3827,18 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
             <Button loading={reportLoading} onClick={() => void loadReport()}>Refresh</Button>
           </Space>
           {reportError ? <Alert type="error" showIcon message={reportError} /> : null}
+          {report?.coverage && (!report.coverage.complete || report.coverage.alerts_truncated) ? (
+            <Alert
+              type="warning"
+              showIcon
+              message={[
+                !report.coverage.complete
+                  ? `Diagnostics keeps ${report.coverage.retention_days} day${report.coverage.retention_days === 1 ? '' : 's'} of events: this report only covers ${formatActivityTime(dayjs.unix(report.coverage.retained_from).toISOString())} onwards.`
+                  : null,
+                report.coverage.alerts_truncated ? 'More alerts were open in this range than the report lists.' : null,
+              ].filter(Boolean).join(' ')}
+            />
+          ) : null}
           {reportLoading && !report ? <Empty description="Generating report" /> : null}
           {!report && !reportLoading && !reportError ? (
             <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Generating report for the selected range" />
@@ -3940,13 +4268,13 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
 
             <div className='diagnostics-investigation-section'>
               <div className='diagnostics-investigation-section-header'>
-                <Text className='diagnostics-investigation-heading' strong>Event history</Text>
-                <Text type='secondary'>{contextData.events.length}</Text>
+                <Text className='diagnostics-investigation-heading' strong>Other events</Text>
+                <Text type='secondary'>{contextOtherEvents.length}</Text>
               </div>
-              {contextData.events.length ? (
+              {contextOtherEvents.length ? (
                 <div className='diagnostics-evidence-timeline'>
-                  {contextData.events.map((ev) => (
-                    <div className='diagnostics-evidence-item diagnostics-evidence-item-interactive' key={ev.event_id} onClick={() => setSelectedEvent({ event: ev, resources: ev.resource_type ? [ev.resource_type] : [] })}>
+                  {contextOtherEvents.map((ev) => (
+                    <div className='diagnostics-evidence-item diagnostics-evidence-item-interactive' key={ev.event_id} onClick={() => setSelectedEvent(displayEvents([ev])[0])}>
                       <Space size={8} wrap>
                         <Text className='diagnostics-evidence-time' type='secondary'>{dayjs(ev.ts_utc).format('MM-DD HH:mm:ss')}</Text>
                         {severityTag(ev.severity)}
@@ -3957,7 +4285,7 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                   ))}
                 </div>
               ) : (
-                <Text type='secondary'>No event history in window</Text>
+                <Text type='secondary'>No other events in window</Text>
               )}
             </div>
 
@@ -4031,9 +4359,11 @@ export default function Diagnostics({ active, alertsRequest, currentAlerts, rang
                       <Space size={8} wrap>
                         <Text className='diagnostics-evidence-time' type='secondary'>{formatLogTs(r)}</Text>
                         {severityTag(r.level)}
-                        <Text type='secondary'>{r.service || r.logger || r.source}</Text>
+                        <Text type='secondary'>{isKernelLog(r) ? logOrigin(r) : r.service || r.logger || r.source}</Text>
+                        {kernelBlockLabel(r) ? <Tag className='diagnostics-trigger-tag'>{kernelBlockLabel(r)}</Tag> : null}
+                        {logLineCount(r) > 1 ? <Tag className='diagnostics-trigger-tag'>{logLineCount(r)} lines</Tag> : null}
                       </Space>
-                      <Text style={{ color: COLORS.text }}>{r.message}</Text>
+                      <Text style={{ color: COLORS.text }}>{logLineCount(r) > 1 ? logHeadline(r) : r.message}</Text>
                     </div>
                   ))}
                   {contextData.logs.truncated || contextData.logs.records.length > 5 ? (

@@ -79,7 +79,12 @@ import type {
   ConfigRestoreResult,
   PressureGroup,
   PressureTuningResult,
+  DiagAlert,
+  DiagAlertPoliciesData,
+  DiagAlertOccurrencesData,
   DiagAlertsData,
+  DiagSourceHealth,
+  DiagSourcesData,
   DiagControlLifecycleQuery,
   DiagControlLifecyclesData,
   DiagLogQuery,
@@ -301,11 +306,32 @@ export const api = {
     const data = await get<DiagEventsData>(`/diag/events?event_id=${encodeURIComponent(eventId)}&limit=1`)
     return data.events?.[0] ?? null
   },
+  // Which event types create alerts and how each closes: the server's policies,
+  // never a copy kept here.
+  getDiagAlertPolicies: () => get<DiagAlertPoliciesData>('/diag/alert-policies'),
+  // Each detection behind one alert, newest first, within its span.
+  getDiagAlertOccurrences: (alert: Pick<DiagAlert, 'event_type' | 'scope' | 'first_fired_at' | 'resolved_at'>) => {
+    const q = new URLSearchParams({ event_type: alert.event_type, scope: alert.scope || '' })
+    const from = Math.floor(new Date(alert.first_fired_at).getTime() / 1000)
+    const to = alert.resolved_at ? Math.ceil(new Date(alert.resolved_at).getTime() / 1000) : Math.ceil(Date.now() / 1000)
+    if (Number.isFinite(from)) q.set('from', String(from))
+    if (Number.isFinite(to)) q.set('to', String(to))
+    return get<DiagAlertOccurrencesData>(`/diag/alert-occurrences?${q.toString()}`)
+  },
   getDiagAlerts: (active = true, limit = 100, notifyable = false, range?: { from: number; to: number }) =>
     get<DiagAlertsData>(`/diag/alerts?active=${active ? 'true' : 'false'}&limit=${limit}&notifyable=${notifyable ? 'true' : 'false'}${range ? `&from=${range.from}&to=${range.to}` : ''}`),
-  acknowledgeDiagAlert: (dedupKey: string) =>
+  // Both send the last_event_id of the alert as shown: if it was detected again
+  // since, the server refuses (409) rather than close faults nobody has seen.
+  acknowledgeDiagAlert: (alert: Pick<DiagAlert, 'dedup_key' | 'last_event_id'>) =>
     // ``closed`` is true for one-off faults, which acknowledging also closes.
-    post<{ acknowledged: boolean; closed: boolean }>(`/diag/alerts/${encodeURIComponent(dedupKey)}/acknowledge`),
+    post<{ acknowledged: boolean; closed: boolean }>(
+      `/diag/alerts/${encodeURIComponent(alert.dedup_key)}/acknowledge`, { last_event_id: alert.last_event_id }),
+  getDiagSources: () => get<DiagSourcesData>('/diag/sources'),
+  // Close any open alert by hand, e.g. one whose recovery can no longer be
+  // recorded (the condition ended while the service was down).
+  closeDiagAlert: (alert: Pick<DiagAlert, 'dedup_key' | 'last_event_id'>) =>
+    post<{ closed: boolean }>(
+      `/diag/alerts/${encodeURIComponent(alert.dedup_key)}/close`, { last_event_id: alert.last_event_id }),
   silenceDiagAlert: (dedupKey: string, minutes: 30 | 120) =>
     post<{ silenced_until: string }>(`/diag/alerts/${encodeURIComponent(dedupKey)}/silence`, { minutes }),
   getDiagLogs: (params: DiagLogQuery = {}) => {

@@ -4,6 +4,19 @@
 import { useEffect, useRef } from 'react'
 import { subscribe } from '../events/sseHub'
 
+/** The alert a 'diag_alert' notification announces (GET /diag/alerts has the rest). */
+export interface DiagAlertPush {
+  dedup_key: string
+  event_type: string
+  label: string
+  severity: string
+  summary: string | null
+  scope: string | null
+  fire_count: number
+  last_event_id: string | null
+  last_fired_at: string | null
+}
+
 export interface AppStatusEvent {
   app_id: string
   app_name: string
@@ -15,6 +28,8 @@ export interface AppStatusEvent {
   disk_level?: string
   /** 'auto_limit_changed' only: which staged-restore step fired, for debugging. */
   detail?: string
+  /** 'diag_alert' only: an alert that should notify. */
+  alert?: DiagAlertPush
 }
 
 type EventCallback = (event: AppStatusEvent) => void

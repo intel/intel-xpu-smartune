@@ -451,10 +451,48 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
       message.success(typeof success === 'function' ? success(result) : success)
     } catch (error) {
       message.error(error instanceof Error ? error.message : 'Unable to update alert')
+      // The alert may have been detected again (the server refuses then):
+      // show its current state before the user tries again.
+      loadAlerts()
     } finally {
       setAlertCenterActionKey(null)
     }
   }, [loadAlerts])
+
+  // The server pushes an alert when it should notify (a new occurrence, or one
+  // firing again past its cooldown, and not silenced): show it on whatever tab
+  // is open and refresh the alert center now instead of on the next poll.
+  useAppEvents(
+    useCallback(
+      (event) => {
+        if (event.purpose !== 'notify' || event.status !== 'diag_alert' || !event.alert) return
+        const alert = event.alert
+        loadAlerts()
+        const key = `diag-alert-${alert.dedup_key}`
+        const critical = alert.severity === 'critical'
+        notify[critical || alert.severity === 'error' ? 'error' : 'warning']({
+          key,
+          message: `${alert.severity.toUpperCase()} alert: ${alert.label || alert.event_type}`,
+          description: alert.summary || event.message,
+          duration: critical ? 0 : 10, // a critical fault waits for them
+          btn: (
+            <Button
+              type="primary"
+              size="small"
+              onClick={() => {
+                openInDiagnostics({ kind: 'current' })
+                notify.destroy(key)
+              }}
+            >
+              Open Alerts
+            </Button>
+          ),
+        })
+      },
+      [loadAlerts, notify, openInDiagnostics],
+    ),
+    live && diagnosticsEnabled,
+  )
 
   const formatAlertTime = useCallback((value: string) => {
     const date = new Date(value)
@@ -519,7 +557,7 @@ export default function App({ colorMode, onColorModeChange }: AppProps) {
                   color="default"
                   variant="filled"
                   loading={alertCenterActionKey === alert.dedup_key}
-                  onClick={() => void runAlertCenterAction(alert, () => api.acknowledgeDiagAlert(alert.dedup_key), (result) => (result.closed ? 'Alert acknowledged and closed' : 'Alert acknowledged'))}
+                  onClick={() => void runAlertCenterAction(alert, () => api.acknowledgeDiagAlert(alert), (result) => (result.closed ? 'Alert acknowledged and closed' : 'Alert acknowledged'))}
                 >
                   Acknowledge
                 </Button>

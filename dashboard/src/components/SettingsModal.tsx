@@ -11,6 +11,7 @@ import {
   Card,
   Form,
   Input,
+  InputNumber,
   Switch,
   Select,
   Row,
@@ -43,6 +44,7 @@ import {
   CloudDownloadOutlined,
 } from '@ant-design/icons'
 import { api } from '../api/client'
+import { loadAlertPolicies } from '../utils/alertPolicy'
 import type {
   MonitoredSectionsData,
   SaveResult,
@@ -79,7 +81,15 @@ interface DiagnosticRule {
   domain: 'compute' | 'data-path' | 'services' | 'hardware' | 'platform' | 'other'
   event_kind: 'pressure' | 'control' | 'hardware-fault' | 'lifecycle' | 'availability' | 'configuration' | 'observability' | 'status'
   fatal_signatures?: ('oom' | 'kernel-panic' | 'gpu-hang')[]
+  alert_mode?: 'off' | 'until_ack' | 'until_quiet'
+  alert_quiet_minutes?: number
 }
+
+const DIAGNOSTIC_ALERT_MODE_OPTIONS = [
+  { value: 'off', label: 'No alert' },
+  { value: 'until_ack', label: 'Alert until acknowledged' },
+  { value: 'until_quiet', label: 'Alert until quiet' },
+]
 
 const DIAGNOSTIC_DOMAIN_OPTIONS = [
   { value: 'compute', label: 'Compute devices' },
@@ -682,14 +692,26 @@ function DiagnosticsEventsPanel() {
             <Row gutter={[16, 12]}>
               {domain.events.map((event) => (
                 <Col key={event.event_type} xs={24} md={12}>
-                  <Form.Item name={event.event_type} valuePropName="checked" style={{ marginBottom: 0 }}>
-                    <Checkbox disabled={!event.configurable}>
+                  {event.configurable ? (
+                    <Form.Item name={event.event_type} valuePropName="checked" style={{ marginBottom: 0 }}>
+                      <Checkbox>
+                        <Space direction="vertical" size={0}>
+                          <Text>{event.label}</Text>
+                          <Text type="secondary" style={{ fontSize: 12 }}>{event.description}</Text>
+                        </Space>
+                      </Checkbox>
+                    </Form.Item>
+                  ) : (
+                    // Required events are always recorded. They are not part of
+                    // the saved settings (the server has none for them), so they
+                    // are shown checked here rather than bound to the form.
+                    <Checkbox checked disabled>
                       <Space direction="vertical" size={0}>
-                        <Text>{event.label}{!event.configurable ? ' (required)' : ''}</Text>
+                        <Text>{event.label} (required)</Text>
                         <Text type="secondary" style={{ fontSize: 12 }}>{event.description}</Text>
                       </Space>
                     </Checkbox>
-                  </Form.Item>
+                  )}
                 </Col>
               ))}
             </Row>
@@ -713,6 +735,8 @@ function newDiagnosticRule(): DiagnosticRule {
     domain: 'services',
     event_kind: 'status',
     fatal_signatures: [],
+    alert_mode: 'off',
+    alert_quiet_minutes: 10,
   }
 }
 
@@ -731,19 +755,34 @@ function DiagnosticRulesPanel() {
   return (
     <FormCard
       title="Custom diagnostic rules"
-      description="Create rules for supported log sources. A match creates a diagnostic event; Alerts and Advice use separate built-in policies."
+      description="Create rules for supported log sources. A match creates a diagnostic event and, when the rule's alert is on, raises an alert. Errors without a rule are still tracked: an unusual burst raises an alert, and a never-seen error is recorded as an event."
       scope="diagnostic_rules"
       load={async () => {
         const config = await api.getConfig<DiagnosticRulesConfig>('diagnostic_rules')
         return { values: { rules: config.rules ?? [] }, updatedAt: config.updated_at }
       }}
-      save={(values, updatedAt) => api.updateConfig('diagnostic_rules', values, updatedAt)}
+      save={async (values, updatedAt) => {
+        const result = await api.updateConfig('diagnostic_rules', {
+          // A quiet period cleared while the field was shown, then hidden by
+          // switching the alert mode, must not be sent as null.
+          rules: ((values.rules as DiagnosticRule[] | undefined) ?? []).map((rule) => ({
+            ...rule,
+            message_pattern: (rule.message_pattern ?? '').trim(),
+            alert_quiet_minutes: rule.alert_quiet_minutes ?? 10,
+          })),
+        }, updatedAt)
+        // A rule's alert setting is part of the alert policy shown elsewhere.
+        void loadAlertPolicies(true)
+        return result
+      }}
       currentToValues={(current) => ({
         rules: ((current.rules as DiagnosticRule[] | undefined) ?? []).map((rule) => ({
           ...rule,
           domain: rule.domain || 'services',
           event_kind: rule.event_kind || 'status',
           fatal_signatures: rule.fatal_signatures || [],
+          alert_mode: rule.alert_mode || 'off',
+          alert_quiet_minutes: rule.alert_quiet_minutes ?? 10,
         })),
       })}
     >
@@ -802,7 +841,15 @@ function DiagnosticRulesPanel() {
                     </Form.Item>
                   </Col>
                   <Col xs={24} md={12}>
-                    <Form.Item label={<DiagnosticRuleLabel label="Message contains" tooltip="A required case-insensitive phrase. A matching log message creates a diagnostic event using the settings below." />} name={[field.name, 'message_pattern']} rules={[{ required: true, max: 256 }]}>
+                    <Form.Item label={<DiagnosticRuleLabel label="Message contains" tooltip="A required case-insensitive phrase. A matching log message creates a diagnostic event using the settings below." />} name={[field.name, 'message_pattern']} rules={[{
+                      validator(_, value) {
+                        const length = typeof value === 'string' ? value.trim().length : 0
+                        // A one- or two-character phrase matches nearly every line.
+                        if (length < 3) return Promise.reject(new Error('Enter at least 3 characters (spaces at the ends do not count).'))
+                        if (length > 256) return Promise.reject(new Error('Use at most 256 characters.'))
+                        return Promise.resolve()
+                      },
+                    }]}>
                       <Input maxLength={256} placeholder="connection refused to redis" />
                     </Form.Item>
                   </Col>
@@ -826,6 +873,36 @@ function DiagnosticRulesPanel() {
                       <Select mode="multiple" options={DIAGNOSTIC_FATAL_SIGNATURE_OPTIONS} />
                     </Form.Item>
                   </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      label={<DiagnosticRuleLabel label="Alert" tooltip="Whether a match also raises an alert, with the rule's severity (warning or higher). Until acknowledged: for one-off faults; acknowledging closes it. Until quiet: closes by itself once the rule has not matched for the quiet period. Repeated matches fold into one open alert." />}
+                      name={[field.name, 'alert_mode']}
+                      dependencies={[[field.name, 'severity']]}
+                      rules={[({ getFieldValue }) => ({
+                        validator(_, value) {
+                          if (value && value !== 'off' && getFieldValue(['rules', field.name, 'severity']) === 'info') {
+                            return Promise.reject(new Error('Use warning or higher severity to raise an alert.'))
+                          }
+                          return Promise.resolve()
+                        },
+                      })]}
+                    >
+                      <Select options={DIAGNOSTIC_ALERT_MODE_OPTIONS} />
+                    </Form.Item>
+                  </Col>
+                  <Form.Item noStyle shouldUpdate={(prev, next) => prev.rules?.[field.name]?.alert_mode !== next.rules?.[field.name]?.alert_mode}>
+                    {({ getFieldValue }) => getFieldValue(['rules', field.name, 'alert_mode']) === 'until_quiet' ? (
+                      <Col xs={24} md={8}>
+                        <Form.Item
+                          label={<DiagnosticRuleLabel label="Quiet period (minutes)" tooltip="The alert closes after the rule has not matched for this long." />}
+                          name={[field.name, 'alert_quiet_minutes']}
+                          rules={[{ required: true, type: 'integer', min: 1, max: 1440 }]}
+                        >
+                          <InputNumber min={1} max={1440} precision={0} style={{ width: '100%' }} />
+                        </Form.Item>
+                      </Col>
+                    ) : null}
+                  </Form.Item>
                 </Row>
               </div>
             ))}

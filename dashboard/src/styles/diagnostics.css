@@ -1931,6 +1931,28 @@
   overflow-wrap: anywhere;
 }
 
+.diagnostics-log-time {
+  display: grid;
+  line-height: 1.3;
+}
+
+.diagnostics-log-monotonic {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A merged kernel report keeps its indentation (trace frames, register dumps)
+   and stays scrollable instead of wrapping hex dumps into noise. */
+.diagnostics-log-block {
+  max-height: 420px;
+  overflow: auto;
+  overflow-wrap: normal;
+  white-space: pre;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
 .diagnostics-log-truncation {
   display: block;
   margin-top: 8px;

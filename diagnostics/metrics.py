@@ -5,28 +5,41 @@
 # providers use wall-clock timestamps so diagnostics can align their series.
 
 import json
-from pathlib import Path
 
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
+def _window_rows(start_time, end_time, limit):
+    """Dynamic snapshots spanning the whole window, evenly downsampled to at most ``limit``.
+
+    Returns ``(rows, step_seconds)``; a step of 0 means every stored sample.
+    """
+    from db.DatabaseModel import MonitorSnapshot
+
+    if start_time is None or end_time is None:
+        rows = MonitorSnapshot.query_recent(
+            snapshot_type="dynamic",
+            start_time=int(start_time) if start_time is not None else None,
+            end_time=int(end_time) if end_time is not None else None,
+            limit=limit,
+        )
+        return rows, 0
+    return MonitorSnapshot.query_sampled("dynamic", int(start_time), int(end_time),
+                                         max_points=limit)
+
+
 def read_monitor(start_time, end_time, limit=2000):
     """System metric series from MonitorSnapshot within [start_time, end_time]
-    (epoch seconds). Reuses the existing indexed range query."""
+    (epoch seconds), evenly downsampled to at most ``limit`` samples.
+    ``step_seconds`` is the sampling bucket (0 = every stored sample)."""
     try:
-        from db.DatabaseModel import MonitorSnapshot
+        rows, step = _window_rows(start_time, end_time, limit)
     except Exception as exc:
         logger.warning("metrics monitor provider unavailable: %s", exc)
-        return {"series": [], "count": 0}
+        return {"series": [], "count": 0, "step_seconds": 0}
 
-    rows = MonitorSnapshot.query_recent(
-        snapshot_type="dynamic",
-        start_time=int(start_time) if start_time is not None else None,
-        end_time=int(end_time) if end_time is not None else None,
-        limit=limit,
-    )
     series = []
     for r in rows:
         try:
@@ -40,7 +53,7 @@ def read_monitor(start_time, end_time, limit=2000):
         })
     # Oldest-first for charting.
     series.sort(key=lambda s: s["ts_epoch"])
-    return {"series": series, "count": len(series)}
+    return {"series": series, "count": len(series), "step_seconds": step}
 
 
 def _resource_utilization_values(data):
@@ -113,20 +126,15 @@ def _pressure_levels(data):
     }
 
 
-def read_resource_utilization(start_time, end_time, limit=2000, max_points=120):
-    """Return resource averages, peaks, and a compact trend for diagnostics."""
+def read_resource_utilization(start_time, end_time, limit=4000, max_points=120):
+    """Return resource averages, peaks, and a compact trend for diagnostics.
+
+    Samples span the whole window, evenly downsampled (see ``_window_rows``)."""
     try:
-        from db.DatabaseModel import MonitorSnapshot
+        rows, _step = _window_rows(start_time, end_time, limit)
     except Exception as exc:
         logger.warning("metrics monitor provider unavailable: %s", exc)
         return {"resources": [], "trend": [], "count": 0}
-
-    rows = MonitorSnapshot.query_recent(
-        snapshot_type="dynamic",
-        start_time=int(start_time) if start_time is not None else None,
-        end_time=int(end_time) if end_time is not None else None,
-        limit=limit,
-    )
     values = {}
     buckets = {}
     range_start = int(start_time or 0)
@@ -324,7 +332,8 @@ def environment_snapshot(at_epoch):
         return None
     try:
         # Fetch the most recent "dynamic" snapshot within 30s before completion.
-        monitor_data = read_monitor(start_time=at_epoch - 30, end_time=at_epoch, limit=1)
+        # (limit=1 samples one bucket spanning the window: its newest row.)
+        monitor_data = read_monitor(start_time=int(at_epoch) - 30, end_time=int(at_epoch), limit=1)
         if not monitor_data.get("series"):
             return None
         latest = monitor_data["series"][-1]  # read_monitor returns oldest-first

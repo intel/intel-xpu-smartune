@@ -3,8 +3,13 @@
 
 """On-demand, read-only diagnostics digests."""
 
+import time as _time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, timezone
+
+# Alert rows a digest lists; ``coverage.alerts_truncated`` says when there were more.
+_ALERT_LIMIT = 100
+_DIGEST_CATEGORY = "diagnostic.digest"
 
 
 @dataclass
@@ -18,6 +23,8 @@ class Digest:
     benchmark_regressions: list
     active_alerts: list
     comparison: dict = None
+    # Retention window; ``complete`` is false when the range reaches back further.
+    coverage: dict = None
 
 
 def _as_date(value):
@@ -65,9 +72,13 @@ class DigestGenerator:
 
     def generate_weekly(self, end_date):
         start_time, end_time = _weekly_window(end_date)
-        previous = self._summary_for_window(_previous_week_start(end_date), start_time)
-        return self._generate("week", start_time=start_time, end_time=end_time,
-                              comparison={"previous_period": previous})
+        previous_start = _previous_week_start(end_date)
+        if previous_start < _retained_from():
+            # Outside retention: all-zero counts would read as a problem-free week.
+            comparison = {"previous_period": None, "unavailable_reason": "outside_retention"}
+        else:
+            comparison = {"previous_period": self._summary_for_window(previous_start, start_time)}
+        return self._generate("week", start_time=start_time, end_time=end_time, comparison=comparison)
 
     def generate_range(self, start_time, end_time):
         try:
@@ -84,61 +95,54 @@ class DigestGenerator:
         return self._generate("boot", boot_id=boot_id)
 
     def _generate(self, kind, *, start_time=None, end_time=None, boot_id=None, comparison=None):
-        from diagnostics import config_revision, event_store
+        from db.DatabaseModel import OperationalEvent
+        from diagnostics import config_revision, event_store, retention
 
-        filters = {"limit": 5000}
-        if start_time is not None:
-            filters["start_time"] = start_time
-            filters["end_time"] = end_time - 1
-        if boot_id:
-            filters["boot_id"] = boot_id
-        events = self._business_events(event_store.query_events(**filters))
-        if kind == "boot" and events:
-            timestamps = [self._event_epoch(event) for event in events]
-            timestamps = [timestamp for timestamp in timestamps if timestamp is not None]
-            start_time = min(timestamps) if timestamps else None
-            end_time = max(timestamps) + 1 if timestamps else None
-        revisions = (config_revision.query_revisions_range(start_time, end_time - 1)
-                     if start_time is not None and end_time is not None else [])
+        counts, first, last = OperationalEvent.severity_counts(
+            start_time=start_time, end_time=end_time - 1 if end_time is not None else None,
+            boot_id=boot_id, exclude_category=_DIGEST_CATEGORY)
+        if kind == "boot":
+            # A boot spans its events; with none there is no range, so no range alerts.
+            start_time, end_time = (first, last + 1) if first is not None else (None, None)
+        bounded = start_time is not None and end_time is not None
+        revisions = config_revision.query_revisions_range(start_time, end_time - 1) if bounded else []
         config_changes = [revision for revision in revisions if revision.get("change_summary")]
-        active_alerts = event_store.query_alerts(active_only=True, limit=100)
+        active_alerts = event_store.query_alerts(active_only=True, limit=_ALERT_LIMIT)
         # Every occurrence active at some point in the range, matching the
         # dashboard's alert history view.
         range_alerts = event_store.query_alerts(
-            active_only=False, limit=100,
-            start_time=start_time, end_time=end_time - 1 if end_time is not None else None,
-        )
+            active_only=False, limit=_ALERT_LIMIT + 1,
+            start_time=start_time, end_time=end_time - 1,
+        ) if bounded else []
+        alerts_truncated = len(range_alerts) > _ALERT_LIMIT
+        range_alerts = range_alerts[:_ALERT_LIMIT]
+        retained_from = _retained_from()
         digest = Digest(
             period={"kind": kind, "from": start_time, "to": end_time, "boot_id": boot_id},
             generated_at=datetime.now(timezone.utc).isoformat(),
-            event_stats=self._event_stats(events),
+            event_stats=self._event_stats(counts),
             alert_summary=self._top_alerts(range_alerts),
             range_alerts=range_alerts,
             config_changes=config_changes,
             benchmark_regressions=[],
             active_alerts=active_alerts,
             comparison=comparison,
+            coverage={
+                "retention_days": retention.configured_days(),
+                "retained_from": retained_from,
+                "complete": start_time is None or start_time >= retained_from,
+                "alerts_truncated": alerts_truncated,
+            },
         )
         return asdict(digest)
 
     @staticmethod
-    def _business_events(events):
-        return [event for event in events if event.get("category") != "diagnostic.digest"]
-
-    @staticmethod
-    def _event_epoch(event):
-        try:
-            return int(datetime.fromisoformat(event.get("ts_utc") or "").timestamp())
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _event_stats(events):
-        severity_counts = {severity: 0 for severity in ("info", "warning", "error", "critical")}
-        for event in events:
-            severity = (event.get("severity") or "info").lower()
-            severity_counts[severity] = severity_counts.get(severity, 0) + 1
-        return {"total": len(events), "by_severity": severity_counts}
+    def _event_stats(counts):
+        by_severity = {severity: 0 for severity in ("info", "warning", "error", "critical")}
+        for severity, count in counts.items():
+            key = (severity or "info").lower()
+            by_severity[key] = by_severity.get(key, 0) + count
+        return {"total": sum(by_severity.values()), "by_severity": by_severity}
 
     @staticmethod
     def _top_alerts(active_alerts):
@@ -149,8 +153,15 @@ class DigestGenerator:
         )[:3]
 
     def _summary_for_window(self, start_time, end_time):
-        from diagnostics import event_store
+        from db.DatabaseModel import OperationalEvent
 
-        events = event_store.query_events(
-            start_time=start_time, end_time=end_time - 1, limit=5000)
-        return self._event_stats(self._business_events(events))
+        counts, _, _ = OperationalEvent.severity_counts(
+            start_time=start_time, end_time=end_time - 1, exclude_category=_DIGEST_CATEGORY)
+        return self._event_stats(counts)
+
+
+def _retained_from():
+    """Epoch of the oldest event the ledger still keeps."""
+    from diagnostics import retention
+
+    return int(_time.time()) - retention.configured_days() * 86400

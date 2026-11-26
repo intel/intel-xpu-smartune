@@ -10,6 +10,8 @@
 # Guarded/optional: the benchmark toolchain is not in every deployment, so all
 # imports are lazy and available() reports False when it is absent.
 
+import collections
+import dataclasses
 import os
 
 from diagnostics.sources.base import LogQueryFilter, LogRecord, LogSource
@@ -78,10 +80,16 @@ class BenchmarkLogSource(LogSource):
         # log into a generic query would drown the smartune stream.
         if not flt.job_id and not flt.allow_unscoped:
             return []
+        # Every line carries the file mtime, so a job-scoped query drops the time window.
+        line_filter = (dataclasses.replace(flt, start_time=None, end_time=None)
+                       if flt.job_id else flt)
         records = []
         for path in self._log_files(job_id=flt.job_id):
-            if len(records) >= flt.limit:
+            room = flt.limit - len(records)
+            if room <= 0:
                 break
+            # Keep a long log's last lines: they hold the run's outcome.
+            tail = collections.deque(maxlen=room)
             try:
                 mtime = os.path.getmtime(path)
                 run_name = os.path.basename(path)
@@ -100,12 +108,9 @@ class BenchmarkLogSource(LogSource):
                             job_id=flt.job_id,
                             fields={"run_log": run_name, "line": idx},
                         )
-                        # Time, level, keyword (and boot) filters still apply
-                        # after job scoping -- reuse the shared filter contract so
-                        # /diag/logs?from=...&to=... is honored, not just level.
-                        if not flt.accepts(rec):
-                            continue
-                        records.append(rec)
+                        if line_filter.accepts(rec):
+                            tail.append(rec)
             except OSError as exc:
                 logger.debug("benchmark source skip %s: %s", path, exc)
-        return records[:flt.limit]
+            records.extend(tail)
+        return records

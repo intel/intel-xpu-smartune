@@ -50,8 +50,8 @@ class LogQueryFilter:
     """Normalized query passed to every source. A source ignores filters it does
     not support (e.g. the benchmark source keys off job_id)."""
 
-    start_time: Optional[int] = None      # epoch seconds, inclusive
-    end_time: Optional[int] = None        # epoch seconds, inclusive
+    start_time: Optional[float] = None    # epoch seconds, inclusive
+    end_time: Optional[float] = None      # epoch seconds, inclusive
     min_level: Optional[str] = None       # keep records with level >= this
     job_id: Optional[str] = None
     boot_id: Optional[str] = None         # journald boot session; ignored by sources without a boot concept
@@ -75,7 +75,8 @@ class LogQueryFilter:
             return False
         if self.min_level and level_rank(rec.level) < level_rank(self.min_level):
             return False
-        if self.job_id and rec.job_id != self.job_id:
+        # The journal has no job ids: its lines are scoped by the job's time range instead.
+        if self.job_id and rec.source != "journal" and rec.job_id != self.job_id:
             return False
         if self.boot_id:
             # Lenient by design: only records that carry a boot_id are scoped by
@@ -90,26 +91,31 @@ class LogQueryFilter:
         return True
 
 
+class LogSourceError(Exception):
+    """The source could not be read, as opposed to having no matching records."""
+
+
+class SourceRecords(list):
+    """Records a source returns; ``truncated`` when it knows it left matching records out."""
+
+    def __init__(self, records=(), truncated=False):
+        super().__init__(records)
+        self.truncated = truncated
+
+
 class LogSource:
     """Interface every source implements. Subclasses override ``name`` and the
     methods they can serve; unsupported capabilities return empty results."""
 
     name = "base"
 
-    def describe(self) -> dict:
-        """Static self-description for the UI/source picker."""
-        return {"name": self.name, "available": self.available()}
-
     def available(self) -> bool:
         return True
 
     def query(self, flt: "LogQueryFilter"):
-        """Return a list[LogRecord] matching ``flt``. Best-effort, never raises."""
+        """Return a list[LogRecord] matching ``flt`` (or SourceRecords). Raises
+        LogSourceError only when the source could not be read at all."""
         raise NotImplementedError
-
-    def tail(self, flt: "LogQueryFilter"):
-        """Optional: most-recent records for a follow view. Defaults to query()."""
-        return self.query(flt)
 
     def list_boots(self, limit=15):
         """Optional: enumerate boot sessions this source can scope by.

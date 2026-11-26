@@ -19,10 +19,16 @@ try:
     # best-effort, so the only thing to guard is the import itself (a minimal
     # deployment may strip the diagnostics package). Fall back to a no-op so
     # control flow is unchanged.
-    from diagnostics import record_control_action
-except Exception:  # pragma: no cover - diagnostics absent
+    from diagnostics import record_control_action, record_control_change
+except ModuleNotFoundError as exc:  # pragma: no cover - diagnostics absent
+    # Only a missing diagnostics package gets the no-op; other import errors must surface.
+    if exc.name != "diagnostics":
+        raise
+
     def record_control_action(*_a, **_k):
         return None
+
+    record_control_change = record_control_action
 from utils import app_utils, quiet_mode, self_guard
 from config.config import b_config
 import threading
@@ -123,15 +129,56 @@ _SWAP_GROWTH_URGENT_INTERVAL = 10.0
 _RECLAIM_DISK_QUIET_SEC = 20.0
 
 
+def _emit_control_change(family: str, action: str, *, app_id, app_name, trigger: str,
+                         cgroups=None, pids=None, **facts) -> None:
+    """Record a non-limit control change (see ``event_catalog.CONTROL_ACTION_EVENTS``).  Never raises."""
+    try:
+        record_control_change(family, action, app_id=app_id, app_name=app_name,
+                              cgroups=cgroups, pids=list(pids or []), trigger=trigger,
+                              facts=facts)
+    except Exception as exc:  # pragma: no cover - diagnostics is not load-bearing
+        logger.warning("Failed to record %s %s for %s: %s", family, action, app_id, exc)
+
+
+def _emit_freeze_event(action: str, entry: "LimitedApp", trigger: str,
+                       cgroups: Optional[list] = None, **facts) -> None:
+    """A freeze-state change of a limited app, linked to its limit's protection id."""
+    _emit_control_change(
+        "freeze", action, app_id=entry.public_app_id, app_name=entry.app_name,
+        trigger=trigger, cgroups=cgroups if cgroups is not None else list(entry.cgroups),
+        pids=entry.pids, limit_protection_id=entry.protection_id or None,
+        priority=entry.priority, control_mode=entry.source, **facts)
+
+
+def _emit_affinity_event(action: str, *, app_id: str, app_name: str, dirs: list,
+                         trigger: str = "user", **facts) -> None:
+    """A CPU-affinity change; *dirs* (absolute cgroup paths) are recorded by basename, as limit events do."""
+    _emit_control_change(
+        "affinity", action, app_id=app_id, app_name=app_name, trigger=trigger,
+        cgroups=[os.path.basename(str(d).rstrip("/")) for d in dirs or []], **facts)
+
+
+def _emit_freq_event(action: str, units: list, *, trigger: str = "user", **facts) -> None:
+    """A device frequency change.  Per device, so the event names no app."""
+    _emit_control_change("freq", action, app_id=None, app_name=None, trigger=trigger,
+                         units=", ".join(units), **facts)
+
+
 def _emit_reclaim_event(event_type: str, severity: str, summary: str,
                         entry: "LimitedApp", attributes: dict) -> None:
-    """Report one L2 outcome to diagnostics.  Best-effort, never raises."""
+    """Report one L2 outcome to diagnostics, written off the reclaim path.  Best-effort, never raises."""
     try:
-        from diagnostics import emit_event
-    except Exception:  # pragma: no cover - diagnostics absent
+        from diagnostics import post_event
+    except ModuleNotFoundError as exc:  # pragma: no cover - diagnostics absent
+        if exc.name != "diagnostics":
+            logger.error("Diagnostics import failed; %s not recorded: %s", event_type, exc)
+        return
+    except Exception as exc:  # pragma: no cover - broken diagnostics package
+        # Never raise into the reclaim path, but never drop the event silently.
+        logger.error("Diagnostics import failed; %s not recorded: %s", event_type, exc)
         return
     try:
-        emit_event(event_type, severity=severity, category="resource.memory",
+        post_event(event_type, severity=severity, category="resource.memory",
                    summary=summary, source="balancer",
                    app_id=entry.public_app_id, resource_type="memory",
                    protection_id=entry.protection_id,
@@ -1017,7 +1064,9 @@ class DynamicBalancer:
         # A previous run may have died while an app was frozen; nothing in the
         # (process-lifetime) registry knows about it, so thaw what we recorded.
         try:
-            self.control_manager.thaw_leftover_frozen()
+            for cgroup in self.control_manager.thaw_leftover_frozen():
+                _emit_control_change("freeze", "THAWED", app_id=None, app_name=None,
+                                     cgroups=[cgroup], trigger="startup_recovery")
         except Exception:
             logger.error("Failed to thaw leftover frozen cgroups", exc_info=True)
 
@@ -3027,8 +3076,18 @@ class DynamicBalancer:
                         restore_success = False
                         failed_parts['io_limited'] = True
 
-            if entry.frozen and not self._thaw_cgroups(cgroups):
-                restore_success = False
+            if entry.frozen:
+                thawed = self._thaw_cgroups(cgroups)
+                if not notify:
+                    trigger = "shutdown"
+                elif notify_status == "app_closed_limit_restored":
+                    trigger = "app_closed"
+                else:
+                    trigger = "restore"
+                _emit_freeze_event("THAWED" if thawed else "THAW_FAILED", entry, trigger,
+                                   cgroups=cgroups)
+                if not thawed:
+                    restore_success = False
 
             if gone == len(cgroups):
                 logger.info(f"All cgroups for {source} limited app {key} already gone; limit already cleared")
@@ -3330,15 +3389,22 @@ class DynamicBalancer:
         dirs = self._tracked_affinity_dirs(app_id)
         if not dirs:
             return True, "not bound"
-        restored, failures = [], []
+        restored, failures, failed_dirs = [], [], []
         with self._affinity_op_lock:
             for d in dirs:
                 ok, msg = self.control_manager.cpu.restore(d)
                 (restored if ok else failures).append(d if ok else msg)
+                if not ok:
+                    failed_dirs.append(d)
         self._forget_affinity(app_id, restored)
         if restored:
+            _emit_affinity_event("RESTORED", app_id=app_id, app_name=app_name,
+                                 dirs=restored, trigger="unregister")
             self._notify_ui_refresh(app_id, app_name, 'cpu_affinity_changed')
         if failures:
+            _emit_affinity_event("RESTORE_FAILED", app_id=app_id, app_name=app_name,
+                                 dirs=failed_dirs, trigger="unregister",
+                                 error="; ".join(failures))
             return False, "; ".join(failures)
         logger.info(f"Released CPU affinity of {app_id} ({len(restored)} cgroup(s))")
         return True, "Affinity restored"
@@ -3381,11 +3447,23 @@ class DynamicBalancer:
                     continue
                 self._affinity_apps.pop(app_id, None)
             logger.info(f"Affinity reaper: app '{tracked['app_name']}' ({app_id}) closed; unpinning cores")
+            restored, failed = [], []
             with self._affinity_op_lock:
                 for d in tracked["dirs"]:
                     ok, msg = self.control_manager.cpu.restore(d)
-                    if not ok:
+                    if ok:
+                        restored.append(d)
+                    else:
+                        failed.append((d, msg))
                         logger.error(f"Affinity reaper: restore failed for {d}: {msg}")
+            if restored:
+                _emit_affinity_event("RESTORED", app_id=app_id, app_name=tracked["app_name"],
+                                     dirs=restored, trigger="app_closed")
+            if failed:
+                _emit_affinity_event("RESTORE_FAILED", app_id=app_id,
+                                     app_name=tracked["app_name"],
+                                     dirs=[d for d, _ in failed], trigger="app_closed",
+                                     error="; ".join(msg for _, msg in failed))
             self._notify_ui_refresh(app_id, tracked["app_name"], 'cpu_affinity_changed')
 
     def _notify_long_frozen(self) -> None:
@@ -3403,9 +3481,13 @@ class DynamicBalancer:
             for entry in self.all_limits.apps.values():
                 if entry.frozen and not entry.freeze_notified and now - entry.frozen_at >= after:
                     entry.freeze_notified = True
-                    due.append((entry.public_app_id, entry.app_name))
-        for app_id, app_name in due:
+                    due.append(entry)
+        for entry in due:
+            app_id, app_name = entry.public_app_id, entry.app_name
             logger.warning(f"App {app_name} ({app_id}) has been frozen for over {after:.0f}s")
+            _emit_freeze_event("FROZEN_LONG", entry, "reminder",
+                               frozen_seconds=round(now - entry.frozen_at),
+                               threshold_seconds=after)
             app_utils.callback_manager.send_callback_notification({
                 'app_id': app_id,
                 'app_name': app_name,
@@ -4197,13 +4279,15 @@ class DynamicBalancer:
             if entry.frozen == freeze:
                 return True, "Already frozen" if freeze else "Not frozen"
 
+        failed_action = "FREEZE_FAILED" if freeze else "THAW_FAILED"
         done = []
         for cg in cgroups:
             ok, msg = self.control_manager.freeze_cgroup(cg, freeze)
             if not ok:
                 logger.error(f"{'Freeze' if freeze else 'Thaw'} failed for {app_id} ({cg}): {msg}")
-                if freeze:
-                    self._thaw_cgroups(done)   # don't leave a half-frozen app
+                rolled_back = self._thaw_cgroups(done) if freeze else None  # don't leave a half-frozen app
+                _emit_freeze_event(failed_action, entry, "user", cgroups=cgroups,
+                                   failed_cgroup=cg, error=msg, rolled_back=rolled_back)
                 return False, msg
             done.append(cg)
 
@@ -4211,13 +4295,17 @@ class DynamicBalancer:
             found = self.all_limits.by_public_id(app_id, source="manual")
             if found is None:
                 # Restored while we were writing: its thaw ran before our freeze landed.
+                # (An unfreeze racing a restore needs no event: the restore records its own thaw.)
                 if freeze:
                     self._thaw_cgroups(done)
+                    _emit_freeze_event(failed_action, entry, "user", cgroups=cgroups,
+                                       error="Limit was restored while freezing")
                 return False, "Limit was restored while freezing"
             found[1].frozen = freeze
             found[1].frozen_at = time.time() if freeze else 0.0
             found[1].freeze_notified = False
         logger.info(f"{'Froze' if freeze else 'Thawed'} app {app_id} ({len(done)} cgroup(s))")
+        _emit_freeze_event("FROZEN" if freeze else "THAWED", entry, "user", cgroups=done)
         self._notify_ui_refresh(app_id, entry.app_name, 'app_frozen_changed')
         return True, "Frozen" if freeze else "Unfrozen"
 
@@ -4269,16 +4357,36 @@ class DynamicBalancer:
                     uid, min_mhz, max_mhz, clamp=True)
                 results[uid] = {"ok": ok, "message": msg, **(applied or {})}
         failed = [uid for uid, r in results.items() if not r["ok"]]
+        done = [uid for uid in results if uid not in failed]
+        requested = {"min_mhz": min_mhz, "max_mhz": max_mhz, "range": f"{min_mhz:g}-{max_mhz:g} MHz"}
+        applied = {uid: {"min_mhz": r.get("min_mhz"), "max_mhz": r.get("max_mhz")}
+                   for uid, r in results.items() if r.get("max_mhz") is not None}
+        if done:
+            _emit_freq_event("LIMITED", done, applied={uid: applied.get(uid) for uid in done},
+                             **requested)
         if failed:
-            return False, "; ".join(f"{uid}: {results[uid]['message']}" for uid in failed), results
+            message = "; ".join(f"{uid}: {results[uid]['message']}" for uid in failed)
+            _emit_freq_event("LIMIT_FAILED", failed, error=message,
+                             applied={uid: applied[uid] for uid in failed if uid in applied},
+                             **requested)
+            return False, message, results
         return True, "ok", results
 
-    def restore_freq(self, units: Optional[list] = None) -> "tuple[bool, str]":
+    def restore_freq(self, units: Optional[list] = None,
+                     trigger: str = "user") -> "tuple[bool, str]":
         """Restore the given units, or every limited one when ``units`` is empty."""
         freq = self.control_manager.freq
         with self._freq_op_lock:
-            outcomes = [(uid, *freq.restore(uid)) for uid in (units or freq.limited_units())]
+            limited = set(freq.limited_units())
+            outcomes = [(uid, *freq.restore(uid)) for uid in (units or sorted(limited))]
+        # A unit SmarTune never limited is a no-op, not a change worth recording.
+        restored = {uid: msg for uid, ok, msg in outcomes if ok and uid in limited}
         failed = [f"{uid}: {msg}" for uid, ok, msg in outcomes if not ok]
+        if restored:
+            _emit_freq_event("RESTORED", list(restored), trigger=trigger, restored=restored)
+        if failed:
+            _emit_freq_event("RESTORE_FAILED", [uid for uid, ok, _ in outcomes if not ok],
+                             trigger=trigger, error="; ".join(failed))
         return (False, "; ".join(failed)) if failed else (True, "ok")
 
     def _notify_ui_refresh(self, app_id: str, app_name: str, status: str) -> None:
@@ -4322,8 +4430,13 @@ class DynamicBalancer:
             results = [(d, *self.control_manager.cpu.restore(d)) for d in dirs]
             failures = [msg for _, ok, msg in results if not ok]
             if failures:
+                _emit_affinity_event("RESTORE_FAILED", app_id=app_id, app_name=app_name,
+                                     dirs=dirs, error="; ".join(failures))
                 return False, "; ".join(failures)
             self._forget_affinity(app_id, dirs)
+            if dirs:  # nothing was pinned: no change to record
+                _emit_affinity_event("RESTORED", app_id=app_id, app_name=app_name, dirs=dirs,
+                                     outcome=self._restore_summary(app_name, results))
             return True, self._restore_summary(app_name, results)
         if not dirs:
             return False, f"No running cgroup found for {app_name}"
@@ -4344,6 +4457,11 @@ class DynamicBalancer:
                 rollback = done + ([d] if self.control_manager.cpu.is_bound(d) else [])
                 undone = [p for p in rollback if self.control_manager.cpu.restore(p)[0]]
                 self._forget_affinity(app_id, undone)
+                _emit_affinity_event(
+                    "SET_FAILED", app_id=app_id, app_name=app_name, dirs=dirs, pids=pids,
+                    cpu_class=cpu_class.lower(), cpus=value,
+                    failed_cgroup=os.path.basename(d), error=detail,
+                    rolled_back=len(undone) == len(rollback))
                 return False, detail
             done.append(d)
         with self._affinity_lock:
@@ -4353,6 +4471,8 @@ class DynamicBalancer:
             tracked["dirs"].update(done)
         self.control_manager.cpu.remember_choice(app_id, cpu_class.lower(), value)
         logger.info(f"Bound app {app_id} ({len(done)} cgroup(s)) to cpus {value}")
+        _emit_affinity_event("SET", app_id=app_id, app_name=app_name, dirs=done, pids=pids,
+                             cpu_class=cpu_class.lower(), cpus=value)
         return True, f"Bound to cpus {value}"
 
     def set_restore_resource(self, app_id: str) -> bool:
@@ -4423,8 +4543,12 @@ class DynamicBalancer:
             # Thaw last: limits are already lifted, so the app does not resume
             # straight into a memory.high / io.max stall.  A failed limit restore
             # must not leave the app frozen, so this runs regardless.
-            if was_frozen and not self._thaw_cgroups(effective_app_ids):
-                restore_success = False
+            if was_frozen:  # only set when a manual ``entry`` was found
+                thawed = self._thaw_cgroups(effective_app_ids)
+                _emit_freeze_event("THAWED" if thawed else "THAW_FAILED", entry, "restore",
+                                   cgroups=effective_app_ids)
+                if not thawed:
+                    restore_success = False
 
             if restore_success:
                 app_utils.update_app_status(app_id, "running")
@@ -4896,6 +5020,9 @@ class DynamicBalancer:
         self.is_running = False
 
         self.restore_all_limited_apps_resources()
+        self._restore_affinity_on_exit()
+        self.restore_freq(trigger="shutdown")
+        # Anything left that the calls above did not track (none in practice).
         self.control_manager.cpu.restore_all()
         self.control_manager.freq.restore_all()
         self.network_controller.clear_network_rules_on_exit()
@@ -4908,6 +5035,30 @@ class DynamicBalancer:
             self.app_intercept_thread.join(timeout=1)
         self._resume_held_apps_on_exit()
         logger.info("Service stopped; all threads have exited")
+
+    def _restore_affinity_on_exit(self) -> None:
+        """Unpin every app this service bound to cores, recording each one."""
+        with self._affinity_lock:
+            tracked_apps = list(self._affinity_apps.items())
+            self._affinity_apps.clear()
+        for app_id, tracked in tracked_apps:
+            restored, failed = [], []
+            with self._affinity_op_lock:
+                for d in sorted(tracked["dirs"]):
+                    ok, msg = self.control_manager.cpu.restore(d)
+                    if ok:
+                        restored.append(d)
+                    else:
+                        failed.append((d, msg))
+                        logger.error(f"Restore affinity failed for {d}: {msg}")
+            if restored:
+                _emit_affinity_event("RESTORED", app_id=app_id, app_name=tracked["app_name"],
+                                     dirs=restored, trigger="shutdown")
+            if failed:
+                _emit_affinity_event("RESTORE_FAILED", app_id=app_id,
+                                     app_name=tracked["app_name"],
+                                     dirs=[d for d, _ in failed], trigger="shutdown",
+                                     error="; ".join(msg for _, msg in failed))
 
     def _resume_held_apps_on_exit(self) -> None:
         """SIGCONT every app still held for launching under critical pressure.

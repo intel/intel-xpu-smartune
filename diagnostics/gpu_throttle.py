@@ -52,9 +52,11 @@ class GpuThrottleTracker:
     the same snapshot does not count twice. Returns an action dict when the
     confirmed state changes, else None. No IO -- the driver does the emit."""
 
-    def __init__(self, confirm_samples=CONFIRM_SAMPLES):
+    def __init__(self, confirm_samples=CONFIRM_SAMPLES, confirmed=False):
         self.confirm_samples = confirm_samples
-        self._confirmed = False
+        # ``confirmed`` resumes the throttle state recorded before a restart, so a
+        # throttle that ended while the service was down still gets its cleared event.
+        self._confirmed = bool(confirmed)
         self._pending = 0          # consecutive samples disagreeing with confirmed
         self._last_ts = None
         self._last_reasons = []
@@ -131,19 +133,33 @@ def _summary(subject, action):
     return f"GPU {gt} throttling cleared"
 
 
+_THROTTLED_EVENT = "DEVICE_GPU_THROTTLED"
+
+
+def _open_throttle_subjects():
+    """Subjects with an open throttle alert (the alert scope is the event's source)."""
+    try:
+        from db.DatabaseModel import AlertState
+    except Exception as exc:
+        logger.debug("gpu throttle alert read unavailable: %s", exc)
+        return set()
+    return {alert.scope for alert in AlertState.active_alerts()
+            if alert.event_type == _THROTTLED_EVENT and alert.scope}
+
+
 def _emit(subject, action):
     from diagnostics import emit_event, event_catalog
 
     if action["state"] == "throttled":
         emit_event(
-            "DEVICE_GPU_THROTTLED", severity="warning", category="device.gpu",
+            _THROTTLED_EVENT, severity="warning", category="device.gpu",
             summary=_summary(subject, action), source=subject,
             attributes={"reasons": action["reasons"]},
         )
         return
-    # Only close a throttle that was recorded; if the event type is disabled
-    # there is nothing to recover from.
-    if event_catalog.enabled("DEVICE_GPU_THROTTLED"):
+    # Only close a throttle that was recorded, or whose alert is still open (the
+    # event type may have been disabled since).
+    if event_catalog.enabled(_THROTTLED_EVENT) or subject in _open_throttle_subjects():
         emit_event(
             "DEVICE_GPU_THROTTLE_CLEARED", severity="info", category="device.gpu",
             summary=_summary(subject, action), source=subject,
@@ -159,10 +175,16 @@ def run_once():
         return []
     devices, ts = snap
     emitted = []
+    open_at_start = None
     for device in devices:
         for freq in device.get("freqs") or []:
             subject = _subject(device, freq)
-            tracker = _trackers.setdefault(subject, GpuThrottleTracker())
+            tracker = _trackers.get(subject)
+            if tracker is None:
+                # First sight of this GT: resume from its open alert, if any.
+                if open_at_start is None:
+                    open_at_start = _open_throttle_subjects()
+                tracker = _trackers[subject] = GpuThrottleTracker(confirmed=subject in open_at_start)
             action = tracker.observe(
                 freq.get("throttled"), freq.get("throttle_reasons"), ts)
             if action is None:

@@ -15,6 +15,8 @@ from flask import Blueprint, request
 
 import psutil
 
+from diagnostics.custom_rules import ALERT_MODES as _CUSTOM_RULE_ALERT_MODES
+from diagnostics.custom_rules import DEFAULT_QUIET_MINUTES as _DEFAULT_CUSTOM_RULE_QUIET_MINUTES
 from diagnostics.sanitize import scrub_text
 from db.DatabaseModel import MonitorSnapshot
 from monitor import ResourceMonitor, PSIMonitor, PressureAnalyzer
@@ -2789,6 +2791,7 @@ _CUSTOM_RULE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _CUSTOM_RULE_CATEGORY_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 _CUSTOM_RULE_SOURCES = {"journal", "smartune"}
 _CUSTOM_RULE_SEVERITIES = {"info", "warning", "error", "critical"}
+_CUSTOM_RULE_QUIET_MINUTES = (1, 1440)
 _CUSTOM_RULE_DOMAINS = {"compute", "data-path", "services", "hardware", "platform", "other"}
 _CUSTOM_RULE_EVENT_KINDS = {
     "pressure", "control", "hardware-fault", "lifecycle", "availability",
@@ -2797,6 +2800,8 @@ _CUSTOM_RULE_EVENT_KINDS = {
 _CUSTOM_RULE_FATAL_SIGNATURES = {"oom", "kernel-panic", "gpu-hang"}
 _MAX_CUSTOM_DIAGNOSTIC_RULES = 32
 _MAX_CUSTOM_RULE_PATTERN_LENGTH = 256
+# Patterns are case-insensitive substrings; shorter ones would match nearly every line.
+_MIN_CUSTOM_RULE_PATTERN_LENGTH = 3
 
 
 def _get_diagnostic_rules_config():
@@ -2826,6 +2831,11 @@ def _validate_diagnostic_rules_config(body):
         event_kind = rule.get("event_kind", "status")
         fatal_signatures = rule.get("fatal_signatures", [])
         service = rule.get("service")
+        alert_mode = rule.get("alert_mode", "off")
+        quiet_minutes = rule.get("alert_quiet_minutes")
+        if quiet_minutes is None and alert_mode != "until_quiet":
+            # Only used by until_quiet; the form hides (and may clear) it otherwise.
+            quiet_minutes = _DEFAULT_CUSTOM_RULE_QUIET_MINUTES
         if not isinstance(rule_id, str) or not _CUSTOM_RULE_ID_RE.fullmatch(rule_id):
             raise ValueError(f"Rule {index} id must use lowercase letters, numbers, and hyphens")
         if rule_id in ids:
@@ -2835,8 +2845,11 @@ def _validate_diagnostic_rules_config(body):
             raise ValueError(f"Rule {index} name must be 1 to 80 characters")
         if source not in _CUSTOM_RULE_SOURCES:
             raise ValueError(f"Rule {index} source must be journal or smartune")
-        if not isinstance(pattern, str) or not pattern or len(pattern) > _MAX_CUSTOM_RULE_PATTERN_LENGTH:
-            raise ValueError(f"Rule {index} message pattern must be 1 to {_MAX_CUSTOM_RULE_PATTERN_LENGTH} characters")
+        # Length is checked after trimming, since the trimmed pattern is what gets stored.
+        if (not isinstance(pattern, str)
+                or not _MIN_CUSTOM_RULE_PATTERN_LENGTH <= len(pattern.strip()) <= _MAX_CUSTOM_RULE_PATTERN_LENGTH):
+            raise ValueError(f"Rule {index} message pattern must be {_MIN_CUSTOM_RULE_PATTERN_LENGTH} to "
+                             f"{_MAX_CUSTOM_RULE_PATTERN_LENGTH} characters, not counting surrounding spaces")
         if severity not in _CUSTOM_RULE_SEVERITIES:
             raise ValueError(f"Rule {index} severity is invalid")
         if not isinstance(category, str) or not _CUSTOM_RULE_CATEGORY_RE.fullmatch(category):
@@ -2853,6 +2866,13 @@ def _validate_diagnostic_rules_config(body):
             raise ValueError(f"Rule {index} service must be 1 to 128 characters when set")
         if not isinstance(rule.get("enabled"), bool):
             raise ValueError(f"Rule {index} enabled must be a boolean")
+        if alert_mode not in _CUSTOM_RULE_ALERT_MODES:
+            raise ValueError(f"Rule {index} alert mode must be off, until_ack or until_quiet")
+        if alert_mode != "off" and severity == "info":
+            raise ValueError(f"Rule {index} must be warning, error or critical to raise an alert")
+        low, high = _CUSTOM_RULE_QUIET_MINUTES
+        if isinstance(quiet_minutes, bool) or not isinstance(quiet_minutes, int) or not low <= quiet_minutes <= high:
+            raise ValueError(f"Rule {index} alert quiet period must be {low} to {high} minutes")
         validated.append({
             "id": rule_id,
             "name": name.strip(),
@@ -2865,6 +2885,8 @@ def _validate_diagnostic_rules_config(body):
             "domain": domain,
             "event_kind": event_kind,
             "fatal_signatures": fatal_signatures,
+            "alert_mode": alert_mode,
+            "alert_quiet_minutes": quiet_minutes,
         })
     return {"rules": validated}
 

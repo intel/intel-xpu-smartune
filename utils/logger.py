@@ -25,6 +25,7 @@
 
 import contextlib
 import contextvars
+import fcntl
 import json
 import logging
 import os
@@ -87,6 +88,21 @@ def current_log_context():
     so diagnostics' emit_event() can inherit them from the ambient
     bind_log_context() without threading them through."""
     return {name: var.get() for name, var in _ctx_vars.items() if var.get() is not None}
+
+
+# Set while diagnostics records an event or scans logs; lines logged meanwhile
+# carry ``"diag_internal": true`` and the log detector skips them (no feedback loop).
+_diag_internal = contextvars.ContextVar("smartune_diag_internal", default=False)
+
+
+@contextlib.contextmanager
+def diagnostics_internal():
+    """Mark log lines written inside the block as diagnostics' own (see above)."""
+    token = _diag_internal.set(True)
+    try:
+        yield
+    finally:
+        _diag_internal.reset(token)
 
 
 def _resolve_level():
@@ -164,6 +180,8 @@ class _JsonFormatter(logging.Formatter):
             "msg": record.getMessage(),
         }
         payload.update(_record_context(record))
+        if _diag_internal.get():
+            payload["diag_internal"] = True
         if record.exc_info:
             payload["exc"] = "".join(
                 traceback.format_exception(*record.exc_info)).rstrip()
@@ -215,10 +233,10 @@ def prune_old_logs(log_dir, prefix=LOG_PREFIX, keep=LOG_RETENTION):
 
     Called at import so every process start trims the backlog. Best-effort: it
     never raises, so a cleanup hiccup cannot stop the service from starting. The
-    ``<prefix>_latest.log`` symlink and non-regular files are left untouched.
-    Files are ranked by name, which the fixed ``YYYYMMDD_HHMMSS`` stamp makes
-    chronological without depending on mtimes. ``keep < 0`` disables pruning;
-    ``keep == 0`` removes all matching files.
+    ``<prefix>_latest.log`` symlink, non-regular files and files still in use
+    (``_log_file_in_use``) are left untouched. Files are ranked by name, which the
+    fixed ``YYYYMMDD_HHMMSS`` stamp makes chronological without depending on
+    mtimes. ``keep < 0`` disables pruning; ``keep == 0`` removes all other files.
     """
     if keep < 0:
         return
@@ -239,10 +257,35 @@ def prune_old_logs(log_dir, prefix=LOG_PREFIX, keep=LOG_RETENTION):
         candidates.append(path)
     candidates.sort()  # lexical == chronological for the fixed-width timestamp
     for path in (candidates[:-keep] if keep else candidates):
+        if _log_file_in_use(path):
+            continue
         try:
             os.remove(path)
         except OSError:
             pass
+
+
+def _log_file_in_use(path):
+    """Whether a process still holds ``path``'s shared ``flock`` (``_hold_log_lock``).
+
+    A file we cannot open counts as in use: it is not ours to delete."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def _hold_log_lock(handler):
+    """Hold a shared ``flock`` on the handler's log until exit, so it is not pruned."""
+    with contextlib.suppress(Exception):
+        fcntl.flock(handler.stream.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
 
 
 # --- base logger configuration --------------------------------------------
@@ -299,6 +342,7 @@ class Logger:
                 file_handler = _NoFollowFileHandler(log_file)
                 file_handler.setFormatter(file_formatter)
                 file_handler.stream.reconfigure(encoding="utf-8")
+                _hold_log_lock(file_handler)
                 self.logger.addHandler(file_handler)
                 file_ok = True
             except OSError:

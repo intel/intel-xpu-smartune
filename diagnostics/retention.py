@@ -37,11 +37,16 @@ def configured_days():
 def run_cleanup(days=None):
     """Remove expired history while preserving unresolved operational state."""
     from db.DatabaseModel import AlertEpisode, AlertState, OperationalEvent
+    from diagnostics.service_lifecycle import LIFECYCLE_EVENT_TYPES
 
     days = configured_days() if days is None else days
+    # Keep old events that live state still reads: active alerts' evidence and each
+    # service's last lifecycle record (its next start checks it for a crash).
+    keep = AlertState.live_evidence_event_ids() | OperationalEvent.newest_event_ids_per_source(
+        LIFECYCLE_EVENT_TYPES)
     return {
         "retention_days": days,
-        "events_deleted": OperationalEvent.delete_older_than(days),
+        "events_deleted": OperationalEvent.delete_older_than(days, keep_event_ids=keep),
         "resolved_alerts_deleted": AlertState.delete_resolved_older_than(days),
         "alert_episodes_deleted": AlertEpisode.delete_older_than(days),
     }
@@ -53,7 +58,8 @@ def status():
     return {
         "retention_days": days,
         "retention_setting": "snapshot_retention_days",
-        "event_ledger": "expired after retention period, except unresolved control lifecycles",
+        "event_ledger": ("expired after retention period, except unresolved control lifecycles, "
+                         "the evidence of active alerts and each service's last lifecycle record"),
         "resolved_alerts": "expired after retention period",
         "active_alerts": "retained until resolved",
         "monitor_snapshots": "managed separately by monitor history retention",

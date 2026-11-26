@@ -41,11 +41,11 @@ class PressureLevelTracker:
     observe(level, score, ts) samples in time order; it returns an action dict when
     the confirmed band changes, otherwise None. No IO -- the driver does emit."""
 
-    def __init__(self, trigger_seconds=TRIGGER_SECONDS, clear_seconds=CLEAR_SECONDS):
+    def __init__(self, trigger_seconds=TRIGGER_SECONDS, clear_seconds=CLEAR_SECONDS, level=_NORMAL):
         self.trigger_seconds = trigger_seconds
         self.clear_seconds = clear_seconds
-        # Start at normal so sustained pressure after startup is recorded.
-        self._confirmed = _NORMAL
+        # Start from the resumed band, or normal so sustained pressure after startup is recorded.
+        self._confirmed = level if level in _BAND_RANK else _NORMAL
         self._pending_dir = 0         # +1 diverging up, -1 diverging down, 0 settled
         self._pending_since = None    # ts divergence in this direction began
 
@@ -84,9 +84,33 @@ class PressureLevelTracker:
         }
 
 
-_tracker = PressureLevelTracker()
+_EVENT_TYPE = "RESOURCE_SYSTEM_PRESSURE_CHANGED"
+# Created on the first scan, from the last recorded transition (see _recorded_band).
+_tracker = None
 
 _LOOP_STARTED = False
+
+
+def _recorded_band():
+    """The band this boot's last recorded transition left, else normal; a restarted
+    service resumes from it."""
+    try:
+        from diagnostics import event_store
+        from diagnostics.system_info import read_boot_id
+
+        rows = event_store.query_events(event_type=_EVENT_TYPE, boot_id=read_boot_id(), limit=1)
+    except Exception as exc:
+        logger.debug("pressure history unavailable: %s", exc)
+        return _NORMAL
+    attributes = (rows[0].get("attributes") or {}) if rows else {}
+    return attributes.get("to_level") if attributes.get("to_level") in _BAND_RANK else _NORMAL
+
+
+def _get_tracker():
+    global _tracker
+    if _tracker is None:
+        _tracker = PressureLevelTracker(level=_recorded_band())
+    return _tracker
 _LOOP_START_LOCK = threading.Lock()
 
 
@@ -120,7 +144,7 @@ def run_once():
     if reading is None:
         return None
     level, score, ts = reading
-    action = _tracker.observe(level, score, ts)
+    action = _get_tracker().observe(level, score, ts)
     if action is None:
         return None
     try:
@@ -144,7 +168,7 @@ def _emit_change(action):
     from_level, to_level = action["from_level"], action["to_level"]
     raw_level = action.get("raw_level")
     emit_event(
-        "RESOURCE_SYSTEM_PRESSURE_CHANGED", severity=action["severity"],
+        _EVENT_TYPE, severity=action["severity"],
         category="resource.system",
         summary=_summary(from_level, to_level, action.get("score"), raw_level),
         source="monitor",

@@ -71,8 +71,9 @@ def _on_job(job):
         summary = f"{label} job {job.id} {status}" + (
             f" (exit {rc})" if rc is not None else "")
         attributes = {"kind": kind, "status": status, "returncode": rc,
-                      "duration": duration, "started_at": started, "finished_at": finished,
-                      "log_path": log_path,
+                      "duration_seconds": duration, "started_at": started,
+                      "finished_at": finished,
+                      "log_path": str(log_path) if log_path is not None else None,
                       "run_name": meta.get("run_name"), "meta": meta}
         # Freeze the run's KPI numbers onto the terminal event so they outlive the
         # Results tab deleting the run directory. Best-effort and only where there

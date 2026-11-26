@@ -18,6 +18,7 @@ from peewee import (
     SQL,
     SqliteDatabase,
     TextField,
+    fn,
 )
 from threading import Lock
 import time
@@ -37,8 +38,10 @@ class DBStatus(Enum):
 # Create a global synchronization lock
 db_lock = Lock()
 
-# Database connection object
-_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'my_database.db')
+# Database connection object. SMARTUNE_DB_PATH points a test run or second instance
+# at its own file, since the connection is opened at import time.
+_DB_PATH = (os.environ.get("SMARTUNE_DB_PATH")
+            or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'my_database.db'))
 db = SqliteDatabase(_DB_PATH)
 db.execute_sql('PRAGMA journal_mode=WAL;')
 
@@ -51,6 +54,11 @@ db.execute_sql('PRAGMA journal_mode=WAL;')
 _write_epochs: dict[str, int] = {}
 
 
+def _boot_key(boot_id):
+    """A boot id as stored: journald's 32 hex digits, also when given dashed."""
+    return boot_id.strip().replace("-", "").lower() if isinstance(boot_id, str) else boot_id
+
+
 def get_write_epoch(model_cls) -> int:
     """Return the current write counter for ``model_cls``."""
     return _write_epochs.get(model_cls.__name__, 0)
@@ -60,6 +68,39 @@ def _bump_write_epoch(model_cls) -> None:
     """Record a write against ``model_cls``.  Called with ``db_lock`` held."""
     name = model_cls.__name__
     _write_epochs[name] = _write_epochs.get(name, 0) + 1
+
+
+_DELETE_BATCH_ROWS = 2000
+
+
+def _delete_in_batches(model, condition, key=None, batch=_DELETE_BATCH_ROWS):
+    """Delete the rows matching ``condition`` in batches, each its own transaction under db_lock,
+    so other threads get the lock in between. Returns the count deleted; stops at the first error."""
+    key = key if key is not None else model._meta.primary_key
+    deleted = 0
+    while True:
+        with db_lock:
+            try:
+                with db.atomic():
+                    ids = model.select(key).where(condition).limit(batch)
+                    count = model.delete().where(key.in_(ids)).execute()
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error deleting old {model.__name__} rows: {e}")
+                return deleted
+        deleted += count
+        if count < batch:
+            return deleted
+        time.sleep(0)  # yield the lock to waiting threads
+
+
+def _iso_to_epoch(value):
+    """ISO 8601 -> epoch seconds (int, floored), or None; a naive value is read as local time."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
 
 
 class DataBaseModel(Model):
@@ -259,19 +300,47 @@ class MonitorSnapshot(DataBaseModel):
                 return []
 
     @classmethod
+    def query_sampled(cls, snapshot_type: str, start_time: int, end_time: int,
+                      max_points: int = 2000):
+        """Snapshots spread evenly across [start_time, end_time], oldest first.
+
+        Keeps the newest row of each of ``max_points`` time buckets. Returns
+        ``(rows, step_seconds)``; ``step_seconds`` is 0 when no downsampling was needed.
+        """
+        start_time, end_time = int(start_time), int(end_time)
+        max_points = max(1, int(max_points))
+        with db_lock:
+            try:
+                with db.atomic():
+                    base = cls.select().where(
+                        (cls.snapshot_type == snapshot_type)
+                        & (cls.create_time >= start_time)
+                        & (cls.create_time <= end_time))
+                    if base.count() <= max_points:
+                        return list(base.order_by(cls.create_time.asc(), cls.id.asc())), 0
+                    # Ceiling division so the bucket count never exceeds max_points.
+                    step = max(1, -(-(end_time - start_time + 1) // max_points))
+                    newest_per_bucket = (
+                        cls.select(fn.MAX(cls.id))
+                        .where((cls.snapshot_type == snapshot_type)
+                               & (cls.create_time >= start_time)
+                               & (cls.create_time <= end_time))
+                        .group_by(SQL("(create_time - ?) / ?", (start_time, step))))
+                    rows = list(cls.select().where(cls.id.in_(newest_per_bucket))
+                                .order_by(cls.create_time.asc(), cls.id.asc()))
+                    return rows, step
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error sampling monitor snapshots: {e}")
+                return [], 0
+
+    @classmethod
     def delete_older_than(cls, days: int) -> int:
         """Delete snapshots whose ``create_time`` is older than ``days`` days.
 
         Returns the number of rows deleted, or 0 on error.
         """
         cutoff = int(time.time()) - max(1, int(days)) * 86400
-        with db_lock:
-            try:
-                with db.atomic():
-                    return cls.delete().where(cls.create_time < cutoff).execute()
-            except (IntegrityError, OperationalError) as e:
-                logger.error(f"Error deleting old monitor snapshots: {e}")
-                return 0
+        return _delete_in_batches(cls, cls.create_time < cutoff)
 
 
 class OperationalEvent(DataBaseModel):
@@ -280,16 +349,19 @@ class OperationalEvent(DataBaseModel):
     The single high-value event account: pressure transitions, control actions,
     benchmark lifecycle, detected exceptions. Raw application/system logs are NOT
     stored here -- they stay in their own sources and are joined by
-    a time window. ``create_time`` (inherited, epoch seconds at
-    insert) backs the cheap time-window range query; ``ts_utc`` keeps the precise
-    timezone-aware origin timestamp for display.
+    a time window. ``create_time`` (inherited) is the epoch second the event
+    occurred, from ``ts_utc`` (scanners may insert it much later; ``update_time``
+    is the insert time), and backs every time-window query, sort and retention
+    pass. ``ts_utc`` keeps the precise timezone-aware origin timestamp for display.
     """
 
     event_id = CharField(max_length=32, primary_key=True)
-    ts_utc = CharField(max_length=40, null=False, help_text="timezone-aware ISO 8601", index=True)
+    # No index on ts_utc, severity_origin or category alone (unfiltered, or covered by the
+    # (category, create_time) index): each index costs every insert and retention delete.
+    ts_utc = CharField(max_length=40, null=False, help_text="timezone-aware ISO 8601")
     severity = CharField(max_length=16, null=False, help_text="info/warning/error/critical", index=True)
-    severity_origin = CharField(max_length=16, default="producer", null=True, help_text="producer | rule_escalated", index=True)
-    category = CharField(max_length=32, null=False, help_text="service/pressure/control/benchmark/kernel", index=True)
+    severity_origin = CharField(max_length=16, default="producer", null=True, help_text="producer | rule_escalated")
+    category = CharField(max_length=32, null=False, help_text="service/pressure/control/benchmark/kernel")
     # event_type IS the normalized reason_code: <DOMAIN>_<SUBJECT>_<STATE>, per the
     # §A.1.4 registry (e.g. CONTROL_CPU_LIMIT_APPLIED / RESOURCE_MEMORY_OOM_KILL).
     event_type = CharField(max_length=64, null=False, help_text="normalized reason_code <DOMAIN>_<SUBJECT>_<STATE>", index=True)
@@ -326,6 +398,9 @@ class OperationalEvent(DataBaseModel):
         with db_lock:
             timestamp = int(time.time())
             now = datetime.now()
+            occurred = _iso_to_epoch(ts_utc)
+            if occurred is None:
+                occurred = timestamp
             attrs = json.dumps(attributes, ensure_ascii=False, default=str) if attributes else None
             try:
                 with db.atomic():
@@ -339,7 +414,8 @@ class OperationalEvent(DataBaseModel):
                         episode_id=episode_id, attributes_json=attrs,
                         boot_id=boot_id, dedup_key=dedup_key,
                         config_revision_id=config_revision_id,
-                        create_time=timestamp, create_date=now,
+                        create_time=occurred,
+                        create_date=datetime.fromtimestamp(occurred),
                         update_time=timestamp, update_date=now,
                     )
                     _bump_write_epoch(cls)
@@ -359,10 +435,10 @@ class OperationalEvent(DataBaseModel):
                      impact=None, resource_type=None, protection_id=None, episode_id=None,
                      boot_id=None, config_revision_id=None,
                      keyword=None, start_time=None, end_time=None,
-                     limit=200, offset=0):
+                     severities=None, limit=200, offset=0):
         """Filtered, newest-first event query. ``start_time``/``end_time`` are
-        epoch seconds matched against the inherited ``create_time``;
-        ``event_types`` keeps events whose type is any of the given ones."""
+        epoch seconds matched against the occurrence time (``create_time``);
+        ``event_types`` / ``severities`` keep events matching any given value."""
         with db_lock:
             try:
                 with db.atomic():
@@ -375,13 +451,15 @@ class OperationalEvent(DataBaseModel):
                         (cls.impact, impact),
                         (cls.resource_type, resource_type),
                         (cls.protection_id, protection_id), (cls.episode_id, episode_id),
-                        (cls.boot_id, boot_id),
+                        (cls.boot_id, _boot_key(boot_id)),
                         (cls.config_revision_id, config_revision_id),
                     ):
                         if value:
                             query = query.where(field == value)
                     if event_types:
                         query = query.where(cls.event_type.in_(list(event_types)))
+                    if severities:
+                        query = query.where(cls.severity.in_(list(severities)))
                     if keyword:
                         query = query.where(
                             cls.summary.contains(keyword) | cls.event_type.contains(keyword))
@@ -389,7 +467,8 @@ class OperationalEvent(DataBaseModel):
                         query = query.where(cls.create_time >= start_time)
                     if isinstance(end_time, int):
                         query = query.where(cls.create_time <= end_time)
-                    query = query.order_by(cls.create_time.desc())
+                    # rowid breaks same-second ties so paging stays stable.
+                    query = query.order_by(cls.create_time.desc(), SQL("rowid").desc())
                     query = query.limit(max(1, limit)).offset(max(0, offset))
                     return list(query)
             except (IntegrityError, OperationalError) as e:
@@ -397,9 +476,10 @@ class OperationalEvent(DataBaseModel):
                 return []
 
     @classmethod
-    def delete_older_than(cls, days: int) -> int:
+    def delete_older_than(cls, days: int, keep_event_ids=()) -> int:
         """Delete operational events outside the retention window, but keep the
-        full history of any control protection that is still unresolved.
+        full history of any control protection that is still unresolved, and
+        the events named in ``keep_event_ids`` (evidence live state points at).
 
         A one-shot event (``protection_id`` NULL: OOM kill, log error, panic)
         expires normally. A control lifecycle must not: control_lifecycle.summarize()
@@ -413,47 +493,75 @@ class OperationalEvent(DataBaseModel):
             try:
                 with db.atomic():
                     retain = cls._protection_ids_to_retain(cutoff)
-                    query = cls.delete().where(cls.create_time < cutoff)
-                    if retain:
-                        query = query.where(
-                            cls.protection_id.is_null(True)
-                            | cls.protection_id.not_in(list(retain)))
-                    return query.execute()
             except (IntegrityError, OperationalError) as e:
                 logger.error(f"Error deleting old operational events: {e}")
                 return 0
+        condition = cls.create_time < cutoff
+        if retain:
+            # A protection that turns live between batches does so through a
+            # new APPLIED, which is inside the window and kept anyway.
+            condition &= cls.protection_id.is_null(True) | cls.protection_id.not_in(list(retain))
+        keep_event_ids = [event_id for event_id in keep_event_ids if event_id]
+        if keep_event_ids:
+            condition &= cls.event_id.not_in(keep_event_ids)
+        return _delete_in_batches(cls, condition)
+
+    @classmethod
+    def newest_event_ids_per_source(cls, event_types) -> set:
+        """The newest event of ``event_types`` from each source, in query_events' order."""
+        event_types = list(event_types)
+        with db_lock:
+            try:
+                sources = [row.source for row in cls.select(cls.source).distinct()
+                           .where(cls.event_type.in_(event_types))]
+                newest = set()
+                for source in sources:
+                    row = (cls.select(cls.event_id)
+                           .where(cls.event_type.in_(event_types)
+                                  & (cls.source.is_null(True) if source is None else cls.source == source))
+                           .order_by(cls.create_time.desc(), SQL("rowid").desc()).first())
+                    if row is not None:
+                        newest.add(row.event_id)
+                return newest
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error reading newest events per source: {e}")
+                return set()
 
     @classmethod
     def _scan_control_lifecycles(cls) -> dict:
-        """One pass over control events -> per-protection tallies
-        ``{applied, closed, rebooted, latest}``, shared by retention and the
-        active-protection read model. Lock-free: callers that need isolation hold
-        ``db_lock`` (``delete_older_than`` does)."""
+        """One pass over lifecycle events (event_catalog.LIFECYCLE_EVENTS) -> per-protection state
+        ``{live, cleared, latest}``, shared by retention and the active-protection read model.
+        ``live`` holds the resources whose latest action is APPLIED, as control_lifecycle.summarize()
+        decides (not APPLIED counted against terminals: re-caps reuse the protection id).
+        Lock-free: callers that need isolation hold ``db_lock`` (``delete_older_than`` does)."""
+        from diagnostics import event_catalog
+
+        definitions = {event.event_type: event for event in event_catalog.LIFECYCLE_EVENTS}
         stats = {}
-        rows = cls.select(cls.protection_id, cls.event_type, cls.create_time).where(
-            cls.protection_id.is_null(False) & (cls.category == "platform.control"))
+        rows = (cls.select(cls.protection_id, cls.event_type, cls.resource_type, cls.create_time)
+                .where(cls.protection_id.is_null(False) & cls.event_type.in_(list(definitions)))
+                .order_by(cls.create_time, SQL("rowid")))
         for row in rows:
             state = stats.get(row.protection_id)
             if state is None:
-                state = stats[row.protection_id] = {
-                    "applied": 0, "closed": 0, "rebooted": False, "latest": 0}
-            event_type = row.event_type or ""
-            if event_type.endswith("_APPLIED"):
-                state["applied"] += 1
-            elif event_type.endswith(("_RECOVERED", "_FAILED")):
-                state["closed"] += 1
-            elif event_type == "CONTROL_LIFECYCLE_CLEARED_BY_REBOOT":
-                state["rebooted"] = True
+                state = stats[row.protection_id] = {"live": set(), "cleared": False, "latest": 0}
+            definition = definitions[row.event_type]
+            if definition.resource is not None:
+                resource = row.resource_type or definition.resource
+                if definition.action == "applied":
+                    state["live"].add(resource)
+                else:  # recovered / failed
+                    state["live"].discard(resource)
+            elif definition.action in event_catalog.LIFECYCLE_CLEARED_ACTIONS:
+                state["cleared"] = True
             state["latest"] = max(state["latest"], row.create_time or 0)
         return stats
 
     @staticmethod
     def _is_unresolved(state) -> bool:
-        """A protection with an APPLIED that has no matching terminal
-        ``*_RECOVERED``/``*_FAILED`` and was not cleared by a reboot -- the
-        balancer emits one terminal per resource, so the counts pair up -- i.e. a
-        resource limit that is still live."""
-        return not state["rebooted"] and state["applied"] > state["closed"]
+        """A resource limit that is still live: some resource's latest action is
+        APPLIED and no reboot or operator clear ended the lifecycle."""
+        return not state["cleared"] and bool(state["live"])
 
     @classmethod
     def _protection_ids_to_retain(cls, cutoff: int) -> set:
@@ -466,6 +574,31 @@ class OperationalEvent(DataBaseModel):
             pid for pid, state in stats.items()
             if cls._is_unresolved(state) or state["latest"] >= cutoff
         }
+
+    @classmethod
+    def severity_counts(cls, *, start_time=None, end_time=None, boot_id=None, exclude_category=None):
+        """Exact per-severity counts of the matching events and the occurrence
+        span they cover: ``(counts, first_epoch, last_epoch)``."""
+        with db_lock:
+            try:
+                query = cls.select(cls.severity, fn.COUNT(cls.event_id),
+                                   fn.MIN(cls.create_time), fn.MAX(cls.create_time))
+                if start_time is not None:
+                    query = query.where(cls.create_time >= start_time)
+                if end_time is not None:
+                    query = query.where(cls.create_time <= end_time)
+                if boot_id:
+                    query = query.where(cls.boot_id == _boot_key(boot_id))
+                if exclude_category:
+                    query = query.where(cls.category != exclude_category)
+                rows = list(query.group_by(cls.severity).tuples())
+            except OperationalError as e:
+                logger.error(f"Error counting operational events: {e}")
+                return {}, None, None
+        counts = {severity: count for severity, count, _, _ in rows}
+        firsts = [first for _, _, first, _ in rows if first is not None]
+        lasts = [last for _, _, _, last in rows if last is not None]
+        return counts, (min(firsts) if firsts else None), (max(lasts) if lasts else None)
 
     @classmethod
     def unresolved_protection_ids(cls) -> set:
@@ -500,11 +633,21 @@ class OperationalEvent(DataBaseModel):
                 return []
 
 
+class AlertChanged(Exception):
+    """The alert gained detections after the operator loaded it."""
+
+    def __init__(self, dedup_key, fire_count, last_event_id):
+        super().__init__(f"alert {dedup_key} changed since it was loaded")
+        self.dedup_key = dedup_key
+        self.fire_count = fire_count
+        self.last_event_id = last_event_id
+
+
 class AlertState(DataBaseModel):
     """Derived alert state for policy-promoted events, never a second log.
 
-    Pending candidates are kept internal until their sustained window completes;
-    active and resolved rows retain the alert lifecycle shown to users. Every row
+    Active and resolved rows retain the alert lifecycle shown to users. Rows left in
+    the legacy "pending" status by older releases are never shown and age out. Every row
     points back to its most recent evidence via ``last_event_id``. Severity may
     be escalated by rules; escalation is retained for audit.
     """
@@ -522,6 +665,9 @@ class AlertState(DataBaseModel):
     last_seen_at = CharField(max_length=40, null=True)
     resolved_at = CharField(max_length=40, null=True)
     resolved_event_id = CharField(max_length=32, null=True)
+    # What closed the occurrence (the policy may change later): acknowledged / recovered /
+    # expired / operator_closed / cleared_by_reboot.
+    resolved_reason = CharField(max_length=32, null=True)
     scope = CharField(max_length=96, null=True, index=True)
     severity = CharField(max_length=16, null=True, index=True)
     severity_origin = CharField(max_length=16, default="producer", null=True, help_text="producer | rule_escalated", index=True)
@@ -562,70 +708,44 @@ class AlertState(DataBaseModel):
                         )
                         _bump_write_epoch(cls)
                         return True, 1
-                    should_notify = row.status != "active" or (now - int(row.update_time or 0)) >= max(0, cooldown_seconds)
                     became_active = row.status != "active"
+                    should_notify = became_active or (now - int(row.update_time or 0)) >= max(0, cooldown_seconds)
                     # A new occurrence counts from 1, like first_fired_at below;
                     # the previous occurrence's count lives on in AlertEpisode.
                     count = 1 if became_active else int(row.fire_count or 0) + 1
+                    keeps_escalation = not became_active and row.severity_origin == "rule_escalated"
                     fields = dict(
                         last_fired_at=ts_utc, fire_count=count, last_event_id=event_id,
-                        severity=(row.severity if row.status == "active" and row.severity_origin == "rule_escalated" else severity),
+                        severity=(row.severity if keeps_escalation else severity),
                         event_type=event_type, summary=summary,
                         scope=scope, status="active", pending_since=None, last_seen_at=ts_utc,
-                        resolved_at=None, resolved_event_id=None,
+                        resolved_at=None, resolved_event_id=None, resolved_reason=None,
                     )
                     if should_notify:
                         fields["update_time"] = now
                         fields["update_date"] = dt
                     if became_active:
                         fields["first_fired_at"] = ts_utc
+                        # A new occurrence needs a new acknowledgement.
                         fields["acknowledged_at"] = None
-                        fields["silenced_until"] = None
-                        fields["silence_reason"] = None
+                        # A silence runs until its deadline, across occurrences of a flapping alert.
+                        silenced_until = _iso_to_epoch(row.silenced_until)
+                        if silenced_until is None or silenced_until <= now:
+                            fields["silenced_until"] = None
+                            fields["silence_reason"] = None
+                        # Escalation applied to the previous occurrence; a new one starts unescalated.
+                        fields.update(
+                            severity_origin="producer", baseline_severity=None,
+                            escalation_rule_id=None, escalation_rule_version=None,
+                            escalation_reason=None, escalation_evidence_json=None,
+                            escalated_at=None,
+                        )
                     (cls.update(**fields).where(cls.dedup_key == dedup_key).execute())
                     _bump_write_epoch(cls)
                     return should_notify, count
             except (IntegrityError, OperationalError) as e:
                 logger.error(f"Error recording alert fire: {e}")
                 return False, 0
-
-    @classmethod
-    def record_pending(cls, *, dedup_key, ts_utc, event_id, severity=None,
-                       event_type=None, summary=None, scope=None):
-        """Persist a candidate anomaly without exposing it as an active alert."""
-        with db_lock:
-            now = int(time.time())
-            dt = datetime.now()
-            try:
-                with db.atomic():
-                    row = cls.get_or_none(cls.dedup_key == dedup_key)
-                    if row is None:
-                        cls.create(
-                            dedup_key=dedup_key, first_fired_at=ts_utc,
-                            last_fired_at=ts_utc, last_event_id=event_id,
-                            pending_since=ts_utc, last_seen_at=ts_utc,
-                            severity=severity, event_type=event_type,
-                            summary=summary, scope=scope, status="pending",
-                            create_time=now, create_date=dt,
-                            update_time=now, update_date=dt,
-                        )
-                        _bump_write_epoch(cls)
-                        return ts_utc
-                    if row.status == "active":
-                        return None
-                    pending_since = row.pending_since or ts_utc
-                    (cls.update(
-                        last_fired_at=ts_utc, last_seen_at=ts_utc, last_event_id=event_id,
-                        severity=severity, summary=summary, scope=scope, event_type=event_type,
-                        status="pending", pending_since=pending_since,
-                        resolved_at=None, resolved_event_id=None,
-                        update_time=now, update_date=dt,
-                    ).where(cls.dedup_key == dedup_key).execute())
-                    _bump_write_epoch(cls)
-                    return pending_since
-            except (IntegrityError, OperationalError) as e:
-                logger.error(f"Error recording pending alert: {e}")
-                return None
 
     @classmethod
     def active_alerts(cls):
@@ -636,41 +756,53 @@ class AlertState(DataBaseModel):
                 logger.error(f"Error reading active alerts: {e}")
                 return []
 
-    @classmethod
-    def acknowledge(cls, dedup_key, ts_utc):
-        with db_lock:
-            try:
-                with db.atomic():
-                    changed = (cls.update(
-                        acknowledged_at=ts_utc,
-                        update_time=int(time.time()), update_date=datetime.now(),
-                    ).where(
-                        (cls.dedup_key == dedup_key) & (cls.status == "active")
-                    ).execute())
-                    if changed:
-                        _bump_write_epoch(cls)
-                    return bool(changed)
-            except (IntegrityError, OperationalError) as e:
-                logger.error(f"Error acknowledging alert: {e}")
-                return False
+    @staticmethod
+    def _check_seen(row, seen_event_id):
+        """Raise AlertChanged if ``last_event_id`` moved on since the operator loaded the alert."""
+        if seen_event_id is not None and row.last_event_id != seen_event_id:
+            raise AlertChanged(row.dedup_key, row.fire_count, row.last_event_id)
 
     @classmethod
-    def close_acknowledged(cls, dedup_key, ts_utc):
-        """Acknowledge and close an active alert in one step, for alerts with no
-        recovery signal (an operator having seen it is what ends it). The
-        occurrence is archived like any other resolution, with no
-        ``resolved_event_id``."""
+    def acknowledge(cls, dedup_key, ts_utc, seen_event_id=None):
+        """Mark an active alert as handled. ``seen_event_id`` is the
+        ``last_event_id`` the operator saw; raises AlertChanged when it is stale."""
         with db_lock:
             try:
                 with db.atomic():
                     row = cls.get_or_none((cls.dedup_key == dedup_key) & (cls.status == "active"))
                     if row is None:
                         return False
-                    row.acknowledged_at = ts_utc
-                    AlertEpisode.archive(row, resolved_at=ts_utc)
+                    cls._check_seen(row, seen_event_id)
                     (cls.update(
                         acknowledged_at=ts_utc,
+                        update_time=int(time.time()), update_date=datetime.now(),
+                    ).where(cls.dedup_key == dedup_key).execute())
+                    _bump_write_epoch(cls)
+                    return True
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error acknowledging alert: {e}")
+                return False
+
+    @classmethod
+    def close_acknowledged(cls, dedup_key, ts_utc, reason="acknowledged", seen_event_id=None):
+        """Acknowledge and close an active alert in one step: for alerts with no
+        recovery signal (an operator having seen it is what ends it), and for manual
+        closes (``reason="operator_closed"``). The occurrence is archived like any other
+        resolution, with no ``resolved_event_id``. ``seen_event_id``: see acknowledge()."""
+        with db_lock:
+            try:
+                with db.atomic():
+                    row = cls.get_or_none((cls.dedup_key == dedup_key) & (cls.status == "active"))
+                    if row is None:
+                        return False
+                    cls._check_seen(row, seen_event_id)
+                    acknowledged_at = row.acknowledged_at or ts_utc
+                    row.acknowledged_at = acknowledged_at
+                    AlertEpisode.archive(row, resolved_at=ts_utc, resolved_reason=reason)
+                    (cls.update(
+                        acknowledged_at=acknowledged_at,
                         status="resolved", resolved_at=ts_utc, resolved_event_id=None,
+                        resolved_reason=reason,
                         update_time=int(time.time()), update_date=datetime.now(),
                     ).where(cls.dedup_key == dedup_key).execute())
                     _bump_write_epoch(cls)
@@ -744,21 +876,52 @@ class AlertState(DataBaseModel):
                 return False
 
     @classmethod
-    def resolve(cls, *, event_type, scope, ts_utc, resolved_event_id=None):
+    def live_evidence_event_ids(cls) -> set:
+        """Event ids active alerts point at: their latest occurrence and escalation trigger."""
+        with db_lock:
+            try:
+                rows = list(cls.select(cls.last_event_id, cls.escalation_evidence_json)
+                            .where(cls.status == "active"))
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error reading active alert evidence: {e}")
+                return set()
+        ids = set()
+        for row in rows:
+            ids.add(row.last_event_id)
+            try:
+                evidence = json.loads(row.escalation_evidence_json or "{}")
+            except ValueError:
+                evidence = {}
+            if isinstance(evidence, dict):
+                ids.add(evidence.get("trigger_event_id"))
+        ids.discard(None)
+        ids.discard("")
+        return ids
+
+    @classmethod
+    def resolve(cls, *, event_type, scope, ts_utc, resolved_event_id=None,
+                reason="recovered", last_seen_before=None):
         """Resolve active alerts only when a matching recovery fact is recorded.
         Each resolved occurrence is archived as an AlertEpisode first, because
-        this row is reused (and overwritten) if the alert fires again."""
+        this row is reused (and overwritten) if the alert fires again.
+
+        ``last_seen_before`` (UTC ISO) closes only alerts not seen since, so one
+        renewed during a lease sweep stays open.
+        """
         with db_lock:
             try:
                 with db.atomic():
                     condition = ((cls.event_type == event_type)
                                  & (cls.scope == scope)
                                  & (cls.status == "active"))
+                    if last_seen_before is not None:
+                        condition &= cls.last_seen_at.is_null(False) & (cls.last_seen_at <= last_seen_before)
                     for row in cls.select().where(condition):
-                        AlertEpisode.archive(row, resolved_at=ts_utc, resolved_event_id=resolved_event_id)
+                        AlertEpisode.archive(row, resolved_at=ts_utc, resolved_event_id=resolved_event_id,
+                                             resolved_reason=reason)
                     changed = (cls.update(
                         status="resolved", resolved_at=ts_utc,
-                        resolved_event_id=resolved_event_id,
+                        resolved_event_id=resolved_event_id, resolved_reason=reason,
                         update_time=int(time.time()), update_date=datetime.now(),
                     ).where(condition).execute())
                     if changed:
@@ -816,13 +979,13 @@ class AlertState(DataBaseModel):
 
     @classmethod
     def delete_resolved_older_than(cls, days: int) -> int:
-        """Delete resolved alerts outside the diagnostics retention window."""
+        """Delete resolved and legacy "pending" alerts outside the diagnostics retention window."""
         cutoff = int(time.time()) - max(1, int(days)) * 86400
         with db_lock:
             try:
                 with db.atomic():
                     return (cls.delete()
-                            .where((cls.status == "resolved") & (cls.update_time < cutoff))
+                            .where(cls.status.in_(("resolved", "pending")) & (cls.update_time < cutoff))
                             .execute())
             except (IntegrityError, OperationalError) as e:
                 logger.error(f"Error deleting old resolved alerts: {e}")
@@ -854,6 +1017,7 @@ class AlertEpisode(DataBaseModel):
     last_fired_at = CharField(max_length=40)
     resolved_at = CharField(max_length=40, index=True)
     resolved_event_id = CharField(max_length=32, null=True)
+    resolved_reason = CharField(max_length=32, null=True)
     fire_count = IntegerField(default=0)
     last_event_id = CharField(max_length=32, null=True)
     acknowledged_at = CharField(max_length=40, null=True)
@@ -880,7 +1044,7 @@ class AlertEpisode(DataBaseModel):
         return uuid.uuid5(uuid.NAMESPACE_URL, f"{dedup_key}|{first_fired_at}").hex
 
     @classmethod
-    def archive(cls, state, *, resolved_at, resolved_event_id=None):
+    def archive(cls, state, *, resolved_at, resolved_event_id=None, resolved_reason=None):
         """Copy an AlertState row as a closed occurrence. Caller holds
         ``db_lock`` inside a transaction."""
         now = int(time.time())
@@ -889,6 +1053,7 @@ class AlertEpisode(DataBaseModel):
         (cls.insert(
             episode_id=cls.episode_id_for(state.dedup_key, state.first_fired_at),
             resolved_at=resolved_at, resolved_event_id=resolved_event_id,
+            resolved_reason=resolved_reason,
             create_time=now, create_date=dt, update_time=now, update_date=dt,
             **fields,
         ).on_conflict_ignore().execute())
@@ -897,33 +1062,34 @@ class AlertEpisode(DataBaseModel):
     def delete_older_than(cls, days: int) -> int:
         """Delete occurrences outside the diagnostics retention window."""
         cutoff = int(time.time()) - max(1, int(days)) * 86400
-        with db_lock:
-            try:
-                with db.atomic():
-                    return cls.delete().where(cls.update_time < cutoff).execute()
-            except (IntegrityError, OperationalError) as e:
-                logger.error(f"Error deleting old alert episodes: {e}")
-                return 0
+        return _delete_in_batches(cls, cls.update_time < cutoff)
 
 class DetectorCursor(DataBaseModel):
     """Persistent scan position for a diagnostics event source."""
 
     source = CharField(max_length=64, primary_key=True)
     cursor_epoch = FloatField(default=0.0)
+    # Opaque source-native position (journald __CURSOR) to resume exactly after the last
+    # entry. Added by _ensure_columns() on old DBs.
+    cursor_text = TextField(null=True)
 
     @classmethod
-    def get_cursor(cls, source: str) -> float:
+    def get_position(cls, source: str):
+        """Return ``(cursor_epoch, cursor_text)``; ``(0.0, None)`` when unset."""
         with db_lock:
             try:
                 with db.atomic():
                     record = cls.get_or_none(cls.source == source)
-                    return float(record.cursor_epoch) if record is not None else 0.0
+                    if record is None:
+                        return 0.0, None
+                    return float(record.cursor_epoch or 0.0), (record.cursor_text or None)
             except (IntegrityError, OperationalError, TypeError, ValueError) as e:
                 logger.error(f"Error reading detector cursor: {e}")
-                return 0.0
+                return 0.0, None
 
     @classmethod
-    def save_cursor(cls, source: str, cursor_epoch: float) -> bool:
+    def save_cursor(cls, source: str, cursor_epoch: float, cursor_text: str = None) -> bool:
+        """Persist the scan position; ``cursor_text`` is only overwritten when given."""
         try:
             cursor_epoch = float(cursor_epoch)
         except (TypeError, ValueError):
@@ -938,20 +1104,121 @@ class DetectorCursor(DataBaseModel):
                     if record is None:
                         cls.create(
                             source=source, cursor_epoch=cursor_epoch,
+                            cursor_text=cursor_text,
                             create_time=timestamp, create_date=now,
                             update_time=timestamp, update_date=now,
                         )
                     else:
-                        (cls.update(
-                            cursor_epoch=cursor_epoch,
-                            update_time=timestamp,
-                            update_date=now,
-                        ).where(cls.source == source).execute())
+                        fields = {"cursor_epoch": cursor_epoch,
+                                  "update_time": timestamp, "update_date": now}
+                        if cursor_text is not None:
+                            fields["cursor_text"] = cursor_text
+                        cls.update(**fields).where(cls.source == source).execute()
                     _bump_write_epoch(cls)
                     return True
             except (IntegrityError, OperationalError) as e:
                 logger.error(f"Error saving detector cursor: {e}")
                 return False
+
+
+class ErrorSignature(DataBaseModel):
+    """One normalized error message template (diagnostics.error_signatures), kept across restarts.
+
+    ``first_seen`` / ``last_seen`` are event times (epoch seconds), not row write times.
+    """
+
+    fingerprint = CharField(max_length=32, primary_key=True)
+    source = CharField(max_length=32, null=True)
+    origin = CharField(max_length=128, null=True)
+    template = TextField(null=True)
+    sample = TextField(null=True)
+    first_seen = FloatField(default=0.0)
+    last_seen = FloatField(default=0.0, index=True)
+    total_count = IntegerField(default=0)
+
+    @classmethod
+    def load_recent(cls, limit: int):
+        """Most recently seen signatures, newest first; [] on a read failure."""
+        with db_lock:
+            try:
+                with db.atomic():
+                    return list(cls.select().order_by(cls.last_seen.desc()).limit(limit))
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error reading error signatures: {e}")
+                return []
+
+    @classmethod
+    def lookup(cls, fingerprint: str):
+        with db_lock:
+            try:
+                with db.atomic():
+                    return cls.get_or_none(cls.fingerprint == fingerprint)
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error reading error signature: {e}")
+                return None
+
+    @classmethod
+    def upsert_many(cls, rows) -> bool:
+        """Insert or replace whole signature rows (dicts of the columns above)."""
+        if not rows:
+            return True
+        timestamp = int(time.time())
+        now = datetime.now()
+        with db_lock:
+            try:
+                with db.atomic():
+                    for row in rows:
+                        cls.insert(
+                            **row, create_time=timestamp, create_date=now,
+                            update_time=timestamp, update_date=now,
+                        ).on_conflict(
+                            conflict_target=[cls.fingerprint],
+                            preserve=[cls.source, cls.origin, cls.template, cls.last_seen,
+                                      cls.total_count, cls.update_time, cls.update_date],
+                        ).execute()
+                    _bump_write_epoch(cls)
+                    return True
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error saving error signatures: {e}")
+                return False
+
+    @classmethod
+    def prune(cls, older_than_epoch: float) -> int:
+        with db_lock:
+            try:
+                with db.atomic():
+                    deleted = cls.delete().where(cls.last_seen < older_than_epoch).execute()
+                    if deleted:
+                        _bump_write_epoch(cls)
+                    return deleted
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error pruning error signatures: {e}")
+                return 0
+
+    # The learning-period state lives in DetectorCursor, the detectors' small
+    # key/value store: the end time as the epoch, the rest as JSON.
+    _LEARNING_KEY = "error_signatures.learning"
+
+    @classmethod
+    def load_learning(cls):
+        """The persisted learning state, or None before the first save."""
+        until, text = DetectorCursor.get_position(cls._LEARNING_KEY)
+        if text is None:
+            return None
+        try:
+            state = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(state, dict):
+            return None
+        state["until"] = until
+        return state
+
+    @classmethod
+    def save_learning(cls, state):
+        extra = {key: value for key, value in state.items() if key != "until"}
+        return DetectorCursor.save_cursor(cls._LEARNING_KEY, float(state.get("until") or 0.0),
+                                          json.dumps(extra, sort_keys=True))
 
 
 class ConfigRevision(DataBaseModel):
@@ -1053,21 +1320,117 @@ class ConfigRevision(DataBaseModel):
 
 
 def _create_extra_indexes():
-    """Indexes the model definitions cannot express: DESC ordering and the
-    partial UNIQUE index on dedup_key that write-level event idempotency relies
-    on. Run after create_tables()."""
-    for sql in (
-        "CREATE INDEX IF NOT EXISTS operationalevent_create_time ON operationalevent (create_time DESC)",
-        "CREATE INDEX IF NOT EXISTS operationalevent_category_create_time ON operationalevent (category, create_time DESC)",
-        # Partial: events without a dedup_key are never deduplicated.
-        "CREATE UNIQUE INDEX IF NOT EXISTS operationalevent_dedup_key ON operationalevent (dedup_key) WHERE dedup_key IS NOT NULL",
-    ):
-        db.execute_sql(sql)
+    """Indexes the model definitions cannot express: DESC ordering, composite
+    keys and the partial UNIQUE index on dedup_key that write-level event
+    idempotency relies on. Run after create_tables(), under db_lock."""
+    with db_lock:
+        for sql in (
+            "CREATE INDEX IF NOT EXISTS operationalevent_create_time ON operationalevent (create_time DESC)",
+            "CREATE INDEX IF NOT EXISTS operationalevent_category_create_time ON operationalevent (category, create_time DESC)",
+            # Partial: events without a dedup_key are never deduplicated.
+            "CREATE UNIQUE INDEX IF NOT EXISTS operationalevent_dedup_key ON operationalevent (dedup_key) WHERE dedup_key IS NOT NULL",
+            # Snapshot reads select one type in a time range; retention deletes by time.
+            "CREATE INDEX IF NOT EXISTS monitorsnapshot_type_create_time ON monitorsnapshot (snapshot_type, create_time)",
+            "CREATE INDEX IF NOT EXISTS monitorsnapshot_create_time ON monitorsnapshot (create_time)",
+        ):
+            db.execute_sql(sql)
+
+
+# Columns added after a table first shipped. create_tables() never alters an
+# existing table, so an upgraded install needs them added explicitly.
+_ADDED_COLUMNS = (
+    ("detectorcursor", "cursor_text", "TEXT"),
+    ("alertstate", "resolved_reason", "VARCHAR(32)"),
+    ("alertepisode", "resolved_reason", "VARCHAR(32)"),
+)
+# The DDL is built once from the constants above, never at call time (SDL SAV-DB-01).
+_ADD_COLUMN_SQL = tuple((table, column, f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+                        for table, column, sql_type in _ADDED_COLUMNS)
+
+
+def _ensure_columns():
+    for table, column, statement in _ADD_COLUMN_SQL:
+        if column not in {meta.name for meta in db.get_columns(table)}:
+            db.execute_sql(statement)
+
+
+def _backfill_event_occurrence():
+    """Set create_time from ts_utc on rows from older releases, which stored the insert time.
+
+    Only timezone-qualified values are converted (SQLite reads a naive one as UTC, the writer
+    meant local time); a no-op once every row is aligned.
+    """
+    with db_lock:
+        db.execute_sql(
+            "UPDATE operationalevent SET create_time = CAST(strftime('%s', ts_utc) AS INTEGER) "
+            "WHERE (ts_utc LIKE '%+__:__' OR ts_utc LIKE '%-__:__' OR ts_utc LIKE '%Z') "
+            "AND strftime('%s', ts_utc) IS NOT NULL "
+            "AND create_time != CAST(strftime('%s', ts_utc) AS INTEGER)")
+
+
+# ISO 8601 columns compared as strings; values older releases wrote with a local
+# offset ("+08:00") are rewritten to UTC.
+_UTC_COLUMNS = (
+    ("operationalevent", ("ts_utc", "acknowledged_at")),
+    ("alertstate", ("first_fired_at", "last_fired_at", "acknowledged_at", "silenced_until",
+                    "pending_since", "last_seen_at", "resolved_at", "escalated_at")),
+    ("alertepisode", ("first_fired_at", "last_fired_at", "resolved_at", "acknowledged_at",
+                      "silenced_until", "escalated_at")),
+)
+# Built once from the constants above, like _ADD_COLUMN_SQL; no-ops once every row is UTC.
+_UTC_REWRITE_SQL = tuple(
+    f"UPDATE {table} SET {column} = strftime('%Y-%m-%dT%H:%M:%f', {column}) || '+00:00' "
+    f"WHERE ({column} LIKE '%+__:__' OR {column} LIKE '%-__:__' OR {column} LIKE '%Z') "
+    f"AND {column} NOT LIKE '%+00:00' AND strftime('%s', {column}) IS NOT NULL"
+    for table, columns in _UTC_COLUMNS for column in columns)
+
+
+# Boot ids written before journald's dashless form was adopted. Built once.
+_LEGACY_BOOT_ID_PROBE_SQL = "SELECT 1 FROM operationalevent WHERE boot_id LIKE '%-%' LIMIT 1"
+_BOOT_ID_REWRITE_SQL = (
+    "UPDATE operationalevent SET boot_id = lower(replace(boot_id, '-', '')) WHERE boot_id LIKE '%-%'",
+    "UPDATE configrevision SET boot_id = lower(replace(boot_id, '-', '')) WHERE boot_id LIKE '%-%'",
+) + tuple(
+    f"UPDATE operationalevent SET attributes_json = json_set(attributes_json, '$.{key}', "
+    f"lower(replace(json_extract(attributes_json, '$.{key}'), '-', ''))) "
+    f"WHERE attributes_json LIKE '%\"{key}\"%' AND json_valid(attributes_json) "
+    f"AND json_extract(attributes_json, '$.{key}') LIKE '%-%'"
+    for key in ("boot_id", "previous_boot_id"))
+
+
+def _normalize_boot_ids():
+    """Rewrite dashed boot ids once, so one boot is never listed as two."""
+    with db_lock:
+        if db.execute_sql(_LEGACY_BOOT_ID_PROBE_SQL).fetchone() is None:
+            return
+        with db.atomic():
+            for statement in _BOOT_ID_REWRITE_SQL:
+                db.execute_sql(statement)
+
+
+def _normalize_utc_timestamps():
+    with db_lock:
+        with db.atomic():
+            for statement in _UTC_REWRITE_SQL:
+                db.execute_sql(statement)
 
 
 def init_database():
-    db.create_tables([AIAppPriority, MonitorSnapshot, OperationalEvent, AlertState, AlertEpisode, DetectorCursor, ConfigRevision])
+    db.create_tables([AIAppPriority, MonitorSnapshot, OperationalEvent, AlertState, AlertEpisode, DetectorCursor, ConfigRevision, ErrorSignature])
+    _ensure_columns()
     _create_extra_indexes()
+    try:
+        _backfill_event_occurrence()
+    except OperationalError as e:  # never block startup on a best-effort re-key
+        logger.warning(f"Operational event occurrence backfill skipped: {e}")
+    try:
+        _normalize_utc_timestamps()
+    except OperationalError as e:
+        logger.warning(f"UTC timestamp normalization skipped: {e}")
+    try:
+        _normalize_boot_ids()
+    except OperationalError as e:
+        logger.warning(f"Boot id normalization skipped: {e}")
 
 
 if __name__ == "__main__":

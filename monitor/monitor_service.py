@@ -26,23 +26,22 @@ from monitor.monitor_api import (
     stop_dynamic_info_collector,
 )
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
-from features import mount_benchmark, mount_dashboard, mount_diagnostics
+from features import (mount_benchmark, mount_dashboard, mount_diagnostics,
+                      start_diagnostics_background, start_diagnostics_writer)
 from smartune_api import auth_bp, set_benchmark_available, set_diagnostics_available, smartune_bp
-try:
-    from diagnostics.detectors import start_detector_loop
-except ModuleNotFoundError as exc:
-    if exc.name not in {"diagnostics", "diagnostics.detectors"}:
-        raise
-
-    def start_detector_loop():
-        return None
 from utils.logger import get_logger
 logger = get_logger(__name__)
 try:
-    from diagnostics import emit_event  # best-effort seam; no-op if stripped
-except Exception:  # pragma: no cover
+    from diagnostics import emit_event, record_service_started  # best-effort seams; no-op if stripped
+except ModuleNotFoundError as exc:
+    # Only a missing diagnostics package gets the no-op; other import errors must surface.
+    if exc.name != "diagnostics":
+        raise
+
     def emit_event(*_a, **_k):
         return None
+
+    record_service_started = emit_event
 from utils import ui_shutdown
 from utils.http_utils import apply_request_limits, DeferredHandshakeSSLContext, QuietWSGIRequestHandler
 
@@ -142,6 +141,8 @@ def main():
         return
 
     init_database()
+    start_diagnostics_writer()  # request-path events are written in the background
+    start_diagnostics_background()
     try:
         preload_static_info()
     except Exception as exc:
@@ -150,18 +151,18 @@ def main():
     # Persist dynamic history in monitor-only mode. This is a no-op when no
     # sections are configured for monitoring.
     _start_dynamic_info_auto_refresh()
-    start_detector_loop()
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    emit_event("PLATFORM_SERVICE_STARTED", severity="info", category="platform.availability",
-               source="monitor", summary="Monitor service started (API + Dashboard)",
-               attributes={
-                   "mode": os.environ.get("SMARTUNE_MODE", "monitor"),
-                   "api_service": "started",
-                   "dashboard_ui": "mounted",
-               })
+    # Also records a crash of the previous run that left no shutdown record.
+    record_service_started(
+        "monitor", summary="Monitor service started (API + Dashboard)",
+        attributes={
+            "mode": os.environ.get("SMARTUNE_MODE", "monitor"),
+            "api_service": "started",
+            "dashboard_ui": "mounted",
+        })
 
     # Packaged deployments (run_monitor.sh sets SMARTUNE_UI_SHUTDOWN) let the
     # dashboard stop the service.
@@ -194,7 +195,8 @@ def main():
             emit_event("PLATFORM_SERVICE_CRASHED", severity="critical", category="platform.availability",
                        impact="failed", source="monitor",
                        summary="Monitor service crashed with uncaught exception",
-                       attributes={"exception_type": type(exc).__name__, "exception_message": str(exc)[:500]})
+                       attributes={"detected_by": "exception", "exception_type": type(exc).__name__,
+                                   "exception_message": str(exc)[:500]})
         except Exception:
             pass  # Best-effort; never let diagnostics itself break crash recovery
         raise

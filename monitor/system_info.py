@@ -571,6 +571,8 @@ class _DynamicInfoCollector:
         cpu_temps = get_cpu_temperatures(num_logical=num_logical)
         cpu["temperature_c"] = cpu_temps["package_c"]
         cpu["per_core_temperature_c"] = cpu_temps["per_core_c"]
+        # The CPU's own throttle point; diagnostics compares temperatures against it.
+        cpu["package_tjmax_c"] = cpu_temps.get("package_tjmax_c")
         return cpu
 
     def memory(self) -> Dict[str, Any]:

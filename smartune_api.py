@@ -17,7 +17,7 @@ import time
 from flask import Blueprint, request
 
 from features import DASHBOARD_ENDPOINT
-from diagnostics import emit_event
+from diagnostics import post_event
 from utils.http_utils import RetCode, construct_response
 from utils.logger import get_logger
 logger = get_logger(__name__)
@@ -117,6 +117,47 @@ def _token_is_valid(provided: str) -> bool:
     return hmac.compare_digest(provided_hash, _get_secret_hash())
 
 
+# Rate limit for AUTH_ACCESS_DENIED events: at most one per address and a few in total per
+# window; the next event carries the count of rejections it stands for.
+_DENIED_EVENT_WINDOW_SEC = 60.0
+_DENIED_EVENTS_PER_WINDOW = 10
+_DENIED_TRACKED_MAX = 512
+
+_denied_lock = threading.Lock()
+_denied_by_addr = {}  # remote_addr -> [last_event_monotonic, rejections_not_yet_reported]
+_denied_window = [0.0, 0]  # [window_start_monotonic, events_recorded_in_window]
+
+
+def _admit_denied_event(remote_addr):
+    """Return the earlier suppressed rejections a new event reports, or None to only count this one."""
+    now = time.monotonic()
+    with _denied_lock:
+        state = _denied_by_addr.get(remote_addr)
+        if state is None:
+            if len(_denied_by_addr) >= _DENIED_TRACKED_MAX:
+                # Evict the addresses quiet longest; their unreported counts are lost.
+                for addr, _ in sorted(_denied_by_addr.items(), key=lambda item: item[1][0] or 0.0)[
+                        :len(_denied_by_addr) - _DENIED_TRACKED_MAX + 1]:
+                    del _denied_by_addr[addr]
+            state = _denied_by_addr[remote_addr] = [None, 0]
+        if now - _denied_window[0] >= _DENIED_EVENT_WINDOW_SEC:
+            _denied_window[0], _denied_window[1] = now, 0
+        recent = state[0] is not None and now - state[0] < _DENIED_EVENT_WINDOW_SEC
+        if recent or _denied_window[1] >= _DENIED_EVENTS_PER_WINDOW:
+            state[1] += 1
+            return None
+        suppressed, state[0], state[1] = state[1], now, 0
+        _denied_window[1] += 1
+        return suppressed
+
+
+def _reset_denied_events():
+    """Forget the rejection counters (for tests)."""
+    with _denied_lock:
+        _denied_by_addr.clear()
+        _denied_window[0], _denied_window[1] = 0.0, 0
+
+
 @auth_bp.record_once
 def _provision_token_on_register(_state):
     """Provision the token as soon as the blueprint is registered (i.e. at
@@ -155,15 +196,22 @@ def _enforce_api_token():
     if _token_is_valid(provided):
         return None
 
-    emit_event(
-        "AUTH_ACCESS_DENIED", severity="warning", category="platform.security",
-        impact="refused", summary="Unauthorized API request rejected",
-        attributes={
+    remote_addr = request.remote_addr or "unknown"
+    suppressed = _admit_denied_event(remote_addr)
+    if suppressed is not None:
+        attributes = {
             "method": request.method,
             "path": request.url_rule.rule if request.url_rule else "<unmatched>",
-            "remote_addr": request.remote_addr or "unknown",
-        },
-    )
+            "remote_addr": remote_addr,
+        }
+        if suppressed:
+            # Rejections from this address counted but not recorded since its previous event.
+            attributes["suppressed_since_last"] = suppressed
+        post_event(
+            "AUTH_ACCESS_DENIED", severity="warning", category="platform.security",
+            impact="refused", summary="Unauthorized API request rejected",
+            attributes=attributes,
+        )
     response = construct_response(
         data={"authenticated": False},
         retcode=RetCode.UNAUTHORIZED,
@@ -222,7 +270,7 @@ def _record_login_failure(remote_addr):
     if locked_out:
         logger.warning(f"/auth/login rate limit: locking out {remote_addr} for {_LOGIN_LOCKOUT_SEC:.0f}s "
                         f"after {_LOGIN_FAILURE_LIMIT} invalid attempts in {_LOGIN_FAILURE_WINDOW_SEC:.0f}s")
-        emit_event(
+        post_event(
             "AUTH_LOGIN_RATE_LIMITED", severity="warning", category="platform.security",
             impact="refused",
             summary=f"Locked out {remote_addr} from /auth/login after repeated invalid attempts",

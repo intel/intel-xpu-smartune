@@ -323,6 +323,7 @@ def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
             "e_core_freq_mhz": to_float(cpu.get("e_core_freq_mhz")),
             "lpe_core_freq_mhz": to_float(cpu.get("lpe_core_freq_mhz")),
             "temperature_c": to_float(cpu.get("temperature_c")),
+            "package_tjmax_c": to_float(cpu.get("package_tjmax_c")),
             "per_core_usage": cpu.get("per_core_usage") or [],
             "per_core_freq_mhz": cpu.get("per_core_freq_mhz") or [],
             "per_core_temperature_c": cpu.get("per_core_temperature_c") or [],

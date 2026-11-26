@@ -286,8 +286,12 @@ def _get_card_pci_slot(card: str) -> Optional[str]:
 
 
 def _parse_xe_vram_mm(card_index: int) -> Dict[str, Optional[float]]:
-    """Parse size/usage from Xe debugfs tile*/vram_mm, summed over all tiles."""
-    paths = sorted(glob.glob(f"/sys/kernel/debug/dri/{card_index}/tile*/vram_mm"))
+    """Parse size/usage from Xe debugfs vram*_mm, summed over all VRAM regions.
+
+    Newer kernels expose dri/N/vram0_mm; older ones dri/N/tile*/vram_mm.
+    """
+    root = f"/sys/kernel/debug/dri/{card_index}"
+    paths = sorted(glob.glob(f"{root}/vram*_mm")) or sorted(glob.glob(f"{root}/tile*/vram_mm"))
     total_bytes = 0.0
     used_bytes = 0.0
     found = False

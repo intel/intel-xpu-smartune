@@ -25,7 +25,8 @@ from monitor.monitor_api import (
     stop_dynamic_info_collector,
 )
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
-from features import mount_benchmark, mount_dashboard, mount_diagnostics
+from features import (mount_benchmark, mount_dashboard, mount_diagnostics, push_diagnostic_alerts,
+                      start_diagnostics_background, start_diagnostics_writer)
 from smartune_api import auth_bp, smartune_bp, set_balancer_available, set_benchmark_available, set_diagnostics_available
 try:
     from diagnostics.detectors import start_detector_loop
@@ -42,10 +43,18 @@ from utils.logger import get_logger
 from utils import ui_shutdown
 logger = get_logger(__name__)
 try:
-    from diagnostics import emit_event  # best-effort seam; no-op if stripped
-except Exception:  # pragma: no cover
+    # Best-effort seams, no-op if stripped: post_event writes in the background, emit_event inline.
+    from diagnostics import emit_event, post_event, record_service_started
+except ModuleNotFoundError as exc:
+    # Only a missing diagnostics package gets the no-op; other import errors must surface.
+    if exc.name != "diagnostics":
+        raise
+
     def emit_event(*_a, **_k):
         return None
+
+    post_event = emit_event
+    record_service_started = emit_event
 
 app = Flask(__name__)
 apply_request_limits(app)
@@ -57,6 +66,9 @@ app.register_blueprint(auth_bp)
 benchmark_available = mount_benchmark(app)
 # Diagnostics /diag/* API (event ledger, alerts, incident/context, log query).
 diagnostics_available = mount_diagnostics(app)
+# A new alert is pushed on /app/events, which every open dashboard tab listens to.
+if diagnostics_available:
+    push_diagnostic_alerts(callback_manager.send_callback_notification)
 # Keep the full balancer deployment consistent with monitor-only: serve the
 # dashboard from this same Flask process and route its /api calls to the API.
 mount_dashboard(app)
@@ -216,13 +228,14 @@ def start_service():
             signal.signal(signal.SIGINT, _handle_signal)
             signal.signal(signal.SIGTERM, _handle_signal)
             _service.start()
-            emit_event("PLATFORM_SERVICE_STARTED", severity="info", category="platform.availability",
-                       source="balancer", summary="SmarTune service started (API + Dashboard)",
-                       attributes={
-                           "mode": os.environ.get("SMARTUNE_MODE", "all"),
-                           "api_service": "started",
-                           "dashboard_ui": "mounted",
-                       })
+            # Also records a crash of the previous run that left no shutdown record.
+            record_service_started(
+                "balancer", summary="SmarTune service started (API + Dashboard)",
+                attributes={
+                    "mode": os.environ.get("SMARTUNE_MODE", "all"),
+                    "api_service": "started",
+                    "dashboard_ui": "mounted",
+                })
         else:
             logger.debug("DynamicService already initialized, skipping")
     return _service
@@ -1583,7 +1596,7 @@ def set_oom_score():
 
         app_info = AIAppPriority.query().filter(AIAppPriority.app_id == app_id).first()
         if app_info is None:
-            emit_event(
+            post_event(
                 "APP_OOM_SCORE_REFUSED", severity="warning", category="platform.control",
                 app_id=app_id, impact="refused",
                 summary="Refused /app/set_oom_score for an unregistered app_id",
@@ -1737,7 +1750,7 @@ def app_resource_limit():
         # Use the registered app identity when locating processes to limit.
         app_record = AIAppPriority.query().filter(AIAppPriority.app_id == app_id).first()
         if not app_record or not app_record.controlled:
-            emit_event(
+            post_event(
                 "APP_RESOURCE_LIMIT_REFUSED", severity="warning", category="platform.control",
                 app_id=app_id, impact="refused",
                 summary="Refused /app/resource_limit for an unregistered/non-controlled app_id",
@@ -2307,6 +2320,9 @@ def main():
         return
 
     init_database()
+    # Before the balancer starts, so its control events are written in the background.
+    start_diagnostics_writer()
+    start_diagnostics_background()
     # config.yaml decides *which* apps are managed, and it is read once at import
     # (no hot reload), so a hand-edited entry only ever takes effect here.  Must
     # precede start_service(): the BPF monitor list and the OOM adjustment are
@@ -2361,7 +2377,8 @@ def main():
             emit_event("PLATFORM_SERVICE_CRASHED", severity="critical", category="platform.availability",
                        impact="failed", source="balancer",
                        summary="Balancer service crashed with uncaught exception",
-                       attributes={"exception_type": type(exc).__name__, "exception_message": str(exc)[:500]})
+                       attributes={"detected_by": "exception", "exception_type": type(exc).__name__,
+                                   "exception_message": str(exc)[:500]})
         except Exception:
             pass  # Best-effort; never let diagnostics itself break crash recovery
         raise

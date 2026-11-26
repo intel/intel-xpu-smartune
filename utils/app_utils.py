@@ -710,6 +710,11 @@ def _pids_from_cgroupfs(cgroup_path):
     return _filter_visible_cgroup_pids(dict.fromkeys(pids))
 
 
+def read_cgroup_pids(cgroup_path):
+    """PIDs inside the cgroup, read from cgroupfs without spawning systemd-cgls, so it never blocks."""
+    return _pids_from_cgroupfs(cgroup_path)
+
+
 def get_pids_in_cgroup(cgroup_path):
     """Return all process PIDs inside the specified cgroup."""
     try:

@@ -179,13 +179,45 @@ def mount_benchmark(app) -> bool:
 _DIAGNOSTICS_ABSENT = {"diagnostics"}
 
 
+def start_diagnostics_writer() -> bool:
+    """Start the diagnostics writer thread for business-code events. Returns whether it runs.
+
+    Not called from mount_diagnostics(), so importing a service module writes events inline.
+    """
+    try:
+        from diagnostics import writer
+    except ImportError as exc:
+        if getattr(exc, "name", None) not in _DIAGNOSTICS_ABSENT:
+            raise
+        return False
+    try:
+        writer.start()
+        return True
+    except Exception:
+        logger.exception("Diagnostics writer could not be started; events are written inline")
+        return False
+
+
+def push_diagnostic_alerts(send) -> bool:
+    """Push notifying alerts through ``send(payload)``; False when diagnostics is absent."""
+    try:
+        from diagnostics import alerts
+    except ImportError as exc:
+        if getattr(exc, "name", None) not in _DIAGNOSTICS_ABSENT:
+            raise
+        return False
+    alerts.add_notification_sink(send)
+    return True
+
+
 def mount_diagnostics(app) -> bool:
     """Register the /diag blueprint on ``app``. Returns whether it is available.
 
     The caller passes the result to smartune_api.set_diagnostics_available so
     /smartune/capabilities reports it to the dashboard (conditional Diagnostics
     tab). Also ensures the diagnostics SQLite tables exist, so a monitor-only or
-    freshly-provisioned deployment can serve /diag/* immediately.
+    freshly-provisioned deployment can serve /diag/* immediately. Runs on mere import,
+    so it starts no background work (see start_diagnostics_background()).
     """
     try:
         from diagnostics.diag_api import diag_bp
@@ -198,6 +230,24 @@ def mount_diagnostics(app) -> bool:
 
     event_store.ensure_tables()
     app.register_blueprint(diag_bp)
+    # Wire benchmark lifecycle -> events via the JobManager observer (no-op when
+    # benchmark is absent). Kept here so benchmark never imports diagnostics.
+    try:
+        from diagnostics.hooks import register_benchmark_listener
+        register_benchmark_listener()
+    except Exception:
+        logger.exception("Diagnostics benchmark listener could not be registered")
+    return True
+
+
+def start_diagnostics_background() -> bool:
+    """Reconcile interrupted control lifecycles, start diagnostics' loops; False if absent."""
+    try:
+        import diagnostics  # noqa: F401
+    except ImportError as exc:
+        if getattr(exc, "name", None) not in _DIAGNOSTICS_ABSENT:
+            raise
+        return False
     try:
         from diagnostics.control_lifecycle import reconcile_interrupted_lifecycles
         reconcile_interrupted_lifecycles()
@@ -214,7 +264,7 @@ def mount_diagnostics(app) -> bool:
     except Exception:
         logger.exception("Diagnostics alert expiry loop could not be started")
     # Background detector: turn newly-arrived ERROR/CRITICAL application-log lines
-    # into events. Idempotent + daemon; failure here must not fail the mount.
+    # into events.
     try:
         from diagnostics.detectors import start_detector_loop
         start_detector_loop()
@@ -235,13 +285,6 @@ def mount_diagnostics(app) -> bool:
         start_gpu_throttle_loop()
     except Exception:
         logger.exception("Diagnostics GPU throttle loop could not be started")
-    # Wire benchmark lifecycle -> events via the JobManager observer (no-op when
-    # benchmark is absent). Kept here so benchmark never imports diagnostics.
-    try:
-        from diagnostics.hooks import register_benchmark_listener
-        register_benchmark_listener()
-    except Exception:
-        logger.exception("Diagnostics benchmark listener could not be registered")
     # Configuration-revision chain: baseline + a daily recheck for BIOS/DIMM/
     # disk/driver/firmware drift, both done off the startup path (dmidecode/
     # lsblk/debugfs reads run after the loop's own settle delay).

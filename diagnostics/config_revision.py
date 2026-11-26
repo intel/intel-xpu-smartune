@@ -11,7 +11,7 @@ import time
 import uuid
 
 from diagnostics.emitter import emit_event
-from diagnostics.system_info import read_boot_id
+from diagnostics.system_info import normalize_boot_id, read_boot_id
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -23,15 +23,33 @@ _REMOVED_AFTER_MISSES = 2
 _LOOP_STARTED = False
 _LOOP_START_LOCK = threading.Lock()
 _RECHECK_INTERVAL_SEC = 86400.0
+# How often the loop checks whether a recheck is due (at startup, then daily by wall clock).
+_POLL_INTERVAL_SEC = 3600.0
 _INITIAL_DELAY_SEC = 60.0
+
+
+def _vram_capacity(vram):
+    """Per-GPU memory size only, without the live usage the inventory's vram entries carry."""
+    if not isinstance(vram, dict):
+        return vram
+    return {label: {key: entry.get(key) for key in ("total_bytes", "pci_slot")}
+            for label, entry in sorted(vram.items()) if isinstance(entry, dict)}
+
+
+def _physical_nics(network):
+    """Names of interfaces backed by a device (not docker, veth, bridges or VPN tunnels)."""
+    import os
+
+    names = (network.get("network_speeds_mbps") or {}).keys()
+    return sorted(name for name in names if os.path.exists(f"/sys/class/net/{name}/device")) or None
 
 
 def _hw_view(inventory: dict) -> dict:
     """Stable hardware fields worth fingerprinting. Deliberately excludes
     live/current readings (per-core current frequency, NIC IP leases, disk
-    free space) that collect_static_info() mixes in alongside truly static
-    fields -- those churn on every recheck and would make every revision
-    look "changed" for no real reason."""
+    free space, GPU memory in use, link speeds) that collect_static_info()
+    mixes in alongside truly static fields -- those churn on every recheck and
+    would make every revision look "changed" for no real reason."""
     bios = inventory.get("bios") or {}
     cpu = inventory.get("cpu") or {}
     memory = inventory.get("memory") or {}
@@ -50,15 +68,14 @@ def _hw_view(inventory: dict) -> dict:
         "disk_total_size_bytes": disk.get("total_size_bytes"),
         "disk_devices": [{"name": d.get("name"), "size_bytes": d.get("size_bytes")}
                          for d in (disk.get("devices") or [])],
-        "network_nic_count": network.get("nic_count"),
-        "network_speeds_mbps": network.get("network_speeds_mbps"),
+        "network_physical_nics": _physical_nics(network),
         "gpu_names": gpu.get("names"),
         "gpu_count": gpu.get("count"),
-        "gpu_vram": gpu.get("vram"),
+        "gpu_vram": _vram_capacity(gpu.get("vram")),
         "gpu_eu_count": gpu.get("eu_count"),
         "gpu_pci_addresses": gpu.get("pci_addresses"),
-        "gpu_freq_bounds_mhz": gpu.get("freq_bounds_mhz"),
-        "gpu_gt_freq_bounds_mhz": gpu.get("gt_freq_bounds_mhz"),
+        # Not the GPU's min/max frequency: those are the writable limits that
+        # Device Control (or the user) sets, so a cap would read as new hardware.
         "npu_names": npu.get("names"),
         "npu_freq_bounds_mhz": npu.get("freq_bounds_mhz"),
     }
@@ -240,7 +257,8 @@ def check_and_record_if_changed():
             return
 
         boot_id = read_boot_id()
-        time_accuracy = "observed_after_restart" if (latest.boot_id and boot_id and latest.boot_id != boot_id) else "exact"
+        rebooted = latest.boot_id and boot_id and normalize_boot_id(latest.boot_id) != boot_id
+        time_accuracy = "observed_after_restart" if rebooted else "exact"
         revision_id = _new_revision_id()
         field_status = {"hw": hw_status, "sw": sw_status}
         status = ConfigRevision.insert_revision(
@@ -293,16 +311,17 @@ def start_config_revision_loop():
 
     def loop():
         time.sleep(_INITIAL_DELAY_SEC)
-        try:
-            ensure_baseline()
-        except Exception as exc:
-            logger.error("Config revision baseline initialization failed: %s", exc, exc_info=True)
+        last_check = None
         while True:
-            time.sleep(_RECHECK_INTERVAL_SEC)
-            try:
-                check_and_record_if_changed()
-            except Exception as exc:
-                logger.warning("Config revision loop iteration failed: %s", exc)
+            # Wall-clock time: it keeps running through suspend.
+            if last_check is None or time.time() - last_check >= _RECHECK_INTERVAL_SEC:
+                last_check = time.time()
+                try:
+                    # Creates the baseline on first use, else compares with it.
+                    check_and_record_if_changed()
+                except Exception as exc:
+                    logger.warning("Config revision loop iteration failed: %s", exc)
+            time.sleep(_POLL_INTERVAL_SEC)
 
     t = threading.Thread(target=loop, daemon=True, name="diag-config-revision")
     t.start()

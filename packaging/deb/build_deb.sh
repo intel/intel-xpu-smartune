@@ -151,6 +151,8 @@ STAGE_EXCLUDES=(
     --exclude='benchmark/runtime'
     # Dev-only: eBPF experiments and unit tests.
     --exclude='balancer/test'
+    --exclude='diagnostics/test'
+    --exclude='monitor/test'
     --exclude='config/runtime_state.json'
     # SDK development leftovers: tests and local build output.
     --exclude='sdk/tests'

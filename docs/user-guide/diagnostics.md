@@ -64,31 +64,113 @@ events*, but only a fixed set of event types creates one:
 | Event type | Severity | What closes the alert |
 |---|---|---|
 | `PLATFORM_KERNEL_PANIC` | critical | Acknowledging it |
-| `RESOURCE_MEMORY_OOM_KILL` | critical | Acknowledging it |
+| `RESOURCE_MEMORY_OOM_KILL` | critical | Acknowledging it. Raised for the kernel OOM killer and for systemd-oomd |
+| `PLATFORM_HOST_UNCLEAN_SHUTDOWN` | error | Acknowledging it. Raised once per boot when the previous one ended without a clean shutdown (crash, hang, reset or power loss) |
 | `DEVICE_GPU_HANG` | critical | Acknowledging it |
+| `PLATFORM_KERNEL_OOPS` | critical | Acknowledging it |
+| `PLATFORM_KERNEL_LOCKUP` | critical | Acknowledging it |
+| `DEVICE_HARDWARE_ERROR_UNCORRECTED` | critical | Acknowledging it |
+| `PLATFORM_KERNEL_HUNG_TASK` | error | Acknowledging it |
+| `DEVICE_STORAGE_IO_ERROR` | error | Acknowledging it |
 | `DEVICE_GPU_THROTTLED` | warning | The GPU stops being throttled (confirmed over 3 consecutive samples) |
-| `PLATFORM_SERVICE_CRASHED` | critical | The same service starts again |
-| `PLATFORM_SYSTEMD_RESTART_LOOP` | error | 2 minutes without a new detection (escalates to critical when detected 3 times in 5 minutes) |
-| `CONTROL_CPU_LIMIT_FAILED` | error | The CPU limit recovers |
-| `CONTROL_MEMORY_LIMIT_FAILED` | error | The memory limit recovers |
-| `CONTROL_DISK_IO_LIMIT_FAILED` | error | The disk I/O limit recovers |
+| `PLATFORM_SERVICE_CRASHED` | critical | Acknowledging it. Raised for an uncaught exception, or at the next start when the previous run ended without shutting down (killed, OOM-killed, crashed in native code) |
+| `PLATFORM_SYSTEMD_RESTART_LOOP` | error | 5 minutes without a new detection. A loop is recorded at most once a minute per unit; it escalates to critical when the restart counter reaches 10 or after 3 detections in 5 minutes |
+| `CONTROL_CPU_LIMIT_FAILED` | error | Acknowledging it, or a reboot |
+| `CONTROL_MEMORY_LIMIT_FAILED` | error | Acknowledging it, or a reboot |
+| `CONTROL_DISK_IO_LIMIT_FAILED` | error | Acknowledging it, or a reboot |
+| `LOG_ERROR_SIGNATURE_BURST` | error | 10 minutes without a new detection |
+| `CUSTOM_RULE::<id>` | the rule's severity | Set per rule: acknowledging it, or the rule not matching for its quiet period. Only rules whose **Alert** setting is on |
 
-Every other event — including events from your own custom rules — stays
-diagnostic evidence only, even when its severity is error or critical. The ⓘ
+**Errors without a rule.** You do not need a rule for every error message.
+SmarTune reads every error-level line from its own logs and from the system
+journal (any service, plus the kernel). It reduces each line to a template:
+numbers, ids, paths, addresses and quoted values become placeholders, so
+`Cannot read private key file /etc/xrdp/key.pem` and the same message with
+another path are one template. For each template it records when it was
+first and last seen and how often it occurs, and records:
+
+- **New error** (`LOG_ERROR_SIGNATURE_NEW`): a template never seen before on
+  this host. It is an event, not an alert: evidence to look at when you (or an
+  agent) investigate. An error that keeps recurring at its usual rate, for
+  example a unit that fails every hour, is reported once and then stays quiet.
+- **Error burst** (`LOG_ERROR_SIGNATURE_BURST`, an alert): a template occurs at least 10
+  times in 5 minutes *and* at least 5 times more often than its own history
+  predicts. It is recorded at most every 5 minutes per component while the
+  burst lasts, and the alert closes 10 minutes after the burst ends.
+
+Lines already recognised by a built-in rule (OOM kill, kernel fault, restart
+loop, …) or matched by one of your custom rules are not counted again. To
+limit noise, during the first hour after installation (restarts included) and
+the first minutes of the first boot after it, existing errors are learned
+without events. At most 10 new-error events are recorded per hour: the next one
+reports how many were held back, and a held-back error is reported when it
+occurs again. When systemd reports a failing unit, the unit counts as the
+component, so bursts from two failing services are two alerts. Both event types can be
+turned off in **Settings → Diagnostic events**.
+
+**Custom rules can alert.** A rule's message phrase needs at least 3 characters
+(spaces at either end are ignored): shorter ones match nearly every line. In
+**Settings → Custom diagnostic rules**, set a
+rule's **Alert** to *Alert until acknowledged* (one-off faults) or *Alert until
+quiet* (the alert closes after the rule has not matched for the quiet period,
+1 to 1440 minutes, default 10). The alert uses the rule's severity, which must
+be warning or higher. Repeated matches fold into one open alert. Changes apply
+without a restart. If you delete a rule or turn its alert off, its open alerts
+close when acknowledged.
+
+Every other event stays
+diagnostic evidence only, even when its severity is error or critical. That
+includes kernel WARNs (`PLATFORM_KERNEL_WARNING`), process crashes
+(`PLATFORM_PROCESS_CRASHED`), corrected hardware errors
+(`DEVICE_HARDWARE_ERROR_CORRECTED`) and CPU thermal throttling
+(`DEVICE_CPU_THERMAL_THROTTLED`): they are frequent enough that alerting on
+each would bury real faults, so they feed **Advices** instead. Repeats of the
+same kernel fault on the same subject (a task re-reported every two minutes, a
+storm of corrected PCIe errors) are recorded a few times per 10 minutes, and
+each recorded event carries `occurrences` and `suppressed_since_last` counts. The ⓘ
 icon next to the **Alerts** heading shows this **Alert policy** in the
 dashboard.
 
 **Open and Closed.** An alert is **Open** while someone may still need to act,
 and **Closed** once whatever ends it has happened (see the table above). The
-first three types are one-off faults with no recovery signal, so
+"Acknowledging it" types are one-off faults with no recovery signal, so
 **acknowledging them is what closes them** — investigate first, then
 acknowledge.
 
 **Repeats are merged.** Repeated detections of the same event type in the same
 scope (app, service, control lifecycle, …) are grouped into one alert and
-counted in **Times detected**, instead of raising new alerts. Notifications for
-the same alert are sent at most once every 5 minutes. If the alert fires again
-after it has closed, that is a new occurrence with its own row.
+counted in **Times detected**, instead of raising new alerts; the bell lists
+each open alert once. If the alert fires again after it has closed, that is a
+new occurrence with its own row.
+
+**New alerts pop up.** When an alert opens, a notification appears on whichever
+dashboard tab you have open, with **Open Alerts** to go to it; a critical one
+stays until you dismiss it. Further detections of an open alert notify at most
+once every 5 minutes; an acknowledged or silenced alert does not notify again.
+An escalation notifies at once, even inside those 5 minutes, and needs
+attention again even if the alert was acknowledged. (In
+monitor-only mode the bell picks new alerts up within 30 seconds instead.)
+
+**Event, alert and advice severity.** One incident can show three severity
+levels, because each answers a different question:
+
+- An **event's** severity is set by whatever reported it and describes that
+  one observation. For example, the kernel log line of an OOM kill is recorded
+  as *error*.
+- An **alert's** severity comes from its alert policy (the table above) and says
+  how urgently someone should act: an OOM kill alert is *critical*. An
+  escalation rule can raise it while the alert is open (a restart loop that goes
+  on becomes *critical*); its details then show why.
+- An **advice** item's severity is set by the rule that produced it, which weighs
+  all the evidence in the window together.
+
+The event list, the timeline and the severity counts use event severities; the
+Alerts list, the bell and notifications use alert severities.
+
+**When detection is blind.** If SmarTune cannot read the system journal or its
+own logs (for example, journal access is denied), a warning at the top of the
+page says so and since when: faults from that source are not being detected
+until it can be read again.
 
 <!-- Screenshot: the Alerts section — Open/Closed switch, handling filter, and
      the alert table with at least one open and one closed alert. -->
@@ -107,6 +189,12 @@ selected time range:
   and a **Lifecycle** hint — for an open alert, what will close it; for a closed
   one, what closed it.
 - **Investigate** opens the investigation view for the event behind the alert.
+- **Close** (open alerts) closes an alert by hand, whatever normally closes it.
+  Use it when the problem is over but its recovery was never recorded — for
+  example GPU throttling that ended while SmarTune was restarting, or a device
+  that is gone. If the fault is detected again, a new alert opens. A closed
+  alert's **Lifecycle** then reads *Closed manually*; a failed resource limit
+  from an earlier boot is closed at startup and reads *Cleared by reboot*.
 - If the selected range ends in the past and newer alerts have opened since, a
   hint offers **Jump to now**.
 
@@ -121,14 +209,16 @@ alert is not in the loaded alert list.
 Handle current alerts from the **Current alerts** panel behind the bell icon in
 the header (see [Getting started](getting-started.md#4-a-tour-of-the-dashboard)):
 
-- **Acknowledge** — you've seen it. For kernel panic, OOM kill, and GPU hang
-  this also **closes** the alert; for the other types it only marks the alert as
-  being handled, and it stays open until its recovery condition is met.
+- **Acknowledge** — you've seen it. For the one-off faults (the types closed by
+  "Acknowledging it" in the table above) this also **closes** the alert; for the
+  other types it only marks the alert as being handled, and it stays open until
+  its recovery condition is met.
 - **Silence** — stop notifications for **30 minutes** or **2 hours**.
 
-Acknowledge and silence apply to the current occurrence only: if the alert
-fires again after closing, or its severity is escalated, it needs attention
-again.
+An acknowledgement applies to the current occurrence only: if the alert fires
+again after closing, or its severity is escalated, it needs attention again. A
+silence lasts until it runs out, even if the alert closes and fires again in
+between, so an alert that keeps flapping stays quiet for the time you chose.
 
 Select an alert in the panel to jump here with the page centered on that alert's
 time span; **View all alerts** opens the Alerts list scoped to a range ending

@@ -33,7 +33,10 @@ The full rules shared by all SmarTune skills are in `agent/policy/` (`safety.md`
 - On `"error"`, report the error and its `"hint"`. If it says the diagnostics feature is not
   served, tell the user diagnostics is not installed on this machine. On exit code 3 or 4
   (connection or token), run `smartune doctor` once and relay its first failed check.
-- If the output has `_truncated`, narrow the window or add filters and run the query again.
+- If the output has `_truncated`, or `truncated_by_server: true`, narrow the window or add
+  filters and run the query again.
+- A source listed in `failed_sources` could not be read: say so, and never conclude from its
+  missing lines that nothing happened.
 - This skill only diagnoses. If the user wants to change something (restore a limit, change a
   priority, freeze an app), use the `smartune-control` skill: it shows a plan and applies it only
   after the user agrees. Silencing an alert is done from the SmarTune dashboard.
@@ -46,15 +49,17 @@ The full rules shared by all SmarTune skills are in `agent/policy/` (`safety.md`
 |---|---|---|
 | Any problems right now? | `smartune diag alerts` (add `--all` to include resolved alerts) | `list_alerts(include_resolved)` |
 | Why is / was app X limited? | `smartune diag why <app_id> --since 24h` (get the `app_id` from `smartune apps` or `smartune limits`) | `explain_app_control(app_id, since)` |
-| What happened recently | `smartune diag events --since 6h` · add `--severity warning`, `--category platform.control` (or `workload.benchmark`), `--app <app_id>`, `--type <EVENT_TYPE>` or `--keyword <text>` | `list_events(since, severity, category, app_id, event_type, keyword)` |
+| What happened recently | `smartune diag events --since 6h` · add `--severity warning` (warning and above), `--category platform.control` (or `workload.benchmark`), `--app <app_id>`, `--type <EVENT_TYPE>` or `--keyword <text>` | `list_events(since, severity, category, app_id, event_type, keyword)` |
 | Limit history | `smartune diag lifecycles --since 24h` · `smartune diag lifecycles --app <app_id>` | `list_control_lifecycles(since, app_id)` |
-| Logs | `smartune diag logs --since 1h --level error` · `smartune diag logs --since 1h --keyword <text>` · `smartune diag logs --since 1h --source smartune,journal` (sources: smartune, benchmark, journal) | `query_logs(since, level, keyword, sources)` |
+| Logs | `smartune diag logs --since 1h --level error` · `smartune diag logs --since 1h --keyword <text>` · `smartune diag logs --since 1h --source smartune,journal` (sources: smartune, benchmark, journal; journal is kernel lines only unless `--all-journal`) | `query_logs(since, level, keyword, sources)` |
 | Summary of a day / week | `smartune diag digest` (today) · `smartune diag digest --date 2026-10-28` · `smartune diag digest --period week` | `get_diag_digest(period, date)` |
 | Summary of the last N hours | `smartune diag digest --since 6h` | `get_diag_digest(since)` |
 | Since the last reboot | `smartune diag boots` → `smartune diag digest --period boot --boot <boot_id>` | `list_boots` → `get_diag_digest(period="boot", boot_id)` |
-| Root-cause evidence | `smartune diag context --app <app_id>` · `smartune diag context --job <run_id>` (benchmark run id from `smartune bench status`) · `smartune diag context --since 30m --findings-only` | `get_diag_context(app_id / job_id / since, findings_only)` |
+| Root-cause evidence | `smartune diag context --app <app_id> --since 6h` · `smartune diag context --job <run_id>` (benchmark run id from `smartune bench status`) · `smartune diag context --since 30m --findings-only` | `get_diag_context(app_id / job_id / since, findings_only)` |
 | Event types that exist | `smartune diag catalog` | `get_event_catalog` |
 | How far back data goes | `smartune diag retention` | `get_retention` |
+| Whether diagnostics is taking everything in (log sources, dropped or unstored events) | `smartune diag sources` | `get_diag_sources` |
+| Which events raise alerts and how each alert closes | `smartune diag policies` | `get_alert_policies` |
 
 Pair these with `smartune-status` commands when you need the resource picture: for example,
 `smartune history --since 2h` shows whether pressure was high when a limit was applied. For a

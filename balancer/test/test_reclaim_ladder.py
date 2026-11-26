@@ -21,6 +21,7 @@ Run: PYTHONDONTWRITEBYTECODE=1 python3 balancer/test/test_reclaim_ladder.py
 """
 
 import errno
+import contextlib
 import logging
 import os
 import sys
@@ -41,6 +42,7 @@ _test_logger = logging.getLogger("test_reclaim_ladder")
 _logger_module.logger = _test_logger
 _logger_module.get_logger = lambda name=None: _test_logger
 _logger_module.current_log_context = lambda: {}
+_logger_module.diagnostics_internal = contextlib.nullcontext
 sys.modules["utils.logger"] = _logger_module
 
 

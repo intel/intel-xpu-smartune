@@ -66,7 +66,7 @@ FULL_ARGS = {
                     "event_type": "T", "keyword": "k", "job_id": "j", "n": 5},
     "list_control_lifecycles": {"since": "2h", "app_id": "a", "n": 5},
     "query_logs": {"since": "30m", "sources": ["smartune", "journal"], "level": "error",
-                   "keyword": "k", "job_id": "j", "n": 5},
+                   "keyword": "k", "job_id": "j", "n": 5, "all_journal": True},
     "get_diag_digest": {"period": "boot", "boot_id": "b1"},
     "get_diag_context": {"since": "30m", "findings_only": True},
     "explain_app_control": {"app_id": "a", "since": "12h"},
@@ -269,3 +269,12 @@ def test_server_registers_read_and_write_tools():
     resources = asyncio.run(server.list_resources())
     if mcp_server.agent_dir():
         assert "smartune://methodology" in {str(r.uri) for r in resources}
+
+
+def test_diag_context_passes_since_for_an_app(monkeypatch):
+    seen = []
+    monkeypatch.setattr(mcp_server, "run_command", lambda argv: seen.append(argv) or {})
+    mcp_server.TOOLS["get_diag_context"](app_id="a", since="6h")
+    mcp_server.TOOLS["get_diag_context"](job_id="j", since="6h")
+    assert seen == [["diag", "context", "--app", "a", "--since", "6h"],
+                    ["diag", "context", "--job", "j"]]

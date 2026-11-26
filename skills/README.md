@@ -96,6 +96,7 @@ What the installer changes and how to finish the setup in each agent:
 | Digest for a day, week, boot session or the last N hours | `smartune diag digest` · `smartune diag boots` |
 | Root-cause evidence (by app, benchmark run or window) | `smartune diag context` |
 | Event types, and how far back the data reaches | `smartune diag catalog` · `smartune diag retention` |
+| Whether diagnostics is complete, and which events raise alerts | `smartune diag sources` · `smartune diag policies` |
 
 Method: scope the question, take the overview, drill down, then conclude. Which signal to check
 first for each symptom, the reference thresholds and the next command are in

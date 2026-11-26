@@ -97,6 +97,9 @@ READ_ROUTES = (
     ("GET", r"/diag/context"),
     ("GET", r"/diag/monitor-metrics"),
     ("GET", r"/diag/digest"),
+    # Diagnostics health and the alert policies; both only read in-memory state.
+    ("GET", r"/diag/sources"),
+    ("GET", r"/diag/alert-policies"),
     # Not /bench/env: despite being a GET it bootstraps the benchmark venv.
     ("GET", r"/bench/run"),
     ("GET", r"/bench/run/[A-Za-z0-9][A-Za-z0-9._:-]*"),

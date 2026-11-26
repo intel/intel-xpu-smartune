@@ -40,6 +40,8 @@ Categories:
 | `GET /monitor/history/retention` | Internal | Used by the settings page; `diag retention` covers the agent's needs |
 | `POST /monitor/history/retention` | Internal | Changes configuration and deletes history data at once |
 | `GET /monitor/config-hints` | Internal | Field descriptions and defaults for the settings page |
+| `POST /monitor/config-restore` | Internal | Writes startup or factory values back to the configuration at once (settings page) |
+| `GET /monitor/pressure-tuning/<group>`, `POST /monitor/pressure-tuning/<group>` | Internal | The relax/tighten bar on the settings page. The `POST` only computes the next step; the settings page saves it |
 | `GET/POST /monitor/config/*` (weights_top, passive_control, monitored_sections, network_control, system_pressure, ...) | Internal | Tuning parameters. An agent changing them carries far more risk than benefit, and reading them only matters to whoever tunes the system |
 
 ## Applications (`/app`, needs balancer)
@@ -93,14 +95,17 @@ when the service stops. Nothing is saved across restarts.
 | Endpoint | Category | Notes |
 |---|---|---|
 | `GET /diag/alerts` | Read-only | `smartune diag alerts` |
+| `GET /diag/alert-occurrences` | Internal | The dashboard's list of when each detection of an alert happened; agents get the same events with `smartune diag events --type <event_type>` |
 | `GET /diag/events` | Read-only | `smartune diag events` |
 | `GET /diag/control-lifecycles` | Read-only | `smartune diag lifecycles`, `diag why` |
 | `GET /diag/logs` | Read-only | `smartune diag logs`. The server redacts the lines |
 | `GET /diag/digest` | Read-only | `smartune diag digest`. Also the agent-side source for AI log analysis and daily reports |
 | `GET /diag/context` | Read-only | `smartune diag context`, `diag why` |
 | `GET /diag/boots`, `/diag/retention`, `/diag/event-catalog` | Read-only | Supporting queries |
+| `GET /diag/sources` | Read-only | `smartune diag sources`. Whether the log sources are readable, the event writer is dropping events, and event writes are failing: an empty answer means little when this reports a problem |
+| `GET /diag/alert-policies` | Read-only | `smartune diag policies`. Which event types raise alerts and how each one closes and escalates |
 | `GET /diag/monitor-metrics` | Read-only | In the allow-list; the CLI has no command for it yet and uses `smartune history` instead |
-| `POST /diag/alerts/<key>/acknowledge`, `/silence` | Control (not exposed) | Silencing an alert can hide a problem; needs user confirmation if ever exposed |
+| `POST /diag/alerts/<key>/acknowledge`, `/silence`, `/close` | Control (not exposed) | Silencing or closing an alert can hide a problem; needs user confirmation if ever exposed |
 | `POST /diag/control-lifecycles/clear-without-runtime-state` | Internal | Cleans up orphaned records; an operator task |
 
 ## Benchmark (`/bench`, needs benchmark)
@@ -113,6 +118,7 @@ when the service stops. Nothing is saved across restarts.
 | `GET /bench/models` | Read-only | `bench models` |
 | `GET /bench/env` | Internal | **A GET, but it installs the venv when missing**, so it stays out of the read-only allow-list |
 | `POST /bench/run`, `/bench/run/<id>/cancel` | Control (not exposed) | A run enters quiet mode, which pauses automatic control |
+| `GET /bench/params/schema`, `/bench/params/predict`, `POST /bench/params/validate` | Internal | The batch parameter editor: form schema per tool, which tool a model routes to, and a case-count check. Only useful while a human fills in a run |
 | `POST /bench/run/plan`, `GET /bench/run/<id>/plan`, `POST /bench/run/advanced` | Internal | Advanced mode; needs a human to edit the command |
 | `POST /bench/env/setup`, `/bench/env/ov`, `/bench/models/refresh` | Internal | Environment installation and switching; slow |
 | `GET /bench/network`, `POST /bench/network`, `POST /bench/network/test` | Internal | Proxy and Hugging Face token settings for model and package downloads (settings page). `POST` changes configuration and restarts pending downloads; `/network/test` makes outbound probes |

@@ -302,11 +302,15 @@ def cmd_diag_alerts(client, args):
 
 def cmd_diag_events(client, args):
     start, end = window(args.since)
-    data = client.diag("events", severity=args.severity, category=args.category,
+    # keep_important: -n bounds only the info events, so a burst of them cannot
+    # hide an older warning+ event; the server says when it left any out.
+    data = client.diag("events", min_severity=args.severity, category=args.category,
                        app_id=args.app, event_type=args.type, job_id=args.job,
-                       keyword=args.keyword, limit=args.n, **{"from": start, "to": end}) or {}
+                       keyword=args.keyword, limit=args.n, keep_important="true",
+                       **{"from": start, "to": end}) or {}
     events = data.get("events") or []
-    return {"window": {"from": iso(start), "to": iso(end)}, "count": len(events), "events": events}
+    return {"window": {"from": iso(start), "to": iso(end)}, "count": len(events),
+            "truncated_by_server": bool(data.get("truncated")), "events": events}
 
 
 def cmd_diag_lifecycles(client, args):
@@ -319,11 +323,17 @@ def cmd_diag_lifecycles(client, args):
 
 def cmd_diag_logs(client, args):
     start, end = window(args.since)
+    params = {"from": start, "to": end}
+    if args.all_journal:
+        params["kernel_only"] = "false"  # the server reads only the kernel ring by default
     data = client.diag("logs", source=args.source, level=args.level, keyword=args.keyword,
-                       job_id=args.job, limit=args.n, **{"from": start, "to": end}) or {}
-    lines = data.get("lines") or []
-    return {"window": {"from": iso(start), "to": iso(end)}, "sources": data.get("sources"),
-            "truncated_by_server": data.get("truncated"), "lines": lines}
+                       job_id=args.job, limit=args.n, **params) or {}
+    lines = data.get("records") or []
+    out = {"window": {"from": iso(start), "to": iso(end)}, "sources": data.get("sources"),
+           "truncated_by_server": data.get("truncated"), "lines": lines}
+    if data.get("failed_sources"):
+        out["failed_sources"] = data["failed_sources"]
+    return out
 
 
 def cmd_diag_digest(client, args):
@@ -341,9 +351,9 @@ def cmd_diag_digest(client, args):
 def cmd_diag_context(client, args):
     if args.job:
         return client.diag("context", job_id=args.job)
-    if args.app:
-        return client.diag("context", app_id=args.app)
     start, end = window(args.since)
+    if args.app:
+        return client.diag("context", app_id=args.app, **{"from": start, "to": end})
     return client.diag("context", findings_only="true" if args.findings_only else None,
                        **{"from": start, "to": end})
 
@@ -362,11 +372,11 @@ def cmd_diag_why(client, args):
     part("current_limit", lambda: client.limit_snapshot(args.app_id))
     part("lifecycles", lambda: (client.diag("control-lifecycles", app_id=args.app_id, limit=20,
                                             **{"from": start, "to": end}) or {}).get("lifecycles") or [])
-    part("events", lambda: (client.diag("events", app_id=args.app_id, limit=30,
+    part("events", lambda: (client.diag("events", app_id=args.app_id, limit=30, keep_important="true",
                                         **{"from": start, "to": end}) or {}).get("events") or [])
 
     def context():
-        ctx = client.diag("context", app_id=args.app_id) or {}
+        ctx = client.diag("context", app_id=args.app_id, **{"from": start, "to": end}) or {}
         return pick(ctx, "window", "findings", "control_actions")
     part("context", context)
     return out
@@ -594,7 +604,8 @@ def build_parser():
 
     p = add(dsub, "events", cmd_diag_events, "Operational events in a time window")
     p.add_argument("--since", default="24h")
-    p.add_argument("--severity")
+    p.add_argument("--severity", choices=("info", "warning", "error", "critical"),
+                   help="minimum severity: warning also returns error and critical")
     p.add_argument("--category")
     p.add_argument("--app", help="app_id")
     p.add_argument("--type", help="event_type, see `smartune diag catalog`")
@@ -614,6 +625,8 @@ def build_parser():
     p.add_argument("--level", help="minimum level, e.g. warning, error")
     p.add_argument("--keyword")
     p.add_argument("--job", help="benchmark job id")
+    p.add_argument("--all-journal", action="store_true",
+                   help="read every journald unit (service restarts, crashes), not only kernel lines")
     p.add_argument("-n", type=int, default=100)
 
     p = add(dsub, "digest", cmd_diag_digest, "Summary of a day, week, boot session or recent window")
@@ -626,7 +639,8 @@ def build_parser():
     scope = p.add_mutually_exclusive_group()
     scope.add_argument("--app", help="app_id")
     scope.add_argument("--job", help="benchmark job id")
-    p.add_argument("--since", default="1h", help="window when neither --app nor --job is given")
+    p.add_argument("--since", default="1h",
+                   help="evidence window, e.g. 6h (a --job uses the job's own time span)")
     p.add_argument("--findings-only", action="store_true")
 
     p = add(dsub, "why", cmd_diag_why, "Why an app is (or was) limited: current limit, lifecycles, events, findings")
@@ -637,6 +651,10 @@ def build_parser():
     p.add_argument("-n", type=int, default=15)
     add(dsub, "retention", cmd_diag_simple("retention"), "How far back each evidence source reaches")
     add(dsub, "catalog", cmd_diag_simple("event-catalog"), "Built-in diagnostic event types")
+    add(dsub, "sources", cmd_diag_simple("sources"),
+        "Whether diagnostics takes everything in: log sources, event writer drops, failed event writes")
+    add(dsub, "policies", cmd_diag_simple("alert-policies"),
+        "Which event types raise alerts, and how each alert closes and escalates")
 
     bench = sub.add_parser("bench", help="Model benchmark: run status and results (read-only)")
     bsub = bench.add_subparsers(dest="bench_command", metavar="BENCH_COMMAND")
